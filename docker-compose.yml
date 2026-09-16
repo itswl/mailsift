@@ -1,0 +1,50 @@
+services:
+  mailsift:
+    # 直接拉现成镜像，不需要 build。要从源码构建见 docker-compose.build.yml
+    image: ghcr.io/itswl/mailsift:latest
+    pull_policy: missing
+    container_name: mailsift
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+
+    volumes:
+      # 命名卷而不是绑定挂载：容器以 uid 10001 运行，
+      # 宿主机目录通常是 root 拥有，绑定挂载会直接写不进去
+      - mailsift-data:/app/data
+
+    # 日志进 stdout，不轮转的话服务器上迟早撑爆磁盘
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # SIGTERM 后让当前这一轮跑完再退，避免半路中断留下不一致的游标
+    stop_grace_period: 60s
+
+  # MCP server（可选，默认不启动）。
+  #   开启：docker compose --profile mcp up -d
+  #   关闭：docker compose --profile mcp down mailsift-mcp
+  # 与主服务共享同一个数据卷；开关它都不影响主服务，也不会丢游标或 token。
+  mailsift-mcp:
+    image: ghcr.io/itswl/mailsift:latest
+    pull_policy: missing
+    container_name: mailsift-mcp
+    restart: unless-stopped
+    profiles: ["mcp"]
+    env_file: .env
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+    command: ["node", "dist/src/mcp.js"]
+    volumes:
+      - mailsift-data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  mailsift-data:

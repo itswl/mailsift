@@ -1,0 +1,34 @@
+{
+  "name": "mailsift",
+  "version": "1.0.0",
+  "description": "多邮箱重要邮件分诊：收件箱与垃圾箱一起盯，LLM 判重要性，推到飞书",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node --disable-warning=ExperimentalWarning dist/src/main.js",
+    "dev": "tsx src/main.ts",
+    "check": "tsx src/main.ts --check",
+    "probe": "tsx scripts/probe.ts",
+    "oauth": "tsx scripts/oauth-setup.ts",
+    "mcp": "tsx src/mcp.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "mcp:prod": "node --disable-warning=ExperimentalWarning dist/src/mcp.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "imapflow": "^2.0.5",
+    "mailparser": "^3.9.28",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.0.0"
+  }
+}
