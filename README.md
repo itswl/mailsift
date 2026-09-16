@@ -286,9 +286,16 @@ QQ 的 IMAP 不支持 `SINCE` 过滤（实测 1 天和 365 天返回一样多）
 **OAuth 的 token 会过期吗？要定期续期吗？**
 不用管。access_token 约 1 小时过期，程序自动刷新并回写；refresh_token 长期有效，
 服务常驻运行时每小时刷新等于持续续命（微软 90 天 / Google 约 6 个月**不用**才会
-失效，跑着就碰不到）。会触发失效的情况：改密码、在账号设置里撤销授权
-（微软 [consent 管理页](https://account.live.com/consent/Manage)、Google 账号「安全性 →
-第三方应用访问」）、平台策略变化导致所用的公开凭据失效。失效不会静默：账号连续失败 2 次
+失效，跑着就碰不到）。会触发失效的情况：改密码、在账号设置里撤销授权、平台
+策略变化导致所用的公开凭据失效。撤销授权的入口：
+
+- Outlook 个人账号：[account.live.com/consent/Manage](https://account.live.com/consent/Manage)
+  （工作/学校账号在 [myapps.microsoft.com](https://myapps.microsoft.com) →
+  右上角头像 → 查看帐户 → 管理应用程序，管理员也可代为撤销）
+- Google：[myaccount.google.com/linkedapps](https://myaccount.google.com/linkedapps)
+  （或「Google 帐号 → 安全性 → 第三方应用访问」）
+
+失效不会静默：账号连续失败 2 次
 （`ACCOUNT_ALERT_AFTER_FAILURES`）即触发推送告警，重新授权即可——tokens.json 里
 留着旧记录，要加 `--force`：
 
