@@ -8,8 +8,11 @@
  * 默认不启动；开启方式见 README。
  */
 import './env.js'; // 必须最先执行：把 .env 灌进 process.env
+import { createServer as createHttpServer } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { z } from 'zod';
 import { loadConfig } from './config.js';
 import { StateStore } from './services/state.js';
@@ -198,9 +201,74 @@ export function createServer(): McpServer {
   return server;
 }
 
+/**
+ * Streamable HTTP 模式：给远程 MCP 客户端用的。
+ *
+ * 无状态实现（sessionIdGenerator 为 undefined）：每个请求独立的 server +
+ * transport，处理完即回收，不留会话——本服务的工具全是短平快的查询/触发，
+ * 不需要跨请求会话，换来的是零状态、随便横向扩。
+ *
+ * 端点固定为 /mcp；绑定非回环地址时强烈建议设置 MCP_TOKEN，
+ * 否则任何能连到端口的人都能读你的邮件分诊结果。
+ */
+async function serveHttp(): Promise<void> {
+  const port = Number(process.env.MCP_PORT ?? 8410);
+  const host = process.env.MCP_BIND ?? '127.0.0.1';
+  const token = process.env.MCP_TOKEN?.trim() ?? '';
+  const loopback = ['127.0.0.1', 'localhost', '::1'].includes(host);
+
+  if (!loopback && !token) {
+    console.error(
+      `⚠️  MCP_BIND=${host} 且未设置 MCP_TOKEN：任何能连到 ${host}:${port} 的人` +
+        '都能查询你的邮件，请尽快在 .env 里设置 MCP_TOKEN',
+    );
+  }
+
+  const httpServer = createHttpServer((req, res) => {
+    void (async () => {
+      try {
+        const url = new URL(req.url ?? '/', `http://${host}:${port}`);
+        if (url.pathname !== '/mcp') {
+          res.writeHead(404).end();
+          return;
+        }
+        if (token && req.headers.authorization !== `Bearer ${token}`) {
+          res.writeHead(401, { 'content-type': 'application/json' }).end('{"error":"unauthorized"}');
+          return;
+        }
+        const server = createServer();
+        // 不传 sessionIdGenerator 即无状态模式（SDK 类型注释明确说明）
+        const transport = new StreamableHTTPServerTransport({});
+        res.on('close', () => {
+          void transport.close();
+          void server.close();
+        });
+        // SDK 的 streamableHttp 实现把 onclose 声明成可空，与 Transport 接口在
+        // exactOptionalPropertyTypes 下不合（stdio 就合），只能断言绕过
+        await server.connect(transport as unknown as Transport);
+        await transport.handleRequest(req, res);
+      } catch (error) {
+        console.error('MCP 请求处理失败:', error);
+        if (!res.headersSent) res.writeHead(500).end();
+      }
+    })();
+  });
+
+  httpServer.listen(port, host, () => {
+    console.error(
+      `mailsift MCP (Streamable HTTP) http://${host}:${port}/mcp · 鉴权: ` +
+        (token ? 'Bearer token' : '无'),
+    );
+  });
+}
+
 async function main(): Promise<void> {
   // stdio 下 stdout 属于协议通道，日志一律走 stderr（见 logger.ts）
   process.env.LOG_LEVEL ??= 'warn';
+  if ((process.env.MCP_TRANSPORT ?? 'stdio') === 'http') {
+    await serveHttp();
+    return;
+  }
   const server = createServer();
   await server.connect(new StdioServerTransport());
 }

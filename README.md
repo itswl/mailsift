@@ -215,6 +215,33 @@ docker compose --profile mcp up -d
 }
 ```
 
+服务器上的 stdio 还有零配置一招——让 MCP 客户端直接通过 SSH 拉起远程进程，
+stdio 走的是 SSH 通道，不用开任何端口：
+
+```json
+{
+  "mcpServers": {
+    "mailsift": {
+      "command": "ssh",
+      "args": ["server", "node", "/opt/mailsift/dist/src/mcp.js"]
+    }
+  }
+}
+```
+
+远程接入用 Streamable HTTP（`.env` 里 `MCP_TRANSPORT=http` 后启动），
+端点是 `/mcp`，可配 `MCP_PORT` / `MCP_BIND` / `MCP_TOKEN`（Bearer 鉴权）：
+
+```bash
+# Claude Code 接入示例
+claude mcp add --transport http mailsift http://服务器:8410/mcp \
+  --header "Authorization: Bearer $MCP_TOKEN"
+```
+
+Docker 的 `--profile mcp` 就是这个模式（容器内绑 0.0.0.0，宿主机默认只发布到
+回环地址）。**对外暴露前务必设置 `MCP_TOKEN`**——这个端点能读你所有邮箱的
+分诊结果；更稳妥的做法是不设 token、只回环发布，远程走 SSH 隧道。
+
 提供 8 个工具：
 
 | 工具 | 作用 |
