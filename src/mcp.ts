@@ -119,8 +119,16 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
     new ResourceTemplate('mailsift://mail/{messageId}', { list: undefined }),
     { mimeType: 'application/json', description: 'Read one stored mailsift triage record by Message-ID.' },
     async (uri, variables) => {
-      const messageId = variables['messageId'];
-      const found = typeof messageId === 'string' ? store.getMail(messageId) : undefined;
+      const rawMessageId = variables['messageId'];
+      let messageId: string | undefined;
+      if (typeof rawMessageId === 'string') {
+        try {
+          messageId = decodeURIComponent(rawMessageId);
+        } catch {
+          messageId = undefined;
+        }
+      }
+      const found = messageId ? store.getMail(messageId) : undefined;
       if (!found) throw new Error('mail record not found');
       return {
         contents: [{
