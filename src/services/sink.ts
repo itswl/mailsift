@@ -1,9 +1,8 @@
 /**
- * 出口：飞书直推 与 WebhookWise，可并存。
+ * Outputs: Feishu and WebhookWise can be enabled together.
  *
- * WebhookWise 的鉴权用 token 头。它也支持 x-webhook-signature，但当前实现里
- * ensure_webhook_auth 对 body 签名、enforce_replay_protection 对 "timestamp.body"
- * 签名，开了防重放后同一个头满足不了两边，所以不走签名。
+ * WebhookWise authentication uses a token header. Its signature modes sign
+ * different payloads, so one header cannot satisfy both replay protection checks.
  */
 import { snippet, type MailMessage } from '../imap/message.js';
 import { FeishuSink, type Sink } from './feishu.js';
@@ -15,10 +14,10 @@ const log = getLogger('sink');
 const MAX_SNIPPET = 600;
 
 /**
- * 构造 WebhookWise 入站事件。
+ * Build a WebhookWise inbound event.
  *
- * 字段名刻意嵌在 mail / triage 两个对象里：既避开了 generic_json 适配器的
- * alert_name + level 检测，也让 mailsift.yaml 的 detect 条件足够专一。
+ * Keep fields under mail / triage to avoid generic_json adapter detection and
+ * keep mailsift.yaml detection specific.
  */
 export function buildWebhookPayload(message: MailMessage, result: TriageResult): Record<string, unknown> {
   return {
@@ -28,7 +27,7 @@ export function buildWebhookPayload(message: MailMessage, result: TriageResult):
       folder: message.folder,
       in_spam: message.inSpam,
       message_id: message.messageId,
-      subject: message.subject || '(无主题)',
+      subject: message.subject || '(no subject)',
       from: message.fromAddr,
       from_name: message.fromName,
       date: message.date,
@@ -66,7 +65,7 @@ export class WebhookWiseSink implements Sink {
 
   async push(message: MailMessage, result: TriageResult): Promise<boolean> {
     if ((process.env.DRY_RUN ?? '').toLowerCase() === 'true') {
-      log.info(`[dry-run] 本应推 WebhookWise | ${result.importance} | ${message.subject}`);
+      log.info(`[dry-run] Would send to WebhookWise | ${result.importance} | ${message.subject}`);
       return true;
     }
     if (!this.configured) return false;
@@ -82,22 +81,22 @@ export class WebhookWiseSink implements Sink {
         signal: AbortSignal.timeout(30_000),
       });
       if (!response.ok) {
-        log.error(`WebhookWise 推送被拒 | HTTP ${response.status} | ${message.subject}`);
+        log.error(`WebhookWise push rejected | HTTP ${response.status} | ${message.subject}`);
         return false;
       }
-      log.info(`WebhookWise 已送达 | ${result.importance} | ${message.subject}`);
+      log.info(`WebhookWise delivered | ${result.importance} | ${message.subject}`);
       return true;
     } catch (error) {
-      log.error(`WebhookWise 推送失败 | ${message.subject} | ${error}`);
+      log.error(`WebhookWise push failed | ${message.subject} | ${error}`);
       return false;
     }
   }
 }
 
 /**
- * 把同一条结论发往多个出口。
+ * Send the same result to multiple outputs.
  *
- * 任一出口成功即算送达——两个都配的时候，一个挂了不该让另一个也被记成失败。
+ * Any successful output counts as delivery; one failed output must not hide another success.
  */
 export class CompositeSink implements Sink {
   constructor(private readonly sinks: Sink[]) {}
@@ -108,10 +107,10 @@ export class CompositeSink implements Sink {
 
   async push(message: MailMessage, result: TriageResult): Promise<boolean> {
     if (this.sinks.length === 0) {
-      log.error(`没有任何可用出口，消息被丢弃 | ${message.subject}`);
+      log.error(`No configured output; message dropped | ${message.subject}`);
       return false;
     }
-    // 不短路：每个出口都要试，否则第一个失败会让后面的收不到
+    // Do not short-circuit: try every output even when one fails.
     const results = await Promise.all(this.sinks.map((sink) => sink.push(message, result)));
     return results.some(Boolean);
   }

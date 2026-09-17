@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * mailsift MCP server — 让 AI 主动查邮件分诊结果。
+ * mailsift MCP server — lets an AI query triage results.
  *
- * 推送解决的是"要紧的事立刻知道"，但"今天有什么要紧邮件""XX 公司来过信吗"
- * 是拉取式的，交给 AI 直接查本地状态库。
+ * Push handles urgent alerts, while questions such as "what arrived today" are
+ * pull-based and can be answered from the local state database.
  *
- * 默认不启动；开启方式见 README。
+ * Disabled by default; see README for activation.
  */
-import './env.js'; // 必须最先执行：把 .env 灌进 process.env
+import './env.js'; // Must run first so .env is loaded.
 import { createServer as createHttpServer } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -23,10 +23,9 @@ import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
 import { FAIL_COUNT_KEY, LLM_FAIL_COUNT_KEY } from './services/health.js';
 
 const INSTRUCTIONS =
-  '查询 mailsift 的邮件分诊结果。它同时监控多个邮箱的收件箱和垃圾箱，' +
-  '用 LLM 判断重要性。重要的已实时推送，其余进每日简报。\n' +
-  '注意 inSpam=true 表示该邮件被邮件服务商判为垃圾——如果它同时 pushed=true，' +
-  '说明是被捞回来的误判，这类最值得关注。';
+  'Query mailsift triage results. It monitors inboxes and spam folders, uses an LLM to assess importance, ' +
+  'pushes important messages, and queues the rest for the daily digest.\n' +
+  'inSpam=true means the provider classified a message as spam; when pushed=true, it was rescued as a likely false positive.';
 
 const IMPORTANCE = z.enum(['critical', 'warning', 'info']);
 
@@ -42,8 +41,8 @@ export function createServer(): McpServer {
 
   server.tool(
     'list_mail',
-    '列出最近处理过的邮件。默认返回 24 小时内的。importance 可选 critical/warning/info；' +
-      'spamOnly=true 只看垃圾箱里的；pushedOnly=true 只看已实时推送的。',
+    'List recently processed mail (24 hours by default). importance accepts critical/warning/info; ' +
+      'spamOnly=true filters spam and pushedOnly=true filters real-time deliveries.',
     {
       hours: z.number().int().positive().default(24),
       importance: IMPORTANCE.optional(),
@@ -67,8 +66,8 @@ export function createServer(): McpServer {
 
   server.tool(
     'search_mail',
-    '按关键词搜索邮件，匹配标题、发件人、分诊分类、摘要和判定理由。' +
-      '用于回答"XX 来过信吗""关于续费的邮件有哪些"。',
+    'Search subject, sender, triage category, summary, and reason by keyword. ' +
+      'Use it to answer whether a sender wrote or which messages concern a renewal.',
     { query: z.string().min(1), hours: z.number().int().positive().optional(), limit: z.number().int().positive().max(200).default(30) },
     async (args) => {
       const mail = state().queryMail({
@@ -82,7 +81,7 @@ export function createServer(): McpServer {
 
   server.tool(
     'get_mail',
-    '按 Message-ID 取单封邮件的完整记录，含正文摘要和分诊理由。',
+    'Get a complete record by Message-ID, including body preview and triage reason.',
     { messageId: z.string().min(1) },
     async (args) => {
       const found = state().getMail(args.messageId);
@@ -92,14 +91,14 @@ export function createServer(): McpServer {
 
   server.tool(
     'mail_summary',
-    '统计概览：时间窗内处理了多少封、推送了多少、其中多少来自垃圾箱、多少是从垃圾箱捞回的误判。',
+    'Summarize processed and pushed messages in a time window, including spam and spam rescues.',
     { hours: z.number().int().positive().default(24) },
     async (args) => json(state().summarize(args.hours)),
   );
 
   server.tool(
     'list_accounts',
-    '列出正在监控的邮箱账号及其扫描的文件夹、认证方式。',
+    'List monitored accounts, folders, and authentication methods.',
     {},
     async () => {
       try {
@@ -122,8 +121,8 @@ export function createServer(): McpServer {
 
   server.tool(
     'health',
-    '服务健康状态：上轮轮询时间、各账号是否失联、模型是否可用、简报队列积压多少。' +
-      '排查"为什么没收到通知"时先看这个。',
+    'Show service health: last poll, account outages, LLM status, and digest backlog. ' +
+      'Check this first when investigating a missing notification.',
     {},
     async () => {
       const store = state();
@@ -165,7 +164,7 @@ export function createServer(): McpServer {
 
   server.tool(
     'poll_now',
-    '立刻跑一轮收取与分诊，不等下一个轮询周期。耗时取决于新邮件数量，通常几秒到一分钟。',
+    'Run one fetch and triage cycle immediately instead of waiting. Usually takes seconds to a minute.',
     {},
     async () => {
       try {
@@ -188,7 +187,7 @@ export function createServer(): McpServer {
 
   server.tool(
     'send_digest_now',
-    '立刻发送每日简报（会清空当前简报队列），不等到设定的时间点。',
+    'Send the daily digest immediately and clear the current digest queue.',
     {},
     async () => {
       const store = state();
@@ -202,14 +201,14 @@ export function createServer(): McpServer {
 }
 
 /**
- * Streamable HTTP 模式：给远程 MCP 客户端用的。
+ * Streamable HTTP mode for remote MCP clients.
  *
- * 无状态实现（sessionIdGenerator 为 undefined）：每个请求独立的 server +
- * transport，处理完即回收，不留会话——本服务的工具全是短平快的查询/触发，
- * 不需要跨请求会话，换来的是零状态、随便横向扩。
+ * Stateless implementation (sessionIdGenerator is undefined): each request gets
+ * an independent server and transport, then is released. Tools are short queries
+ * or triggers and do not need cross-request sessions.
  *
- * 端点固定为 /mcp；绑定非回环地址时强烈建议设置 MCP_TOKEN，
- * 否则任何能连到端口的人都能读你的邮件分诊结果。
+ * The endpoint is /mcp. Set MCP_TOKEN before binding outside loopback or anyone
+ * who can reach the port can read triage results.
  */
 async function serveHttp(): Promise<void> {
   const port = Number(process.env.MCP_PORT ?? 8410);
@@ -219,8 +218,8 @@ async function serveHttp(): Promise<void> {
 
   if (!loopback && !token) {
     console.error(
-      `⚠️  MCP_BIND=${host} 且未设置 MCP_TOKEN：任何能连到 ${host}:${port} 的人` +
-        '都能查询你的邮件，请尽快在 .env 里设置 MCP_TOKEN',
+      `⚠️  MCP_BIND=${host} has no MCP_TOKEN; anyone reaching ${host}:${port} ` +
+        'can query your mail. Set MCP_TOKEN in .env.',
     );
   }
 
@@ -237,18 +236,18 @@ async function serveHttp(): Promise<void> {
           return;
         }
         const server = createServer();
-        // 不传 sessionIdGenerator 即无状态模式（SDK 类型注释明确说明）
+        // Omitting sessionIdGenerator selects stateless mode.
         const transport = new StreamableHTTPServerTransport({});
         res.on('close', () => {
           void transport.close();
           void server.close();
         });
-        // SDK 的 streamableHttp 实现把 onclose 声明成可空，与 Transport 接口在
-        // exactOptionalPropertyTypes 下不合（stdio 就合），只能断言绕过
+        // The SDK declares onclose as nullable here, which conflicts with the
+        // Transport interface under exactOptionalPropertyTypes.
         await server.connect(transport as unknown as Transport);
         await transport.handleRequest(req, res);
       } catch (error) {
-        console.error('MCP 请求处理失败:', error);
+        console.error('MCP request failed:', error);
         if (!res.headersSent) res.writeHead(500).end();
       }
     })();
@@ -256,14 +255,14 @@ async function serveHttp(): Promise<void> {
 
   httpServer.listen(port, host, () => {
     console.error(
-      `mailsift MCP (Streamable HTTP) http://${host}:${port}/mcp · 鉴权: ` +
-        (token ? 'Bearer token' : '无'),
+      `mailsift MCP (Streamable HTTP) http://${host}:${port}/mcp · auth: ` +
+        (token ? 'Bearer token' : 'none'),
     );
   });
 }
 
 async function main(): Promise<void> {
-  // stdio 下 stdout 属于协议通道，日志一律走 stderr（见 logger.ts）
+  // stdout is the protocol channel in stdio mode; logs use stderr.
   process.env.LOG_LEVEL ??= 'warn';
   if ((process.env.MCP_TRANSPORT ?? 'stdio') === 'http') {
     await serveHttp();

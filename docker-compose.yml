@@ -1,6 +1,6 @@
 services:
   mailsift:
-    # 直接拉现成镜像，不需要 build。要从源码构建见 docker-compose.build.yml
+    # Pull the published image. See docker-compose.build.yml to build from source.
     image: ghcr.io/itswl/mailsift:latest
     pull_policy: missing
     container_name: mailsift
@@ -10,26 +10,26 @@ services:
       - TZ=${TZ:-Asia/Shanghai}
 
     volumes:
-      # 命名卷而不是绑定挂载：容器以 uid 10001 运行，
-      # 宿主机目录通常是 root 拥有，绑定挂载会直接写不进去
+      # Use a named volume because the container runs as uid 10001 and a root-owned
+      # host bind mount would not be writable.
       - mailsift-data:/app/data
 
-    # 日志进 stdout，不轮转的话服务器上迟早撑爆磁盘
+    # Logs go to stdout; rotate them or they will eventually fill the disk.
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
 
-    # SIGTERM 后让当前这一轮跑完再退，避免半路中断留下不一致的游标
+    # Finish the current poll after SIGTERM to avoid inconsistent cursors.
     stop_grace_period: 60s
 
-  # MCP server（可选，默认不启动，以 Streamable HTTP 暴露）。
-  #   开启：docker compose --profile mcp up -d
-  #   关闭：docker compose --profile mcp down mailsift-mcp
-  # 与主服务共享同一个数据卷；开关它都不影响主服务，也不会丢游标或 token。
-  # 容器内必须绑 0.0.0.0 端口映射才可达；宿主机默认只发布到回环，
-  # 远程接入走 SSH 隧道，或设置 MCP_TOKEN 后把发布地址改成对外。
+  # Optional MCP server, disabled by default, exposed through Streamable HTTP.
+  # Enable: docker compose --profile mcp up -d
+  # Disable: docker compose --profile mcp down mailsift-mcp
+  # It shares the data volume with the main service and does not affect cursors or tokens.
+  # Bind 0.0.0.0 inside the container; the host publishes to loopback by default.
+  # Use an SSH tunnel for remote access or set MCP_TOKEN before publishing externally.
   mailsift-mcp:
     image: ghcr.io/itswl/mailsift:latest
     pull_policy: missing

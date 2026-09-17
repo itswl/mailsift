@@ -18,17 +18,17 @@ const OUTLOOK: Account = { ...QQ, name: 'Outlook', provider: 'outlook', username
 
 const store = () => new StateStore(':memory:');
 
-describe('账号失联', () => {
-  it('认证失败立即告警——那是确定性的，等两轮毫无意义', async () => {
+describe('account outages', () => {
+  it('alerts immediately on authentication failures because they are deterministic', async () => {
     const s = store();
     const sink = new RecordingSink();
     expect(await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'))).toBe(true);
     const [message, result] = sink.pushed[0]!;
     expect(result.importance).toBe('critical');
-    expect(message.subject).toContain('失联');
+    expect(message.subject).toContain('unavailable');
   });
 
-  it('非认证失败等第二次', async () => {
+  it('waits for a second non-authentication failure', async () => {
     process.env.ACCOUNT_ALERT_AFTER_FAILURES = '2';
     const s = store();
     const sink = new RecordingSink();
@@ -36,14 +36,14 @@ describe('账号失联', () => {
     expect(await recordAccountFailure(s, sink, QQ, new Error('ETIMEDOUT'))).toBe(true);
   });
 
-  it('冷却期内不重复刷屏', async () => {
+  it('does not repeat alerts during the cooldown', async () => {
     const s = store();
     const sink = new RecordingSink();
     for (let i = 0; i < 5; i += 1) await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     expect(sink.pushed).toHaveLength(1);
   });
 
-  it('冷却过期后可以再告警', async () => {
+  it('alerts again after the cooldown expires', async () => {
     const s = store();
     const sink = new RecordingSink();
     await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
@@ -52,48 +52,48 @@ describe('账号失联', () => {
     expect(sink.pushed).toHaveLength(2);
   });
 
-  it('告警正文说清失去了什么', async () => {
+  it('explains what is no longer being monitored', async () => {
     const s = store();
     const sink = new RecordingSink();
     await recordAccountFailure(s, sink, QQ, new Error('authentication failed'));
-    expect(sink.pushed[0]![0].body).toContain('垃圾箱');
+    expect(sink.pushed[0]![0].body).toContain('including spam');
   });
 
-  it('Gmail 的修复建议点出 7 天陷阱', async () => {
+  it('mentions the Gmail seven-day testing trap in the recovery advice', async () => {
     const s = store();
     const sink = new RecordingSink();
     await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     const body = sink.pushed[0]![0].body;
-    expect(body).toContain('7 天');
-    expect(body).toContain('测试');
+    expect(body).toContain('7 days');
+    expect(body).toContain('Testing');
   });
 
-  it('Outlook 的修复建议先提 IMAP 开关', async () => {
+  it('mentions the Outlook IMAP switch first in the recovery advice', async () => {
     const s = store();
     const sink = new RecordingSink();
     await recordAccountFailure(s, sink, OUTLOOK, new Error('invalid_grant'));
     const body = sink.pushed[0]![0].body;
-    expect(body).toContain('转发和 IMAP');
-    expect(body).toContain('默认是关的');
+    expect(body).toContain('Forwarding and IMAP');
+    expect(body).toContain('disabled by default');
   });
 
-  it('任何服务商的排查项都包含 IMAP 没开这条', async () => {
-    // 大多数邮箱默认不开 IMAP，这是接入失败最常见的原因
+  it('includes the IMAP check for every provider', async () => {
+    // Most mailboxes disable IMAP by default, making it the most common setup issue.
     const s = store();
     const sink = new RecordingSink();
     await recordAccountFailure(s, sink, QQ, new Error('login failed'));
     expect(sink.pushed[0]![0].body).toContain('IMAP');
   });
 
-  it('恢复后补一条通知', async () => {
+  it('sends a recovery notification', async () => {
     const s = store();
     const sink = new RecordingSink();
     await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     expect(await recordAccountSuccess(s, sink, GMAIL)).toBe(true);
-    expect(sink.pushed[1]![0].subject).toContain('已恢复');
+    expect(sink.pushed[1]![0].subject).toContain('recovered');
   });
 
-  it('抖一下自己好了不打扰', async () => {
+  it('does not notify when a transient failure recovers', async () => {
     process.env.ACCOUNT_ALERT_AFTER_FAILURES = '2';
     const s = store();
     const sink = new RecordingSink();
@@ -102,15 +102,15 @@ describe('账号失联', () => {
     expect(sink.pushed).toHaveLength(0);
   });
 
-  it('一直正常的账号不产生任何消息', async () => {
+  it('does not emit messages for a continuously healthy account', async () => {
     const sink = new RecordingSink();
     expect(await recordAccountSuccess(store(), sink, QQ)).toBe(false);
     expect(sink.pushed).toHaveLength(0);
   });
 });
 
-describe('模型不可用', () => {
-  it('达到阈值才告警', async () => {
+describe('LLM outages', () => {
+  it('alerts only after reaching the threshold', async () => {
     process.env.LLM_ALERT_AFTER_FAILURES = '2';
     const s = store();
     const sink = new RecordingSink();
@@ -119,18 +119,18 @@ describe('模型不可用', () => {
     expect(sink.pushed[0]![1].importance).toBe('critical');
   });
 
-  it('正文说清降级后果，而不只是报错', async () => {
+  it('explains the consequences of fallback instead of only reporting the error', async () => {
     process.env.LLM_ALERT_AFTER_FAILURES = '1';
     const s = store();
     const sink = new RecordingSink();
     await recordLlmFailure(s, sink, new Error('HTTP 401 invalid api key'));
     const body = sink.pushed[0]![0].body;
-    expect(body).toContain('关键词兜底');
-    expect(body).toContain('每日简报');
+    expect(body).toContain('keyword fallback');
+    expect(body).toContain('daily digest');
     expect(body).toContain('401');
   });
 
-  it('冷却生效', async () => {
+  it('enforces the cooldown', async () => {
     process.env.LLM_ALERT_AFTER_FAILURES = '1';
     const s = store();
     const sink = new RecordingSink();
@@ -138,28 +138,28 @@ describe('模型不可用', () => {
     expect(sink.pushed).toHaveLength(1);
   });
 
-  it('恢复通知提醒去简报里复核', async () => {
+  it('points to the digest for review in the recovery notice', async () => {
     process.env.LLM_ALERT_AFTER_FAILURES = '1';
     const s = store();
     const sink = new RecordingSink();
     await recordLlmFailure(s, sink, new Error('x'));
     s.setMeta(LLM_ALERTED_AT_KEY, new Date().toISOString());
     expect(await recordLlmSuccess(s, sink)).toBe(true);
-    expect(sink.pushed[1]![0].body).toContain('简报');
+    expect(sink.pushed[1]![0].body).toContain('digest');
   });
 });
 
-describe('启动失败', () => {
-  it('说清当前完全没在监控，并给出自检命令', async () => {
+describe('startup failures', () => {
+  it('explains that nothing is being monitored and gives a check command', async () => {
     process.env.STATE_DB_PATH = ':memory:';
     const sink = new RecordingSink();
     expect(await recordStartupFailure(new Error('MAIL_ACCOUNT_1 格式不对'), sink)).toBe(true);
     const body = sink.pushed[0]![0].body;
-    expect(body).toContain('不会被检查');
+    expect(body).toContain('will be checked');
     expect(body).toContain('--check');
   });
 
-  it('没有出口时只记日志，不再抛异常盖住原始错误', async () => {
+  it('logs without masking the original error when no sink is configured', async () => {
     process.env.STATE_DB_PATH = ':memory:';
     const sink = new RecordingSink();
     sink.configured = false;

@@ -17,57 +17,57 @@ function cardTitle(card: Record<string, unknown>): string {
   return header.title.content;
 }
 
-describe('卡片要能独立看懂', () => {
-  it('摘要放最前面', () => {
-    // 用户看不到原文，摘要必须领头
+describe('self-contained cards', () => {
+  it('puts the summary first', () => {
+    // The user cannot see the raw message, so the summary must lead.
     const body = cardBody(buildCard(makeMessage(), makeResult()));
     expect(body.split('---')[0]).toContain('Namecheap 通知域名');
     expect(body).toContain('¥88');
   });
 
-  it('截止时间单独标出', () => {
+  it('shows the deadline separately', () => {
     const body = cardBody(buildCard(makeMessage(), makeResult()));
-    expect(body).toContain('截止');
+    expect(body).toContain('Deadline');
     expect(body).toContain('2026-09-20');
   });
 
-  it('没有截止时间就不显示那一行', () => {
+  it('omits the deadline row when there is no deadline', () => {
     expect(cardBody(buildCard(makeMessage(), makeResult({ deadline: '' })))).not.toContain('截止');
   });
 
-  it('没有摘要时退回理由', () => {
+  it('falls back to the reason when there is no summary', () => {
     expect(cardBody(buildCard(makeMessage(), makeResult({ summary: '' })))).toContain('域名到期');
   });
 
-  it('垃圾箱捞回在标题标出来', () => {
-    expect(cardTitle(buildCard(makeMessage({ inSpam: true, folder: 'Junk' }), makeResult()))).toContain('垃圾箱捞回');
+  it('marks recovered spam in the title', () => {
+    expect(cardTitle(buildCard(makeMessage({ inSpam: true, folder: 'Junk' }), makeResult()))).toContain('Recovered from spam');
   });
 
-  it('按重要性着色', () => {
+  it('colors by importance', () => {
     const color = (imp: 'critical' | 'info'): unknown =>
       (buildCard(makeMessage(), makeResult({ importance: imp }))['card'] as { header: { template: string } }).header.template;
     expect(color('critical')).toBe('red');
     expect(color('info')).toBe('blue');
   });
 
-  it('尖括号转义，否则地址会被卡片 markdown 吞掉', () => {
+  it('escapes angle brackets so card Markdown does not swallow addresses', () => {
     expect(cardBody(buildCard(makeMessage({ fromAddr: 'a@b.com' }), makeResult()))).toContain('\\<a@b.com\\>');
   });
 
-  it('时间转成可读格式', () => {
+  it('formats timestamps for readability', () => {
     const body = cardBody(buildCard(makeMessage({ date: '2026-09-16T06:32:00.000Z' }), makeResult()));
     expect(body).not.toContain('T06:32:00');
   });
 
-  it('简报渲染完整正文而不是摘要', () => {
+  it('renders the full digest body instead of the summary', () => {
     const long = Array.from({ length: 100 }, (_, i) => `- 第 ${i} 封`).join('\n');
     const card = buildCard(makeMessage({ subject: '每日邮件简报', body: long, extra: { digest: true } }), makeResult({ importance: 'info' }));
     expect(cardBody(card)).toContain('第 50 封');
   });
 });
 
-describe('跳转按钮', () => {
-  it('Gmail 能按 Message-ID 精确定位', () => {
+describe('navigation buttons', () => {
+  it('locates Gmail messages precisely by Message-ID', () => {
     const card = buildCard(makeMessage({ provider: 'gmail', account: 'me@gmail.com', messageId: '<CAB=abc@mail.gmail.com>' }), makeResult());
     const action = cardElements(card).at(-1)!;
     const button = (action['actions'] as Array<Record<string, unknown>>)[0]!;
@@ -75,38 +75,38 @@ describe('跳转按钮', () => {
     expect(button['type']).toBe('primary');
   });
 
-  it('QQ 只能给邮箱入口，文案不能骗人说"打开这封"', () => {
+  it('uses the QQ mailbox entry point without claiming to open the message', () => {
     const card = buildCard(makeMessage({ provider: 'qq' }), makeResult());
     const button = (cardElements(card).at(-1)!['actions'] as Array<Record<string, unknown>>)[0]!;
-    expect((button['text'] as { content: string }).content).toBe('打开 QQ 邮箱');
+    expect((button['text'] as { content: string }).content).toBe('Open QQ Mail');
     expect(button['type']).toBe('default');
   });
 
-  it('生成的 Message-ID 不做精确跳转', () => {
+  it('does not offer precise navigation for generated Message-IDs', () => {
     const link = buildLink('gmail', 'me@gmail.com', '<generated-abc@mailsift>');
     expect(link?.exact).toBe(false);
   });
 
-  it('不认识的 provider 没有按钮', () => {
+  it('omits buttons for unknown providers', () => {
     const card = buildCard(makeMessage({ provider: 'imap' }), makeResult());
     expect(cardElements(card).every((e) => e['tag'] !== 'action')).toBe(true);
   });
 });
 
-describe('签名与 WebhookWise payload', () => {
-  it('签名是确定性的', () => {
+describe('signatures and WebhookWise payloads', () => {
+  it('generates deterministic signatures', () => {
     expect(sign('secret', 1_700_000_000)).toBe(sign('secret', 1_700_000_000));
     expect(sign('secret', 1_700_000_000)).not.toBe(sign('secret', 1_700_000_001));
   });
 
-  it('payload 带齐适配器 spec 依赖的路径', () => {
-    // mailsift.yaml 的 detect/identity 依赖这几个路径，改名会静默丢去重
+  it('includes paths required by the adapter spec', () => {
+    // mailsift.yaml detect/identity rules depend on these paths; renaming them silently breaks deduplication.
     const payload = buildWebhookPayload(makeMessage({ inSpam: true }), makeResult());
     expect(payload['mail']).toMatchObject({ message_id: '<m1@example.com>', account: 'me@qq.com', in_spam: true });
     expect(payload['triage']).toMatchObject({ importance: 'critical', category: '账单续费' });
   });
 
-  it('顶层只有 mail / triage，避开 generic_json 适配器的检测', () => {
+  it('keeps only mail / triage at the top level for generic_json adapter detection', () => {
     expect(Object.keys(buildWebhookPayload(makeMessage(), makeResult())).sort()).toEqual(['mail', 'triage']);
   });
 });

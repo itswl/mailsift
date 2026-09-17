@@ -1,7 +1,7 @@
 /**
- * 编排：拉取 -> 去重 -> 分诊 -> 推送/入简报队列。
+ * Orchestration: fetch -> deduplicate -> triage -> push or queue for digest.
  *
- * 各账号并发拉取，但分诊统一批量做——LLM 按批计费，攒一批比一封一调便宜。
+ * Accounts fetch concurrently, while triage is batched to reduce LLM cost.
  */
 import { IMPORTANCE_RANK, type Account, type Importance, type WatchConfig } from '../config.js';
 import {
@@ -44,9 +44,9 @@ function newStats(): PollStats {
 
 export function summarizeStats(stats: PollStats): string {
   return (
-    `账号 ${stats.accountsOk} 成功/${stats.accountsFailed} 失败 | ` +
-    `拉取 ${stats.fetched} | 新邮件 ${stats.fresh} | ` +
-    `推送 ${stats.pushed}（垃圾箱捞回 ${stats.spamRescued}）| 入简报 ${stats.queued}`
+    `accounts ${stats.accountsOk} ok/${stats.accountsFailed} failed | ` +
+    `fetched ${stats.fetched} | fresh ${stats.fresh} | ` +
+    `pushed ${stats.pushed} (spam recovered ${stats.spamRescued}) | queued ${stats.queued}`
   );
 }
 
@@ -60,11 +60,10 @@ export class Watcher {
   ) {}
 
   /**
-   * 拉一个账号所有目标文件夹的新邮件。
+   * Fetch new mail from all target folders for one account.
    *
-   * 游标**不在这里落盘**——必须等这些邮件真正分诊并投递完才能推进，
-   * 否则进程若死在 dispatch 阶段，游标已经越过去了，这批信再也不会被
-   * 拉到，而且是完全静默的。宁可重复拉取，不可静默丢失。
+   * Cursors are not persisted here. They advance only after triage and delivery,
+   * so an interruption cannot silently skip a batch.
    */
   async collectAccount(
     account: Account,
@@ -77,12 +76,12 @@ export class Watcher {
     try {
       const folders = await targetFolders(client, account);
       if (folders.length === 0) {
-        log.warn(`[${account.name}] 没有可扫描的文件夹`);
+        log.warn(`[${account.name}] no selectable folders to scan`);
         return { messages, cursors };
       }
       log.info(
-        `[${account.name}] 扫描文件夹: ${folders
-          .map((f) => `${f.path}${f.isSpam ? '(垃圾箱)' : ''}`)
+        `[${account.name}] scanning folders: ${folders
+          .map((f) => `${f.path}${f.isSpam ? ' (spam)' : ''}`)
           .join(', ')}`,
       );
 
@@ -97,7 +96,7 @@ export class Watcher {
           messages.push(...result.messages);
           cursors.push([account.username, folder.path, result.cursor.uidValidity, result.cursor.lastUid]);
         } catch (error) {
-          log.error(`[${account.name}/${folder.path}] 拉取失败: ${error}`);
+          log.error(`[${account.name}/${folder.path}] fetch failed: ${error}`);
         }
       }
     } finally {
@@ -127,16 +126,16 @@ export class Watcher {
           messages.push(...result.messages);
           cursors.push(...result.cursors);
           await health.recordAccountSuccess(this.state, this.sink, account).catch((e) =>
-            log.error(`发送恢复通知失败: ${e}`),
+            log.error(`Failed to send recovery notice: ${e}`),
           );
         } catch (error) {
           stats.accountsFailed += 1;
           stats.failures.push(`${account.name}: ${error}`);
-          log.error(`[${account.name}] 账号处理失败: ${error}`);
-          // 失联必须出声：静默停止监控正是这个工具要防的事
+          log.error(`[${account.name}] account processing failed: ${error}`);
+          // Account loss must be visible; silent monitoring gaps are unacceptable.
           await health
             .recordAccountFailure(this.state, this.sink, account, error)
-            .catch((e) => log.error(`发送失联告警本身也失败了: ${e}`));
+            .catch((e) => log.error(`Failed to send account failure alert: ${e}`));
         }
       }
     };
@@ -147,8 +146,8 @@ export class Watcher {
   }
 
   /**
-   * 只保留没处理过的。只查不写——标记推迟到这封信真正处理完（见 dispatch）。
-   * 同一轮内还要去一次重：同一封信可能同时出现在两个被监控的文件夹里。
+   * Keep only unseen messages. Marking is deferred until dispatch completes.
+   * Deduplicate within a poll because one message may appear in two folders.
    */
   filterFresh(messages: MailMessage[]): MailMessage[] {
     const batch = new Set<string>();
@@ -197,12 +196,12 @@ export class Watcher {
       const task = error
         ? health.recordLlmFailure(this.state, this.sink, error)
         : health.recordLlmSuccess(this.state, this.sink);
-      void task.catch((e) => log.error(`模型可用性告警本身失败: ${e}`));
+      void task.catch((e) => log.error(`Failed to send LLM availability alert: ${e}`));
     };
 
     for (const [message, result] of await triage(messages, this.config.rules, onLlmResult)) {
-      // 先建 seen 行再写结论：两步都在这一封处理完之前完成，进程若死在这里，
-      // 这封信下轮会被重新拉取和分诊，而不是静默消失。
+      // Create the seen row before the outcome. An interruption before completion
+      // leaves the message eligible for the next poll.
       const key = dedupKey(message);
       this.state.markSeen(key, message.account, message.subject);
       const fields = this.outcomeFields(message, result);
@@ -215,17 +214,16 @@ export class Watcher {
         }
         this.state.recordOutcome(key, result.importance, delivered, fields);
         if (delivered) continue;
-        // 投递失败的不能就这么没了：它已经被标记 seen，下轮不会再拉，
-        // 兜进简报至少保证还能看到一次。
-        log.warn(`投递失败，改入简报: ${message.subject}`);
+        // A failed delivery is already marked seen, so queue it for the digest.
+        log.warn(`Delivery failed; queued for digest: ${message.subject}`);
         this.state.queueDigest(key, digest.toDigestItem(message, result));
         stats.queued += 1;
         continue;
       }
 
       this.state.recordOutcome(key, result.importance, false, fields);
-      // 垃圾箱的邮件一律进简报：实时推送要克制，但"进了垃圾箱的东西你从来
-      // 看不到"正是这个工具要解决的问题，每天给一份可复核的清单。
+      // Always include spam in the digest: it is the category most likely to hide
+      // an important message.
       if (message.inSpam || rank(result) >= digestThreshold) {
         this.state.queueDigest(key, digest.toDigestItem(message, result));
         stats.queued += 1;
@@ -233,7 +231,7 @@ export class Watcher {
     }
   }
 
-  /** 每天清理一次过期的 seen 记录。不清的话这张表只增不减。 */
+  /** Prune old seen records once per day. */
   private maybePrune(): void {
     const keepDays = Number(process.env.STATE_RETENTION_DAYS ?? 90);
     if (keepDays <= 0) return;
@@ -242,9 +240,9 @@ export class Watcher {
     try {
       const removed = this.state.prune(keepDays);
       this.state.setMeta(PRUNE_KEY, today);
-      if (removed) log.info(`已清理 ${removed} 条超过 ${keepDays} 天的记录`);
+      if (removed) log.info(`Pruned ${removed} records older than ${keepDays} days`);
     } catch (error) {
-      log.warn(`清理状态库失败（不影响本轮）: ${error}`);
+      log.warn(`State pruning failed (poll continues): ${error}`);
     }
   }
 
@@ -256,10 +254,10 @@ export class Watcher {
     stats.fresh = fresh.length;
 
     if (fresh.length) await this.dispatch(fresh, stats);
-    else log.info('本轮没有新邮件');
+    else log.info('No new messages in this poll.');
 
-    // 分诊投递都走完了，这批 UID 才算真正处理过，可以推进游标。
-    // dispatch 抛异常时这里不会执行，下轮重新拉取——重复远好过静默丢失。
+    // Only after triage and delivery complete are these UIDs safe to advance.
+    // If dispatch throws, the next poll retries them.
     for (const [account, folder, uidValidity, lastUid] of cursors) {
       this.state.saveCursor(account, folder, uidValidity, lastUid);
     }
@@ -271,12 +269,12 @@ export class Watcher {
     const stuck = this.state.countUndispatched();
     if (stuck) {
       log.warn(
-        `有 ${stuck} 封邮件标记过但没有分诊结论（多半是上次被中断）。` +
-          '用 node dist/src/main.js --recover 让它们重新处理',
+        `${stuck} messages are marked without a triage result (likely interrupted). ` +
+          'Run node dist/src/main.js --recover to retry them.',
       );
     }
 
-    // 心跳放最后——只有真正跑完一轮才算活着，卡在 IMAP 上不会续命
+    // Write the heartbeat last: a poll stuck in IMAP must not appear healthy.
     this.state.setMeta(HEARTBEAT_KEY, new Date().toISOString());
     log.info(summarizeStats(stats));
     return stats;

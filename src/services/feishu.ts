@@ -1,8 +1,8 @@
 /**
- * 飞书机器人直推。
+ * Direct Feishu bot output.
  *
- * 卡片要能独立看懂——用户手机上没有邮件客户端，不会去翻原文。
- * 所以顺序是：先说这封信讲了什么、要做什么，再是元信息，最后给跳转按钮。
+ * Cards must stand alone because the user may not have a mail client on their phone.
+ * Show the summary first, then metadata, then an optional link button.
  */
 import { createHmac } from 'node:crypto';
 import { IMPORTANCE_RANK, type Importance } from '../config.js';
@@ -17,12 +17,12 @@ const TEMPLATE: Record<Importance, string> = { critical: 'red', warning: 'orange
 const PREFIX: Record<Importance, string> = { critical: '🔴', warning: '🟠', info: '🔵' };
 const MAX_CARD_CHARS = 3000;
 
-/** 卡片 markdown 里裸 < > 会被吞掉，发件人地址常带尖括号 */
+/** Bare angle brackets are swallowed by card Markdown, but addresses contain them. */
 function esc(text: string): string {
   return text.replace(/</g, '\\<').replace(/>/g, '\\>');
 }
 
-/** ISO 时间串在卡片上太难读，转成本地时区的 "09-16 14:32" */
+/** Convert an ISO timestamp to a compact local-time display. */
 function formatDate(raw: string): string {
   const parsed = new Date(raw);
   if (Number.isNaN(parsed.valueOf())) return raw;
@@ -45,20 +45,20 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
     };
   }
 
-  const spamTag = message.inSpam ? '【垃圾箱捞回】' : '';
+  const spamTag = message.inSpam ? '[Recovered from spam] ' : '';
   const title = `${PREFIX[result.importance] ?? ''} ${spamTag}${message.subject}`.slice(0, 200);
 
   const lines = [esc(headline(result))];
-  if (result.deadline) lines.push(`\n⏰ **截止**　${esc(result.deadline)}`);
+  if (result.deadline) lines.push(`\n⏰ **Deadline** ${esc(result.deadline)}`);
   lines.push(
     '',
     '---',
-    `**发件人**　${esc(message.fromName || message.fromAddr)} \\<${esc(message.fromAddr)}\\>`,
-    `**收件箱**　${message.accountLabel}　·　${message.folder}`,
-    `**时间**　　${formatDate(message.date)}`,
-    `**分类**　　${result.category}${result.actionRequired ? '　·　需要处理' : ''}`,
+    `**From** ${esc(message.fromName || message.fromAddr)} \\<${esc(message.fromAddr)}\\>`,
+    `**Account** ${message.accountLabel} · ${message.folder}`,
+    `**Date** ${formatDate(message.date)}`,
+    `**Category** ${result.category}${result.actionRequired ? ' · Action required' : ''}`,
   );
-  if (message.hasAttachments) lines.push('**附件**　　有');
+  if (message.hasAttachments) lines.push('**Attachments** available');
   const body = snippet(message);
   if (body) lines.push('', '---', esc(body));
 
@@ -91,7 +91,7 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
   };
 }
 
-/** 飞书签名：以 "{timestamp}\n{secret}" 为密钥对空串做 HMAC-SHA256 */
+/** Sign `{timestamp}\n{secret}` with HMAC-SHA256 over an empty payload. */
 export function sign(secret: string, timestamp: number): string {
   return createHmac('sha256', `${timestamp}\n${secret}`).update('').digest('base64');
 }
@@ -111,7 +111,7 @@ export class FeishuSink implements Sink {
     return Boolean(this.url);
   }
 
-  /** 飞书阈值只能比全局更严，简报不受此限 */
+  /** Feishu may be stricter than the global threshold; digests are exempt. */
   private get threshold(): number {
     const level = (process.env.FEISHU_MIN_IMPORTANCE ||
       process.env.PUSH_MIN_IMPORTANCE ||
@@ -131,7 +131,7 @@ export class FeishuSink implements Sink {
     }
 
     if ((process.env.DRY_RUN ?? '').toLowerCase() === 'true') {
-      log.info(`[dry-run] 本应发飞书 | ${result.importance} | ${message.subject}`);
+      log.info(`[dry-run] Would send to Feishu | ${result.importance} | ${message.subject}`);
       return true;
     }
     if (!this.configured) return false;
@@ -144,22 +144,22 @@ export class FeishuSink implements Sink {
         signal: AbortSignal.timeout(30_000),
       });
       if (!response.ok) {
-        log.error(`飞书推送失败 | HTTP ${response.status} | ${message.subject}`);
+        log.error(`Feishu push failed | HTTP ${response.status} | ${message.subject}`);
         return false;
       }
-      // 飞书对业务错误也返回 HTTP 200，必须看 body 里的 code
+      // Feishu may return HTTP 200 for business errors; inspect the response code.
       const data = (await response.json()) as { code?: number; msg?: string; StatusCode?: number };
       const code = data.code ?? data.StatusCode ?? 0;
       if (code !== 0) {
-        log.error(`飞书拒绝 | code=${code} msg=${data.msg ?? ''}`);
+        log.error(`Feishu rejected message | code=${code} msg=${data.msg ?? ''}`);
         return false;
       }
       log.info(
-        `飞书已送达 | ${result.importance} | ${message.subject}${message.inSpam ? '（垃圾箱捞回）' : ''}`,
+        `Feishu delivered | ${result.importance} | ${message.subject}${message.inSpam ? ' (recovered from spam)' : ''}`,
       );
       return true;
     } catch (error) {
-      log.error(`飞书推送失败 | ${message.subject} | ${error}`);
+      log.error(`Feishu push failed | ${message.subject} | ${error}`);
       return false;
     }
   }

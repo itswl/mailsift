@@ -29,8 +29,8 @@ const stats = () => ({
   pushed: 0, queued: 0, spamRescued: 0, failures: [] as string[],
 });
 
-describe('推送阈值', () => {
-  it('达到阈值才实时推', async () => {
+describe('push threshold', () => {
+  it('pushes in real time only at or above the threshold', async () => {
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     const { w, sink } = watcher();
     stubTriage({
@@ -47,7 +47,7 @@ describe('推送阈值', () => {
     expect(sink.pushed.map(([m]) => m.messageId)).toEqual(['<c@x>', '<w@x>']);
   });
 
-  it('低于阈值进简报', async () => {
+  it('queues below-threshold messages for the digest', async () => {
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     const { w, state } = watcher();
     stubTriage({ '<i@x>': makeResult({ importance: 'info' }) });
@@ -58,8 +58,8 @@ describe('推送阈值', () => {
   });
 });
 
-describe('垃圾箱策略', () => {
-  it('默认不加档——全推等于把垃圾箱噪音搬到 IM 上', async () => {
+describe('spam strategy', () => {
+  it('does not boost spam by default because pushing all spam moves noise to IM', async () => {
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     const { w, state } = watcher();
     stubTriage({ '<s@x>': makeResult({ importance: 'info' }) });
@@ -69,8 +69,8 @@ describe('垃圾箱策略', () => {
     expect(state.digestPending()).toBe(1);
   });
 
-  it('垃圾箱必进简报，不受简报阈值限制', async () => {
-    // 这是"垃圾箱不再是黑洞"的兜底
+  it('always includes spam in the digest regardless of the digest threshold', async () => {
+    // This ensures spam is not a black hole.
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     process.env.DIGEST_MIN_IMPORTANCE = 'critical';
     const { w, state } = watcher();
@@ -82,7 +82,7 @@ describe('垃圾箱策略', () => {
     expect(state.digestPending()).toBe(1);
   });
 
-  it('加档是可选的', async () => {
+  it('supports an optional spam boost', async () => {
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     process.env.SPAM_RANK_BONUS = '1';
     const { w } = watcher();
@@ -92,7 +92,7 @@ describe('垃圾箱策略', () => {
     expect(s.pushed).toBe(1);
   });
 
-  it('捞回计数单独统计', async () => {
+  it('tracks rescued spam separately', async () => {
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     const { w } = watcher();
     stubTriage({
@@ -106,8 +106,8 @@ describe('垃圾箱策略', () => {
   });
 });
 
-describe('去重', () => {
-  it('批内去重（同一封信可能在两个文件夹里）', () => {
+describe('deduplication', () => {
+  it('deduplicates within a batch when one message appears in two folders', () => {
     const { w } = watcher();
     const fresh = w.filterFresh([
       makeMessage({ messageId: '<a@x>' }),
@@ -117,8 +117,8 @@ describe('去重', () => {
     expect(fresh).toHaveLength(2);
   });
 
-  it('filterFresh 只查不写', () => {
-    // 标记推迟到 dispatch，否则崩溃会让邮件静默消失
+  it('filterFresh reads without writing', () => {
+    // Defer marking until dispatch so a crash does not silently lose a message.
     const { w, state } = watcher();
     const messages = [makeMessage({ messageId: '<a@x>' })];
     expect(w.filterFresh(messages)).toHaveLength(1);
@@ -126,7 +126,7 @@ describe('去重', () => {
     expect(state.isSeen('me@qq.com|<a@x>')).toBe(false);
   });
 
-  it('同一封信发到两个邮箱各算一条', () => {
+  it('counts the same message once per mailbox', () => {
     const { w } = watcher();
     const fresh = w.filterFresh([
       makeMessage({ messageId: '<a@x>', account: 'me@qq.com' }),
@@ -135,7 +135,7 @@ describe('去重', () => {
     expect(fresh).toHaveLength(2);
   });
 
-  it('处理过的下轮不再进', async () => {
+  it('does not reprocess handled messages on the next round', async () => {
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     const { w } = watcher();
     stubTriage({ '<a@x>': makeResult({ importance: 'critical' }) });
@@ -144,8 +144,8 @@ describe('去重', () => {
   });
 });
 
-describe('投递失败的处理', () => {
-  it('不计入推送数', async () => {
+describe('delivery failures', () => {
+  it('does not count failed deliveries as pushes', async () => {
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     const { w } = watcher(new RecordingSink(false));
     stubTriage({ '<c@x>': makeResult({ importance: 'critical' }) });
@@ -154,8 +154,8 @@ describe('投递失败的处理', () => {
     expect(s.pushed).toBe(0);
   });
 
-  it('状态库如实记录未送达', async () => {
-    // 谎报成功的话事后根本查不出漏了哪封
+  it('records undelivered messages accurately', async () => {
+    // If success is reported incorrectly, there is no way to find the missing message later.
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     const { w, state } = watcher(new RecordingSink(false));
     stubTriage({ '<c@x>': makeResult({ importance: 'critical' }) });
@@ -163,8 +163,8 @@ describe('投递失败的处理', () => {
     expect(state.queryMail({ pushedOnly: true })).toHaveLength(0);
   });
 
-  it('兜进简报，不让它凭空消失', async () => {
-    // 邮件已被标记 seen，下轮不会重拉；投递失败必须有个去处
+  it('queues failed deliveries in the digest instead of losing them', async () => {
+    // The message is marked seen and will not be fetched next round, so failures need a destination.
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     const { w, state } = watcher(new RecordingSink(false));
     stubTriage({ '<c@x>': makeResult({ importance: 'critical' }) });
@@ -175,22 +175,22 @@ describe('投递失败的处理', () => {
   });
 });
 
-describe('崩溃安全', () => {
-  it('分诊失败时游标不推进', async () => {
-    // 否则这批信再也拉不到，且完全静默
+describe('crash safety', () => {
+  it('does not advance the cursor when triage fails', async () => {
+    // Otherwise this batch could never be fetched again and would disappear silently.
     const { w, state } = watcher();
     vi.spyOn(w, 'collectAll').mockResolvedValue({
       messages: [makeMessage({ messageId: '<a@x>' })],
       cursors: [['me@qq.com', 'INBOX', '1', 99]],
     });
-    vi.spyOn(triageModule, 'triage').mockRejectedValue(new Error('崩了'));
+    vi.spyOn(triageModule, 'triage').mockRejectedValue(new Error('crashed'));
 
-    await expect(w.pollOnce()).rejects.toThrow('崩了');
+    await expect(w.pollOnce()).rejects.toThrow('crashed');
     expect(state.getCursor('me@qq.com', 'INBOX')).toBeUndefined();
     expect(state.isSeen('me@qq.com|<a@x>')).toBe(false);
   });
 
-  it('成功后才推进游标', async () => {
+  it('advances the cursor only after success', async () => {
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     const { w, state } = watcher();
     vi.spyOn(w, 'collectAll').mockResolvedValue({
@@ -204,7 +204,7 @@ describe('崩溃安全', () => {
     expect(state.isSeen('me@qq.com|<a@x>')).toBe(true);
   });
 
-  it('写心跳供健康检查用', async () => {
+  it('writes a heartbeat for health checks', async () => {
     const { w, state } = watcher();
     vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [], cursors: [] });
     expect(state.getMeta('last_poll_at')).toBeUndefined();
@@ -212,7 +212,7 @@ describe('崩溃安全', () => {
     expect(state.getMeta('last_poll_at')).toBeTruthy();
   });
 
-  it('每天清理一次状态库', async () => {
+  it('prunes the state store once per day', async () => {
     const { w, state } = watcher();
     vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [], cursors: [] });
     const spy = vi.spyOn(state, 'prune').mockReturnValue(0);
@@ -222,7 +222,7 @@ describe('崩溃安全', () => {
     expect(spy).toHaveBeenCalledWith(90);
   });
 
-  it('清理可关闭', async () => {
+  it('allows pruning to be disabled', async () => {
     process.env.STATE_RETENTION_DAYS = '0';
     const { w, state } = watcher();
     vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [], cursors: [] });

@@ -1,4 +1,4 @@
-/** IMAP 抓到的原始信封 -> 结构化 MailMessage。解析全程不抛异常。 */
+/** Convert an IMAP envelope into a structured MailMessage without throwing. */
 import { createHash } from 'node:crypto';
 import { simpleParser } from 'mailparser';
 
@@ -20,7 +20,7 @@ export interface MailMessage {
   body: string;
   hasAttachments: boolean;
   listUnsubscribe: boolean;
-  /** 合成消息（简报、健康告警）用它标记渲染方式 */
+  /** Synthetic messages (digest and health alerts) use this to select rendering. */
   extra?: Record<string, unknown>;
 }
 
@@ -29,11 +29,10 @@ const STYLE_BLOCK = /<(script|style)[^>]*>[\s\S]*?<\/\1>/gi;
 const WHITESPACE = /\s+/g;
 
 /**
- * HTML 实体 -> 字符。
+ * Decode HTML entities.
  *
- * 邮件 HTML 里 `&nbsp;` 极其常见（招行这类账单模板靠它排版），
- * 不解码的话会大量进正文，既占 LLM token 又让模型读到乱码。
- * 只处理常见命名实体 + 数字实体，不引 HTML 解析库。
+ * `&nbsp;` is common in mail HTML. Decoding it keeps LLM input smaller and readable.
+ * Handle common named and numeric entities without adding an HTML parser.
  */
 const NAMED_ENTITIES: Record<string, string> = {
   nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", '#39': "'",
@@ -47,7 +46,7 @@ export function decodeEntities(text: string): string {
     const key = body.toLowerCase();
     if (key.startsWith('#')) {
       const code = key.startsWith('#x') ? parseInt(key.slice(2), 16) : parseInt(key.slice(1), 10);
-      // 排除代理区和越界码点，String.fromCodePoint 会对它们抛异常
+      // Exclude surrogate and out-of-range code points.
       if (Number.isFinite(code) && code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff)) {
         return String.fromCodePoint(code);
       }
@@ -67,15 +66,15 @@ export function snippet(message: MailMessage): string {
   return message.body.slice(0, SNIPPET_CHARS);
 }
 
-/** 同一封信发到两个邮箱各算一条——收件人不同，处理动作也不同。 */
+/** The same message in two accounts counts twice because the recipient differs. */
 export function dedupKey(message: MailMessage): string {
   return `${message.account}|${message.messageId}`;
 }
 
 /**
- * 没有 Message-ID 时造一个稳定 ID。
+ * Create a stable ID when Message-ID is missing.
  *
- * 不能只用 uid：UID 只在同一个 UIDVALIDITY 里唯一，邮箱重建后会撞。
+ * UID alone is insufficient: it is unique only within one UIDVALIDITY.
  */
 export function fallbackMessageId(
   account: string,
@@ -95,27 +94,26 @@ export function normalizeDate(value: Date | string | undefined): string {
 }
 
 /**
- * 从 RFC822 原文里取出正文。
+ * Extract the body from the original RFC822 message.
  *
- * 必须走 MIME 解析而不是直接把 source 转字符串——原文里混着 SMTP 头、
- * MIME 分隔符，正文本身还可能是 base64 / quoted-printable 编码、
- * GB2312 之类的非 UTF-8 字符集。直接 toString 得到的是邮件头，
- * 模型会以为"正文没有内容"。
+ * Use MIME parsing rather than converting source directly to a string: the source
+ * contains SMTP headers and MIME boundaries, and the body may use base64,
+ * quoted-printable, or a non-UTF-8 charset.
  *
- * mailparser 是 ImapFlow 的同门（都出自 nodemailer），这些都替我们处理了。
+ * mailparser and ImapFlow share the nodemailer ecosystem and handle these details.
  */
 export async function extractBody(source: Buffer | undefined): Promise<{ body: string; hasAttachments: boolean }> {
   if (!source) return { body: '', hasAttachments: false };
   try {
     const parsed = await simpleParser(source, { skipImageLinks: true });
-    // 优先纯文本，没有才降级 HTML
+    // Prefer plain text and fall back to HTML.
     const text = parsed.text?.trim() || (parsed.html ? htmlToText(parsed.html) : '');
     return {
       body: text.replace(/\s+/g, ' ').trim(),
       hasAttachments: (parsed.attachments?.length ?? 0) > 0,
     };
   } catch {
-    // 单封畸形邮件不该中断整个文件夹
+    // One malformed message must not stop the entire folder.
     return { body: '', hasAttachments: false };
   }
 }

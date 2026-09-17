@@ -1,8 +1,7 @@
-# ---- 构建 ----
-# 固定在构建机本身的架构上跑（--platform=$BUILDPLATFORM）。
-# 跨架构构建 arm64 镜像时，若让这一段跟着目标架构走，npm 会在 QEMU 模拟下执行，
-# 大概率直接 SIGILL（exit 132）。运行时依赖全是纯 JS，没有原生扩展，
-# 所以在 amd64 上装好再拷到 arm64 镜像里是安全的。
+# ---- Build ----
+# Run the build stage on the builder architecture (--platform=$BUILDPLATFORM).
+# This avoids QEMU SIGILL failures during cross-architecture npm installs.
+# Runtime dependencies are pure JavaScript, so copying them across architectures is safe.
 FROM --platform=$BUILDPLATFORM node:22-alpine AS build
 WORKDIR /app
 
@@ -13,13 +12,12 @@ COPY src/ src/
 COPY scripts/ scripts/
 RUN npm run build
 
-# 编译完再把 node_modules 收敛成只剩运行时依赖，
-# typescript / vitest / tsx 不进最终镜像
+# Keep only runtime dependencies in the final image; typescript, vitest, and tsx are omitted.
 RUN npm prune --omit=dev && npm cache clean --force
 
-# ---- 运行 ----
+# ---- Runtime ----
 FROM node:22-alpine
-# node:sqlite 目前仍标记为实验特性，每次启动都会打一行警告，压掉免得刷日志
+# node:sqlite is still experimental and would print a warning on every start.
 ENV NODE_ENV=production TZ=Asia/Shanghai NODE_OPTIONS=--disable-warning=ExperimentalWarning
 WORKDIR /app
 
@@ -27,7 +25,7 @@ COPY package*.json ./
 COPY --from=build /app/node_modules/ node_modules/
 COPY --from=build /app/dist/ dist/
 
-# 以非 root 运行；data/ 放状态库和 OAuth token，必须持久化
+# Run as non-root; persist data/ because it contains the state database and OAuth tokens.
 RUN adduser -D -u 10001 mailwatch \
  && mkdir -p /app/data \
  && chown -R mailwatch:mailwatch /app
@@ -35,7 +33,7 @@ USER mailwatch
 
 VOLUME ["/app/data"]
 
-# 查存活而非查配置：start-period 给足首轮回溯时间（可能有几百封要分诊）
+# Check liveness rather than configuration; start-period allows the first backfill to finish.
 HEALTHCHECK --interval=2m --timeout=20s --start-period=15m --retries=3 \
     CMD node dist/src/main.js --healthcheck || exit 1
 

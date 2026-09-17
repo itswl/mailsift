@@ -30,60 +30,60 @@ function mockLlm(results: unknown[], usage?: Record<string, unknown>): void {
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe('规则层', () => {
-  it('白名单直接判 critical，不花 token', () => {
+describe('rule layer', () => {
+  it('classifies allowlisted senders as critical without spending tokens', () => {
     const result = applyRules(makeMessage({ fromAddr: 'billing@vendor.com' }), RULES);
     expect(result).toMatchObject({ importance: 'critical', decidedBy: 'rule' });
   });
 
-  it('黑名单直接判 info', () => {
+  it('classifies blocklisted senders as info', () => {
     expect(applyRules(makeMessage({ fromAddr: 'newsletter@site.com' }), RULES)?.importance).toBe('info');
   });
 
-  it('白名单优先于黑名单', () => {
+  it('gives the allowlist priority over the blocklist', () => {
     const message = makeMessage({ fromAddr: 'billing@x.com', fromName: 'newsletter@x' });
     expect(applyRules(message, RULES)?.importance).toBe('critical');
   });
 
-  it('也匹配显示名', () => {
+  it('also matches display names', () => {
     const message = makeMessage({ fromAddr: 'x@y.com', fromName: 'Acme billing@dept' });
     expect(applyRules(message, RULES)?.importance).toBe('critical');
   });
 
-  it('未命中时交给下一层', () => {
+  it('passes unmatched messages to the next layer', () => {
     expect(applyRules(makeMessage({ fromAddr: 'random@x.com' }), RULES)).toBeUndefined();
   });
 });
 
-describe('关键词兜底', () => {
-  it('抓住验证码这类高危信号', () => {
+describe('keyword fallback', () => {
+  it('catches high-risk signals such as verification codes', () => {
     const result = keywordFallback(makeMessage({ subject: '您的验证码是 123456' }), RULES);
     expect(result).toMatchObject({ importance: 'warning', decidedBy: 'fallback' });
   });
 
-  it('覆盖繁体字形', () => {
-    // 台港来信不能因为字形不同就漏掉
+  it('covers Traditional Chinese variants', () => {
+    // Mail from Taiwan and Hong Kong must not be missed due to character variants.
     for (const kw of ['驗證碼', '帳單', '續費', '快遞', '簽證']) {
       expect(FALLBACK_KEYWORDS as readonly string[]).toContain(kw);
     }
     expect(keywordFallback(makeMessage({ subject: '您的驗證碼為 123456' }), RULES).importance).toBe('warning');
   });
 
-  it('不确定时归档而不是打扰', () => {
-    // 兜底判别力差，"宁可多报"会把通知渠道淹掉，而渠道没了信噪比反而更容易漏
+  it('archives uncertain messages instead of interrupting the user', () => {
+    // Fallback classification is weak; over-alerting would flood the channel and make real messages easier to miss.
     const result = keywordFallback(makeMessage({ subject: '关于下周的安排' }), RULES);
     expect(result.importance).toBe('info');
     expect(result.score).toBeGreaterThan(keywordFallback(makeMessage({ subject: '本周精选', listUnsubscribe: true }), RULES).score);
   });
 
-  it('模型不可用时也给出摘要，不让卡片一片空白', () => {
+  it('still provides a summary when the model is unavailable', () => {
     const result = keywordFallback(makeMessage({ subject: '帳單通知', body: '本期應繳 500 元' }), RULES);
     expect(result.summary).toContain('本期應繳');
   });
 });
 
-describe('LLM 层', () => {
-  it('解析 summary 与 deadline', async () => {
+describe('LLM layer', () => {
+  it('parses summary and deadline', async () => {
     mockLlm([{
       index: 0, importance: 'critical', score: 95, category: '医疗健康',
       action_required: true, reason: '检查结果异常需复诊',
@@ -96,8 +96,8 @@ describe('LLM 层', () => {
     expect(headline(result!)).toBe(result!.summary);
   });
 
-  it('zod 把脏数据降级而不是抛异常', async () => {
-    // 模型返回非法 importance / 超范围 score 时自动落回安全值
+  it('degrades invalid data instead of throwing', async () => {
+    // Invalid importance or out-of-range scores from the model fall back to safe values.
     mockLlm([{ index: 0, importance: 'VERY URGENT!!', score: 999, reason: 'x' }]);
     process.env.LLM_API_KEY = 'k';
     const [[, result]] = await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
@@ -105,7 +105,7 @@ describe('LLM 层', () => {
     expect(result!.score).toBe(100);
   });
 
-  it('模型漏返回某一条时该封走兜底', async () => {
+  it('uses fallback for a message omitted by the model', async () => {
     mockLlm([{ index: 0, importance: 'info', score: 1, reason: 'ad' }]);
     process.env.LLM_API_KEY = 'k';
     const results = await triage(
@@ -116,7 +116,7 @@ describe('LLM 层', () => {
     expect(results[1]![1].decidedBy).toBe('fallback');
   });
 
-  it('调用失败时整批兜底并回调', async () => {
+  it('uses fallback for the batch and invokes the callback on failure', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 500 })));
     process.env.LLM_API_KEY = 'k';
     const seen: unknown[] = [];
@@ -127,7 +127,7 @@ describe('LLM 层', () => {
     expect(seen[0]).toBeTruthy();
   });
 
-  it('成功时回调收到 null', async () => {
+  it('passes null to the callback on success', async () => {
     mockLlm([{ index: 0, importance: 'info', score: 1, reason: 'x' }]);
     process.env.LLM_API_KEY = 'k';
     const seen: unknown[] = [];
@@ -135,7 +135,7 @@ describe('LLM 层', () => {
     expect(seen).toEqual([null]);
   });
 
-  it('规则命中的不送模型', async () => {
+  it('does not send rule matches to the model', async () => {
     const spy = vi.fn(async () => new Response('{}', { status: 200 }));
     vi.stubGlobal('fetch', spy);
     process.env.LLM_API_KEY = 'k';
@@ -143,7 +143,7 @@ describe('LLM 层', () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it('保持输入顺序（规则与模型混在一批时）', async () => {
+  it('preserves input order when rules and model results are mixed', async () => {
     mockLlm([{ index: 0, importance: 'info', score: 1, reason: 'ad' }]);
     process.env.LLM_API_KEY = 'k';
     const results = await triage(
@@ -155,14 +155,14 @@ describe('LLM 层', () => {
     expect(results[1]![1].decidedBy).toBe('llm');
   });
 
-  it('没有 API key 时全程兜底', async () => {
+  it('uses fallback throughout without an API key', async () => {
     const [[, result]] = await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
     expect(result!.decidedBy).toBe('fallback');
   });
 });
 
-describe('厂商预设', () => {
-  it('默认 deepseek', () => {
+describe('provider presets', () => {
+  it('defaults to DeepSeek', () => {
     expect(resolveLlmBaseUrl()).toBe('https://api.deepseek.com');
   });
 
@@ -175,14 +175,14 @@ describe('厂商预设', () => {
     expect(resolveLlmBaseUrl()).toBe(url);
   });
 
-  it('显式 base_url 压过预设（自建网关场景）', () => {
+  it('explicit base_url overrides the preset for a self-hosted gateway', () => {
     process.env.LLM_PROVIDER = 'xai';
     process.env.LLM_BASE_URL = 'https://gateway.internal/v1';
     expect(resolveLlmBaseUrl()).toBe('https://gateway.internal/v1');
   });
 
-  it('未知厂商报错而不是静默走默认', () => {
+  it('errors on an unknown provider instead of silently using the default', () => {
     process.env.LLM_PROVIDER = 'nope';
-    expect(() => resolveLlmBaseUrl()).toThrow(/未知 LLM_PROVIDER/);
+    expect(() => resolveLlmBaseUrl()).toThrow(/Unknown LLM_PROVIDER/);
   });
 });

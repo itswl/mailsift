@@ -15,7 +15,7 @@ const MANAGED = [
   'ACCOUNT_ALERT_AFTER_FAILURES', 'ACCOUNT_ALERT_COOLDOWN_SECONDS',
 ];
 
-/** 每个用例都从干净的环境变量起步，避免相互污染 */
+/** Start every test with a clean environment to avoid cross-test contamination. */
 function clean(): void {
   for (const key of Object.keys(process.env)) {
     if (key.startsWith('MAIL_ACCOUNT_') || MANAGED.includes(key)) delete process.env[key];
