@@ -45,7 +45,7 @@ services:
       - MCP_TOKEN=${MCP_TOKEN:-}
     command: ["node", "dist/src/mcp.js"]
     ports:
-      - "127.0.0.1:${MCP_PORT:-8410}:8410"
+      - "${MCP_PUBLIC_HOST:-127.0.0.1}:${MCP_PORT:-8410}:8410"
     volumes:
       - mailsift-data:/app/data
     logging:
