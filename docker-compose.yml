@@ -1,7 +1,7 @@
 services:
   mailsift:
     # Pull the published image. See docker-compose.build.yml to build from source.
-    image: ghcr.io/itswl/mailsift:latest
+    image: ghcr.io/itswl/mailsift:${MAILSIFT_VERSION:-1.0.0}
     pull_policy: missing
     container_name: mailsift
     restart: unless-stopped
@@ -31,7 +31,7 @@ services:
   # Bind 0.0.0.0 inside the container; the host publishes to loopback by default.
   # Use an SSH tunnel for remote access or set MCP_TOKEN before publishing externally.
   mailsift-mcp:
-    image: ghcr.io/itswl/mailsift:latest
+    image: ghcr.io/itswl/mailsift:${MAILSIFT_VERSION:-1.0.0}
     pull_policy: missing
     container_name: mailsift-mcp
     restart: unless-stopped
@@ -43,6 +43,7 @@ services:
       - MCP_BIND=0.0.0.0
       - MCP_PORT=${MCP_PORT:-8410}
       - MCP_TOKEN=${MCP_TOKEN:-}
+      - MCP_READ_ONLY=${MCP_READ_ONLY:-true}
     command: ["node", "dist/src/mcp.js"]
     ports:
       - "${MCP_PUBLIC_HOST:-127.0.0.1}:${MCP_PORT:-8410}:8410"

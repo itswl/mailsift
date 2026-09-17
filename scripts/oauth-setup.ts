@@ -44,13 +44,14 @@ function openBrowser(url: string): void {
 
 function authorizeUrl(
   provider: OAuthProvider, redirectUri: string, challenge: string, loginHint: string,
-): string {
+): { url: string; state: string } {
+  const state = randomBytes(16).toString('base64url');
   const params = new URLSearchParams({
     client_id: provider.clientId,
     redirect_uri: redirectUri,
     response_type: 'code',
     scope: provider.scope,
-    state: randomBytes(16).toString('base64url'),
+    state,
     code_challenge: challenge,
     code_challenge_method: 'S256',
     login_hint: loginHint,
@@ -60,27 +61,42 @@ function authorizeUrl(
     params.set('access_type', 'offline');
     params.set('prompt', 'consent');
   }
-  return `${provider.authorizeUrl}?${params}`;
+  return { url: `${provider.authorizeUrl}?${params}`, state };
 }
 
-function codeFromInput(raw: string): string | undefined {
+function codeFromInput(raw: string, expectedState: string): string | undefined {
   const text = raw.trim();
   if (!text) return undefined;
-  if (text.startsWith('http://') || text.startsWith('https://')) {
+  if (!text.startsWith('http://') && !text.startsWith('https://')) {
+    console.log('❌ Paste the complete redirect URL so the OAuth state can be verified.');
+    return undefined;
+  }
+  try {
     const url = new URL(text);
+    if (url.searchParams.get('state') !== expectedState) {
+      console.log('❌ OAuth state mismatch; refusing to exchange this callback.');
+      return undefined;
+    }
     if (url.searchParams.get('error')) {
       console.log(`❌ Authorization denied: ${url.searchParams.get('error')}`);
       return undefined;
     }
     return url.searchParams.get('code') ?? undefined;
+  } catch {
+    console.log('❌ The redirect value is not a valid URL.');
+    return undefined;
   }
-  return text;
 }
 
-async function waitForCallback(port: number): Promise<string | undefined> {
+async function waitForCallback(port: number, expectedState: string): Promise<string | undefined> {
   return new Promise((resolve) => {
     const server = createServer((req, res) => {
       const url = new URL(req.url ?? '/', `http://localhost:${port}`);
+      if (url.searchParams.get('state') !== expectedState) {
+        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<h2>❌ Invalid OAuth callback</h2><p>The state did not match. You can close this page.</p>');
+        return;
+      }
       const code = url.searchParams.get('code') ?? undefined;
       const body = code
         ? '<h2>✅ Authorization succeeded</h2><p>refresh_token was saved. You can close this page.</p>'
@@ -103,26 +119,26 @@ async function authorize(account: Account, store: TokenStore, manual: boolean): 
   const port = Number(process.env.OAUTH_REDIRECT_PORT ?? 8765);
   const redirectUri = `http://localhost:${port}/`;
   const { verifier, challenge } = pkcePair();
-  const url = authorizeUrl(provider, redirectUri, challenge, account.username);
+  const authorization = authorizeUrl(provider, redirectUri, challenge, account.username);
 
   console.log(`\n=== Authorizing ${account.name} (${account.username}) via ${provider.name} ===`);
 
   let code: string | undefined;
   if (manual) {
     console.log('\n1) Open this link in a browser on your computer:\n');
-    console.log(url);
+    console.log(authorization.url);
     console.log(`\n2) After approval the browser redirects to ${redirectUri}; it is normal that it does not load.`);
-    console.log('3) Paste the complete URL from the address bar (or only the value after code=):\n');
+    console.log('3) Paste the complete redirect URL from the address bar:\n');
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    code = codeFromInput(await rl.question('> '));
+    code = codeFromInput(await rl.question('> '), authorization.state);
     rl.close();
   } else {
     console.log('Opening the authorization page; open this URL manually if needed:');
-    console.log(url);
+    console.log(authorization.url);
     console.log(`\n(The redirect URI must be registered as ${redirectUri} or http://localhost.)`);
     console.log('Waiting for the authorization callback (5-minute timeout)...');
-    openBrowser(url);
-    code = await waitForCallback(port);
+    openBrowser(authorization.url);
+    code = await waitForCallback(port, authorization.state);
   }
 
   if (!code) {

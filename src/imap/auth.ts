@@ -7,7 +7,8 @@
  * access_token values are short-lived; refresh_token values are persisted.
  * Initial authorization is handled by scripts/oauth-setup.ts.
  */
-import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { getLogger } from '../logger.js';
 import type { AuthKind } from '../config.js';
@@ -92,6 +93,8 @@ export function getOAuthProvider(auth: AuthKind): OAuthProvider {
  * File mode is 0600: these are long-lived mailbox credentials.
  */
 export class TokenStore {
+  private static readonly saveQueues = new Map<string, Promise<void>>();
+
   constructor(private readonly path: string = tokenStorePath()) {}
 
   private async readAll(): Promise<Record<string, TokenRecord>> {
@@ -109,13 +112,27 @@ export class TokenStore {
   }
 
   async save(username: string, record: TokenRecord): Promise<void> {
-    const all = await this.readAll();
-    all[username] = record;
-    await mkdir(dirname(this.path), { recursive: true });
-    const tmp = `${this.path}.tmp`;
-    await writeFile(tmp, JSON.stringify(all, null, 2), 'utf8');
-    await chmod(tmp, 0o600);
-    await rename(tmp, this.path);
+    const previous = TokenStore.saveQueues.get(this.path) ?? Promise.resolve();
+    let current: Promise<void>;
+    current = previous.catch(() => undefined).then(async () => {
+      const all = await this.readAll();
+      all[username] = record;
+      await mkdir(dirname(this.path), { recursive: true });
+      const tmp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(tmp, JSON.stringify(all, null, 2), 'utf8');
+        await chmod(tmp, 0o600);
+        await rename(tmp, this.path);
+      } finally {
+        await unlink(tmp).catch(() => undefined);
+      }
+    });
+    TokenStore.saveQueues.set(this.path, current);
+    try {
+      await current;
+    } finally {
+      if (TokenStore.saveQueues.get(this.path) === current) TokenStore.saveQueues.delete(this.path);
+    }
   }
 
   async usernames(): Promise<string[]> {

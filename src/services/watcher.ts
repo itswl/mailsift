@@ -51,6 +51,7 @@ export function summarizeStats(stats: PollStats): string {
 }
 
 type PendingCursor = [account: string, folder: string, uidValidity: string, lastUid: number];
+type CollectAccountResult = { messages: MailMessage[]; cursors: PendingCursor[]; failures?: string[] };
 
 export class Watcher {
   constructor(
@@ -68,9 +69,10 @@ export class Watcher {
   async collectAccount(
     account: Account,
     budget: MessageBudget,
-  ): Promise<{ messages: MailMessage[]; cursors: PendingCursor[] }> {
+  ): Promise<CollectAccountResult> {
     const messages: MailMessage[] = [];
     const cursors: PendingCursor[] = [];
+    const failures: string[] = [];
     const client = await connect(account);
 
     try {
@@ -96,6 +98,7 @@ export class Watcher {
           messages.push(...result.messages);
           cursors.push([account.username, folder.path, result.cursor.uidValidity, result.cursor.lastUid]);
         } catch (error) {
+          failures.push(`${folder.path}: ${error}`);
           log.error(`[${account.name}/${folder.path}] fetch failed: ${error}`);
         }
       }
@@ -103,7 +106,7 @@ export class Watcher {
       await client.logout().catch(() => undefined);
     }
 
-    return { messages, cursors };
+    return { messages, cursors, failures };
   }
 
   async collectAll(stats: PollStats): Promise<{ messages: MailMessage[]; cursors: PendingCursor[] }> {
@@ -122,12 +125,18 @@ export class Watcher {
         if (!account) return;
         try {
           const result = await this.collectAccount(account, budget);
-          stats.accountsOk += 1;
+          const failures = result.failures ?? [];
+          if (failures.length === 0) stats.accountsOk += 1;
+          else {
+            stats.accountsFailed += 1;
+            stats.failures.push(...failures.map((failure) => `${account.name}/${failure}`));
+          }
           messages.push(...result.messages);
           cursors.push(...result.cursors);
-          await health.recordAccountSuccess(this.state, this.sink, account).catch((e) =>
-            log.error(`Failed to send recovery notice: ${e}`),
-          );
+          const healthTask = failures.length
+            ? health.recordAccountFailure(this.state, this.sink, account, failures.join('; '))
+            : health.recordAccountSuccess(this.state, this.sink, account);
+          await healthTask.catch((e) => log.error(`Failed to send account health notice: ${e}`));
         } catch (error) {
           stats.accountsFailed += 1;
           stats.failures.push(`${account.name}: ${error}`);

@@ -60,11 +60,13 @@ async function checkConfig(): Promise<number> {
   let outlets = 0;
   if (process.env.FEISHU_WEBHOOK_URL?.trim()) {
     outlets += 1;
-    console.log(`✅ Output Feishu bot: ${process.env.FEISHU_WEBHOOK_URL.slice(0, 48)}***`);
+    console.log('✅ Output Feishu bot: configured');
   }
   if (process.env.WEBHOOKWISE_URL?.trim()) {
     outlets += 1;
-    console.log(`✅ Output WebhookWise: ${new WebhookWiseSink().endpoint}`);
+    let host = 'configured';
+    try { host = new URL(new WebhookWiseSink().endpoint).host; } catch { /* report configured only */ }
+    console.log(`✅ Output WebhookWise: configured (${host})`);
     if (!process.env.WEBHOOKWISE_TOKEN?.trim()) {
       console.log('   ⚠️  WEBHOOKWISE_TOKEN is not set; an authenticated endpoint will reject requests.');
     }

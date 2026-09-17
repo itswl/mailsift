@@ -312,19 +312,37 @@ export class StateStore {
     return Number(row['n'] ?? 0);
   }
 
-  drainDigest(): unknown[] {
+  peekDigestEntries(): Array<{ dedupKey: string; payload: unknown }> {
     const rows = this.db
-      .prepare('SELECT payload FROM digest_queue ORDER BY created_at')
+      .prepare('SELECT dedup_key, payload FROM digest_queue ORDER BY created_at')
       .all() as Array<Record<string, unknown>>;
-    this.db.exec('DELETE FROM digest_queue');
-    const items: unknown[] = [];
+    const items: Array<{ dedupKey: string; payload: unknown }> = [];
     for (const row of rows) {
       try {
-        items.push(JSON.parse(String(row['payload'])));
+        items.push({ dedupKey: String(row['dedup_key']), payload: JSON.parse(String(row['payload'])) });
       } catch {
         log.warn('A corrupt digest queue record was skipped.');
       }
     }
+    return items;
+  }
+
+  peekDigest(): unknown[] {
+    return this.peekDigestEntries().map((entry) => entry.payload);
+  }
+
+  clearDigest(dedupKeys?: string[]): void {
+    if (!dedupKeys?.length) {
+      this.db.exec('DELETE FROM digest_queue');
+      return;
+    }
+    const remove = this.db.prepare('DELETE FROM digest_queue WHERE dedup_key = ?');
+    for (const key of dedupKeys) remove.run(key);
+  }
+
+  drainDigest(): unknown[] {
+    const items = this.peekDigest();
+    this.clearDigest();
     return items;
   }
 

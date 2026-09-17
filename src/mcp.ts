@@ -8,6 +8,7 @@
  * Disabled by default; see README for activation.
  */
 import './env.js'; // Must run first so .env is loaded.
+import { timingSafeEqual } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -29,12 +30,13 @@ const INSTRUCTIONS =
 
 const IMPORTANCE = z.enum(['critical', 'warning', 'info']);
 
-export function createServer(): McpServer {
+export function createServer(options: { state?: StateStore; readOnly?: boolean } = {}): McpServer {
+  const store = options.state ?? new StateStore();
+  const readOnly = options.readOnly ?? false;
   const server = new McpServer(
     { name: 'mailsift', version: '1.0.0' },
     { instructions: INSTRUCTIONS },
   );
-  const state = (): StateStore => new StateStore();
   const json = (value: unknown) => ({
     content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
   });
@@ -52,7 +54,7 @@ export function createServer(): McpServer {
       limit: z.number().int().positive().max(200).default(30),
     },
     async (args) => {
-      const mail = state().queryMail({
+      const mail = store.queryMail({
         sinceHours: args.hours,
         ...(args.importance ? { importance: args.importance } : {}),
         spamOnly: args.spamOnly,
@@ -70,7 +72,7 @@ export function createServer(): McpServer {
       'Use it to answer whether a sender wrote or which messages concern a renewal.',
     { query: z.string().min(1), hours: z.number().int().positive().optional(), limit: z.number().int().positive().max(200).default(30) },
     async (args) => {
-      const mail = state().queryMail({
+      const mail = store.queryMail({
         search: args.query,
         ...(args.hours ? { sinceHours: args.hours } : {}),
         limit: args.limit,
@@ -84,7 +86,7 @@ export function createServer(): McpServer {
     'Get a complete record by Message-ID, including body preview and triage reason.',
     { messageId: z.string().min(1) },
     async (args) => {
-      const found = state().getMail(args.messageId);
+      const found = store.getMail(args.messageId);
       return json(found ? { found: true, ...found } : { found: false, messageId: args.messageId });
     },
   );
@@ -93,7 +95,7 @@ export function createServer(): McpServer {
     'mail_summary',
     'Summarize processed and pushed messages in a time window, including spam and spam rescues.',
     { hours: z.number().int().positive().default(24) },
-    async (args) => json(state().summarize(args.hours)),
+    async (args) => json(store.summarize(args.hours)),
   );
 
   server.tool(
@@ -125,7 +127,6 @@ export function createServer(): McpServer {
       'Check this first when investigating a missing notification.',
     {},
     async () => {
-      const store = state();
       const last = store.getMeta(HEARTBEAT_KEY);
       const ageSeconds = last ? Math.round((Date.now() - new Date(last).valueOf()) / 1000) : null;
       const interval = Number(process.env.POLL_INTERVAL_SECONDS ?? 300);
@@ -162,40 +163,50 @@ export function createServer(): McpServer {
     },
   );
 
-  server.tool(
-    'poll_now',
-    'Run one fetch and triage cycle immediately instead of waiting. Usually takes seconds to a minute.',
-    {},
-    async () => {
-      try {
-        const watcher = new Watcher(loadConfig(), state(), buildSink());
-        const stats = await watcher.pollOnce();
-        return json({
-          ok: stats.failures.length === 0,
-          fetched: stats.fetched,
-          new: stats.fresh,
-          pushed: stats.pushed,
-          rescuedFromSpam: stats.spamRescued,
-          queuedForDigest: stats.queued,
-          failures: stats.failures,
-        });
-      } catch (error) {
-        return json({ ok: false, error: String(error) });
-      }
-    },
-  );
+  if (!readOnly) {
+    server.tool(
+      'poll_now',
+      'Run one fetch and triage cycle immediately instead of waiting. Usually takes seconds to a minute.',
+      {},
+      async () => {
+        try {
+          const watcher = new Watcher(loadConfig(), store, buildSink());
+          const stats = await watcher.pollOnce();
+          return json({
+            ok: stats.failures.length === 0,
+            fetched: stats.fetched,
+            new: stats.fresh,
+            pushed: stats.pushed,
+            rescuedFromSpam: stats.spamRescued,
+            queuedForDigest: stats.queued,
+            failures: stats.failures,
+          });
+        } catch (error) {
+          return json({ ok: false, error: String(error) });
+        }
+      },
+    );
 
-  server.tool(
-    'send_digest_now',
-    'Send the daily digest immediately and clear the current digest queue.',
-    {},
-    async () => {
-      const store = state();
-      const pending = store.digestPending();
-      const sent = await sendDigest(store, buildSink());
-      return json({ ok: true, sent, items: pending });
-    },
-  );
+    server.tool(
+      'send_digest_now',
+      'Send the daily digest immediately and clear the current digest queue only after delivery succeeds.',
+      {},
+      async () => {
+        const pending = store.digestPending();
+        try {
+          const sent = await sendDigest(store, buildSink());
+          return json({
+            ok: sent || pending === 0,
+            status: pending === 0 ? 'empty' : sent ? 'sent' : 'failed',
+            sent,
+            items: pending,
+          });
+        } catch (error) {
+          return json({ ok: false, status: 'failed', sent: false, items: pending, error: String(error) });
+        }
+      },
+    );
+  }
 
   return server;
 }
@@ -215,12 +226,11 @@ async function serveHttp(): Promise<void> {
   const host = process.env.MCP_BIND ?? '127.0.0.1';
   const token = process.env.MCP_TOKEN?.trim() ?? '';
   const loopback = ['127.0.0.1', 'localhost', '::1'].includes(host);
+  const readOnly = !loopback && (process.env.MCP_READ_ONLY ?? 'true').toLowerCase() !== 'false';
 
   if (!loopback && !token) {
-    console.error(
-      `⚠️  MCP_BIND=${host} has no MCP_TOKEN; anyone reaching ${host}:${port} ` +
-        'can query your mail. Set MCP_TOKEN in .env.',
-    );
+    console.error(`MCP_BIND=${host} requires MCP_TOKEN; refusing to start an unauthenticated HTTP server.`);
+    return;
   }
 
   const httpServer = createHttpServer((req, res) => {
@@ -231,17 +241,30 @@ async function serveHttp(): Promise<void> {
           res.writeHead(404).end();
           return;
         }
-        if (token && req.headers.authorization !== `Bearer ${token}`) {
+        const presented = req.headers.authorization?.startsWith('Bearer ')
+          ? req.headers.authorization.slice('Bearer '.length)
+          : '';
+        const authorized = !token || (token.length === presented.length && timingSafeEqual(
+          Buffer.from(token), Buffer.from(presented),
+        ));
+        if (!authorized) {
           res.writeHead(401, { 'content-type': 'application/json' }).end('{"error":"unauthorized"}');
           return;
         }
-        const server = createServer();
+        const state = new StateStore();
+        const server = createServer({ state, readOnly });
         // Omitting sessionIdGenerator selects stateless mode.
         const transport = new StreamableHTTPServerTransport({});
-        res.on('close', () => {
+        let cleaned = false;
+        const cleanup = (): void => {
+          if (cleaned) return;
+          cleaned = true;
           void transport.close();
           void server.close();
-        });
+          state.close();
+        };
+        res.once('close', cleanup);
+        res.once('finish', cleanup);
         // The SDK declares onclose as nullable here, which conflicts with the
         // Transport interface under exactOptionalPropertyTypes.
         await server.connect(transport as unknown as Transport);
@@ -256,7 +279,7 @@ async function serveHttp(): Promise<void> {
   httpServer.listen(port, host, () => {
     console.error(
       `mailsift MCP (Streamable HTTP) http://${host}:${port}/mcp · auth: ` +
-        (token ? 'Bearer token' : 'none'),
+        (token ? 'Bearer token' : 'none') + ` · mode: ${readOnly ? 'read-only' : 'read-write'}`,
     );
   });
 }
