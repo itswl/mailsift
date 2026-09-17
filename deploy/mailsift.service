@@ -23,10 +23,10 @@ Restart=on-failure
 RestartSec=10
 
 # Run with a low-privilege user:
-# useradd -r -s /usr/sbin/nologin mailwatch
-# chown -R mailwatch:mailwatch /opt/mailsift
-# User=mailwatch
-# Group=mailwatch
+# useradd -r -s /usr/sbin/nologin mailsift
+# chown -R mailsift:mailsift /opt/mailsift
+# User=mailsift
+# Group=mailsift
 NoNewPrivileges=true
 
 [Install]

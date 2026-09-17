@@ -55,6 +55,18 @@ describe('rendering', () => {
     expect(body).toContain('⏰本周内');
   });
 
+  it('escapes Markdown control characters from mail data', () => {
+    const row = toDigestItem(
+      makeMessage({ fromName: '*sender* [external]' }),
+      makeResult({ category: 'billing_[urgent]', summary: 'Pay `now` *please*', deadline: '[today]' }),
+    );
+    const body = renderDigest([row]);
+    expect(body).toContain('**\\*sender\\* \\[external\\]**');
+    expect(body).toContain('billing\\_\\[urgent\\]');
+    expect(body).toContain('Pay \\`now\\` \\*please\\*');
+    expect(body).toContain('⏰\\[today\\]');
+  });
+
   it('truncates long categories and explains the omission', () => {
     expect(renderDigest(items(0, 60))).toContain('more in this category');
   });
@@ -104,5 +116,14 @@ describe('sending', () => {
     expect(await sendDigest(state, sink, new Date('2026-09-16T09:00:00'))).toBe(false);
     expect(sink.pushed).toHaveLength(0);
     expect(state.getMeta('digest_last_sent_date')).toBe('2026-09-16');
+  });
+
+  it('retains the queue and does not record the date when delivery fails', async () => {
+    const state = new StateStore(':memory:');
+    state.queueDigest('failed', items(0, 1)[0]!);
+    const at = new Date('2026-09-16T09:00:00');
+    expect(await sendDigest(state, new RecordingSink(false), at)).toBe(false);
+    expect(state.digestPending()).toBe(1);
+    expect(state.getMeta('digest_last_sent_date')).toBeUndefined();
   });
 });

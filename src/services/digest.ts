@@ -50,7 +50,7 @@ function line(item: DigestItem): string {
   const sender = item.fromName || item.from || 'Unknown sender';
   const gist = (item.summary || '').trim();
   const shown = gist.length > 90 ? `${gist.slice(0, 90)}…` : gist;
-  return `- **${sender}**: ${shown}${item.deadline ? ` ⏰${item.deadline}` : ''}`;
+  return `- **${markdownText(sender)}**: ${markdownText(shown)}${item.deadline ? ` ⏰${markdownText(item.deadline)}` : ''}`;
 }
 
 export function renderDigest(items: DigestItem[]): string {
@@ -68,7 +68,7 @@ export function renderDigest(items: DigestItem[]): string {
 
   const lines = [
     `**${items.length} messages**  inbox ${inbox.length} · spam ${spam.length}`,
-    ordered.slice(0, 8).map(([name, n]) => `${name} ${n}`).join('  '),
+    ordered.slice(0, 8).map(([name, n]) => `${markdownText(name)} ${n}`).join('  '),
   ];
 
   // Put spam first: it is easiest to miss and the main reason for the digest.
@@ -93,7 +93,7 @@ export function renderDigest(items: DigestItem[]): string {
         droppedCategories += 1;
         continue;
       }
-      lines.push('', `**${category} (${group.length})**`);
+      lines.push('', `**${markdownText(category)} (${group.length})**`);
       const shown = Math.min(group.length, remaining);
       for (const item of group.slice(0, shown)) lines.push(line(item));
       remaining -= shown;
@@ -107,6 +107,10 @@ export function renderDigest(items: DigestItem[]): string {
   return lines.join('\n');
 }
 
+function markdownText(value: string): string {
+  return value.replace(/[\\`*_~\[\]]/g, '\\$&');
+}
+
 export function shouldSend(state: StateStore, at: Date = new Date()): boolean {
   if ((process.env.DIGEST_ENABLED ?? 'true').toLowerCase() === 'false') return false;
   if (at.getHours() < Number(process.env.DIGEST_HOUR ?? 9)) return false;
@@ -116,7 +120,8 @@ export function shouldSend(state: StateStore, at: Date = new Date()): boolean {
 /** Send the digest and record the date, including when the queue is empty. */
 export async function sendDigest(state: StateStore, sink: Sink, at: Date = new Date()): Promise<boolean> {
   const today = at.toISOString().slice(0, 10);
-  const items = state.drainDigest() as DigestItem[];
+  const entries = state.peekDigestEntries();
+  const items = entries.map((entry) => entry.payload) as DigestItem[];
 
   if (items.length === 0) {
     log.info('Digest queue is empty; skipping.');
@@ -155,7 +160,10 @@ export async function sendDigest(state: StateStore, sink: Sink, at: Date = new D
   };
 
   const sent = await sink.push(message, result);
-  state.setMeta(DIGEST_SENT_KEY, today);
+  if (sent) {
+    state.clearDigest(entries.map((entry) => entry.dedupKey));
+    state.setMeta(DIGEST_SENT_KEY, today);
+  }
   log.info(`Digest sent: ${items.length} messages (success=${sent})`);
   return sent;
 }

@@ -90,6 +90,8 @@ systemd 模板见 [deploy/mailsift.service](deploy/mailsift.service)。处理过
 docker compose run --rm mailsift node dist/src/main.js --recover
 ```
 
+Compose 默认使用已发布的 `1.0.0` 镜像。升级时在 `.env` 设置 `MAILSIFT_VERSION`，避免使用可变的 `latest` 标签。
+
 ## MCP
 
 MCP 默认关闭。启用 Docker profile：
@@ -106,9 +108,11 @@ docker compose --profile mcp up -d
 MCP_PUBLIC_HOST=0.0.0.0
 MCP_PORT=8410
 MCP_TOKEN=<随机长 token>
+# 公网 HTTP MCP 默认只读；仅在可信网络中关闭
+MCP_READ_ONLY=true
 ```
 
-请通过反向代理或隧道使用 HTTPS；MCP 会返回邮箱数据，不能让 bearer token 通过公网明文 HTTP 传输。
+请通过反向代理或隧道使用 HTTPS；MCP 会返回邮箱数据，不能让 bearer token 通过公网明文 HTTP 传输。公网 HTTP 模式没有 `MCP_TOKEN` 时会拒绝启动，默认只注册查询工具；只有显式设置 `MCP_READ_ONLY=false` 才会开放立即轮询和发送简报。
 
 ## 开发
 
