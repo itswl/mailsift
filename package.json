@@ -1,7 +1,7 @@
 {
   "name": "mailsift",
   "version": "1.0.0",
-  "description": "多邮箱重要邮件分诊：收件箱与垃圾箱一起盯，LLM 判重要性，推到飞书",
+  "description": "Multi-mailbox triage: monitor inboxes and spam, classify with an LLM, and push important mail",
   "type": "module",
   "engines": {
     "node": ">=22.5"

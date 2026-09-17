@@ -1,29 +1,30 @@
-# 源码部署的常驻方式；Docker 部署用 docker compose up -d，不需要本文件。
+# Persistent source deployment. Docker deployments use docker compose up -d.
 #
-# 安装：
+# Install:
 #   sudo cp deploy/mailsift.service /etc/systemd/system/mailsift.service
 #   sudo systemctl daemon-reload && sudo systemctl enable --now mailsift
-# 日志：journalctl -u mailsift -f
+# Logs: journalctl -u mailsift -f
 
 [Unit]
-Description=mailsift 多邮箱重要邮件监控
+Description=mailsift multi-account mail monitoring
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# WorkingDirectory 决定 .env 和 data/ 的位置，改成实际部署路径
+# WorkingDirectory determines the .env and data/ locations; change it to your path.
 WorkingDirectory=/opt/mailsift
-# node 的绝对路径用 which node 确认；nvm 安装的在 ~/.nvm/versions/ 下
+# Confirm the absolute node path with which node; nvm installs under ~/.nvm/versions/.
 ExecStart=/usr/bin/node dist/src/main.js
 
-# SIGTERM 后应用会把当前一轮跑完再退（同 compose 的 stop_grace_period），给足时间
+# After SIGTERM the app finishes the current poll before exiting.
 TimeoutStopSec=90
 Restart=on-failure
 RestartSec=10
 
-# 建议低权限运行：useradd -r -s /usr/sbin/nologin mailwatch
-# && chown -R mailwatch:mailwatch /opt/mailsift 后解开下面两行
+# Run with a low-privilege user:
+# useradd -r -s /usr/sbin/nologin mailwatch
+# chown -R mailwatch:mailwatch /opt/mailsift
 # User=mailwatch
 # Group=mailwatch
 NoNewPrivileges=true

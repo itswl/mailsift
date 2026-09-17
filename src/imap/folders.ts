@@ -1,8 +1,8 @@
 /**
- * 文件夹选择——重点是把垃圾箱找出来，以及 `all` 的展开。
+ * Folder selection: detect spam and expand the `all` token.
  *
- * mUTF-7 解码和 SPECIAL-USE 解析都由 ImapFlow 处理（Python 版本这两块是
- * 手写的），这里只负责"哪些文件夹该扫"这个业务判断。
+ * ImapFlow handles mUTF-7 decoding and SPECIAL-USE parsing; this module only
+ * decides which folders should be monitored.
  */
 import type { ListResponse } from 'imapflow';
 import { getLogger } from '../logger.js';
@@ -13,10 +13,10 @@ export const SPAM_TOKEN = 'spam';
 export const ALL_TOKEN = 'all';
 
 /**
- * special-use 属性缺失时的兜底名单。
+ * Fallback names for servers that omit special-use flags.
  *
- * 实测 QQ 的垃圾箱叫 `Junk` 且**不带** \Junk 属性，只能按名字认；
- * 不同服务商的本地化名称也不一样。
+ * Some QQ accounts call spam `Junk` without a \Junk flag, and providers use
+ * localized names.
  */
 const KNOWN_SPAM_NAMES = new Set([
   'spam', 'junk', 'junk email', 'junk e-mail', 'bulk mail', 'bulk',
@@ -25,10 +25,10 @@ const KNOWN_SPAM_NAMES = new Set([
 ]);
 
 /**
- * `all` 要排除的。判定优先用 RFC 6154 的 special-use 属性，再按名字兜底。
+ * Folders excluded by `all`. Prefer RFC 6154 special-use flags, then names.
  *
- * 为什么排除：已发送/草稿是自己写的；回收站是主动删的；
- * All Mail / Important / Starred 是视图而非独立存储，收进来等于每封重复一遍。
+ * Sent and drafts are user-authored; trash is intentionally deleted; All Mail,
+ * Important, and Starred are views rather than independent storage.
  */
 const EXCLUDED_FLAGS = new Set(['\\sent', '\\drafts', '\\trash', '\\all', '\\important', '\\flagged']);
 const EXCLUDED_NAMES = new Set([
@@ -41,9 +41,8 @@ const EXCLUDED_NAMES = new Set([
 
 export interface Folder {
   /**
-   * 文件夹路径。ImapFlow 的 `path` 已经是解好 mUTF-7 的 unicode 字符串，
-   * 而且 SELECT 时直接传它即可——Python 版本里那套 mUTF-7 编解码在这里
-   * 完全不需要。线上原文保存在 `rawPath`，只在排错时有用。
+   * Folder path. ImapFlow's `path` is already decoded Unicode and can be passed
+   * directly to SELECT. The original server value is kept in `rawPath` for debugging.
    */
   path: string;
   rawPath: string;
@@ -71,25 +70,25 @@ export function toFolder(entry: ListResponse): Folder {
 }
 
 export function findSpamFolder(folders: Folder[]): Folder | undefined {
-  // special-use 属性优先，名字兜底
+  // Prefer special-use flags, then names.
   return folders.find((f) => f.flags.has('\\junk')) ?? folders.find((f) => f.isSpam);
 }
 
-/** `all` 是否会跳过它。probe 用它判断"未监控"是盲区还是本来就该跳过。 */
+/** Whether `all` skips this folder; probe uses this to distinguish intentional exclusions. */
 export function excludedFromAll(folder: Folder, specialUse?: string): boolean {
   if (specialUse && EXCLUDED_FLAGS.has(lower(specialUse))) return true;
   for (const flag of folder.flags) if (EXCLUDED_FLAGS.has(flag)) return true;
   const name = lower(folder.path);
   if (EXCLUDED_NAMES.has(name)) return true;
-  // 子目录形式的已发送/草稿，如 QQ 的「其他文件夹/Sent Items」
+  // Also handle sent/draft subfolders such as QQ's "Other folders/Sent Items".
   return EXCLUDED_NAMES.has(name.split('/').pop() ?? '');
 }
 
 /**
- * 把配置里的文件夹名解析成真实 Folder。
+ * Resolve configured folder names to real Folder objects.
  *
- * `spam` 与 `all` 是逻辑名；其余按可读名或线上路径精确匹配（忽略大小写）。
- * 找不到的记一条 warning 并跳过，不影响其它文件夹照常扫描。
+ * `spam` and `all` are logical names; other values match display or server paths.
+ * Missing folders produce a warning and do not stop other folders.
  */
 export function resolveFolders(
   entries: ListResponse[],
@@ -108,7 +107,7 @@ export function resolveFolders(
   const push = (folder: Folder): void => {
     if (seen.has(folder.path)) return;
     if (!folder.selectable) {
-      log.warn(`文件夹不可选（是容器节点），跳过: ${folder.path}`);
+      log.warn(`Folder is not selectable (container node); skipping: ${folder.path}`);
       return;
     }
     seen.add(folder.path);
@@ -131,8 +130,8 @@ export function resolveFolders(
       const spam = findSpamFolder(folders);
       if (!spam) {
         log.warn(
-          '未发现垃圾箱文件夹，该账号只扫收件箱；' +
-            '可用 npm run probe 打印实际文件夹列表后写进 MAIL_ACCOUNT_N_FOLDERS',
+          'No spam folder found; this account will scan only the inbox. ' +
+            'Run npm run probe and add the real folder to MAIL_ACCOUNT_N_FOLDERS.',
         );
         continue;
       }
@@ -142,7 +141,7 @@ export function resolveFolders(
 
     const found = byName.get(key);
     if (!found) {
-      log.warn(`文件夹不存在，跳过: ${item}`);
+      log.warn(`Folder does not exist; skipping: ${item}`);
       continue;
     }
     push(found);

@@ -1,8 +1,8 @@
 /**
- * 每日简报：把不值得实时打扰的邮件攒起来，每天一次性给出。
+ * Daily digest: collect messages that do not need real-time interruption.
  *
- * 简报是回看收件箱的主界面（手机上没有邮件客户端），所以每行展示的是
- * 摘要而不是标题——标题常常什么都没说，摘要才是要的信息。
+ * The digest is the main review surface on a phone, so each line shows a summary
+ * instead of a subject. Subjects often omit the useful context.
  */
 import type { MailMessage } from '../imap/message.js';
 import { headline, type TriageResult } from './triage.js';
@@ -35,7 +35,7 @@ export function toDigestItem(message: MailMessage, result: TriageResult): Digest
     accountLabel: message.accountLabel,
     folder: message.folder,
     inSpam: message.inSpam,
-    subject: message.subject || '(无主题)',
+    subject: message.subject || '(no subject)',
     from: message.fromAddr,
     fromName: message.fromName,
     importance: result.importance,
@@ -47,41 +47,41 @@ export function toDigestItem(message: MailMessage, result: TriageResult): Digest
 }
 
 function line(item: DigestItem): string {
-  const sender = item.fromName || item.from || '未知发件人';
+  const sender = item.fromName || item.from || 'Unknown sender';
   const gist = (item.summary || '').trim();
   const shown = gist.length > 90 ? `${gist.slice(0, 90)}…` : gist;
-  return `- **${sender}**：${shown}${item.deadline ? `　⏰${item.deadline}` : ''}`;
+  return `- **${sender}**: ${shown}${item.deadline ? ` ⏰${item.deadline}` : ''}`;
 }
 
 export function renderDigest(items: DigestItem[]): string {
-  if (items.length === 0) return '过去一天没有需要回顾的邮件。';
+  if (items.length === 0) return 'No messages require review from the past day.';
 
   const spam = items.filter((i) => i.inSpam);
   const inbox = items.filter((i) => !i.inSpam);
 
   const counts = new Map<string, number>();
   for (const item of items) {
-    const key = item.category || '未分类';
+    const key = item.category || 'Uncategorized';
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   const ordered = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 
   const lines = [
-    `**共 ${items.length} 封**　收件箱 ${inbox.length} · 垃圾箱 ${spam.length}`,
-    ordered.slice(0, 8).map(([name, n]) => `${name} ${n}`).join('　'),
+    `**${items.length} messages**  inbox ${inbox.length} · spam ${spam.length}`,
+    ordered.slice(0, 8).map(([name, n]) => `${name} ${n}`).join('  '),
   ];
 
-  // 垃圾箱排最前——那是最容易漏的一类，也是简报存在的主要理由
+  // Put spam first: it is easiest to miss and the main reason for the digest.
   if (spam.length) {
-    lines.push('', `**⚠️ 垃圾箱 ${spam.length} 封（服务商判为垃圾，供你复核）**`);
+    lines.push('', `**⚠️ Spam (${spam.length}; review provider-filtered messages)**`);
     for (const item of spam.slice(0, MAX_SPAM_LINES)) lines.push(line(item));
-    if (spam.length > MAX_SPAM_LINES) lines.push(`- …另有 ${spam.length - MAX_SPAM_LINES} 封`);
+    if (spam.length > MAX_SPAM_LINES) lines.push(`- …${spam.length - MAX_SPAM_LINES} more`);
   }
 
   if (inbox.length) {
     const grouped = new Map<string, DigestItem[]>();
     for (const item of inbox) {
-      const key = item.category || '未分类';
+      const key = item.category || 'Uncategorized';
       (grouped.get(key) ?? grouped.set(key, []).get(key)!).push(item);
     }
     const groups = [...grouped.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
@@ -93,14 +93,14 @@ export function renderDigest(items: DigestItem[]): string {
         droppedCategories += 1;
         continue;
       }
-      lines.push('', `**${category}（${group.length}）**`);
+      lines.push('', `**${category} (${group.length})**`);
       const shown = Math.min(group.length, remaining);
       for (const item of group.slice(0, shown)) lines.push(line(item));
       remaining -= shown;
-      if (group.length > shown) lines.push(`- …本类另有 ${group.length - shown} 封`);
+      if (group.length > shown) lines.push(`- …${group.length - shown} more in this category`);
     }
     if (droppedCategories) {
-      lines.push('', `_另有 ${droppedCategories} 个分类因篇幅未展开，可用 MCP 的 list_mail 查全部_`);
+      lines.push('', `_${droppedCategories} more categories omitted; use MCP list_mail to view all_`);
     }
   }
 
@@ -113,13 +113,13 @@ export function shouldSend(state: StateStore, at: Date = new Date()): boolean {
   return state.getMeta(DIGEST_SENT_KEY) !== at.toISOString().slice(0, 10);
 }
 
-/** 发送简报并记录日期。队列为空时也记日期，避免整天反复检查。 */
+/** Send the digest and record the date, including when the queue is empty. */
 export async function sendDigest(state: StateStore, sink: Sink, at: Date = new Date()): Promise<boolean> {
   const today = at.toISOString().slice(0, 10);
   const items = state.drainDigest() as DigestItem[];
 
   if (items.length === 0) {
-    log.info('简报队列为空，跳过');
+    log.info('Digest queue is empty; skipping.');
     state.setMeta(DIGEST_SENT_KEY, today);
     return false;
   }
@@ -127,13 +127,13 @@ export async function sendDigest(state: StateStore, sink: Sink, at: Date = new D
   const spamCount = items.filter((i) => i.inSpam).length;
   const message: MailMessage = {
     account: 'mailsift',
-    accountLabel: '每日简报',
+    accountLabel: 'Daily digest',
     provider: '',
     folder: 'digest',
     inSpam: false,
     uid: 0,
     messageId: `<digest-${today}@mailsift>`,
-    subject: `每日邮件简报 · ${items.length} 封（垃圾箱 ${spamCount}）`,
+    subject: `Daily mail digest · ${items.length} messages (spam ${spamCount})`,
     fromAddr: 'digest@mailsift',
     fromName: 'mailsift',
     toAddrs: [],
@@ -147,15 +147,15 @@ export async function sendDigest(state: StateStore, sink: Sink, at: Date = new D
     importance: 'info',
     score: 0,
     summary: '',
-    reason: `${today} 每日简报，共 ${items.length} 封（其中垃圾箱 ${spamCount} 封）`,
+    reason: `${today} daily digest: ${items.length} messages, including ${spamCount} spam`,
     deadline: '',
-    category: '每日简报',
+    category: 'Daily digest',
     actionRequired: false,
     decidedBy: 'digest',
   };
 
   const sent = await sink.push(message, result);
   state.setMeta(DIGEST_SENT_KEY, today);
-  log.info(`简报已发送: ${items.length} 封 (成功=${sent})`);
+  log.info(`Digest sent: ${items.length} messages (success=${sent})`);
   return sent;
 }

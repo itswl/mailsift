@@ -1,12 +1,11 @@
 /**
- * IMAP 认证：明文密码 与 XOAUTH2。
+ * IMAP authentication: password and XOAUTH2.
  *
- * 绝大多数邮箱走授权码（明文 LOGIN）；Gmail 和 Outlook 个人账号自
- * 2024-09 起基本认证已关闭，必须 XOAUTH2。三家在 IMAP 这一层是同一个
- * 引擎，差别只在这里。
+ * Most providers use an app password (plain LOGIN). Gmail and personal Outlook
+ * accounts have disabled basic auth, so they require XOAUTH2.
  *
- * access_token 短命（约 1 小时），refresh_token 长期有效并落盘。
- * 首次授权由 scripts/oauth-setup.ts 交互完成。
+ * access_token values are short-lived; refresh_token values are persisted.
+ * Initial authorization is handled by scripts/oauth-setup.ts.
  */
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -15,7 +14,7 @@ import type { AuthKind } from '../config.js';
 
 const log = getLogger('auth');
 
-/** access_token 提前这么多秒视为过期，避免卡在边界上 */
+/** Treat access_token as expired this many seconds early. */
 const EXPIRY_SKEW_SECONDS = 120;
 
 export class AuthError extends Error {
@@ -46,9 +45,9 @@ export function getOAuthProvider(auth: AuthKind): OAuthProvider {
     const clientId = process.env.GMAIL_CLIENT_ID?.trim();
     if (!clientId) {
       throw new AuthError(
-        'Gmail 账号需要 GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET。' +
-          '在 Google Cloud Console 建「桌面应用」型 OAuth 客户端后填进 .env。\n' +
-          '个人 Gmail 也可以改用 gmail_pw + 应用专用密码，不必注册应用。',
+        'Gmail accounts require GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET. ' +
+          'Create a desktop OAuth client in Google Cloud Console and add it to .env.\n' +
+          'Personal Gmail can use gmail_pw plus an app password instead.',
       );
     }
     return {
@@ -67,8 +66,8 @@ export function getOAuthProvider(auth: AuthKind): OAuthProvider {
     const clientId = process.env.OUTLOOK_CLIENT_ID?.trim();
     if (!clientId) {
       throw new AuthError(
-        'Outlook 账号需要 OUTLOOK_CLIENT_ID。在 Entra 注册「公共客户端」应用，' +
-          '重定向 URI 填 http://localhost:8765/ 后填进 .env',
+        'Outlook accounts require OUTLOOK_CLIENT_ID. Register a public client in Entra, ' +
+          'set its redirect URI to http://localhost:8765/, and add it to .env.',
       );
     }
     const tenant = process.env.OUTLOOK_TENANT?.trim() || 'common';
@@ -84,13 +83,13 @@ export function getOAuthProvider(auth: AuthKind): OAuthProvider {
     };
   }
 
-  throw new AuthError(`未知 OAuth 类型: ${auth}`);
+  throw new AuthError(`Unknown OAuth type: ${auth}`);
 }
 
 /**
- * refresh_token 的落盘存储。
+ * Persistent refresh_token storage.
  *
- * 文件权限收到 0600——里面是长期有效的邮箱访问凭据，泄漏等同于邮箱被接管。
+ * File mode is 0600: these are long-lived mailbox credentials.
  */
 export class TokenStore {
   constructor(private readonly path: string = tokenStorePath()) {}
@@ -100,7 +99,7 @@ export class TokenStore {
       return JSON.parse(await readFile(this.path, 'utf8')) as Record<string, TokenRecord>;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code !== 'ENOENT') log.error(`token 文件读不了，当作空处理: ${this.path} -> ${error}`);
+      if (code !== 'ENOENT') log.error(`Cannot read token file; treating it as empty: ${this.path} -> ${error}`);
       return {};
     }
   }
@@ -136,7 +135,7 @@ async function postToken(provider: OAuthProvider, body: Record<string, string>):
   });
   if (!response.ok) {
     throw new AuthError(
-      `${provider.name} token 请求失败: HTTP ${response.status} ${(await response.text()).slice(0, 300)}`,
+      `${provider.name} token request failed: HTTP ${response.status} ${(await response.text()).slice(0, 300)}`,
     );
   }
   return response.json();
@@ -157,16 +156,16 @@ export function exchangeCode(
 }
 
 /**
- * 把 token 响应转成落盘记录。
+ * Convert a token response into a persistent record.
  *
- * 刷新响应里不一定回带 refresh_token（Google 通常不带），这时沿用旧的，
- * 否则一次刷新就把长期凭据弄丢了。
+ * Refresh responses may omit refresh_token (Google usually does); preserve the
+ * previous value or one refresh would lose the long-lived credential.
  */
 export function buildTokenRecord(payload: unknown, previous?: TokenRecord): TokenRecord {
   const data = payload as { refresh_token?: string; access_token?: string; expires_in?: number };
   const refreshToken = data.refresh_token ?? previous?.refreshToken;
   if (!refreshToken) {
-    throw new AuthError('授权响应里没有 refresh_token，且本地也没有旧值可沿用');
+    throw new AuthError('Authorization response has no refresh_token and no previous value is available');
   }
   return {
     refreshToken,
@@ -175,7 +174,7 @@ export function buildTokenRecord(payload: unknown, previous?: TokenRecord): Toke
   };
 }
 
-/** 取可用的 access_token，过期就自动刷新并回写。 */
+/** Return a usable access_token, refreshing and persisting it when expired. */
 export async function getAccessToken(
   username: string,
   auth: AuthKind,
@@ -183,14 +182,14 @@ export async function getAccessToken(
 ): Promise<string> {
   const record = await store.get(username);
   if (!record) {
-    throw new AuthError(`${username} 还没有授权记录。先跑: npm run oauth -- --account ${username}`);
+    throw new AuthError(`${username} has no authorization record. Run: npm run oauth -- --account ${username}`);
   }
   if (record.accessToken && record.expiresAt - EXPIRY_SKEW_SECONDS > Date.now() / 1000) {
     return record.accessToken;
   }
 
   const provider = getOAuthProvider(auth);
-  log.info(`刷新 access_token: ${username} (${provider.name})`);
+  log.info(`Refreshing access_token: ${username} (${provider.name})`);
   const updated = buildTokenRecord(
     await postToken(provider, {
       refresh_token: record.refreshToken,

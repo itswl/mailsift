@@ -1,8 +1,8 @@
-# 从源码构建（改了代码，或想自己编镜像时用）：
+# Build from source after code changes or when a local image is needed:
 #
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 #
-# 默认的 docker-compose.yml 直接拉现成镜像，不需要 build。
+# The default docker-compose.yml pulls a published image and does not build.
 
 services:
   mailsift:

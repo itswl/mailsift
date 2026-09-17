@@ -1,21 +1,21 @@
 /**
- * 本地状态：UID 游标、已处理去重、简报队列、健康计数。
+ * Local state: UID cursors, deduplication, digest queue, and health counters.
  *
- * 用 node:sqlite（Node 22.5+ 内置）——不需要任何原生依赖编译，
- * 而 SQLite 本身是必需的：主服务和 MCP 是两个进程共享同一个库，
- * 多账号并发写游标，且"分诊完才标记"依赖单条 UPDATE 的原子性。
+ * Use node:sqlite (built into Node 22.5+) without compiling native dependencies.
+ * The main service and MCP share this database, and atomic updates protect cursor
+ * writes and the "mark only after triage" invariant.
  */
 import { mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname } from 'node:path';
 
 /**
- * node:sqlite 是 Node 22.5+ 才加的内置模块，但直到现在它都还没进
- * `module.builtinModules` 清单——打包器据此判断"是不是内置模块"，
- * 于是静态 import 会被当成待解析的第三方包而报错。
+ * node:sqlite was added in Node 22.5 but is not yet listed in
+ * `module.builtinModules`. Some bundlers therefore treat a static import as a
+ * third-party dependency.
  *
- * 用 createRequire 在运行时加载，打包器的静态分析看不见它，
- * 而 Node 照常解析。类型仍然从 node:sqlite 取，不损失类型安全。
+ * createRequire hides the runtime load from static analysis while Node resolves
+ * it normally. Types still come from node:sqlite.
  */
 const nodeRequire = createRequire(import.meta.url);
 const { DatabaseSync } = nodeRequire('node:sqlite') as typeof import('node:sqlite');
@@ -140,7 +140,7 @@ export class StateStore {
     this.db.close();
   }
 
-  // ---- UID 游标 ----
+  // ---- UID cursors ----
 
   getCursor(account: string, folder: string): { uidValidity: string; lastUid: number } | undefined {
     const row = this.db
@@ -171,9 +171,9 @@ export class StateStore {
     return Number(result.changes);
   }
 
-  // ---- 去重 ----
+  // ---- Deduplication ----
 
-  /** 只查不写。标记要等这封信真正处理完才做（见 watcher.dispatch）。 */
+  /** Read only. Marking waits until the message is fully processed. */
   isSeen(dedupKey: string): boolean {
     return this.db.prepare('SELECT 1 FROM seen WHERE dedup_key = ?').get(dedupKey) !== undefined;
   }
@@ -204,7 +204,7 @@ export class StateStore {
       );
   }
 
-  /** 标记过但没有分诊结论的条数。正常情况下应当为 0。 */
+  /** Count records marked without a triage result; normally zero. */
   countUndispatched(): number {
     const row = this.db.prepare('SELECT COUNT(*) AS n FROM seen WHERE importance IS NULL').get() as
       | Record<string, unknown>
@@ -221,7 +221,7 @@ export class StateStore {
     return Number(this.db.prepare('DELETE FROM seen WHERE created_at < ?').run(cutoff).changes);
   }
 
-  // ---- 查询（MCP / 排查用）----
+  // ---- Queries (MCP and troubleshooting) ----
 
   queryMail(options: QueryOptions = {}): MailRow[] {
     const clauses: string[] = [];
@@ -282,7 +282,7 @@ export class StateStore {
     const byImportance: Record<string, number> = {};
     for (const row of this.db
       .prepare(
-        `SELECT COALESCE(importance,'未分诊') AS k, COUNT(*) AS n
+        `SELECT COALESCE(importance,'Undecided') AS k, COUNT(*) AS n
          FROM seen WHERE created_at >= ? GROUP BY importance`,
       )
       .all(cutoff) as Array<Record<string, unknown>>) {
@@ -299,7 +299,7 @@ export class StateStore {
     };
   }
 
-  // ---- 简报队列 ----
+  // ---- Digest queue ----
 
   queueDigest(dedupKey: string, payload: unknown): void {
     this.db
@@ -322,7 +322,7 @@ export class StateStore {
       try {
         items.push(JSON.parse(String(row['payload'])));
       } catch {
-        log.warn('简报队列里有一条损坏的记录，已跳过');
+        log.warn('A corrupt digest queue record was skipped.');
       }
     }
     return items;

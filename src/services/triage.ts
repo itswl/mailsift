@@ -1,10 +1,10 @@
 /**
- * 重要性判定：规则先行，LLM 兜住剩下的。
+ * Triage: deterministic rules first, with the LLM handling the remainder.
  *
- * 分三层，越靠前越确定、越便宜：
- * 1. 白/黑名单——发件人明确的直接定级，不花 token 也不会被模型改判
- * 2. LLM 批量打分——真正的"这封要紧吗"，一次一批控制成本
- * 3. 关键词兜底——模型不可用时仍能保住验证码/欠费/到期这类高危信号
+ * Three layers, ordered by certainty and cost:
+ * 1. Allow/deny lists: deterministic sender rules with no LLM cost.
+ * 2. Batched LLM scoring: classify the messages that need context.
+ * 3. Keyword fallback: preserve high-risk signals when the LLM is unavailable.
  */
 import { z } from 'zod';
 import { IMPORTANCE, IMPORTANCE_RANK, type Importance, type Rules } from '../config.js';
@@ -13,7 +13,7 @@ import { getLogger } from '../logger.js';
 
 const log = getLogger('triage');
 
-/** 模型不可用时的兜底信号，宁可多报不可漏报。简繁英三套。 */
+/** Fallback signals used when the LLM is unavailable; keep multilingual variants. */
 export const FALLBACK_KEYWORDS = [
   '验证码', '动态密码', '一次性密码', '身份验证', '异常登录', '安全警告', '账号异常', '冻结', '实名认证', '密码重置',
   '驗證碼', '動態密碼', '一次性密碼', '身分驗證', '異常登入', '帳號異常', '凍結', '實名認證', '密碼重設',
@@ -35,10 +35,10 @@ export const FALLBACK_KEYWORDS = [
 export interface TriageResult {
   importance: Importance;
   score: number;
-  /** 邮件说了什么 + 要你做什么。用户手机上没有邮件客户端，这往往是他能看到的全部 */
+  /** What the message says and what the user must do. */
   summary: string;
   reason: string;
-  /** 邮件里写明的截止/生效时间，没有则为空 */
+  /** Explicit deadline or effective time in the message, or empty. */
   deadline: string;
   category: string;
   actionRequired: boolean;
@@ -49,25 +49,25 @@ export function rank(result: TriageResult): number {
   return IMPORTANCE_RANK[result.importance];
 }
 
-/** 卡片和简报里优先展示的一句话 */
+/** The sentence shown first in cards and digests. */
 export function headline(result: TriageResult): string {
   return result.summary || result.reason;
 }
 
 /**
- * 模型输出的 schema。用 zod 而不是手工 coerce：
- * 一份定义同时做校验、类型推导和默认值兜底，模型返回脏数据也不会炸。
+ * Schema for LLM output. Zod validates, infers types, and supplies safe defaults
+ * when a provider returns malformed data.
  */
 const LlmResult = z.object({
   index: z.coerce.number().int().nonnegative(),
   importance: z.enum(IMPORTANCE).catch('warning'),
-  // 越界时夹取而不是回落：模型给 999 的意思是"极高"，
-  // 落回 50 反而把它的判断丢掉了
+  // Clamp out-of-range scores instead of falling back: 999 means "very high"
+  // and falling back to 50 would lose that signal.
   score: z.coerce
     .number()
     .catch(50)
     .transform((n) => Math.max(0, Math.min(100, Math.round(n)))),
-  category: z.string().trim().max(60).catch('未分类'),
+  category: z.string().trim().max(60).catch('Uncategorized'),
   action_required: z.coerce.boolean().catch(false),
   summary: z.string().trim().max(800).catch(''),
   reason: z.string().trim().max(500).catch(''),
@@ -75,103 +75,91 @@ const LlmResult = z.object({
 });
 const LlmResponse = z.object({ results: z.array(LlmResult).default([]) });
 
-const SYSTEM_PROMPT = `你是一个邮件分诊助手。用户的工作和生活都在这几个邮箱里，
-而且他手机上没装邮件客户端——你的输出就是他唯一能看到的东西。他不会去翻原文，
-所以你必须把邮件说清楚，而不只是判个级别。
+const SYSTEM_PROMPT = `You are an email triage assistant. The user's output is often the
+only part of a message they see, so explain what the message says and what action is needed,
+not just its importance level.
 
-# 语言
-邮件正文可能是简体中文、繁体中文或英文，三种都要正确理解。
-**你的输出一律用简体中文**，即使原文是繁体或英文也要转成简体中文表达。
-专有名词（公司名、产品名、订单号、金额、网址）保留原文，不要翻译。
+# Language
+Messages may be in Simplified Chinese, Traditional Chinese, or English; understand all three.
+Write all output in English. Preserve proper nouns, product names, order numbers, amounts, and URLs.
 
-# 评级标准
-判断依据是"不看会不会有实际损失"，工作和生活同等重要。
+# Importance levels
+Judge whether ignoring the message could cause real harm. Work and personal matters are equally important.
 
-- critical：不及时处理会造成实际损失或不可逆后果。
-  例如：验证码与登录异常、支付/扣款失败、账单逾期、服务即将停机、
-  证件或签证到期、医疗检查结果与预约变更、法律与合规通知、
-  明确截止期限在 72 小时内的事项、银行与资金异动、孩子学校的紧急通知。
+- critical: delay could cause financial loss or an irreversible consequence, such as login anomalies,
+  failed payments, overdue bills, expiring services or documents, medical results, legal notices,
+  deadlines within 72 hours, bank activity, or urgent school notices.
+- warning: the user needs to act, but it is not urgent, such as a human message, a reply request,
+  a renewal due within a week, delivery issues, travel changes, interviews, invoices, or appointments.
+- info: awareness only; ignoring it causes no loss, such as marketing, newsletters, social notifications,
+  routine reports, system logs, ordinary platform updates, ads, and completed confirmations.
 
-- warning：需要本人处理但不紧急。
-  例如：真人写来的信（同事、客户、朋友、家人）、需要回复的邮件、
-  一周内到期的续费或缴费、快递与物流的异常或待取件、
-  行程与订票确认或变更、面试与录用、报销与发票、预约提醒。
+# Rules
+- If in_spam=true, assess the message normally. A real bill, code, delivery, institution, or human message
+  may be a false positive; mention that possibility in reason.
+- Marketing remains info even when it says "last day", "one hour left", or "urgent".
+- Judge automated notices by consequences, not by whether the sender is a bot.
+- Human-written messages have higher priority than automated messages.
+- GitHub/GitLab notifications are usually info when they are routine CCs. Use warning or critical only for
+  direct mentions, assignments, review requests, security notices, or failures in the user's own repository.
 
-- info：知会即可，不看也没有损失。
-  例如：营销推广、新闻订阅、社交网络通知、自动化报表、系统日志、
-  平台的例行动态、纯广告、已完成且无需动作的确认信。
+# Output fields
+- summary: the most important field. In 1-2 English sentences, state what the message says and what action
+  is needed. Include amounts, IDs, times, locations, and deadlines. Do not repeat the subject or add filler.
+- reason: one sentence explaining the importance level.
+- deadline: an explicit deadline or effective time, otherwise an empty string.
+- category: a concise English category.
 
-# 注意事项
-- 邮件若来自垃圾箱（in_spam=true），说明服务商判过它是垃圾。多数确实是，
-  但误判的代价很高：如果它看起来是真实的账单、验证码、快递、机构或真人来信，
-  照常给出应有的级别，并在 reason 里点明"疑似误判进垃圾箱"。
-- 营销邮件即使写着"最后一天""仅剩 1 小时""紧急"也是 info。
-  以真实后果判断，不要被措辞带节奏。
-- 自动化通知里也可能混着要紧事（如扣款失败、容量告警），按后果判断而不是按发件人是否为机器人。
-- 真人写来的信优先级天然高于任何自动化邮件。
-- 代码托管平台（GitHub/GitLab 等）的通知要单独看：PR/Issue 的讨论虽然是真人写的，
-  但抄送给你的那部分属于例行动态，是 info。只有明确 @ 你、指派给你、请你 review、
-  安全公告，或你自己仓库的发布/主干构建失败，才算 warning 及以上。
-
-# 输出字段
-- summary：**最重要的字段**。用 1-2 句简体中文说清两件事：这封邮件说了什么、
-  需要你做什么。用户看不到原文，只能看到这句话。
-  含金额、单号、时间、地点、截止日等关键信息时必须写进来。
-  不要复述标题，不要写"这是一封关于……的邮件"这种空话。
-- reason：一句话说明为什么给这个级别。
-- deadline：邮件里有明确的截止或生效时间就填（如"2026-09-20"或"3 天内"），没有就填空字符串。
-- category：2-6 个字的简体中文分类。
-
-只输出 JSON，格式：
-{"results": [{"index": 0, "importance": "critical", "score": 0-100, "category": "分类",
-"action_required": true, "summary": "说了什么+要做什么", "reason": "为什么这个级别", "deadline": ""}]}
-必须为每一封邮件返回一条，index 与输入一一对应。`;
+Return only JSON:
+{"results": [{"index": 0, "importance": "critical", "score": 0-100, "category": "category",
+"action_required": true, "summary": "what it says and what to do", "reason": "why this level", "deadline": ""}]}
+Return exactly one result per message, with indices matching the input order.`;
 
 function matches(message: MailMessage, patterns: string[]): string | undefined {
   const haystack = `${message.fromAddr} ${message.fromName}`.toLowerCase();
   return patterns.find((p) => p && haystack.includes(p));
 }
 
-/** 命中白/黑名单时直接定级，返回 undefined 表示交给下一层。 */
+/** Apply sender rules directly; undefined delegates to the next layer. */
 export function applyRules(message: MailMessage, rules: Rules): TriageResult | undefined {
   const allow = matches(message, rules.alwaysImportant);
   if (allow) {
     return {
-      importance: 'critical', score: 100, category: '白名单', actionRequired: true,
-      decidedBy: 'rule', summary: '', reason: `发件人命中白名单规则「${allow}」`, deadline: '',
+      importance: 'critical', score: 100, category: 'Always important', actionRequired: true,
+      decidedBy: 'rule', summary: '', reason: `Sender matched always-important rule "${allow}"`, deadline: '',
     };
   }
   const deny = matches(message, rules.neverImportant);
   if (deny) {
     return {
-      importance: 'info', score: 0, category: '黑名单', actionRequired: false,
-      decidedBy: 'rule', summary: '', reason: `发件人命中忽略规则「${deny}」`, deadline: '',
+      importance: 'info', score: 0, category: 'Never important', actionRequired: false,
+      decidedBy: 'rule', summary: '', reason: `Sender matched never-important rule "${deny}"`, deadline: '',
     };
   }
   return undefined;
 }
 
-/** LLM 不可用时的保底判定。 */
+/** Safe fallback when the LLM is unavailable. */
 export function keywordFallback(message: MailMessage, rules: Rules): TriageResult {
   const haystack = `${message.subject}\n${snippet(message)}`.toLowerCase();
   const hits = [...rules.keywords, ...FALLBACK_KEYWORDS].filter(
     (kw) => kw && haystack.includes(kw.toLowerCase()),
   );
-  const preview = `（模型不可用，以下为正文开头）${snippet(message).slice(0, 200)}`;
+  const preview = `(LLM unavailable; message preview) ${snippet(message).slice(0, 200)}`;
 
   if (hits.length) {
     return {
-      importance: 'warning', score: 60, category: '关键词命中', actionRequired: true,
+      importance: 'warning', score: 60, category: 'Keyword match', actionRequired: true,
       decidedBy: 'fallback', summary: preview,
-      reason: `模型不可用，关键词兜底命中: ${hits.slice(0, 3).join(', ')}`, deadline: '',
+      reason: `LLM unavailable; fallback keyword match: ${hits.slice(0, 3).join(', ')}`, deadline: '',
     };
   }
-  // 没命中关键词时归档而不是打扰。兜底判别力比模型差得多，此时"宁可多报"
-  // 会把整个通知渠道淹掉，而渠道一旦没了信噪比，漏信的概率反而更高。
+  // Without a keyword, archive rather than interrupt. A weak fallback should not
+  // flood the notification channel and reduce its signal-to-noise ratio.
   return {
     importance: 'info', score: message.listUnsubscribe ? 5 : 20,
-    category: '未分类', actionRequired: false, decidedBy: 'fallback',
-    summary: preview, reason: '模型不可用且无高危关键词，暂归入简报待复核', deadline: '',
+    category: 'Uncategorized', actionRequired: false, decidedBy: 'fallback',
+    summary: preview, reason: 'LLM unavailable and no high-risk keyword matched; queued for review', deadline: '',
   };
 }
 
@@ -195,14 +183,14 @@ export function resolveLlmBaseUrl(): string {
   const preset = presets[provider];
   if (!preset) {
     throw new Error(
-      `未知 LLM_PROVIDER "${provider}"，可选 ${Object.keys(presets).sort().join(' / ')}；` +
-        '要接预设之外的厂商请留空 LLM_PROVIDER 并直接写 LLM_BASE_URL',
+      `Unknown LLM_PROVIDER "${provider}"; choose from ${Object.keys(presets).sort().join(' / ')}. ` +
+        'For a custom provider, leave LLM_PROVIDER empty and set LLM_BASE_URL.',
     );
   }
   return explicit || preset;
 }
 
-/** 记一条 token 用量。分诊是这个服务唯一的付费调用，出账异常时要能回溯。 */
+/** Log token usage; triage is the service's only paid call. */
 function logUsage(payload: unknown, batchSize: number): void {
   const usage = (payload as { usage?: Record<string, unknown> }).usage;
   if (!usage) return;
@@ -210,19 +198,19 @@ function logUsage(payload: unknown, batchSize: number): void {
   const reasoning = Number(
     (usage['completion_tokens_details'] as Record<string, unknown> | undefined)?.['reasoning_tokens'] ?? 0,
   );
-  // 缓存命中的字段名各家不同：DeepSeek 用顶层 prompt_cache_hit_tokens，
-  // xAI / OpenAI 放在 prompt_tokens_details.cached_tokens
+  // Cache-hit field names vary: DeepSeek uses prompt_cache_hit_tokens, while
+  // xAI / OpenAI use prompt_tokens_details.cached_tokens.
   const cached =
     Number(usage['prompt_cache_hit_tokens'] ?? 0) ||
     Number((usage['prompt_tokens_details'] as Record<string, unknown> | undefined)?.['cached_tokens'] ?? 0);
-  // xAI 直接回报实际计费金额。官方口径 1 USD = 1e10 ticks
+  // xAI reports cost directly. The documented unit is 1 USD = 1e10 ticks.
   const ticks = Number(usage['cost_in_usd_ticks'] ?? 0);
-  const cost = ticks ? `，本批实际计费 $${(ticks / 1e10).toFixed(6)}` : '';
+  const cost = ticks ? `, billed $${(ticks / 1e10).toFixed(6)} for this batch` : '';
 
   log.info(
-    `LLM 用量 | ${batchSize} 封 | prompt ${usage['prompt_tokens'] ?? 0} (缓存命中 ${cached}) + ` +
-      `completion ${usage['completion_tokens'] ?? 0} (推理 ${reasoning}) = ${total}，` +
-      `每封约 ${Math.round(total / Math.max(batchSize, 1))} token${cost}`,
+    `LLM usage | ${batchSize} messages | prompt ${usage['prompt_tokens'] ?? 0} (cache hit ${cached}) + ` +
+      `completion ${usage['completion_tokens'] ?? 0} (reasoning ${reasoning}) = ${total}; ` +
+      `about ${Math.round(total / Math.max(batchSize, 1))} tokens/message${cost}`,
   );
 }
 
@@ -236,7 +224,7 @@ function extractJson(content: string): unknown {
     const start = candidate.indexOf('{');
     const end = candidate.lastIndexOf('}');
     if (start !== -1 && end > start) return JSON.parse(candidate.slice(start, end + 1));
-    throw new Error('模型输出里找不到合法 JSON');
+    throw new Error('No valid JSON found in LLM output');
   }
 }
 
@@ -259,10 +247,10 @@ async function callLlm(body: Record<string, unknown>): Promise<unknown> {
 function requestBody(messages: MailMessage[], rules: Rules, jsonMode: boolean): Record<string, unknown> {
   const bodyChars = Number(process.env.LLM_BODY_CHARS ?? 1200);
   const payload = {
-    user_context: rules.context || '（用户未提供额外背景）',
+    user_context: rules.context || '(no additional user context)',
     emails: messages.map((m, index) => ({
       index,
-      subject: m.subject || '(无主题)',
+      subject: m.subject || '(no subject)',
       from: `${m.fromName} <${m.fromAddr}>`.trim(),
       in_spam: m.inSpam,
       is_bulk: m.listUnsubscribe,
@@ -298,7 +286,7 @@ async function classifyBatch(
 ): Promise<TriageResult[]> {
   if (messages.length === 0) return [];
   if (!process.env.LLM_API_KEY?.trim()) {
-    log.warn('未配置 LLM_API_KEY，全部走关键词兜底');
+    log.warn('LLM_API_KEY is not configured; using keyword fallback for all messages.');
     return messages.map((m) => keywordFallback(m, rules));
   }
 
@@ -309,9 +297,9 @@ async function classifyBatch(
     try {
       raw = await callLlm(requestBody(messages, rules, jsonMode));
     } catch (error) {
-      // 有的厂商不支持 json_object，去掉再试一次而不是直接判死
+      // Some providers do not support json_object; retry without it.
       if (!jsonMode || !looksLikeJsonModeRejection(error)) throw error;
-      log.warn('该厂商似乎不支持 response_format，去掉后重试（可设 LLM_JSON_MODE=false 固化）');
+      log.warn('Provider may not support response_format; retrying without it (set LLM_JSON_MODE=false to keep this behavior).');
       raw = await callLlm(requestBody(messages, rules, false));
     }
     logUsage(raw, messages.length);
@@ -319,7 +307,7 @@ async function classifyBatch(
       ?.content;
     parsed = LlmResponse.parse(extractJson(content ?? ''));
   } catch (error) {
-    log.error(`LLM 分诊失败，整批走关键词兜底: ${error}`);
+    log.error(`LLM triage failed; using keyword fallback for the batch: ${error}`);
     onLlmResult?.(error);
     return messages.map((m) => keywordFallback(m, rules));
   }
@@ -330,23 +318,23 @@ async function classifyBatch(
   return messages.map((message, index) => {
     const item = byIndex.get(index);
     if (!item) {
-      log.warn(`模型漏返回 index=${index}，该封走关键词兜底`);
+      log.warn(`LLM omitted index=${index}; using keyword fallback for that message.`);
       return keywordFallback(message, rules);
     }
     return {
       importance: item.importance,
       score: item.score,
       summary: item.summary,
-      reason: item.reason || '模型未给出理由',
+      reason: item.reason || 'The LLM provided no reason',
       deadline: item.deadline,
-      category: item.category || '未分类',
+      category: item.category || 'Uncategorized',
       actionRequired: item.action_required,
       decidedBy: 'llm',
     };
   });
 }
 
-/** 对一批邮件分诊，返回与输入等长、顺序一致的 (邮件, 结论)。 */
+/** Triage a batch and return message/result pairs in input order. */
 export async function triage(
   messages: MailMessage[],
   rules: Rules,

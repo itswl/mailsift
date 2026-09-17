@@ -1,8 +1,7 @@
 /**
- * 配置加载与校验。唯一来源是环境变量（实践中就是 .env）。
+ * Load and validate configuration. Environment variables are the sole source.
  *
- * 用 zod 而不是手工解析：一份 schema 同时产出运行时校验、TypeScript 类型
- * 和人能看懂的报错。配置错误全部在启动时抛出，不留到运行期。
+ * Zod provides runtime validation, TypeScript types, and readable startup errors.
  */
 import { z } from 'zod';
 
@@ -11,11 +10,11 @@ export class ConfigError extends Error {
 }
 
 /**
- * provider 预设：只是省去手写 host/port/auth 的快捷方式。
+ * Provider presets avoid repeating host, port, and auth settings.
  *
- * **任何支持 IMAP 的邮箱都能接**——不在表里的用 `imap` 加自己的 host。
- * 只有 Gmail 和 Outlook 特殊：它们关掉了密码认证必须走 OAuth。
- * 个人 Gmail 可以用 gmail_pw + 应用专用密码绕开（Workspace 不行）。
+ * Any IMAP provider works: use `imap` and provide its host when it is not listed.
+ * Gmail and Outlook require OAuth for most accounts because password auth is disabled.
+ * Personal Gmail can use gmail_pw plus an app password; Workspace cannot.
  */
 export const PROVIDER_PRESETS = {
   gmail: { host: 'imap.gmail.com', port: 993, auth: 'gmail_oauth' },
@@ -85,7 +84,7 @@ const ACCOUNT_LINE = z
     if (!provider || !username) {
       ctx.addIssue({
         code: 'custom',
-        message: `格式不对：期望 provider|username[|password[|host]]，实际是 ${JSON.stringify(raw)}`,
+        message: `Invalid format: expected provider|username[|password[|host]], got ${JSON.stringify(raw)}`,
       });
       return z.NEVER;
     }
@@ -107,8 +106,8 @@ function env(key: string): string | undefined {
 interface ParsedAccountLine {
   provider: string;
   username: string;
-  // exactOptionalPropertyTypes 下要显式带上 undefined：
-  // 「字段不存在」和「字段值是 undefined」是两回事
+  // With exactOptionalPropertyTypes, explicitly include undefined: absence and
+  // an undefined value are distinct types.
   password: string | undefined;
   host: string | undefined;
 }
@@ -119,30 +118,30 @@ function normalizeAccount(parsed: ParsedAccountLine, index: number, varName: str
   ];
   if (!preset) {
     throw new ConfigError(
-      `${varName}: 未知 provider "${parsed.provider}"，可选 ${Object.keys(PROVIDER_PRESETS).sort().join(' / ')}`,
+      `${varName}: unknown provider "${parsed.provider}"; choose from ${Object.keys(PROVIDER_PRESETS).sort().join(' / ')}`,
     );
   }
 
   const prefix = `MAIL_ACCOUNT_${index}_`;
   const host = parsed.host ?? preset.host;
   if (!host) {
-    throw new ConfigError(`${varName}: provider "${parsed.provider}" 需要显式指定 host`);
+    throw new ConfigError(`${varName}: provider "${parsed.provider}" requires an explicit host`);
   }
 
   const auth = (env(prefix + 'AUTH') ?? preset.auth) as AuthKind;
   if (!['password', 'gmail_oauth', 'outlook_oauth'].includes(auth)) {
-    throw new ConfigError(`${prefix}AUTH: 未知认证方式 "${auth}"`);
+    throw new ConfigError(`${prefix}AUTH: unknown authentication method "${auth}"`);
   }
   if (auth === 'password' && !parsed.password) {
     throw new ConfigError(
-      `${varName} (${parsed.username}): auth=password 但没有 password。` +
-        `格式是 provider|邮箱|授权码，授权码不是登录密码`,
+      `${varName} (${parsed.username}): auth=password requires a password. ` +
+        `Format: provider|email|app-password[|custom-host]; use an app password, not the normal login password.`,
     );
   }
 
   const portRaw = env(prefix + 'PORT');
   if (portRaw && !/^\d+$/.test(portRaw)) {
-    throw new ConfigError(`${prefix}PORT 必须是数字，实际是 ${JSON.stringify(portRaw)}`);
+    throw new ConfigError(`${prefix}PORT must be numeric; got ${JSON.stringify(portRaw)}`);
   }
 
   const folders = splitList(env(prefix + 'FOLDERS'));
@@ -172,17 +171,17 @@ export function loadConfig(): WatchConfig {
 
   if (numbered.length === 0) {
     throw new ConfigError(
-      '没有配置任何邮箱账号。在 .env 里加一行，例如：\n' +
-        '  MAIL_ACCOUNT_1=qq|me@qq.com|授权码\n' +
-        '格式是 provider|邮箱地址|授权码[|自定义host]，序号从 1 往下加。\n' +
-        '完整说明见 .env.example。',
+      'No mail accounts configured. Add a line to .env, for example:\n' +
+        '  MAIL_ACCOUNT_1=qq|me@qq.com|app-password\n' +
+        'Format: provider|email|app-password[|custom-host]; increment the account number.\n' +
+        'See .env.example for the complete guide.',
     );
   }
 
   const accounts = numbered.map(({ index, varName, raw }) => {
     const parsed = ACCOUNT_LINE.safeParse(raw);
     if (!parsed.success) {
-      throw new ConfigError(`${varName} ${parsed.error.issues[0]?.message ?? '解析失败'}`);
+      throw new ConfigError(`${varName} ${parsed.error.issues[0]?.message ?? 'parse failed'}`);
     }
     return normalizeAccount(parsed.data, index, varName);
   });
@@ -190,7 +189,7 @@ export function loadConfig(): WatchConfig {
   return {
     accounts,
     rules: {
-      // 统一小写，匹配时不必再关心大小写
+      // Normalize to lowercase so matching is case-insensitive.
       alwaysImportant: splitList(env('MAIL_ALWAYS_IMPORTANT')).map((s) => s.toLowerCase()),
       neverImportant: splitList(env('MAIL_NEVER_IMPORTANT')).map((s) => s.toLowerCase()),
       keywords: splitList(env('MAIL_KEYWORDS')).map((s) => s.toLowerCase()),

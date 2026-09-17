@@ -1,6 +1,6 @@
 name: Release
 
-# 只有打 tag 才构建镜像：日常提交不占用构建额度，也不会把未验证的代码推成 latest
+# Build images only for tags: ordinary commits do not consume build capacity or publish unverified code as latest.
 on:
   push:
     tags: ['v*']

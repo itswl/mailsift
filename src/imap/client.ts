@@ -1,12 +1,11 @@
 /**
- * IMAP 引擎：一套取信逻辑，三种认证方式。
+ * IMAP engine: one mail-fetching path for three authentication methods.
  *
- * 两个从 Python 版本踩出来、必须保留的结论：
+ * Two lessons from the Python implementation must remain:
  *
- * 1. 取信一律不置 \Seen。否则等于这个工具替你把所有邮件都"读"了一遍，
- *    手机上的未读红点全没了。ImapFlow 的 fetch 默认就是 peek 语义。
- * 2. `UID n:*` 在 IMAP 里永远至少返回一条（最后一封），哪怕它的 UID 小于 n。
- *    所以服务端搜完还要在客户端再滤一次，否则每轮都会重复推送最后一封。
+ * 1. Never set \Seen. ImapFlow fetch uses peek semantics by default.
+ * 2. IMAP `UID n:*` returns at least one message, even when its UID is below n.
+ *    Filter the search result client-side or the last message repeats every poll.
  */
 import { ImapFlow, type FetchMessageObject, type ListResponse } from 'imapflow';
 import { getAccessToken } from './auth.js';
@@ -18,7 +17,7 @@ import { getLogger } from '../logger.js';
 const log = getLogger('imap');
 
 export interface FolderCursor {
-  /** UIDVALIDITY 变了意味着服务端重建过，游标作废 */
+  /** A changed UIDVALIDITY means the server rebuilt the mailbox and invalidated the cursor. */
   uidValidity: string;
   lastUid: number;
 }
@@ -63,21 +62,21 @@ export async function connect(account: Account): Promise<ImapFlow> {
     ? { user: account.username, accessToken: await getAccessToken(account.username, account.auth) }
     : { user: account.username, pass: account.password ?? '' };
 
-  log.info(`连接 ${account.name} (${account.host}:${account.port}, auth=${account.auth})`);
+  log.info(`Connecting ${account.name} (${account.host}:${account.port}, auth=${account.auth})`);
   const client = new ImapFlow({
     host: account.host,
     port: account.port,
     secure: account.useSsl,
     auth,
     logger: false,
-    // 只观察，不改动邮箱状态
+    // Observe only; do not modify mailbox state.
     emitLogs: false,
   });
   // ImapFlow can emit a later socket error after connect() has rejected. Node
   // treats an EventEmitter "error" without a listener as process-fatal, which
   // used to turn one provider reset into a container restart loop.
   client.on('error', (error: unknown) => {
-    log.warn(`[${account.name}] IMAP 异步连接错误: ${imapErrorText(error)}`);
+    log.warn(`[${account.name}] asynchronous IMAP error: ${imapErrorText(error)}`);
   });
   try {
     await client.connect();
@@ -149,7 +148,7 @@ async function toMailMessage(
   };
 }
 
-/** 拉取该文件夹里游标之后的新邮件，返回 (邮件列表, 新游标)。 */
+/** Fetch messages after the folder cursor and return the messages plus new cursor. */
 export async function fetchNew(
   client: ImapFlow,
   account: Account,
@@ -157,7 +156,7 @@ export async function fetchNew(
   cursor: FolderCursor | undefined,
   budget?: MessageBudget,
 ): Promise<{ messages: MailMessage[]; cursor: FolderCursor }> {
-  // readOnly：这个工具只观察，不改动邮箱状态
+  // readOnly: this tool observes and does not modify mailbox state.
   const lock = await client.getMailboxLock(folder.path, { readOnly: true });
   try {
     const mailbox = client.mailbox;
@@ -167,7 +166,7 @@ export async function fetchNew(
 
     const fresh = !cursor || cursor.uidValidity !== uidValidity;
     if (cursor && fresh) {
-      log.warn(`UIDVALIDITY 变化（${cursor.uidValidity} -> ${uidValidity}），按日期重新回溯`);
+      log.warn(`UIDVALIDITY changed (${cursor.uidValidity} -> ${uidValidity}); using date lookback`);
     }
 
     const floor = fresh ? 0 : cursor.lastUid;
@@ -180,16 +179,15 @@ export async function fetchNew(
       if (isOversizedLookback(foundUids, maxLookback)) {
         const lastUid = Math.max(...foundUids);
         log.warn(
-          `[${account.name}/${folder.path}] 回看命中 ${foundUids.length} 封，超过 ${maxLookback} 封，` +
-            `跳过整批并推进游标至 UID ${lastUid}`,
+          `[${account.name}/${folder.path}] lookback returned ${foundUids.length} messages, over the ${maxLookback} limit; ` +
+            `skipping the batch and advancing the cursor to UID ${lastUid}`,
         );
         return { messages: [], cursor: { uidValidity, lastUid } };
       }
     }
 
-    // `UID n:*` 的兜底语义会把最后一封带回来，这里再滤一次。取最老的
-    // 一批而不是最新的一批：游标只推进到本轮真正处理的最后一封，不能把
-    // 被 cap 截掉的旧邮件直接跳过去。
+    // `UID n:*` can include the last message as a fallback. Filter again here.
+    // Take the oldest batch so a cap cannot skip older mail.
     const limit = Math.min(maxPerPoll, budget?.remaining ?? maxPerPoll);
     const uids = selectFetchUids(foundUids, floor, limit);
     if (budget) budget.remaining -= uids.length;
@@ -206,13 +204,13 @@ export async function fetchNew(
       try {
         messages.push(await toMailMessage(raw, account, folder));
       } catch (error) {
-        // 单封解析失败不该中断整个文件夹
-        log.warn(`解析 uid=${raw.uid} 失败，跳过: ${error}`);
+        // One malformed message must not stop the entire folder.
+        log.warn(`Failed to parse uid=${raw.uid}; skipping: ${error}`);
       }
     }
 
     log.info(
-      `[${account.name}/${folder.path}] 新邮件 ${messages.length} 封${folder.isSpam ? '（垃圾箱）' : ''}`,
+      `[${account.name}/${folder.path}] fetched ${messages.length} new messages${folder.isSpam ? ' (spam)' : ''}`,
     );
     return { messages, cursor: { uidValidity, lastUid: Math.max(...uids) } };
   } finally {

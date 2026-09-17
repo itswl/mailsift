@@ -6,23 +6,23 @@ function store(): StateStore {
   return new StateStore(':memory:');
 }
 
-describe('去重', () => {
-  it('markSeen 幂等', () => {
+describe('deduplication', () => {
+  it('makes markSeen idempotent', () => {
     const s = store();
     expect(s.markSeen('k1', 'me@qq.com', '主题')).toBe(true);
     expect(s.markSeen('k1', 'me@qq.com', '主题')).toBe(false);
   });
 
-  it('isSeen 只查不写', () => {
-    // 标记要推迟到分诊投递之后，否则崩溃会让邮件静默消失
+  it('makes isSeen read-only', () => {
+    // Defer marking until after triage and delivery so a crash does not silently lose a message.
     const s = store();
     expect(s.isSeen('k1')).toBe(false);
     expect(s.isSeen('k1')).toBe(false);
   });
 });
 
-describe('游标', () => {
-  it('按 (账号, 文件夹) 隔离', () => {
+describe('cursors', () => {
+  it('isolates cursors by account and folder', () => {
     const s = store();
     s.saveCursor('a@qq.com', 'INBOX', '1', 100);
     s.saveCursor('b@qq.com', 'INBOX', '1', 200);
@@ -32,7 +32,7 @@ describe('游标', () => {
     expect(s.getCursor('a@qq.com', 'Junk')).toEqual({ uidValidity: '1', lastUid: 5 });
   });
 
-  it('可整体回滚（--recover 用）', () => {
+  it('can roll back all cursors for --recover', () => {
     const s = store();
     s.saveCursor('a@qq.com', 'INBOX', '1', 100);
     expect(s.clearCursors()).toBe(1);
@@ -40,13 +40,13 @@ describe('游标', () => {
   });
 });
 
-describe('富字段与查询', () => {
+describe('rich fields and queries', () => {
   function seed(s: StateStore, key: string, fields: Record<string, unknown> = {}): void {
     s.markSeen(key, String(fields['account'] ?? 'me@qq.com'), String(fields['subject'] ?? 's'));
     s.recordOutcome(key, String(fields['importance'] ?? 'info'), Boolean(fields['pushed']), fields);
   }
 
-  it('往返保真', () => {
+  it('preserves rich fields through a round trip', () => {
     const s = store();
     seed(s, 'k1', {
       importance: 'critical', pushed: true, messageId: '<a@x>', sender: 'billing@v.com',
@@ -57,7 +57,7 @@ describe('富字段与查询', () => {
     expect(item?.snippet).toBe('正文');
   });
 
-  it('按条件筛选', () => {
+  it('filters by conditions', () => {
     const s = store();
     seed(s, 'k1', { importance: 'critical', pushed: true, messageId: '<1@x>', inSpam: true, sender: 'a@bank.com' });
     seed(s, 'k2', { importance: 'info', messageId: '<2@x>', sender: 'news@site.com' });
@@ -68,13 +68,13 @@ describe('富字段与查询', () => {
     expect(s.queryMail({ search: 'bank' }).map((m) => m.messageId)).toEqual(['<1@x>']);
   });
 
-  it('搜索覆盖摘要与理由', () => {
+  it('searches summaries and reasons', () => {
     const s = store();
     seed(s, 'k1', { messageId: '<1@x>', summary: '域名续费到期通知', category: '账单续费' });
     expect(s.queryMail({ search: '续费' })).toHaveLength(1);
   });
 
-  it('统计垃圾箱捞回', () => {
+  it('counts rescued spam', () => {
     const s = store();
     seed(s, 'k1', { importance: 'critical', pushed: true, inSpam: true });
     seed(s, 'k2', { importance: 'info', inSpam: true });
@@ -85,8 +85,8 @@ describe('富字段与查询', () => {
   });
 });
 
-describe('维护', () => {
-  it('查得出被中断留下的无结论记录并能清掉', () => {
+describe('maintenance', () => {
+  it('finds and clears interrupted records without outcomes', () => {
     const s = store();
     s.markSeen('stuck', 'me@qq.com', '被中断');
     s.markSeen('done', 'me@qq.com', '正常');
@@ -96,13 +96,13 @@ describe('维护', () => {
     expect(s.isSeen('done')).toBe(true);
   });
 
-  it('prune 只删旧的', () => {
+  it('prune deletes only old records', () => {
     const s = store();
     s.markSeen('old', 'me@qq.com', '旧');
     s.markSeen('new', 'me@qq.com', '新');
     s.recordOutcome('old', 'info', false);
     s.recordOutcome('new', 'info', false);
-    // 手工把一条改成 200 天前
+    // Manually move one record 200 days into the past.
     const stale = new Date(Date.now() - 200 * 86_400_000).toISOString();
     (s as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db
       .prepare('UPDATE seen SET created_at = ? WHERE dedup_key = ?')
@@ -112,7 +112,7 @@ describe('维护', () => {
     expect(s.isSeen('new')).toBe(true);
   });
 
-  it('简报队列排空一次就没了', () => {
+  it('draining the digest queue empties it', () => {
     const s = store();
     s.queueDigest('k1', { subject: 'a' });
     s.queueDigest('k2', { subject: 'b' });
@@ -122,7 +122,7 @@ describe('维护', () => {
     expect(s.drainDigest()).toEqual([]);
   });
 
-  it('meta 覆盖写', () => {
+  it('overwrites metadata values', () => {
     const s = store();
     expect(s.getMeta('x')).toBeUndefined();
     s.setMeta('x', 'a');
