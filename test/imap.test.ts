@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { isOversizedLookback, selectFetchUids } from '../src/imap/client.js';
+import {
+  imapErrorText, isOversizedLookback, isTransientConnectError, selectFetchUids,
+} from '../src/imap/client.js';
 
 describe('IMAP fetch caps', () => {
   it('takes the oldest UIDs first so a cap does not skip the backlog', () => {
@@ -17,5 +19,23 @@ describe('IMAP fetch caps', () => {
   it('skips an oversized fresh lookback instead of partially backfilling it', () => {
     expect(isOversizedLookback(Array.from({ length: 500 }, (_, i) => i + 1), 500)).toBe(false);
     expect(isOversizedLookback(Array.from({ length: 501 }, (_, i) => i + 1), 500)).toBe(true);
+  });
+});
+
+describe('IMAP connection errors', () => {
+  it('preserves the provider response in the diagnostic text', () => {
+    const error = {
+      message: 'Command failed',
+      response: '3 NO User is authenticated but not connected.',
+      responseText: 'User is authenticated but not connected.',
+      responseStatus: 'NO',
+    };
+    expect(imapErrorText(error)).toContain('User is authenticated but not connected.');
+    expect(imapErrorText(error)).toContain('NO');
+  });
+
+  it('recognizes transient connection failures without retrying auth rejection', () => {
+    expect(isTransientConnectError({ responseText: 'User is authenticated but not connected.' })).toBe(true);
+    expect(isTransientConnectError({ responseText: 'AUTHENTICATE failed.' })).toBe(false);
   });
 });

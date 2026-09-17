@@ -31,19 +31,32 @@ function intEnv(name: string, fallback: number): number {
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
 }
 
-function imapErrorText(error: unknown): string {
+const TRANSIENT_CONNECT_MARKERS = [
+  'user is authenticated but not connected',
+  'connection reset', 'connection refused', 'socket hang up',
+  'timed out', 'timeout', 'econnreset', 'econnrefused', 'etimedout',
+  'temporarily unavailable', 'try again',
+];
+
+export function imapErrorText(error: unknown): string {
   if (!error || typeof error !== 'object') return String(error);
   const value = error as {
     message?: unknown;
     response?: unknown;
     responseText?: unknown;
+    responseStatus?: unknown;
     code?: unknown;
   };
-  return [value.message, value.response, value.responseText, value.code]
+  return [value.message, value.responseText, value.response, value.responseStatus, value.code]
     .filter((part) => part !== undefined && part !== null && String(part))
     .map(String)
     .filter((part, index, all) => all.indexOf(part) === index)
     .join(' | ');
+}
+
+export function isTransientConnectError(error: unknown): boolean {
+  const text = imapErrorText(error).toLowerCase();
+  return TRANSIENT_CONNECT_MARKERS.some((marker) => text.includes(marker));
 }
 
 export function selectFetchUids(found: readonly number[], floor: number, limit: number): number[] {
@@ -62,35 +75,53 @@ export async function connect(account: Account): Promise<ImapFlow> {
     ? { user: account.username, accessToken: await getAccessToken(account.username, account.auth) }
     : { user: account.username, pass: account.password ?? '' };
 
-  log.info(`Connecting ${account.name} (${account.host}:${account.port}, auth=${account.auth})`);
-  const client = new ImapFlow({
-    host: account.host,
-    port: account.port,
-    secure: account.useSsl,
-    auth,
-    logger: false,
-    // Observe only; do not modify mailbox state.
-    emitLogs: false,
-  });
-  // ImapFlow can emit a later socket error after connect() has rejected. Node
-  // treats an EventEmitter "error" without a listener as process-fatal, which
-  // used to turn one provider reset into a container restart loop.
-  client.on('error', (error: unknown) => {
-    log.warn(`[${account.name}] asynchronous IMAP error: ${imapErrorText(error)}`);
-  });
-  try {
-    await client.connect();
-    return client;
-  } catch (error) {
-    // A failed handshake can leave a half-open TLS socket behind. Close it
-    // before handing the original connection failure back to the watcher.
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    log.info(
+      `Connecting ${account.name} (${account.host}:${account.port}, auth=${account.auth}, attempt ${attempt}/${maxAttempts})`,
+    );
+    const client = new ImapFlow({
+      host: account.host,
+      port: account.port,
+      secure: account.useSsl,
+      auth,
+      logger: false,
+      // Observe only; do not modify mailbox state.
+      emitLogs: false,
+    });
+    // ImapFlow can emit a later socket error after connect() has rejected. Node
+    // treats an EventEmitter "error" without a listener as process-fatal, which
+    // used to turn one provider reset into a container restart loop.
+    client.on('error', (error: unknown) => {
+      log.warn(`[${account.name}] asynchronous IMAP error: ${imapErrorText(error)}`);
+    });
     try {
-      client.close();
-    } catch {
-      // Preserve the original connection error; cleanup is best effort.
+      await client.connect();
+      return client;
+    } catch (error) {
+      // A failed handshake can leave a half-open TLS socket behind. Close it
+      // before retrying or handing the connection failure back to the watcher.
+      try {
+        client.close();
+      } catch {
+        // Cleanup is best effort; preserve the original connection error.
+      }
+
+      const detail = imapErrorText(error);
+      if (attempt === maxAttempts || !isTransientConnectError(error)) {
+        throw new Error(detail, { cause: error });
+      }
+
+      const delayMs = 1_000 * 2 ** (attempt - 1);
+      log.warn(
+        `[${account.name}] transient IMAP connection failure (${attempt}/${maxAttempts}); ` +
+          `retrying in ${delayMs}ms: ${detail}`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
-    throw error;
   }
+
+  throw new Error(`Unable to connect to ${account.name}`);
 }
 
 export async function listFolders(client: ImapFlow): Promise<ListResponse[]> {
