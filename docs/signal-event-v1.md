@@ -17,7 +17,7 @@ small event without copying the message body through every hop.
   "dedup_key": "account@example.com|<message-id>",
   "evidence_ref": {
     "kind": "mcp",
-    "uri": "mailsift://mail/%3Cmessage-id%3E"
+    "uri": "mailsift://imap/account%40example.com/%3Cmessage-id%3E"
   },
   "payload": {
     "account": "account@example.com",
@@ -36,5 +36,6 @@ small event without copying the message body through every hop.
 
 The event contains a decision-ready summary and metadata, not the raw body.
 Consumers that need more context use the `evidence_ref` URI with the authenticated
-mailsift MCP server's Resource API. The reference contains an identifier only; it
-never carries credentials or tokens.
+mailsift MCP server's Resource API. The IMAP Resource fetches a bounded normalized
+body on demand, in read-only mode, and does not persist it. The reference contains
+identifiers only; it never carries credentials or tokens.

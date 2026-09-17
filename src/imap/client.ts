@@ -248,3 +248,47 @@ export async function fetchNew(
     lock.release();
   }
 }
+
+/**
+ * Fetch one message on demand without persisting it or changing mailbox state.
+ *
+ * This is used by the MCP Resource path. The caller supplies a configured
+ * account and Message-ID; the body exists only for the duration of this call.
+ */
+export async function fetchByMessageId(account: Account, messageId: string): Promise<MailMessage | undefined> {
+  const client = await connect(account);
+  const maxSourceBytes = intEnv('MCP_LIVE_SOURCE_BYTES', 5 * 1024 * 1024);
+  try {
+    const folders = await targetFolders(client, account);
+    for (const folder of folders) {
+      const lock = await client.getMailboxLock(folder.path, { readOnly: true });
+      try {
+        const found = await client.search({ header: { 'message-id': messageId } }, { uid: true });
+        const foundUids = Array.isArray(found) ? found : [];
+        if (!foundUids.length) continue;
+        for await (const raw of client.fetch(
+          foundUids,
+          {
+            uid: true,
+            size: true,
+            envelope: true,
+            source: { maxLength: maxSourceBytes + 1 },
+            headers: ['list-unsubscribe'],
+          },
+          { uid: true },
+        )) {
+          if (raw.size !== undefined && raw.size > maxSourceBytes) {
+            throw new Error(`message exceeds MCP_LIVE_SOURCE_BYTES (${maxSourceBytes})`);
+          }
+          const message = await toMailMessage(raw, account, folder);
+          if (message.messageId === messageId) return message;
+        }
+      } finally {
+        lock.release();
+      }
+    }
+    return undefined;
+  } finally {
+    await client.logout().catch(() => undefined);
+  }
+}

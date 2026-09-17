@@ -48,7 +48,7 @@ export function buildMailSignalEvent(message: MailMessage, result: TriageResult)
     dedup_key: dedupKey(message),
     evidence_ref: {
       kind: 'mcp',
-      uri: `mailsift://mail/${encodeURIComponent(message.messageId)}`,
+      uri: `mailsift://imap/${encodeURIComponent(message.account)}/${encodeURIComponent(message.messageId)}`,
     },
     payload: {
       account: message.account,
