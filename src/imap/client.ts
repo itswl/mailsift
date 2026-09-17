@@ -264,10 +264,30 @@ export async function fetchByMessageId(account: Account, messageId: string): Pro
       const lock = await client.getMailboxLock(folder.path, { readOnly: true });
       try {
         const headerFound = await client.search({ header: { 'message-id': messageId } }, { uid: true });
-        const found = Array.isArray(headerFound) && headerFound.length
+        let found = Array.isArray(headerFound) && headerFound.length
           ? headerFound
           : await client.search({ text: messageId }, { uid: true });
-        const foundUids = Array.isArray(found) ? found : [];
+        let foundUids = Array.isArray(found) ? found : [];
+        if (foundUids.length === 0) {
+          const lookbackDays = intEnv('MCP_LIVE_LOOKBACK_DAYS', 90);
+          const maxCandidates = intEnv('MCP_LIVE_SEARCH_MAX_MESSAGES', 500);
+          const broad = await client.search(
+            { since: new Date(Date.now() - lookbackDays * 86_400_000) },
+            { uid: true },
+          );
+          if (Array.isArray(broad) && broad.length > maxCandidates) {
+            throw new Error(`live IMAP search exceeds MCP_LIVE_SEARCH_MAX_MESSAGES (${maxCandidates})`);
+          }
+          const matching: number[] = [];
+          for await (const raw of client.fetch(
+            Array.isArray(broad) ? broad : [],
+            { uid: true, envelope: true },
+            { uid: true },
+          )) {
+            if (raw.envelope?.messageId?.trim() === messageId) matching.push(raw.uid);
+          }
+          foundUids = matching;
+        }
         if (!foundUids.length) continue;
         for await (const raw of client.fetch(
           foundUids,
