@@ -263,7 +263,10 @@ export async function fetchByMessageId(account: Account, messageId: string): Pro
     for (const folder of folders) {
       const lock = await client.getMailboxLock(folder.path, { readOnly: true });
       try {
-        const found = await client.search({ header: { 'message-id': messageId } }, { uid: true });
+        const headerFound = await client.search({ header: { 'message-id': messageId } }, { uid: true });
+        const found = Array.isArray(headerFound) && headerFound.length
+          ? headerFound
+          : await client.search({ text: messageId }, { uid: true });
         const foundUids = Array.isArray(found) ? found : [];
         if (!foundUids.length) continue;
         for await (const raw of client.fetch(
