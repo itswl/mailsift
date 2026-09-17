@@ -26,10 +26,10 @@ COPY --from=build /app/node_modules/ node_modules/
 COPY --from=build /app/dist/ dist/
 
 # Run as non-root; persist data/ because it contains the state database and OAuth tokens.
-RUN adduser -D -u 10001 mailwatch \
+RUN adduser -D -u 10001 mailsift \
  && mkdir -p /app/data \
- && chown -R mailwatch:mailwatch /app
-USER mailwatch
+ && chown -R mailsift:mailsift /app
+USER mailsift
 
 VOLUME ["/app/data"]
 
