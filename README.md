@@ -192,6 +192,8 @@ sudo systemctl daemon-reload && sudo systemctl enable --now mailsift
 ```
 
 首次运行只回看 `INITIAL_LOOKBACK_DAYS`（默认 3）天，不会把历史邮件全推一遍。
+如果单个文件夹的首次回看命中超过 `MAX_MESSAGES_PER_LOOKBACK`（默认 500）封，
+会跳过整批并推进该文件夹游标，不做历史补账，避免重复回看和刷屏。
 
 每个文件夹单轮最多拉取 `MAX_MESSAGES_PER_POLL`（默认 200）封，所有账号和文件夹合计还受
 `MAX_MESSAGES_PER_POLL_TOTAL`（默认 500）限制，防止首次补账一次性刷屏或失控消耗模型额度。

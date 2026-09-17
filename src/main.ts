@@ -98,6 +98,7 @@ async function checkConfig(): Promise<number> {
       `简报 ${(process.env.DIGEST_ENABLED ?? 'true') === 'false' ? '关闭' : `每日 ${process.env.DIGEST_HOUR ?? 9} 点`}`,
   );
   console.log(`   每轮补账上限 ${process.env.MAX_MESSAGES_PER_POLL_TOTAL ?? 500} 封（所有账号/文件夹合计）`);
+  console.log(`   首次回看超过 ${process.env.MAX_MESSAGES_PER_LOOKBACK ?? 500} 封则跳过整批`);
 
   return problems ? 1 : 0;
 }

@@ -54,6 +54,10 @@ export function selectFetchUids(found: readonly number[], floor: number, limit: 
     .slice(0, Math.max(0, limit));
 }
 
+export function isOversizedLookback(found: readonly number[], limit: number): boolean {
+  return found.length > limit;
+}
+
 export async function connect(account: Account): Promise<ImapFlow> {
   const auth = needsOAuth(account)
     ? { user: account.username, accessToken: await getAccessToken(account.username, account.auth) }
@@ -169,12 +173,25 @@ export async function fetchNew(
     const floor = fresh ? 0 : cursor.lastUid;
     const since = new Date(Date.now() - lookbackDays * 86_400_000);
     const found = await client.search(fresh ? { since } : { uid: `${floor + 1}:*` }, { uid: true });
+    const foundUids = found || [];
+
+    if (fresh) {
+      const maxLookback = intEnv('MAX_MESSAGES_PER_LOOKBACK', 500);
+      if (isOversizedLookback(foundUids, maxLookback)) {
+        const lastUid = Math.max(...foundUids);
+        log.warn(
+          `[${account.name}/${folder.path}] 回看命中 ${foundUids.length} 封，超过 ${maxLookback} 封，` +
+            `跳过整批并推进游标至 UID ${lastUid}`,
+        );
+        return { messages: [], cursor: { uidValidity, lastUid } };
+      }
+    }
 
     // `UID n:*` 的兜底语义会把最后一封带回来，这里再滤一次。取最老的
     // 一批而不是最新的一批：游标只推进到本轮真正处理的最后一封，不能把
     // 被 cap 截掉的旧邮件直接跳过去。
     const limit = Math.min(maxPerPoll, budget?.remaining ?? maxPerPoll);
-    const uids = selectFetchUids(found || [], floor, limit);
+    const uids = selectFetchUids(foundUids, floor, limit);
     if (budget) budget.remaining -= uids.length;
     if (uids.length === 0) {
       return { messages: [], cursor: { uidValidity, lastUid: fresh ? 0 : cursor.lastUid } };
