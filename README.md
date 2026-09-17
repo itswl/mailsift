@@ -113,7 +113,15 @@ The MCP server is disabled by default. Enable the Docker profile:
 docker compose --profile mcp up -d
 ```
 
-For local stdio clients, point the command at `dist/src/mcp.js`. For remote clients set `MCP_TRANSPORT=http`, expose `/mcp`, and set `MCP_TOKEN` before binding outside localhost. The server provides tools for listing, searching, inspecting, and summarizing mail, listing accounts, checking health, polling immediately, and sending the digest.
+The default compose mapping is loopback-only. For public HTTP access, set a strong token and bind the host port explicitly:
+
+```dotenv
+MCP_PUBLIC_HOST=0.0.0.0
+MCP_PORT=8410
+MCP_TOKEN=<random-long-token>
+```
+
+Use HTTPS through a reverse proxy or tunnel; the MCP endpoint carries mailbox data and bearer tokens must not cross the public internet over plain HTTP. For local stdio clients, point the command at `dist/src/mcp.js`. The server provides tools for listing, searching, inspecting, and summarizing mail, listing accounts, checking health, polling immediately, and sending the digest.
 
 ## Troubleshooting
 

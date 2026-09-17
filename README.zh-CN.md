@@ -100,6 +100,16 @@ docker compose --profile mcp up -d
 
 远程 HTTP 模式必须设置 `MCP_TOKEN`，不要在没有鉴权的情况下暴露到公网。MCP 提供邮件列表、搜索、详情、汇总、账号、健康检查、立即轮询和立即发送简报等工具。
 
+默认 compose 只映射到本机回环地址。若确实需要公网访问，请设置强 token 并显式绑定主机端口：
+
+```dotenv
+MCP_PUBLIC_HOST=0.0.0.0
+MCP_PORT=8410
+MCP_TOKEN=<随机长 token>
+```
+
+请通过反向代理或隧道使用 HTTPS；MCP 会返回邮箱数据，不能让 bearer token 通过公网明文 HTTP 传输。
+
 ## 开发
 
 ```bash
