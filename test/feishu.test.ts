@@ -104,9 +104,15 @@ describe('signatures and WebhookWise payloads', () => {
     const payload = buildWebhookPayload(makeMessage({ inSpam: true }), makeResult());
     expect(payload['mail']).toMatchObject({ message_id: '<m1@example.com>', account: 'me@qq.com', in_spam: true });
     expect(payload['triage']).toMatchObject({ importance: 'critical', category: '账单续费' });
+    expect(payload['signal']).toMatchObject({
+      schema: 'signal.v1', source: 'mailsift', type: 'email.received',
+      source_event_id: '<m1@example.com>', priority: 'critical',
+      evidence_ref: { kind: 'mcp', tool: 'get_mail', account: 'me@qq.com', message_id: '<m1@example.com>' },
+    });
+    expect((payload['signal'] as Record<string, unknown>)['payload']).not.toHaveProperty('body');
   });
 
-  it('keeps only mail / triage at the top level for generic_json adapter detection', () => {
-    expect(Object.keys(buildWebhookPayload(makeMessage(), makeResult())).sort()).toEqual(['mail', 'triage']);
+  it('keeps the legacy mail / triage shape while adding the source-neutral signal', () => {
+    expect(Object.keys(buildWebhookPayload(makeMessage(), makeResult())).sort()).toEqual(['mail', 'signal', 'triage']);
   });
 });

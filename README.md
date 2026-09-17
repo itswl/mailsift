@@ -86,6 +86,13 @@ Each folder is limited to `MAX_MESSAGES_PER_POLL` (default `200`). All accounts 
 
 State is stored in SQLite (`data/mailsift.db`). Docker persists it in the `mailsift-data` named volume.
 
+### Signal events
+
+WebhookWise deliveries retain the existing `mail` / `triage` payload and add a
+small source-neutral `signal.v1` event. It carries the triage summary and an
+authenticated MCP lookup reference instead of copying the raw message body.
+See [docs/signal-event-v1.md](docs/signal-event-v1.md) for the contract.
+
 ## Running
 
 ```bash
