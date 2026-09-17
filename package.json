@@ -1,7 +1,7 @@
 {
   "name": "mailsift",
   "version": "1.0.0",
-  "description": "Multi-mailbox triage: monitor inboxes and spam, classify with an LLM, and push important mail",
+  "description": "Multi-mailbox email triage: monitor inboxes and spam, classify important mail, and push alerts to Feishu or WebhookWise",
   "type": "module",
   "engines": {
     "node": ">=22.5"
