@@ -7,6 +7,7 @@
 import { snippet, type MailMessage } from '../imap/message.js';
 import { FeishuSink, type Sink } from './feishu.js';
 import type { TriageResult } from './triage.js';
+import { buildMailSignalEvent } from './signal.js';
 import { getLogger } from '../logger.js';
 
 const log = getLogger('sink');
@@ -17,10 +18,12 @@ const MAX_SNIPPET = 600;
  * Build a WebhookWise inbound event.
  *
  * Keep fields under mail / triage to avoid generic_json adapter detection and
- * keep mailsift.yaml detection specific.
+ * keep mailsift.yaml detection specific. The source-neutral signal is additive
+ * and contains only a summary plus an MCP reference, never the message body.
  */
 export function buildWebhookPayload(message: MailMessage, result: TriageResult): Record<string, unknown> {
   return {
+    signal: buildMailSignalEvent(message, result),
     mail: {
       account: message.account,
       account_label: message.accountLabel,
