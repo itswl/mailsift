@@ -4,7 +4,13 @@
  * 各账号并发拉取，但分诊统一批量做——LLM 按批计费，攒一批比一封一调便宜。
  */
 import { IMPORTANCE_RANK, type Account, type Importance, type WatchConfig } from '../config.js';
-import { connect, fetchNew, targetFolders, type FolderCursor } from '../imap/client.js';
+import {
+  connect,
+  fetchNew,
+  targetFolders,
+  type FolderCursor,
+  type MessageBudget,
+} from '../imap/client.js';
 import { dedupKey, snippet, type MailMessage } from '../imap/message.js';
 import { triage, rank, type TriageResult } from './triage.js';
 import * as digest from './digest.js';
@@ -60,7 +66,10 @@ export class Watcher {
    * 否则进程若死在 dispatch 阶段，游标已经越过去了，这批信再也不会被
    * 拉到，而且是完全静默的。宁可重复拉取，不可静默丢失。
    */
-  async collectAccount(account: Account): Promise<{ messages: MailMessage[]; cursors: PendingCursor[] }> {
+  async collectAccount(
+    account: Account,
+    budget: MessageBudget,
+  ): Promise<{ messages: MailMessage[]; cursors: PendingCursor[] }> {
     const messages: MailMessage[] = [];
     const cursors: PendingCursor[] = [];
     const client = await connect(account);
@@ -78,12 +87,13 @@ export class Watcher {
       );
 
       for (const folder of folders) {
+        if (budget.remaining <= 0) break;
         const saved = this.state.getCursor(account.username, folder.path);
         const cursor: FolderCursor | undefined = saved
           ? { uidValidity: saved.uidValidity, lastUid: saved.lastUid }
           : undefined;
         try {
-          const result = await fetchNew(client, account, folder, cursor);
+          const result = await fetchNew(client, account, folder, cursor, budget);
           messages.push(...result.messages);
           cursors.push([account.username, folder.path, result.cursor.uidValidity, result.cursor.lastUid]);
         } catch (error) {
@@ -99,6 +109,10 @@ export class Watcher {
 
   async collectAll(stats: PollStats): Promise<{ messages: MailMessage[]; cursors: PendingCursor[] }> {
     const limit = Math.max(1, Number(process.env.MAX_CONCURRENT_ACCOUNTS ?? 5));
+    const rawBudget = Number(process.env.MAX_MESSAGES_PER_POLL_TOTAL ?? 500);
+    const budget: MessageBudget = {
+      remaining: Number.isFinite(rawBudget) && rawBudget > 0 ? Math.floor(rawBudget) : 500,
+    };
     const messages: MailMessage[] = [];
     const cursors: PendingCursor[] = [];
     const queue = [...this.config.accounts];
@@ -108,7 +122,7 @@ export class Watcher {
         const account = queue.shift();
         if (!account) return;
         try {
-          const result = await this.collectAccount(account);
+          const result = await this.collectAccount(account, budget);
           stats.accountsOk += 1;
           messages.push(...result.messages);
           cursors.push(...result.cursors);

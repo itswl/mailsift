@@ -23,9 +23,35 @@ export interface FolderCursor {
   lastUid: number;
 }
 
+export interface MessageBudget {
+  remaining: number;
+}
+
 function intEnv(name: string, fallback: number): number {
   const raw = Number(process.env[name]);
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+function imapErrorText(error: unknown): string {
+  if (!error || typeof error !== 'object') return String(error);
+  const value = error as {
+    message?: unknown;
+    response?: unknown;
+    responseText?: unknown;
+    code?: unknown;
+  };
+  return [value.message, value.response, value.responseText, value.code]
+    .filter((part) => part !== undefined && part !== null && String(part))
+    .map(String)
+    .filter((part, index, all) => all.indexOf(part) === index)
+    .join(' | ');
+}
+
+export function selectFetchUids(found: readonly number[], floor: number, limit: number): number[] {
+  return [...found]
+    .filter((uid) => uid > floor)
+    .sort((a, b) => a - b)
+    .slice(0, Math.max(0, limit));
 }
 
 export async function connect(account: Account): Promise<ImapFlow> {
@@ -43,8 +69,25 @@ export async function connect(account: Account): Promise<ImapFlow> {
     // 只观察，不改动邮箱状态
     emitLogs: false,
   });
-  await client.connect();
-  return client;
+  // ImapFlow can emit a later socket error after connect() has rejected. Node
+  // treats an EventEmitter "error" without a listener as process-fatal, which
+  // used to turn one provider reset into a container restart loop.
+  client.on('error', (error: unknown) => {
+    log.warn(`[${account.name}] IMAP 异步连接错误: ${imapErrorText(error)}`);
+  });
+  try {
+    await client.connect();
+    return client;
+  } catch (error) {
+    // A failed handshake can leave a half-open TLS socket behind. Close it
+    // before handing the original connection failure back to the watcher.
+    try {
+      client.close();
+    } catch {
+      // Preserve the original connection error; cleanup is best effort.
+    }
+    throw error;
+  }
 }
 
 export async function listFolders(client: ImapFlow): Promise<ListResponse[]> {
@@ -108,6 +151,7 @@ export async function fetchNew(
   account: Account,
   folder: Folder,
   cursor: FolderCursor | undefined,
+  budget?: MessageBudget,
 ): Promise<{ messages: MailMessage[]; cursor: FolderCursor }> {
   // readOnly：这个工具只观察，不改动邮箱状态
   const lock = await client.getMailboxLock(folder.path, { readOnly: true });
@@ -126,8 +170,12 @@ export async function fetchNew(
     const since = new Date(Date.now() - lookbackDays * 86_400_000);
     const found = await client.search(fresh ? { since } : { uid: `${floor + 1}:*` }, { uid: true });
 
-    // `UID n:*` 的兜底语义会把最后一封带回来，这里再滤一次
-    const uids = (found || []).filter((uid) => uid > floor).sort((a, b) => a - b).slice(-maxPerPoll);
+    // `UID n:*` 的兜底语义会把最后一封带回来，这里再滤一次。取最老的
+    // 一批而不是最新的一批：游标只推进到本轮真正处理的最后一封，不能把
+    // 被 cap 截掉的旧邮件直接跳过去。
+    const limit = Math.min(maxPerPoll, budget?.remaining ?? maxPerPoll);
+    const uids = selectFetchUids(found || [], floor, limit);
+    if (budget) budget.remaining -= uids.length;
     if (uids.length === 0) {
       return { messages: [], cursor: { uidValidity, lastUid: fresh ? 0 : cursor.lastUid } };
     }
