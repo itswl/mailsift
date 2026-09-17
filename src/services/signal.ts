@@ -19,9 +19,7 @@ export interface MailSignalEvent {
   dedup_key: string;
   evidence_ref: {
     kind: 'mcp';
-    tool: 'get_mail';
-    account: string;
-    message_id: string;
+    uri: string;
   };
   payload: {
     account: string;
@@ -50,9 +48,7 @@ export function buildMailSignalEvent(message: MailMessage, result: TriageResult)
     dedup_key: dedupKey(message),
     evidence_ref: {
       kind: 'mcp',
-      tool: 'get_mail',
-      account: message.account,
-      message_id: message.messageId,
+      uri: `mailsift://mail/${encodeURIComponent(message.messageId)}`,
     },
     payload: {
       account: message.account,

@@ -17,9 +17,7 @@ small event without copying the message body through every hop.
   "dedup_key": "account@example.com|<message-id>",
   "evidence_ref": {
     "kind": "mcp",
-    "tool": "get_mail",
-    "account": "account@example.com",
-    "message_id": "<message-id>"
+    "uri": "mailsift://mail/%3Cmessage-id%3E"
   },
   "payload": {
     "account": "account@example.com",
@@ -37,6 +35,6 @@ small event without copying the message body through every hop.
 ```
 
 The event contains a decision-ready summary and metadata, not the raw body.
-Consumers that need more context use the `evidence_ref` with the authenticated
-mailsift MCP server. The reference contains identifiers only; it never carries
-credentials or tokens.
+Consumers that need more context use the `evidence_ref` URI with the authenticated
+mailsift MCP server's Resource API. The reference contains an identifier only; it
+never carries credentials or tokens.

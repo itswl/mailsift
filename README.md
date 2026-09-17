@@ -128,11 +128,9 @@ The default compose mapping is loopback-only. For public HTTP access, set a stro
 MCP_PUBLIC_HOST=0.0.0.0
 MCP_PORT=8410
 MCP_TOKEN=<random-long-token>
-# Public HTTP MCP is read-only by default; only disable this on a trusted network.
-MCP_READ_ONLY=true
 ```
 
-Use HTTPS through a reverse proxy or tunnel; the MCP endpoint carries mailbox data and bearer tokens must not cross the public internet over plain HTTP. Public HTTP mode refuses to start without `MCP_TOKEN` and exposes only read-only query tools unless `MCP_READ_ONLY=false` is explicitly set. For local stdio clients, point the command at `dist/src/mcp.js`. The server provides tools for listing, searching, inspecting, and summarizing mail, listing accounts, and checking health; trusted read-write mode also provides immediate polling and digest sending.
+Use HTTPS through a reverse proxy or tunnel; the MCP endpoint carries mailbox data and bearer tokens must not cross the public internet over plain HTTP. Public HTTP mode refuses to start without `MCP_TOKEN` and exposes read-only query tools and a mail-record Resource. For local stdio clients, point the command at `dist/src/mcp.js`. The server provides tools for listing, searching, inspecting, and summarizing mail, listing accounts, and checking health.
 
 ## Troubleshooting
 

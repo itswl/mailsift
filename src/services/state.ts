@@ -63,6 +63,7 @@ export interface MailRecord {
 }
 
 export interface MailRow {
+  dedupKey: string;
   messageId: string | null;
   account: string;
   accountLabel: string | null;
@@ -91,6 +92,8 @@ export interface QueryOptions {
   account?: string;
   search?: string;
   limit?: number;
+  beforeCreatedAt?: string;
+  beforeDedupKey?: string;
 }
 
 function now(): string {
@@ -98,13 +101,14 @@ function now(): string {
 }
 
 const ROW_COLUMNS = [
-  'message_id', 'account', 'account_label', 'subject', 'sender', 'sender_name',
+  'dedup_key', 'message_id', 'account', 'account_label', 'subject', 'sender', 'sender_name',
   'folder', 'in_spam', 'importance', 'category', 'summary', 'reason', 'deadline',
   'decided_by', 'pushed', 'mail_date', 'created_at',
 ] as const;
 
 function toRow(raw: Record<string, unknown>): MailRow {
   return {
+    dedupKey: String(raw['dedup_key'] ?? ''),
     messageId: (raw['message_id'] as string) ?? null,
     account: String(raw['account'] ?? ''),
     accountLabel: (raw['account_label'] as string) ?? null,
@@ -247,13 +251,22 @@ export class StateStore {
       );
       params.push(...Array<string>(6).fill(`%${options.search}%`));
     }
+    if (options.beforeCreatedAt) {
+      if (options.beforeDedupKey) {
+        clauses.push('(created_at < ? OR (created_at = ? AND dedup_key < ?))');
+        params.push(options.beforeCreatedAt, options.beforeCreatedAt, options.beforeDedupKey);
+      } else {
+        clauses.push('created_at < ?');
+        params.push(options.beforeCreatedAt);
+      }
+    }
 
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     params.push(Math.max(1, Math.min(options.limit ?? 50, 200)));
 
     return (
       this.db
-        .prepare(`SELECT ${ROW_COLUMNS.join(', ')} FROM seen ${where} ORDER BY created_at DESC LIMIT ?`)
+        .prepare(`SELECT ${ROW_COLUMNS.join(', ')} FROM seen ${where} ORDER BY created_at DESC, dedup_key DESC LIMIT ?`)
         .all(...params) as Array<Record<string, unknown>>
     ).map(toRow);
   }

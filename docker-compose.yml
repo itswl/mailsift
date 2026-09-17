@@ -43,7 +43,6 @@ services:
       - MCP_BIND=0.0.0.0
       - MCP_PORT=${MCP_PORT:-8410}
       - MCP_TOKEN=${MCP_TOKEN:-}
-      - MCP_READ_ONLY=${MCP_READ_ONLY:-true}
     command: ["node", "dist/src/mcp.js"]
     ports:
       - "${MCP_PUBLIC_HOST:-127.0.0.1}:${MCP_PORT:-8410}:8410"

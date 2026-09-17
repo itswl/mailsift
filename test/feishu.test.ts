@@ -107,7 +107,7 @@ describe('signatures and WebhookWise payloads', () => {
     expect(payload['signal']).toMatchObject({
       schema: 'signal.v1', source: 'mailsift', type: 'email.received',
       source_event_id: '<m1@example.com>', priority: 'critical',
-      evidence_ref: { kind: 'mcp', tool: 'get_mail', account: 'me@qq.com', message_id: '<m1@example.com>' },
+      evidence_ref: { kind: 'mcp', uri: 'mailsift://mail/%3Cm1%40example.com%3E' },
     });
     expect((payload['signal'] as Record<string, unknown>)['payload']).not.toHaveProperty('body');
   });

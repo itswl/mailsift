@@ -10,7 +10,7 @@
 import './env.js'; // Must run first so .env is loaded.
 import { timingSafeEqual } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
@@ -18,9 +18,7 @@ import { z } from 'zod';
 import { loadConfig } from './config.js';
 import { StateStore } from './services/state.js';
 import { resolveLlmBaseUrl } from './services/triage.js';
-import { sendDigest } from './services/digest.js';
-import { buildSink } from './services/sink.js';
-import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
+import { HEARTBEAT_KEY } from './services/watcher.js';
 import { FAIL_COUNT_KEY, LLM_FAIL_COUNT_KEY } from './services/health.js';
 
 const INSTRUCTIONS =
@@ -30,9 +28,28 @@ const INSTRUCTIONS =
 
 const IMPORTANCE = z.enum(['critical', 'warning', 'info']);
 
-export function createServer(options: { state?: StateStore; readOnly?: boolean } = {}): McpServer {
+interface MailCursor {
+  createdAt: string;
+  dedupKey: string;
+}
+
+function encodeCursor(row: { createdAt: string; dedupKey: string }): string {
+  return Buffer.from(JSON.stringify({ createdAt: row.createdAt, dedupKey: row.dedupKey }), 'utf8').toString('base64url');
+}
+
+function decodeCursor(raw: string | undefined): MailCursor | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Partial<MailCursor>;
+    if (typeof parsed.createdAt !== 'string' || typeof parsed.dedupKey !== 'string') return undefined;
+    return { createdAt: parsed.createdAt, dedupKey: parsed.dedupKey };
+  } catch {
+    return undefined;
+  }
+}
+
+export function createServer(options: { state?: StateStore } = {}): McpServer {
   const store = options.state ?? new StateStore();
-  const readOnly = options.readOnly ?? false;
   const server = new McpServer(
     { name: 'mailsift', version: '1.0.0' },
     { instructions: INSTRUCTIONS },
@@ -52,8 +69,10 @@ export function createServer(options: { state?: StateStore; readOnly?: boolean }
       pushedOnly: z.boolean().default(false),
       account: z.string().optional(),
       limit: z.number().int().positive().max(200).default(30),
+      cursor: z.string().optional(),
     },
     async (args) => {
+      const cursor = decodeCursor(args.cursor);
       const mail = store.queryMail({
         sinceHours: args.hours,
         ...(args.importance ? { importance: args.importance } : {}),
@@ -61,8 +80,12 @@ export function createServer(options: { state?: StateStore; readOnly?: boolean }
         pushedOnly: args.pushedOnly,
         ...(args.account ? { account: args.account } : {}),
         limit: args.limit,
+        ...(cursor ? { beforeCreatedAt: cursor.createdAt, beforeDedupKey: cursor.dedupKey } : {}),
       });
-      return json({ count: mail.length, windowHours: args.hours, mail });
+      const nextCursor = mail.length === args.limit && mail.at(-1)?.createdAt
+        ? encodeCursor(mail.at(-1)!)
+        : undefined;
+      return json({ count: mail.length, windowHours: args.hours, mail, ...(nextCursor ? { nextCursor } : {}) });
     },
   );
 
@@ -83,11 +106,29 @@ export function createServer(options: { state?: StateStore; readOnly?: boolean }
 
   server.tool(
     'get_mail',
-    'Get a complete record by Message-ID, including body preview and triage reason.',
+    'Get the stored triage record by Message-ID, including a bounded body preview and triage reason. It does not fetch or return the full raw email.',
     { messageId: z.string().min(1) },
     async (args) => {
       const found = store.getMail(args.messageId);
       return json(found ? { found: true, ...found } : { found: false, messageId: args.messageId });
+    },
+  );
+
+  server.registerResource(
+    'mail-record',
+    new ResourceTemplate('mailsift://mail/{messageId}', { list: undefined }),
+    { mimeType: 'application/json', description: 'Read one stored mailsift triage record by Message-ID.' },
+    async (uri, variables) => {
+      const messageId = variables['messageId'];
+      const found = typeof messageId === 'string' ? store.getMail(messageId) : undefined;
+      if (!found) throw new Error('mail record not found');
+      return {
+        contents: [{
+          uri: uri.href,
+          mimeType: 'application/json',
+          text: JSON.stringify({ found: true, ...found }, null, 2),
+        }],
+      };
     },
   );
 
@@ -163,51 +204,6 @@ export function createServer(options: { state?: StateStore; readOnly?: boolean }
     },
   );
 
-  if (!readOnly) {
-    server.tool(
-      'poll_now',
-      'Run one fetch and triage cycle immediately instead of waiting. Usually takes seconds to a minute.',
-      {},
-      async () => {
-        try {
-          const watcher = new Watcher(loadConfig(), store, buildSink());
-          const stats = await watcher.pollOnce();
-          return json({
-            ok: stats.failures.length === 0,
-            fetched: stats.fetched,
-            new: stats.fresh,
-            pushed: stats.pushed,
-            rescuedFromSpam: stats.spamRescued,
-            queuedForDigest: stats.queued,
-            failures: stats.failures,
-          });
-        } catch (error) {
-          return json({ ok: false, error: String(error) });
-        }
-      },
-    );
-
-    server.tool(
-      'send_digest_now',
-      'Send the daily digest immediately and clear the current digest queue only after delivery succeeds.',
-      {},
-      async () => {
-        const pending = store.digestPending();
-        try {
-          const sent = await sendDigest(store, buildSink());
-          return json({
-            ok: sent || pending === 0,
-            status: pending === 0 ? 'empty' : sent ? 'sent' : 'failed',
-            sent,
-            items: pending,
-          });
-        } catch (error) {
-          return json({ ok: false, status: 'failed', sent: false, items: pending, error: String(error) });
-        }
-      },
-    );
-  }
-
   return server;
 }
 
@@ -226,7 +222,6 @@ async function serveHttp(): Promise<void> {
   const host = process.env.MCP_BIND ?? '127.0.0.1';
   const token = process.env.MCP_TOKEN?.trim() ?? '';
   const loopback = ['127.0.0.1', 'localhost', '::1'].includes(host);
-  const readOnly = !loopback && (process.env.MCP_READ_ONLY ?? 'true').toLowerCase() !== 'false';
 
   if (!loopback && !token) {
     console.error(`MCP_BIND=${host} requires MCP_TOKEN; refusing to start an unauthenticated HTTP server.`);
@@ -252,7 +247,7 @@ async function serveHttp(): Promise<void> {
           return;
         }
         const state = new StateStore();
-        const server = createServer({ state, readOnly });
+        const server = createServer({ state });
         // Omitting sessionIdGenerator selects stateless mode.
         const transport = new StreamableHTTPServerTransport({});
         let cleaned = false;
@@ -279,7 +274,7 @@ async function serveHttp(): Promise<void> {
   httpServer.listen(port, host, () => {
     console.error(
       `mailsift MCP (Streamable HTTP) http://${host}:${port}/mcp · auth: ` +
-        (token ? 'Bearer token' : 'none') + ` · mode: ${readOnly ? 'read-only' : 'read-write'}`,
+        (token ? 'Bearer token' : 'none') + ' · mode: read-only',
     );
   });
 }
