@@ -16,6 +16,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { z } from 'zod';
 import { loadConfig } from './config.js';
+import { fetchByMessageId } from './imap/client.js';
 import { StateStore } from './services/state.js';
 import { resolveLlmBaseUrl } from './services/triage.js';
 import { HEARTBEAT_KEY } from './services/watcher.js';
@@ -46,6 +47,11 @@ function decodeCursor(raw: string | undefined): MailCursor | undefined {
   } catch {
     return undefined;
   }
+}
+
+function liveBodyLimit(): number {
+  const value = Number(process.env.MCP_LIVE_BODY_CHARS ?? 20_000);
+  return Number.isFinite(value) ? Math.max(1_000, Math.min(Math.floor(value), 100_000)) : 20_000;
 }
 
 export function createServer(options: { state?: StateStore } = {}): McpServer {
@@ -135,6 +141,56 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
           uri: uri.href,
           mimeType: 'application/json',
           text: JSON.stringify({ found: true, ...found }, null, 2),
+        }],
+      };
+    },
+  );
+
+  server.registerResource(
+    'mail-source',
+    new ResourceTemplate('mailsift://imap/{account}/{messageId}', { list: undefined }),
+    {
+      mimeType: 'message/rfc822',
+      description: 'Read a bounded normalized email body on demand from the configured IMAP account. Nothing is persisted.',
+    },
+    async (uri, variables) => {
+      const rawAccount = variables['account'];
+      const rawMessageId = variables['messageId'];
+      if (typeof rawAccount !== 'string' || typeof rawMessageId !== 'string') {
+        throw new Error('account and messageId are required');
+      }
+      let accountName: string;
+      let messageId: string;
+      try {
+        accountName = decodeURIComponent(rawAccount);
+        messageId = decodeURIComponent(rawMessageId);
+      } catch {
+        throw new Error('invalid encoded mail resource URI');
+      }
+      const account = loadConfig().accounts.find((candidate) => candidate.username === accountName);
+      if (!account) throw new Error('mail account not found');
+      const message = await fetchByMessageId(account, messageId);
+      if (!message) throw new Error('message not found in configured read-only folders');
+      const limit = liveBodyLimit();
+      const body = message.body.slice(0, limit);
+      return {
+        contents: [{
+          uri: uri.href,
+          mimeType: 'text/plain',
+          text: JSON.stringify({
+            account: message.account,
+            messageId: message.messageId,
+            subject: message.subject,
+            from: message.fromAddr,
+            fromName: message.fromName,
+            to: message.toAddrs,
+            folder: message.folder,
+            inSpam: message.inSpam,
+            date: message.date,
+            hasAttachments: message.hasAttachments,
+            truncated: body.length < message.body.length,
+            body,
+          }, null, 2),
         }],
       };
     },

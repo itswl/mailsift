@@ -90,7 +90,9 @@ State is stored in SQLite (`data/mailsift.db`). Docker persists it in the `mails
 
 WebhookWise deliveries retain the existing `mail` / `triage` payload and add a
 small source-neutral `signal.v1` event. It carries the triage summary and an
-authenticated MCP lookup reference instead of copying the raw message body.
+authenticated MCP lookup reference instead of copying the raw message body. The
+MCP reference can fetch a bounded normalized body from IMAP on demand without
+persisting it; set `MCP_LIVE_BODY_CHARS` to tune the cap.
 See [docs/signal-event-v1.md](docs/signal-event-v1.md) for the contract.
 
 ## Running
