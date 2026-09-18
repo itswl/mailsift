@@ -6,6 +6,9 @@ services:
     container_name: mailsift
     restart: unless-stopped
     env_file: .env
+    ports:
+      # MCP is optional; the port is loopback-only by default.
+      - "${MCP_PUBLIC_HOST:-127.0.0.1}:${MCP_PORT:-8410}:8410"
     environment:
       - TZ=${TZ:-Asia/Shanghai}
       # MCP is embedded in the main process and disabled by default.
