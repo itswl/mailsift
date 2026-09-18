@@ -348,15 +348,14 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
  * The endpoint is /mcp. Set MCP_TOKEN before binding outside loopback or anyone
  * who can reach the port can read triage results.
  */
-async function serveHttp(): Promise<void> {
+export async function startMcpHttp(): Promise<import('node:http').Server> {
   const port = Number(process.env.MCP_PORT ?? 8410);
   const host = process.env.MCP_BIND ?? '127.0.0.1';
   const token = process.env.MCP_TOKEN?.trim() ?? '';
   const loopback = ['127.0.0.1', 'localhost', '::1'].includes(host);
 
   if (!loopback && !token) {
-    console.error(`MCP_BIND=${host} requires MCP_TOKEN; refusing to start an unauthenticated HTTP server.`);
-    return;
+    throw new Error(`MCP_BIND=${host} requires MCP_TOKEN; refusing to start an unauthenticated HTTP server.`);
   }
 
   const httpServer = createHttpServer((req, res) => {
@@ -402,12 +401,29 @@ async function serveHttp(): Promise<void> {
     })();
   });
 
-  httpServer.listen(port, host, () => {
-    console.error(
-      `mailsift MCP (Streamable HTTP) http://${host}:${port}/mcp · auth: ` +
-        (token ? 'Bearer token' : 'none') + ' · mode: read-only',
-    );
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error): void => {
+      httpServer.off('listening', onListening);
+      reject(error);
+    };
+    const onListening = (): void => {
+      httpServer.off('error', onError);
+      console.error(
+        `mailsift MCP (Streamable HTTP) http://${host}:${port}/mcp · auth: ` +
+          (token ? 'Bearer token' : 'none') + ' · mode: read-only',
+      );
+      resolve();
+    };
+    httpServer.once('error', onError);
+    httpServer.once('listening', onListening);
+    httpServer.listen(port, host);
   });
+  return httpServer;
+}
+
+async function serveHttp(): Promise<void> {
+  const httpServer = await startMcpHttp();
+  await new Promise<void>((resolve) => httpServer.once('close', resolve));
 }
 
 async function main(): Promise<void> {

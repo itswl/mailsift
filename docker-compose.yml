@@ -8,6 +8,11 @@ services:
     env_file: .env
     environment:
       - TZ=${TZ:-Asia/Shanghai}
+      # MCP is embedded in the main process and disabled by default.
+      - MCP_ENABLED=${MCP_ENABLED:-false}
+      - MCP_BIND=${MCP_BIND:-127.0.0.1}
+      - MCP_PORT=${MCP_PORT:-8410}
+      - MCP_TOKEN=${MCP_TOKEN:-}
 
     volumes:
       # Use a named volume because the container runs as uid 10001 and a root-owned
@@ -23,36 +28,6 @@ services:
 
     # Finish the current poll after SIGTERM to avoid inconsistent cursors.
     stop_grace_period: 60s
-
-  # Optional MCP server, disabled by default, exposed through Streamable HTTP.
-  # Enable: docker compose --profile mcp up -d
-  # Disable: docker compose --profile mcp down mailsift-mcp
-  # It shares the data volume with the main service and does not affect cursors or tokens.
-  # Bind 0.0.0.0 inside the container; the host publishes to loopback by default.
-  # Use an SSH tunnel for remote access or set MCP_TOKEN before publishing externally.
-  mailsift-mcp:
-    image: ghcr.io/itswl/mailsift:${MAILSIFT_VERSION:-1.0.0}
-    pull_policy: missing
-    container_name: mailsift-mcp
-    restart: unless-stopped
-    profiles: ["mcp"]
-    env_file: .env
-    environment:
-      - TZ=${TZ:-Asia/Shanghai}
-      - MCP_TRANSPORT=http
-      - MCP_BIND=0.0.0.0
-      - MCP_PORT=${MCP_PORT:-8410}
-      - MCP_TOKEN=${MCP_TOKEN:-}
-    command: ["node", "dist/src/mcp.js"]
-    ports:
-      - "${MCP_PUBLIC_HOST:-127.0.0.1}:${MCP_PORT:-8410}:8410"
-    volumes:
-      - mailsift-data:/app/data
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
 
 volumes:
   mailsift-data:

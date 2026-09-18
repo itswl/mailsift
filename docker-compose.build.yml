@@ -9,8 +9,3 @@ services:
     build: .
     image: mailsift:local
     pull_policy: never
-
-  mailsift-mcp:
-    build: .
-    image: mailsift:local
-    pull_policy: never

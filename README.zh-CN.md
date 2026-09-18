@@ -104,23 +104,24 @@ Compose 默认使用已发布的 `1.0.0` 镜像。升级时在 `.env` 设置 `MA
 
 ## MCP
 
-MCP 默认关闭。启用 Docker profile：
+内置 MCP 默认关闭。在主容器中启用：
 
 ```bash
-docker compose --profile mcp up -d
+MCP_ENABLED=true MCP_TOKEN=<随机长 token> docker compose up -d
 ```
 
-远程 HTTP 模式必须设置 `MCP_TOKEN`，不要在没有鉴权的情况下暴露到公网。MCP 提供邮件列表、搜索、详情、汇总、账号、健康检查、立即轮询和立即发送简报等工具。
+需要公网访问时，设置强 token、显式绑定 `MCP_BIND`，并发布或反代 `MCP_PORT`：
 
 默认 compose 只映射到本机回环地址。若确实需要公网访问，请设置强 token 并显式绑定主机端口：
 
 ```dotenv
-MCP_PUBLIC_HOST=0.0.0.0
+MCP_ENABLED=true
+MCP_BIND=0.0.0.0
 MCP_PORT=8410
 MCP_TOKEN=<随机长 token>
 ```
 
-请通过反向代理或隧道使用 HTTPS；MCP 会返回邮箱数据，不能让 bearer token 通过公网明文 HTTP 传输。公网 HTTP 模式没有 `MCP_TOKEN` 时会拒绝启动，只注册只读查询工具和邮件记录 Resource。
+请通过反向代理或隧道使用 HTTPS；MCP 会返回邮箱数据，不能让 bearer token 通过公网明文 HTTP 传输。非回环模式没有 `MCP_TOKEN` 时会拒绝启动。MCP 与主进程合并运行，提供查询和本地恢复工具。
 
 ## 开发
 

@@ -128,21 +128,22 @@ docker compose run --rm mailsift node dist/src/main.js --recover
 
 ## MCP
 
-The MCP server is disabled by default. Enable the Docker profile:
+The embedded MCP server is disabled by default. Enable it in the main container:
 
 ```bash
-docker compose --profile mcp up -d
+MCP_ENABLED=true MCP_TOKEN=<random-long-token> docker compose up -d
 ```
 
-The default compose mapping is loopback-only. For public HTTP access, set a strong token and bind the host port explicitly:
+For public HTTP access, set a strong token, bind `MCP_BIND` explicitly, and publish or reverse-proxy `MCP_PORT`:
 
 ```dotenv
-MCP_PUBLIC_HOST=0.0.0.0
+MCP_ENABLED=true
+MCP_BIND=0.0.0.0
 MCP_PORT=8410
 MCP_TOKEN=<random-long-token>
 ```
 
-Use HTTPS through a reverse proxy or tunnel; the MCP endpoint carries mailbox data and bearer tokens must not cross the public internet over plain HTTP. Public HTTP mode refuses to start without `MCP_TOKEN` and exposes read-only query tools and a mail-record Resource. For local stdio clients, point the command at `dist/src/mcp.js`. The server provides tools for listing, searching, inspecting, and summarizing mail, listing accounts, and checking health.
+Use HTTPS through a reverse proxy or tunnel; the MCP endpoint carries mailbox data and bearer tokens must not cross the public internet over plain HTTP. Non-loopback mode refuses to start without `MCP_TOKEN` and exposes read-only query tools and local recovery tools. For local stdio clients, point the command at `dist/src/mcp.js`.
 
 ## Troubleshooting
 

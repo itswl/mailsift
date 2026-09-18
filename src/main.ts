@@ -6,6 +6,7 @@
  */
 import './env.js'; // Must run first so .env is loaded into process.env.
 import { realpathSync } from 'node:fs';
+import type { Server } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ConfigError, loadConfig, needsOAuth } from './config.js';
@@ -18,6 +19,7 @@ import { recordStartupFailure } from './services/health.js';
 import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
 import { getLogger } from './logger.js';
 import { metrics } from './metrics.js';
+import { startMcpHttp } from './mcp.js';
 
 const log = getLogger('main');
 
@@ -212,10 +214,21 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     return stats.failures.length ? 2 : 0;
   }
 
+  let mcpServer: Server | undefined;
+  if ((process.env.MCP_ENABLED ?? 'false').toLowerCase() === 'true') {
+    try {
+      mcpServer = await startMcpHttp();
+    } catch (error) {
+      log.error(`MCP startup failed: ${error}`);
+      return 1;
+    }
+  }
+
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
       log.info(`Received ${signal}; exiting after the current poll.`);
       stopping = true;
+      if (mcpServer) mcpServer.close();
       void metrics.shutdown().catch((error) => log.warn(`Failed to flush OTel metrics: ${error}`));
     });
   }
