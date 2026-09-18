@@ -46,11 +46,11 @@ describe('IMAP connection errors', () => {
     expect(isTransientConnectError({ responseText: 'AUTHENTICATE failed.' })).toBe(false);
   });
 
-  it('gives Outlook session failures a longer bounded retry profile', () => {
+  it('uses the same bounded retry profile for every provider', () => {
     expect(connectAttempts(OUTLOOK)).toBe(4);
-    expect(retryDelayMs(OUTLOOK, 1)).toBe(3000);
-    expect(retryDelayMs(OUTLOOK, 3)).toBe(12000);
-    expect(connectAttempts(QQ)).toBe(3);
-    expect(retryDelayMs(QQ, 1)).toBe(1000);
+    expect(retryDelayMs(OUTLOOK, 1)).toBe(2000);
+    expect(retryDelayMs(OUTLOOK, 3)).toBe(8000);
+    expect(connectAttempts(QQ)).toBe(4);
+    expect(retryDelayMs(QQ, 1)).toBe(2000);
   });
 });

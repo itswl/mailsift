@@ -69,12 +69,13 @@ export function isTransientConnectError(error: unknown): boolean {
 }
 
 export function connectAttempts(account: Account): number {
-  return account.auth === 'outlook_oauth' ? 4 : 3;
+  void account;
+  return 4;
 }
 
 export function retryDelayMs(account: Account, attempt: number): number {
-  const base = account.auth === 'outlook_oauth' ? 3_000 : 1_000;
-  return base * 2 ** Math.max(0, attempt - 1);
+  void account;
+  return 2_000 * 2 ** Math.max(0, attempt - 1);
 }
 
 export function selectFetchUids(found: readonly number[], floor: number, limit: number): number[] {
