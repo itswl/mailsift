@@ -19,9 +19,17 @@ const OUTLOOK: Account = { ...QQ, name: 'Outlook', provider: 'outlook', username
 const store = () => new StateStore(':memory:');
 
 describe('account outages', () => {
-  it('alerts immediately on authentication failures because they are deterministic', async () => {
+  it('debounces a single authentication failure', async () => {
     const s = store();
     const sink = new RecordingSink();
+    expect(await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'))).toBe(false);
+    expect(sink.pushed).toHaveLength(0);
+  });
+
+  it('alerts after consecutive authentication failures', async () => {
+    const s = store();
+    const sink = new RecordingSink();
+    await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     expect(await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'))).toBe(true);
     const [message, result] = sink.pushed[0]!;
     expect(result.importance).toBe('critical');
@@ -47,6 +55,7 @@ describe('account outages', () => {
     const s = store();
     const sink = new RecordingSink();
     await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
+    await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     s.setMeta(ALERTED_AT_KEY + GMAIL.username, new Date(Date.now() - 7 * 3_600_000).toISOString());
     await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     expect(sink.pushed).toHaveLength(2);
@@ -56,12 +65,14 @@ describe('account outages', () => {
     const s = store();
     const sink = new RecordingSink();
     await recordAccountFailure(s, sink, QQ, new Error('authentication failed'));
+    await recordAccountFailure(s, sink, QQ, new Error('authentication failed'));
     expect(sink.pushed[0]![0].body).toContain('including spam');
   });
 
   it('mentions the Gmail seven-day testing trap in the recovery advice', async () => {
     const s = store();
     const sink = new RecordingSink();
+    await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     const body = sink.pushed[0]![0].body;
     expect(body).toContain('7 days');
@@ -71,6 +82,7 @@ describe('account outages', () => {
   it('mentions the Outlook IMAP switch first in the recovery advice', async () => {
     const s = store();
     const sink = new RecordingSink();
+    await recordAccountFailure(s, sink, OUTLOOK, new Error('invalid_grant'));
     await recordAccountFailure(s, sink, OUTLOOK, new Error('invalid_grant'));
     const body = sink.pushed[0]![0].body;
     expect(body).toContain('Forwarding and IMAP');
@@ -82,12 +94,14 @@ describe('account outages', () => {
     const s = store();
     const sink = new RecordingSink();
     await recordAccountFailure(s, sink, QQ, new Error('login failed'));
+    await recordAccountFailure(s, sink, QQ, new Error('login failed'));
     expect(sink.pushed[0]![0].body).toContain('IMAP');
   });
 
   it('sends a recovery notification', async () => {
     const s = store();
     const sink = new RecordingSink();
+    await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     expect(await recordAccountSuccess(s, sink, GMAIL)).toBe(true);
     expect(sink.pushed[1]![0].subject).toContain('recovered');
@@ -100,6 +114,15 @@ describe('account outages', () => {
     await recordAccountFailure(s, sink, QQ, new Error('ETIMEDOUT'));
     expect(await recordAccountSuccess(s, sink, QQ)).toBe(false);
     expect(sink.pushed).toHaveLength(0);
+  });
+
+  it('does not notify recovery for an undelivered outage alert', async () => {
+    const s = store();
+    const sink = new RecordingSink(false);
+    await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
+    await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
+    expect(await recordAccountSuccess(s, sink, GMAIL)).toBe(false);
+    expect(sink.pushed).toHaveLength(1);
   });
 
   it('does not emit messages for a continuously healthy account', async () => {

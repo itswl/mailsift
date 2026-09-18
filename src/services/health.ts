@@ -1,8 +1,9 @@
 /**
  * Health alerts: account outages, LLM failures, and startup failures.
  *
- * A monitoring tool that stops silently is the worst failure mode. All three
- * failure classes send critical alerts and a recovery notice.
+ * A monitoring tool that stops silently is the worst failure mode. Persistent
+ * failures send critical alerts and a recovery notice, while one-poll blips
+ * stay quiet.
  */
 import type { Account } from '../config.js';
 import type { MailMessage } from '../imap/message.js';
@@ -30,7 +31,7 @@ function withinCooldown(state: StateStore, key: string): boolean {
   return Number.isFinite(age) && age < cooldownSeconds();
 }
 
-/** Authentication failures are credential problems and will not improve by retrying. */
+/** Authentication failures need auth-specific remediation in the alert body. */
 function isAuthFailure(error: unknown): boolean {
   const text = String(error).toLowerCase();
   return [
@@ -105,6 +106,11 @@ function hourStamp(): string {
   return new Date().toISOString().replace(/[-:T]/g, '').slice(0, 10);
 }
 
+function accountAlertThreshold(): number {
+  const value = Number(process.env.ACCOUNT_ALERT_AFTER_FAILURES ?? 2);
+  return Number.isFinite(value) && value > 0 ? Math.max(1, Math.floor(value)) : 2;
+}
+
 export async function recordAccountFailure(
   state: StateStore, sink: Sink, account: Account, error: unknown,
 ): Promise<boolean> {
@@ -112,8 +118,12 @@ export async function recordAccountFailure(
   const failures = Number(state.getMeta(FAIL_COUNT_KEY + account.username) ?? 0) + 1;
   state.setMeta(FAIL_COUNT_KEY + account.username, String(failures));
 
-  const threshold = Number(process.env.ACCOUNT_ALERT_AFTER_FAILURES ?? 2);
-  if (!authFailure && failures < threshold) {
+  // Authentication errors can also be transient (for example an Outlook IMAP
+  // `NO Login failed` during an OAuth/token hiccup). Use the same consecutive
+  // failure threshold for every account failure so one bad poll does not
+  // produce an outage alert immediately followed by a recovery alert.
+  const threshold = accountAlertThreshold();
+  if (failures < threshold) {
     log.warn(`[${account.name}] failure ${failures}; alert threshold not reached: ${error}`);
     return false;
   }
@@ -139,9 +149,11 @@ export async function recordAccountFailure(
     healthMessage(`⚠️ Mail account unavailable: ${account.name}`, body, account.username, hourStamp()),
     critical(`${account.name} ${authFailure ? 'authentication' : 'connection'} failure; monitoring coverage is lost`),
   );
-  state.setMeta(ALERTED_AT_KEY + account.username, new Date().toISOString());
+  // A failed sink delivery must not put the account into the "alerted" state;
+  // otherwise recovery would claim an outage was announced when it was not.
+  if (sent) state.setMeta(ALERTED_AT_KEY + account.username, new Date().toISOString());
   log.error(`[${account.name}] outage alert sent=${sent}: ${error}`);
-  return true;
+  return sent;
 }
 
 export async function recordAccountSuccess(
