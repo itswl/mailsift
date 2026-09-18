@@ -56,6 +56,10 @@ CREATE TABLE IF NOT EXISTS feedback (
   id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL, dedup_key TEXT,
   label TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS mcp_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, client TEXT,
+  success INTEGER NOT NULL, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_seen_created ON seen (created_at);
 CREATE INDEX IF NOT EXISTS idx_seen_importance ON seen (importance);
@@ -420,7 +424,14 @@ export class StateStore {
       deadLetterTotal: this.listDeadLetters(200).length,
       notificationOutboxPending: this.notificationOutboxPending(),
       feedback: this.feedbackSummary(),
+      mcpAuditEvents: Number((this.db.prepare('SELECT COUNT(*) AS n FROM mcp_audit').get() as Record<string, unknown>)['n'] ?? 0),
     };
+  }
+
+  recordMcpAudit(action: string, client: string, success: boolean): void {
+    this.db.prepare(
+      'INSERT INTO mcp_audit (action, client, success, created_at) VALUES (?, ?, ?, ?)',
+    ).run(action.slice(0, 100), client.slice(0, 100), success ? 1 : 0, now());
   }
 
   // ---- Queries (MCP and troubleshooting) ----

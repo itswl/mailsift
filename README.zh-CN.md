@@ -126,6 +126,7 @@ MCP_TOKEN=<随机长 token>
 ```
 
 请通过反向代理或隧道使用 HTTPS；MCP 会返回邮箱数据，不能让 bearer token 通过公网明文 HTTP 传输。非回环模式没有 `MCP_TOKEN` 时会拒绝启动。MCP 与主进程合并运行，提供查询和本地恢复工具。
+MCP 默认按客户端每分钟 120 次请求限流，可通过 `MCP_RATE_LIMIT_PER_MINUTE` 调整。
 
 ## 开发
 

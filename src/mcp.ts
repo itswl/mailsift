@@ -8,7 +8,7 @@
  * Disabled by default; see README for activation.
  */
 import './env.js'; // Must run first so .env is loaded.
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -32,6 +32,29 @@ const INSTRUCTIONS =
   'inSpam=true means the provider classified a message as spam; when pushed=true, it was rescued as a likely false positive.';
 
 const IMPORTANCE = z.enum(['critical', 'warning', 'info']);
+
+const rateWindows = new Map<string, { startedAt: number; count: number }>();
+
+function mcpRateLimit(): number {
+  const value = Number(process.env.MCP_RATE_LIMIT_PER_MINUTE ?? 120);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 120;
+}
+
+export function allowMcpRequest(client: string, now = Date.now()): boolean {
+  const key = client || 'unknown';
+  const current = rateWindows.get(key);
+  if (!current || now - current.startedAt >= 60_000) {
+    rateWindows.set(key, { startedAt: now, count: 1 });
+    return true;
+  }
+  if (current.count >= mcpRateLimit()) return false;
+  current.count += 1;
+  return true;
+}
+
+function clientFingerprint(value: string): string {
+  return createHash('sha256').update(value || 'unknown').digest('hex').slice(0, 16);
+}
 
 interface MailCursor {
   createdAt: string;
@@ -367,6 +390,11 @@ export async function startMcpHttp(): Promise<import('node:http').Server> {
 
   const httpServer = createHttpServer((req, res) => {
     void (async () => {
+      const client = clientFingerprint(req.socket.remoteAddress ?? 'unknown');
+      if (!allowMcpRequest(client)) {
+        res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '60' }).end('{"error":"rate_limited"}');
+        return;
+      }
       try {
         const url = new URL(req.url ?? '/', `http://${host}:${port}`);
         if (url.pathname !== '/mcp') {
@@ -384,6 +412,7 @@ export async function startMcpHttp(): Promise<import('node:http').Server> {
           return;
         }
         const state = new StateStore();
+        state.recordMcpAudit('http_request', client, true);
         const server = createServer({ state });
         // Omitting sessionIdGenerator selects stateless mode.
         const transport = new StreamableHTTPServerTransport({});

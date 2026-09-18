@@ -147,7 +147,7 @@ MCP_PORT=8410
 MCP_TOKEN=<random-long-token>
 ```
 
-Use HTTPS through a reverse proxy or tunnel; the MCP endpoint carries mailbox data and bearer tokens must not cross the public internet over plain HTTP. Non-loopback mode refuses to start without `MCP_TOKEN` and exposes read-only query tools and local recovery tools. For local stdio clients, point the command at `dist/src/mcp.js`.
+Use HTTPS through a reverse proxy or tunnel; the MCP endpoint carries mailbox data and bearer tokens must not cross the public internet over plain HTTP. Non-loopback mode refuses to start without `MCP_TOKEN` and applies `MCP_RATE_LIMIT_PER_MINUTE` (default `120`). It exposes read-only query tools and local recovery tools. For local stdio clients, point the command at `dist/src/mcp.js`.
 
 ## Troubleshooting
 
