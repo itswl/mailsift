@@ -68,6 +68,15 @@ export function isTransientConnectError(error: unknown): boolean {
   return TRANSIENT_CONNECT_MARKERS.some((marker) => text.includes(marker));
 }
 
+export function connectAttempts(account: Account): number {
+  return account.auth === 'outlook_oauth' ? 4 : 3;
+}
+
+export function retryDelayMs(account: Account, attempt: number): number {
+  const base = account.auth === 'outlook_oauth' ? 3_000 : 1_000;
+  return base * 2 ** Math.max(0, attempt - 1);
+}
+
 export function selectFetchUids(found: readonly number[], floor: number, limit: number): number[] {
   return [...found]
     .filter((uid) => uid > floor)
@@ -84,7 +93,7 @@ export async function connect(account: Account): Promise<ImapFlow> {
     ? { user: account.username, accessToken: await getAccessToken(account.username, account.auth) }
     : { user: account.username, pass: account.password ?? '' };
 
-  const maxAttempts = 3;
+  const maxAttempts = connectAttempts(account);
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     log.info(
       `Connecting ${account.name} (${account.host}:${account.port}, auth=${account.auth}, attempt ${attempt}/${maxAttempts})`,
@@ -121,7 +130,7 @@ export async function connect(account: Account): Promise<ImapFlow> {
         throw new Error(detail, { cause: error });
       }
 
-      const delayMs = 1_000 * 2 ** (attempt - 1);
+      const delayMs = retryDelayMs(account, attempt);
       log.warn(
         `[${account.name}] transient IMAP connection failure (${attempt}/${maxAttempts}); ` +
           `retrying in ${delayMs}ms: ${detail}`,

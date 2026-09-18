@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
-  imapErrorText, isOversizedLookback, isTransientConnectError, selectFetchUids,
+  connectAttempts, imapErrorText, isOversizedLookback, isTransientConnectError, retryDelayMs, selectFetchUids,
 } from '../src/imap/client.js';
+import type { Account } from '../src/config.js';
+
+const OUTLOOK: Account = {
+  name: 'Outlook', provider: 'outlook', username: 'me@outlook.com',
+  host: 'outlook.office365.com', port: 993, auth: 'outlook_oauth', folders: ['INBOX'], useSsl: true,
+};
+const QQ: Account = { ...OUTLOOK, name: 'QQ', provider: 'qq', auth: 'password', password: 'x' };
 
 describe('IMAP fetch caps', () => {
   it('takes the oldest UIDs first so a cap does not skip the backlog', () => {
@@ -37,5 +44,13 @@ describe('IMAP connection errors', () => {
   it('recognizes transient connection failures without retrying auth rejection', () => {
     expect(isTransientConnectError({ responseText: 'User is authenticated but not connected.' })).toBe(true);
     expect(isTransientConnectError({ responseText: 'AUTHENTICATE failed.' })).toBe(false);
+  });
+
+  it('gives Outlook session failures a longer bounded retry profile', () => {
+    expect(connectAttempts(OUTLOOK)).toBe(4);
+    expect(retryDelayMs(OUTLOOK, 1)).toBe(3000);
+    expect(retryDelayMs(OUTLOOK, 3)).toBe(12000);
+    expect(connectAttempts(QQ)).toBe(3);
+    expect(retryDelayMs(QQ, 1)).toBe(1000);
   });
 });
