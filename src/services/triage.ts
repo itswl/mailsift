@@ -32,6 +32,12 @@ export const FALLBACK_KEYWORDS = [
   'appointment', 'boarding pass', 'flight change', 'refund', 'chargeback',
 ] as const;
 
+/** Content that should be classified locally because sending it to an LLM is unnecessary risk. */
+export const SENSITIVE_LOCAL_KEYWORDS = [
+  '验证码', '驗證碼', '动态密码', '動態密碼', '一次性密码', '一次性密碼',
+  'verification code', 'one-time password', 'one time password', 'auth code', 'otp',
+] as const;
+
 export interface TriageResult {
   importance: Importance;
   score: number;
@@ -177,6 +183,15 @@ export function keywordFallback(message: MailMessage, rules: Rules): TriageResul
     category: 'Uncategorized', actionRequired: false, decidedBy: 'fallback',
     summary: preview, reason: 'LLM unavailable and no high-risk keyword matched; queued for review', deadline: '',
   };
+}
+
+export function containsSensitiveContent(message: MailMessage): boolean {
+  const haystack = `${message.subject}\n${snippet(message)}`.toLowerCase();
+  return SENSITIVE_LOCAL_KEYWORDS.some((keyword) => haystack.includes(keyword.toLowerCase()));
+}
+
+function skipSensitiveContent(): boolean {
+  return (process.env.LLM_SKIP_SENSITIVE ?? 'true').toLowerCase() !== 'false';
 }
 
 export function resolveLlmBaseUrl(): string {
@@ -369,6 +384,13 @@ export async function triage(
   messages.forEach((message, index) => {
     const ruled = applyRules(message, rules);
     if (ruled) decided.set(index, ruled);
+    else if (skipSensitiveContent() && containsSensitiveContent(message)) {
+      const local = keywordFallback(message, rules);
+      decided.set(index, {
+        ...local,
+        reason: `Sensitive verification content stayed local; LLM skipped. ${local.reason}`,
+      });
+    }
     else pending.push([index, message]);
   });
 

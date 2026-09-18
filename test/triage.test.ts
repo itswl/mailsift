@@ -142,6 +142,7 @@ describe('LLM layer', () => {
   it('uses fallback for the batch and invokes the callback on failure', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 500 })));
     process.env.LLM_API_KEY = 'k';
+    process.env.LLM_SKIP_SENSITIVE = 'false';
     const seen: unknown[] = [];
     const [[, result]] = await triage([makeMessage({ subject: '您的验证码 9999', fromAddr: 'u@x.com' })], RULES, (e) => seen.push(e));
     expect(result!.decidedBy).toBe('fallback');
@@ -181,6 +182,16 @@ describe('LLM layer', () => {
   it('uses fallback throughout without an API key', async () => {
     const [[, result]] = await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
     expect(result!.decidedBy).toBe('fallback');
+  });
+
+  it('keeps verification-code messages out of the LLM', async () => {
+    const spy = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', spy);
+    process.env.LLM_API_KEY = 'k';
+    const [[, result]] = await triage([makeMessage({ subject: 'Your verification code is 123456' })], RULES);
+    expect(spy).not.toHaveBeenCalled();
+    expect(result!.decidedBy).toBe('fallback');
+    expect(result!.reason).toContain('LLM skipped');
   });
 });
 

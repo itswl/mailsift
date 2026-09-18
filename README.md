@@ -98,6 +98,8 @@ State is stored in SQLite (`data/mailsift.db`). Docker persists it in the `mails
 
 Metrics are instrumented with OpenTelemetry and disabled by default. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to send OTLP metrics to an OpenTelemetry Collector. The instruments cover poll duration, account outcomes, triage decisions, notifications, dead letters, and the outbox. Attributes intentionally use only low-cardinality values such as provider, outcome, channel, importance, and decision source.
 
+`LLM_SKIP_SENSITIVE=true` keeps verification codes, one-time passwords, and auth-code messages in the local keyword/rule path. They remain eligible for normal notifications, but their content is never sent to the configured LLM.
+
 ### Signal events
 
 WebhookWise deliveries retain the existing `mail` / `triage` payload and add a
