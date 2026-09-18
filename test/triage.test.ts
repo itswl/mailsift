@@ -3,7 +3,7 @@ import './setup.js';
 import { makeMessage } from './helpers.js';
 import type { Rules } from '../src/config.js';
 import {
-  applyRules, FALLBACK_KEYWORDS, headline, keywordFallback, resolveLlmBaseUrl, triage,
+  applyRules, FALLBACK_KEYWORDS, headline, keywordFallback, redactForLlm, resolveLlmBaseUrl, triage,
 } from '../src/services/triage.js';
 
 const RULES: Rules = {
@@ -192,6 +192,11 @@ describe('LLM layer', () => {
     expect(spy).not.toHaveBeenCalled();
     expect(result!.decidedBy).toBe('fallback');
     expect(result!.reason).toContain('LLM skipped');
+  });
+
+  it('redacts direct identifiers before LLM use', () => {
+    expect(redactForLlm('Contact a@example.com or +86 138-1234-5678; card 4111 1111 1111 1111.'))
+      .toBe('Contact [EMAIL] or [PHONE]; card [CARD].');
   });
 });
 

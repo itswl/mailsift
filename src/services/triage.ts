@@ -277,16 +277,18 @@ async function callLlm(body: Record<string, unknown>): Promise<unknown> {
 
 function requestBody(messages: MailMessage[], rules: Rules, jsonMode: boolean): Record<string, unknown> {
   const bodyChars = Number(process.env.LLM_BODY_CHARS ?? 1200);
+  const redact = (process.env.LLM_REDACT_PII ?? 'true').toLowerCase() !== 'false';
+  const safe = (value: string): string => redact ? redactForLlm(value) : value;
   const payload = {
-    user_context: rules.context || '(no additional user context)',
+    user_context: safe(rules.context) || '(no additional user context)',
     emails: messages.map((m, index) => ({
       index,
-      subject: m.subject || '(no subject)',
-      from: `${m.fromName} <${m.fromAddr}>`.trim(),
+      subject: safe(m.subject) || '(no subject)',
+      from: safe(`${m.fromName} <${m.fromAddr}>`).trim(),
       in_spam: m.inSpam,
       is_bulk: m.listUnsubscribe,
-      to_account: m.account,
-      body: m.body.slice(0, bodyChars),
+      to_account: safe(m.account),
+      body: safe(m.body.slice(0, bodyChars)),
     })),
   };
   return {
@@ -298,6 +300,16 @@ function requestBody(messages: MailMessage[], rules: Rules, jsonMode: boolean): 
       { role: 'user', content: JSON.stringify(payload) },
     ],
   };
+}
+
+/** Remove common direct identifiers before a message is sent to an LLM. */
+export function redactForLlm(value: string): string {
+  return value
+    .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, '[EMAIL]')
+    .replace(/(?<!\d)\+\d{1,3}[ -]\d{3}[- ]\d{4}[- ]\d{4}(?!\d)/g, '[PHONE]')
+    .replace(/(?<!\d)(?:\d[ -]?){13,19}(?!\d)/g, '[CARD]')
+    .replace(/(?<!\d)\d{17}[\dXx](?!\d)/g, '[ID]')
+    .replace(/(?<!\d)(?:\+?\d{1,3}[- ]?)?(?:\d{3}[- ]\d{3}[- ]\d{4}|\d{3}[- ]\d{4}|\d{3}[- ]\d{4}[- ]\d{4})(?!\d)/g, '[PHONE]');
 }
 
 function looksLikeJsonModeRejection(error: unknown): boolean {
