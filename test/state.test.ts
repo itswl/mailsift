@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import './setup.js';
 import { StateStore } from '../src/services/state.js';
+import { makeMessage, makeResult } from './helpers.js';
 
 function store(): StateStore {
   return new StateStore(':memory:');
@@ -86,6 +87,31 @@ describe('rich fields and queries', () => {
 });
 
 describe('maintenance', () => {
+  it('keeps oversized or malformed messages visible as dead letters', () => {
+    const s = store();
+    const input = {
+      account: 'me@qq.com', folder: 'INBOX', uidValidity: '7', uid: 42,
+      messageId: '<bad@x>', subject: '超大附件', reason: 'source too large',
+    };
+    s.recordDeadLetter(input);
+    s.recordDeadLetter(input);
+    expect(s.listDeadLetters()).toMatchObject([{ account: 'me@qq.com', uid: 42, reason: 'source too large' }]);
+    expect(s.listDeadLetters()).toHaveLength(1);
+  });
+
+  it('keeps failed notifications in the durable outbox until delivered', () => {
+    const s = store();
+    const message = makeMessage({ messageId: '<outbox@x>' });
+    const result = makeResult();
+    s.enqueueNotification('me@qq.com|<outbox@x>', message, result);
+    expect(s.notificationOutboxPending()).toBe(1);
+    s.markNotificationFailed('me@qq.com|<outbox@x>', 'endpoint down');
+    expect(s.pendingNotifications()[0]?.attempts).toBe(1);
+    expect(s.pendingNotifications()[0]?.lastError).toContain('endpoint down');
+    s.markNotificationDelivered('me@qq.com|<outbox@x>');
+    expect(s.notificationOutboxPending()).toBe(0);
+  });
+
   it('finds and clears interrupted records without outcomes', () => {
     const s = store();
     s.markSeen('stuck', 'me@qq.com', '被中断');

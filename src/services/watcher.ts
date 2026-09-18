@@ -8,6 +8,7 @@ import {
   connect,
   fetchNew,
   targetFolders,
+  type FetchFailure,
   type FolderCursor,
   type MessageBudget,
 } from '../imap/client.js';
@@ -51,7 +52,12 @@ export function summarizeStats(stats: PollStats): string {
 }
 
 type PendingCursor = [account: string, folder: string, uidValidity: string, lastUid: number];
-type CollectAccountResult = { messages: MailMessage[]; cursors: PendingCursor[]; failures?: string[] };
+type CollectAccountResult = {
+  messages: MailMessage[];
+  cursors: PendingCursor[];
+  failures?: string[];
+  deadLetters?: FetchFailure[];
+};
 
 export class Watcher {
   constructor(
@@ -73,6 +79,7 @@ export class Watcher {
     const messages: MailMessage[] = [];
     const cursors: PendingCursor[] = [];
     const failures: string[] = [];
+    const deadLetters: FetchFailure[] = [];
     const client = await connect(account);
 
     try {
@@ -97,6 +104,7 @@ export class Watcher {
         try {
           const result = await fetchNew(client, account, folder, cursor, budget);
           messages.push(...result.messages);
+          deadLetters.push(...result.failures);
           cursors.push([account.username, folder.path, result.cursor.uidValidity, result.cursor.lastUid]);
         } catch (error) {
           failures.push(`${folder.path}: ${error}`);
@@ -107,10 +115,12 @@ export class Watcher {
       await client.logout().catch(() => undefined);
     }
 
-    return { messages, cursors, failures };
+    return { messages, cursors, failures, deadLetters };
   }
 
-  async collectAll(stats: PollStats): Promise<{ messages: MailMessage[]; cursors: PendingCursor[] }> {
+  async collectAll(stats: PollStats): Promise<{
+    messages: MailMessage[]; cursors: PendingCursor[]; deadLetters?: Array<FetchFailure & { account: string }>;
+  }> {
     const limit = Math.max(1, Number(process.env.MAX_CONCURRENT_ACCOUNTS ?? 5));
     const rawBudget = Number(process.env.MAX_MESSAGES_PER_POLL_TOTAL ?? 500);
     const budget: MessageBudget = {
@@ -118,6 +128,7 @@ export class Watcher {
     };
     const messages: MailMessage[] = [];
     const cursors: PendingCursor[] = [];
+    const deadLetters: Array<FetchFailure & { account: string }> = [];
     const queue = [...this.config.accounts];
 
     const worker = async (): Promise<void> => {
@@ -134,6 +145,9 @@ export class Watcher {
           }
           messages.push(...result.messages);
           cursors.push(...result.cursors);
+          for (const dead of result.deadLetters ?? []) {
+            deadLetters.push({ ...dead, account: account.username });
+          }
           const healthTask = failures.length
             ? health.recordAccountFailure(this.state, this.sink, account, failures.join('; '))
             : health.recordAccountSuccess(this.state, this.sink, account);
@@ -152,7 +166,7 @@ export class Watcher {
 
     await Promise.all(Array.from({ length: Math.min(limit, queue.length) }, worker));
     stats.fetched = messages.length;
-    return { messages, cursors };
+    return { messages, cursors, deadLetters };
   }
 
   /**
@@ -174,6 +188,18 @@ export class Watcher {
   private effectiveRank(message: MailMessage, result: TriageResult): number {
     const bonus = Number(process.env.SPAM_RANK_BONUS ?? 0);
     return message.inSpam ? rank(result) + Math.max(0, bonus) : rank(result);
+  }
+
+  private async flushNotificationOutbox(): Promise<void> {
+    for (const entry of this.state.pendingNotifications()) {
+      const delivered = await this.sink.push(entry.message, entry.result);
+      if (delivered) {
+        this.state.markNotificationDelivered(entry.notificationKey);
+        this.state.clearDigest([entry.notificationKey]);
+      } else {
+        this.state.markNotificationFailed(entry.notificationKey, 'sink delivery failed');
+      }
+    }
   }
 
   private outcomeFields(message: MailMessage, result: TriageResult) {
@@ -217,10 +243,19 @@ export class Watcher {
       const fields = this.outcomeFields(message, result);
 
       if (this.effectiveRank(message, result) >= pushThreshold) {
+        // Persist a bounded, resendable copy before the external write. The
+        // outbox is at-least-once: a crash after provider acceptance and before
+        // the delivered mark can still duplicate a notification, so adapters
+        // should use notificationKey for idempotency where supported.
+        const outboxMessage = { ...message, body: snippet(message) };
+        this.state.enqueueNotification(key, outboxMessage, result);
         const delivered = await this.sink.push(message, result);
         if (delivered) {
+          this.state.markNotificationDelivered(key);
           stats.pushed += 1;
           if (message.inSpam) stats.spamRescued += 1;
+        } else {
+          this.state.markNotificationFailed(key, 'sink delivery failed');
         }
         this.state.recordOutcome(key, result.importance, delivered, fields);
         if (delivered) continue;
@@ -258,13 +293,26 @@ export class Watcher {
 
   async pollOnce(): Promise<PollStats> {
     const stats = newStats();
-    const { messages, cursors } = await this.collectAll(stats);
+    await this.flushNotificationOutbox();
+    const { messages, cursors, deadLetters } = await this.collectAll(stats);
 
     const fresh = this.filterFresh(messages);
     stats.fresh = fresh.length;
 
     if (fresh.length) await this.dispatch(fresh, stats);
     else log.info('No new messages in this poll.');
+
+    for (const dead of deadLetters ?? []) {
+      this.state.recordDeadLetter({
+        account: dead.account,
+        folder: dead.folder,
+        uidValidity: dead.uidValidity,
+        uid: dead.uid,
+        messageId: dead.messageId,
+        subject: dead.subject,
+        reason: dead.reason,
+      });
+    }
 
     // Only after triage and delivery complete are these UIDs safe to advance.
     // If dispatch throws, the next poll retries them.

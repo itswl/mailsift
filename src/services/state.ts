@@ -21,6 +21,8 @@ const nodeRequire = createRequire(import.meta.url);
 const { DatabaseSync } = nodeRequire('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSync = import('node:sqlite').DatabaseSync;
 import { getLogger } from '../logger.js';
+import type { MailMessage } from '../imap/message.js';
+import type { TriageResult } from './triage.js';
 
 const log = getLogger('state');
 
@@ -40,6 +42,15 @@ CREATE TABLE IF NOT EXISTS seen (
 );
 CREATE TABLE IF NOT EXISTS digest_queue (
   dedup_key TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dead_letter (
+  dead_key TEXT PRIMARY KEY, account TEXT NOT NULL, folder TEXT NOT NULL,
+  uid_validity TEXT NOT NULL, uid INTEGER NOT NULL, message_id TEXT,
+  subject TEXT, reason TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notification_outbox (
+  notification_key TEXT PRIMARY KEY, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT, created_at TEXT NOT NULL, delivered_at TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_seen_created ON seen (created_at);
@@ -94,6 +105,27 @@ export interface QueryOptions {
   limit?: number;
   beforeCreatedAt?: string;
   beforeDedupKey?: string;
+}
+
+export interface DeadLetterRow {
+  deadKey: string;
+  account: string;
+  folder: string;
+  uidValidity: string;
+  uid: number;
+  messageId: string | null;
+  subject: string | null;
+  reason: string;
+  createdAt: string;
+}
+
+export interface NotificationOutboxRow {
+  notificationKey: string;
+  message: MailMessage;
+  result: TriageResult;
+  attempts: number;
+  lastError: string | null;
+  createdAt: string;
 }
 
 function now(): string {
@@ -222,7 +254,96 @@ export class StateStore {
 
   prune(keepDays = 90): number {
     const cutoff = new Date(Date.now() - keepDays * 86_400_000).toISOString();
-    return Number(this.db.prepare('DELETE FROM seen WHERE created_at < ?').run(cutoff).changes);
+    const seen = Number(this.db.prepare('DELETE FROM seen WHERE created_at < ?').run(cutoff).changes);
+    const dead = Number(this.db.prepare('DELETE FROM dead_letter WHERE created_at < ?').run(cutoff).changes);
+    const outbox = Number(this.db.prepare(
+      'DELETE FROM notification_outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?',
+    ).run(cutoff).changes);
+    return seen + dead + outbox;
+  }
+
+  recordDeadLetter(input: {
+    account: string; folder: string; uidValidity: string; uid: number;
+    messageId: string; subject: string; reason: string;
+  }): void {
+    const deadKey = `${input.account}|${input.folder}|${input.uidValidity}|${input.uid}`;
+    this.db.prepare(
+      `INSERT OR IGNORE INTO dead_letter
+       (dead_key, account, folder, uid_validity, uid, message_id, subject, reason, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      deadKey, input.account, input.folder, input.uidValidity, input.uid,
+      input.messageId || null, input.subject || null, input.reason, now(),
+    );
+  }
+
+  listDeadLetters(limit = 50): DeadLetterRow[] {
+    const rows = this.db.prepare(
+      `SELECT dead_key, account, folder, uid_validity, uid, message_id, subject, reason, created_at
+       FROM dead_letter ORDER BY created_at DESC LIMIT ?`,
+    ).all(Math.max(1, Math.min(limit, 200))) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      deadKey: String(row['dead_key']),
+      account: String(row['account']),
+      folder: String(row['folder']),
+      uidValidity: String(row['uid_validity']),
+      uid: Number(row['uid']),
+      messageId: (row['message_id'] as string) ?? null,
+      subject: (row['subject'] as string) ?? null,
+      reason: String(row['reason']),
+      createdAt: String(row['created_at']),
+    }));
+  }
+
+  enqueueNotification(notificationKey: string, message: MailMessage, result: TriageResult): void {
+    this.db.prepare(
+      `INSERT OR IGNORE INTO notification_outbox
+       (notification_key, payload, created_at) VALUES (?, ?, ?)`,
+    ).run(notificationKey, JSON.stringify({ message, result }), now());
+  }
+
+  pendingNotifications(limit = 50): NotificationOutboxRow[] {
+    const rows = this.db.prepare(
+      `SELECT notification_key, payload, attempts, last_error, created_at
+       FROM notification_outbox WHERE delivered_at IS NULL ORDER BY created_at LIMIT ?`,
+    ).all(Math.max(1, Math.min(limit, 200))) as Array<Record<string, unknown>>;
+    const out: NotificationOutboxRow[] = [];
+    for (const row of rows) {
+      try {
+        const payload = JSON.parse(String(row['payload'])) as { message: MailMessage; result: TriageResult };
+        out.push({
+          notificationKey: String(row['notification_key']),
+          message: payload.message,
+          result: payload.result,
+          attempts: Number(row['attempts']),
+          lastError: (row['last_error'] as string) ?? null,
+          createdAt: String(row['created_at']),
+        });
+      } catch {
+        log.error(`Notification outbox record ${String(row['notification_key'])} is corrupt`);
+      }
+    }
+    return out;
+  }
+
+  markNotificationDelivered(notificationKey: string): void {
+    this.db.prepare(
+      'UPDATE notification_outbox SET delivered_at = ?, last_error = NULL WHERE notification_key = ?',
+    ).run(now(), notificationKey);
+  }
+
+  markNotificationFailed(notificationKey: string, error: unknown): void {
+    this.db.prepare(
+      `UPDATE notification_outbox SET attempts = attempts + 1, last_error = ?
+       WHERE notification_key = ?`,
+    ).run(String(error).slice(0, 500), notificationKey);
+  }
+
+  notificationOutboxPending(): number {
+    const row = this.db.prepare(
+      'SELECT COUNT(*) AS n FROM notification_outbox WHERE delivered_at IS NULL',
+    ).get() as Record<string, unknown>;
+    return Number(row['n'] ?? 0);
   }
 
   // ---- Queries (MCP and troubleshooting) ----

@@ -227,6 +227,17 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
   );
 
   server.tool(
+    'list_dead_letters',
+    'List messages that were explicitly skipped because they were oversized or could not be parsed. ' +
+      'These records are excluded from normal triage but remain visible for recovery and investigation.',
+    { limit: z.number().int().positive().max(200).default(50) },
+    async (args) => {
+      const deadLetters = store.listDeadLetters(args.limit);
+      return json({ count: deadLetters.length, deadLetters });
+    },
+  );
+
+  server.tool(
     'health',
     'Show service health: last poll, account outages, LLM status, and digest backlog. ' +
       'Check this first when investigating a missing notification.',
@@ -264,6 +275,7 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
           consecutiveFailures: Number(store.getMeta(LLM_FAIL_COUNT_KEY) ?? 0),
         },
         digestPending: store.digestPending(),
+        notificationOutboxPending: store.notificationOutboxPending(),
       });
     },
   );

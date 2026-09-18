@@ -26,6 +26,15 @@ export interface MessageBudget {
   remaining: number;
 }
 
+export interface FetchFailure {
+  folder: string;
+  uidValidity: string;
+  uid: number;
+  subject: string;
+  messageId: string;
+  reason: string;
+}
+
 function intEnv(name: string, fallback: number): number {
   const raw = Number(process.env[name]);
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
@@ -186,7 +195,7 @@ export async function fetchNew(
   folder: Folder,
   cursor: FolderCursor | undefined,
   budget?: MessageBudget,
-): Promise<{ messages: MailMessage[]; cursor: FolderCursor }> {
+): Promise<{ messages: MailMessage[]; cursor: FolderCursor; failures: FetchFailure[] }> {
   // readOnly: this tool observes and does not modify mailbox state.
   const lock = await client.getMailboxLock(folder.path, { readOnly: true });
   try {
@@ -222,27 +231,51 @@ export async function fetchNew(
     const uids = selectFetchUids(foundUids, floor, limit);
     if (budget) budget.remaining -= uids.length;
     if (uids.length === 0) {
-      return { messages: [], cursor: { uidValidity, lastUid: fresh ? 0 : cursor.lastUid } };
+      return { messages: [], cursor: { uidValidity, lastUid: fresh ? 0 : cursor.lastUid }, failures: [] };
     }
 
     const messages: MailMessage[] = [];
+    const failures: FetchFailure[] = [];
+    const maxSourceBytes = intEnv('MAX_MESSAGE_SOURCE_BYTES', 5 * 1024 * 1024);
     for await (const raw of client.fetch(
       uids,
-      { uid: true, envelope: true, source: true, headers: ['list-unsubscribe'] },
+      {
+        uid: true,
+        size: true,
+        envelope: true,
+        source: { maxLength: maxSourceBytes + 1 },
+        headers: ['list-unsubscribe'],
+      },
       { uid: true },
     )) {
+      const envelope = raw.envelope;
+      const subject = envelope?.subject?.trim() ?? '';
+      const messageId = envelope?.messageId?.trim() ?? '';
+      if (raw.size !== undefined && raw.size > maxSourceBytes) {
+        failures.push({
+          folder: folder.path,
+          uidValidity,
+          uid: raw.uid,
+          subject,
+          messageId,
+          reason: `message size ${raw.size} exceeds MAX_MESSAGE_SOURCE_BYTES=${maxSourceBytes}`,
+        });
+        log.error(`[${account.name}/${folder.path}] skipped oversized uid=${raw.uid} (${raw.size} bytes)`);
+        continue;
+      }
       try {
         messages.push(await toMailMessage(raw, account, folder));
       } catch (error) {
         // One malformed message must not stop the entire folder.
         log.warn(`Failed to parse uid=${raw.uid}; skipping: ${error}`);
+        failures.push({ folder: folder.path, uidValidity, uid: raw.uid, subject, messageId, reason: String(error) });
       }
     }
 
     log.info(
       `[${account.name}/${folder.path}] fetched ${messages.length} new messages${folder.isSpam ? ' (spam)' : ''}`,
     );
-    return { messages, cursor: { uidValidity, lastUid: Math.max(...uids) } };
+    return { messages, cursor: { uidValidity, lastUid: Math.max(...uids) }, failures };
   } finally {
     lock.release();
   }
