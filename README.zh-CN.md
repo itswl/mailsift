@@ -104,7 +104,7 @@ Compose 默认使用已发布的 `1.0.0` 镜像。升级时在 `.env` 设置 `MA
 
 ## MCP
 
-内置 MCP 默认关闭。在主容器中启用：
+内置 MCP 默认在主容器中开启，并绑定回环地址：
 
 ```bash
 MCP_ENABLED=true MCP_TOKEN=<随机长 token> docker compose up -d

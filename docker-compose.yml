@@ -12,7 +12,7 @@ services:
     environment:
       - TZ=${TZ:-Asia/Shanghai}
       # MCP is embedded in the main process and disabled by default.
-      - MCP_ENABLED=${MCP_ENABLED:-false}
+      - MCP_ENABLED=${MCP_ENABLED:-true}
       - MCP_BIND=${MCP_BIND:-127.0.0.1}
       - MCP_PORT=${MCP_PORT:-8410}
       - MCP_TOKEN=${MCP_TOKEN:-}

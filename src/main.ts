@@ -215,7 +215,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
 
   let mcpServer: Server | undefined;
-  if ((process.env.MCP_ENABLED ?? 'false').toLowerCase() === 'true') {
+  if ((process.env.MCP_ENABLED ?? 'true').toLowerCase() === 'true') {
     try {
       mcpServer = await startMcpHttp();
     } catch (error) {

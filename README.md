@@ -128,7 +128,7 @@ docker compose run --rm mailsift node dist/src/main.js --recover
 
 ## MCP
 
-The embedded MCP server is disabled by default. Enable it in the main container:
+The embedded MCP server is enabled by default on loopback in the main container:
 
 ```bash
 MCP_ENABLED=true MCP_TOKEN=<random-long-token> docker compose up -d
