@@ -295,6 +295,24 @@ export class StateStore {
     }));
   }
 
+  retryDeadLetter(deadKey: string): boolean {
+    const row = this.db.prepare(
+      `SELECT account, folder, uid_validity, uid FROM dead_letter WHERE dead_key = ?`,
+    ).get(deadKey) as Record<string, unknown> | undefined;
+    if (!row) return false;
+
+    const account = String(row['account']);
+    const folder = String(row['folder']);
+    const uidValidity = String(row['uid_validity']);
+    const uid = Number(row['uid']);
+    const cursor = this.getCursor(account, folder);
+    if (cursor && cursor.uidValidity === uidValidity && cursor.lastUid >= uid) {
+      this.saveCursor(account, folder, uidValidity, Math.max(0, uid - 1));
+    }
+    this.db.prepare('DELETE FROM dead_letter WHERE dead_key = ?').run(deadKey);
+    return true;
+  }
+
   enqueueNotification(notificationKey: string, message: MailMessage, result: TriageResult): void {
     this.db.prepare(
       `INSERT OR IGNORE INTO notification_outbox

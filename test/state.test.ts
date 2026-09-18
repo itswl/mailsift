@@ -99,6 +99,19 @@ describe('maintenance', () => {
     expect(s.listDeadLetters()).toHaveLength(1);
   });
 
+  it('rewinds a cursor when a dead letter is explicitly requeued', () => {
+    const s = store();
+    s.saveCursor('me@qq.com', 'INBOX', '7', 100);
+    s.recordDeadLetter({
+      account: 'me@qq.com', folder: 'INBOX', uidValidity: '7', uid: 42,
+      messageId: '<bad@x>', subject: '坏信', reason: 'parse failed',
+    });
+    expect(s.retryDeadLetter('me@qq.com|INBOX|7|42')).toBe(true);
+    expect(s.getCursor('me@qq.com', 'INBOX')).toEqual({ uidValidity: '7', lastUid: 41 });
+    expect(s.listDeadLetters()).toHaveLength(0);
+    expect(s.retryDeadLetter('missing')).toBe(false);
+  });
+
   it('keeps failed notifications in the durable outbox until delivered', () => {
     const s = store();
     const message = makeMessage({ messageId: '<outbox@x>' });

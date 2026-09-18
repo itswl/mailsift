@@ -86,6 +86,8 @@ Each folder is limited to `MAX_MESSAGES_PER_POLL` (default `200`). All accounts 
 
 Messages larger than `MAX_MESSAGE_SOURCE_BYTES` (default `5 MiB`) are not downloaded into the MIME parser. They are recorded as dead letters and can be inspected through the MCP `list_dead_letters` tool.
 
+The MCP recovery tools expose `recovery_status` and `retry_dead_letter`. Retrying rewinds one folder cursor so the next normal poll can fetch the message again; it does not modify the mailbox.
+
 State is stored in SQLite (`data/mailsift.db`). Docker persists it in the `mailsift-data` named volume.
 
 ### Signal events

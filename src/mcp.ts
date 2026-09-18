@@ -20,7 +20,10 @@ import { fetchByMessageId } from './imap/client.js';
 import { StateStore } from './services/state.js';
 import { resolveLlmBaseUrl } from './services/triage.js';
 import { HEARTBEAT_KEY } from './services/watcher.js';
-import { FAIL_COUNT_KEY, LLM_FAIL_COUNT_KEY } from './services/health.js';
+import {
+  ACCOUNT_LAST_ERROR_KEY, ACCOUNT_LAST_FAILURE_KEY, ACCOUNT_LAST_SUCCESS_KEY,
+  FAIL_COUNT_KEY, LLM_FAIL_COUNT_KEY,
+} from './services/health.js';
 
 const INSTRUCTIONS =
   'Query mailsift triage results. It monitors inboxes and spam folders, uses an LLM to assess importance, ' +
@@ -238,6 +241,36 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
   );
 
   server.tool(
+    'recovery_status',
+    'Show account health timelines, dead-letter backlog, and pending notification outbox items.',
+    { deadLetterLimit: z.number().int().positive().max(200).default(50) },
+    async (args) => {
+      const accounts = loadConfig().accounts.map((account) => ({
+        name: account.name,
+        address: account.username,
+        consecutiveFailures: Number(store.getMeta(FAIL_COUNT_KEY + account.username) ?? 0),
+        lastSuccessAt: store.getMeta(ACCOUNT_LAST_SUCCESS_KEY + account.username) ?? null,
+        lastFailureAt: store.getMeta(ACCOUNT_LAST_FAILURE_KEY + account.username) ?? null,
+        lastError: store.getMeta(ACCOUNT_LAST_ERROR_KEY + account.username) ?? null,
+      }));
+      const deadLetters = store.listDeadLetters(args.deadLetterLimit);
+      return json({
+        accounts,
+        deadLetters,
+        deadLetterCount: deadLetters.length,
+        notificationOutboxPending: store.notificationOutboxPending(),
+      });
+    },
+  );
+
+  server.tool(
+    'retry_dead_letter',
+    'Requeue one explicitly skipped message by rewinding its folder cursor. The next poll will retry it.',
+    { deadKey: z.string().min(1).max(500) },
+    async (args) => json({ deadKey: args.deadKey, requeued: store.retryDeadLetter(args.deadKey) }),
+  );
+
+  server.tool(
     'health',
     'Show service health: last poll, account outages, LLM status, and digest backlog. ' +
       'Check this first when investigating a missing notification.',
@@ -262,7 +295,7 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
         lastPollAgeSeconds: ageSeconds,
         pollIntervalSeconds: interval,
         healthy: ageSeconds !== null && ageSeconds <= interval * 3 + 120,
-        failingAccounts: failing,
+          failingAccounts: failing,
         llm: {
           model: process.env.LLM_MODEL ?? null,
           endpoint: (() => {

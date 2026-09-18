@@ -19,6 +19,9 @@ export const ALERTED_AT_KEY = 'account_alerted_at:';
 export const LLM_FAIL_COUNT_KEY = 'llm_fail_count';
 export const LLM_ALERTED_AT_KEY = 'llm_alerted_at';
 export const STARTUP_ALERTED_AT_KEY = 'startup_alerted_at';
+export const ACCOUNT_LAST_SUCCESS_KEY = 'account_last_success:';
+export const ACCOUNT_LAST_FAILURE_KEY = 'account_last_failure:';
+export const ACCOUNT_LAST_ERROR_KEY = 'account_last_error:';
 
 function cooldownSeconds(): number {
   return Number(process.env.ACCOUNT_ALERT_COOLDOWN_SECONDS ?? 21_600);
@@ -117,6 +120,8 @@ export async function recordAccountFailure(
   const authFailure = isAuthFailure(error);
   const failures = Number(state.getMeta(FAIL_COUNT_KEY + account.username) ?? 0) + 1;
   state.setMeta(FAIL_COUNT_KEY + account.username, String(failures));
+  state.setMeta(ACCOUNT_LAST_FAILURE_KEY + account.username, new Date().toISOString());
+  state.setMeta(ACCOUNT_LAST_ERROR_KEY + account.username, String(error).slice(0, 500));
 
   // Authentication errors can also be transient (for example an Outlook IMAP
   // `NO Login failed` during an OAuth/token hiccup). Use the same consecutive
@@ -159,6 +164,7 @@ export async function recordAccountFailure(
 export async function recordAccountSuccess(
   state: StateStore, sink: Sink, account: Account,
 ): Promise<boolean> {
+  state.setMeta(ACCOUNT_LAST_SUCCESS_KEY + account.username, new Date().toISOString());
   if (!state.getMeta(FAIL_COUNT_KEY + account.username)) return false;
   const hadAlerted = Boolean(state.getMeta(ALERTED_AT_KEY + account.username));
   state.setMeta(FAIL_COUNT_KEY + account.username, '');

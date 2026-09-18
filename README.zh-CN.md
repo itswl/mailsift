@@ -73,6 +73,8 @@ docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual
 
 超过 `MAX_MESSAGE_SOURCE_BYTES`（默认 5 MiB）的邮件不会下载给 MIME 解析器，而会记录为 dead letter，可通过 MCP 的 `list_dead_letters` 查询，不会静默消失。
 
+MCP 恢复工具提供 `recovery_status` 和 `retry_dead_letter`。重试只会回退对应文件夹的本地游标，下一轮正常轮询会重新拉取邮件，不会修改邮箱内容。
+
 状态保存在 SQLite 的 `data/mailsift.db` 中，Docker 使用 `mailsift-data` 命名卷持久化。
 
 ## 运行和恢复
