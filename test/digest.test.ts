@@ -55,6 +55,15 @@ describe('rendering', () => {
     expect(body).toContain('⏰本周内');
   });
 
+  it('marks action-required messages and puts them first within a category', () => {
+    const body = renderDigest([
+      toDigestItem(makeMessage({ fromName: 'FYI' }), makeResult({ actionRequired: false, summary: '仅供了解' })),
+      toDigestItem(makeMessage({ fromName: 'Action' }), makeResult({ actionRequired: true, summary: '需要今天处理' })),
+    ]);
+    expect(body).toContain('⚠️ **Action**');
+    expect(body.indexOf('需要今天处理')).toBeLessThan(body.indexOf('仅供了解'));
+  });
+
   it('escapes Markdown control characters from mail data', () => {
     const row = toDigestItem(
       makeMessage({ fromName: '*sender* [external]' }),

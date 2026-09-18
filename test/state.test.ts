@@ -125,6 +125,16 @@ describe('maintenance', () => {
     expect(s.notificationOutboxPending()).toBe(0);
   });
 
+  it('records feedback and exposes it in observability', () => {
+    const s = store();
+    s.markSeen('k1', 'me@qq.com', '主题');
+    s.recordOutcome('k1', 'warning', true, { messageId: '<feedback@x>' });
+    s.recordFeedback('<feedback@x>', 'false_positive', 'newsletter');
+    s.recordFeedback('<feedback@x>', 'handled');
+    expect(s.feedbackSummary()).toEqual({ false_positive: 1, handled: 1 });
+    expect(s.observability()).toMatchObject({ seenTotal: 1, pushedTotal: 1, feedback: { false_positive: 1, handled: 1 } });
+  });
+
   it('finds and clears interrupted records without outcomes', () => {
     const s = store();
     s.markSeen('stuck', 'me@qq.com', '被中断');

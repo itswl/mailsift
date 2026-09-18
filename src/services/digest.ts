@@ -27,6 +27,7 @@ export interface DigestItem {
   category: string;
   summary: string;
   deadline: string;
+  actionRequired: boolean;
   date: string;
 }
 
@@ -42,6 +43,7 @@ export function toDigestItem(message: MailMessage, result: TriageResult): Digest
     category: result.category,
     summary: headline(result),
     deadline: result.deadline,
+    actionRequired: result.actionRequired,
     date: message.date,
   };
 }
@@ -50,7 +52,13 @@ function line(item: DigestItem): string {
   const sender = item.fromName || item.from || 'Unknown sender';
   const gist = (item.summary || '').trim();
   const shown = gist.length > 90 ? `${gist.slice(0, 90)}…` : gist;
-  return `- **${markdownText(sender)}**: ${markdownText(shown)}${item.deadline ? ` ⏰${markdownText(item.deadline)}` : ''}`;
+  const marker = item.actionRequired ? '⚠️ ' : '';
+  return `- ${marker}**${markdownText(sender)}**: ${markdownText(shown)}${item.deadline ? ` ⏰${markdownText(item.deadline)}` : ''}`;
+}
+
+function urgency(item: DigestItem): number {
+  const importance = item.importance === 'critical' ? 2 : item.importance === 'warning' ? 1 : 0;
+  return importance + (item.actionRequired ? 1 : 0);
 }
 
 export function renderDigest(items: DigestItem[]): string {
@@ -84,7 +92,11 @@ export function renderDigest(items: DigestItem[]): string {
       const key = item.category || 'Uncategorized';
       (grouped.get(key) ?? grouped.set(key, []).get(key)!).push(item);
     }
-    const groups = [...grouped.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+    const groups = [...grouped.entries()].sort((a, b) => {
+      const aUrgency = Math.max(...a[1].map(urgency));
+      const bUrgency = Math.max(...b[1].map(urgency));
+      return bUrgency - aUrgency || b[1].length - a[1].length || a[0].localeCompare(b[0]);
+    });
 
     let remaining = MAX_INBOX_LINES;
     let droppedCategories = 0;
@@ -95,7 +107,11 @@ export function renderDigest(items: DigestItem[]): string {
       }
       lines.push('', `**${markdownText(category)} (${group.length})**`);
       const shown = Math.min(group.length, remaining);
-      for (const item of group.slice(0, shown)) lines.push(line(item));
+      const orderedItems = [...group].sort((a, b) =>
+        urgency(b) - urgency(a) || Number(Boolean(b.deadline)) - Number(Boolean(a.deadline)) ||
+        b.date.localeCompare(a.date),
+      );
+      for (const item of orderedItems.slice(0, shown)) lines.push(line(item));
       remaining -= shown;
       if (group.length > shown) lines.push(`- …${group.length - shown} more in this category`);
     }

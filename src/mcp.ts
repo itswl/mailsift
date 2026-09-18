@@ -18,6 +18,7 @@ import { z } from 'zod';
 import { loadConfig } from './config.js';
 import { fetchByMessageId } from './imap/client.js';
 import { StateStore } from './services/state.js';
+import type { FeedbackLabel } from './services/state.js';
 import { resolveLlmBaseUrl } from './services/triage.js';
 import { HEARTBEAT_KEY } from './services/watcher.js';
 import {
@@ -204,6 +205,27 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
     'Summarize processed and pushed messages in a time window, including spam and spam rescues.',
     { hours: z.number().int().positive().default(24) },
     async (args) => json(store.summarize(args.hours)),
+  );
+
+  server.tool(
+    'observability',
+    'Show processing totals, delivery backlog, dead-letter count, and feedback counts.',
+    {},
+    async () => json(store.observability()),
+  );
+
+  server.tool(
+    'record_feedback',
+    'Record feedback for a processed message so future rules and triage evaluation can use it.',
+    {
+      messageId: z.string().min(1).max(1000),
+      label: z.enum(['false_positive', 'missed', 'handled', 'correct']),
+      note: z.string().max(1000).default(''),
+    },
+    async (args) => {
+      store.recordFeedback(args.messageId, args.label as FeedbackLabel, args.note);
+      return json({ recorded: true, messageId: args.messageId, label: args.label });
+    },
   );
 
   server.tool(

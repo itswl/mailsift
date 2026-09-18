@@ -88,6 +88,8 @@ Messages larger than `MAX_MESSAGE_SOURCE_BYTES` (default `5 MiB`) are not downlo
 
 The MCP recovery tools expose `recovery_status` and `retry_dead_letter`. Retrying rewinds one folder cursor so the next normal poll can fetch the message again; it does not modify the mailbox.
 
+MCP also provides `observability` for processing, delivery, dead-letter, and feedback totals, plus `record_feedback` with `false_positive`, `missed`, `handled`, and `correct` labels. Feedback is stored for later rule and triage evaluation.
+
 State is stored in SQLite (`data/mailsift.db`). Docker persists it in the `mailsift-data` named volume.
 
 ### Signal events

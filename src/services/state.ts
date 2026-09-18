@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
   notification_key TEXT PRIMARY KEY, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
   last_error TEXT, created_at TEXT NOT NULL, delivered_at TEXT
 );
+CREATE TABLE IF NOT EXISTS feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL, dedup_key TEXT,
+  label TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_seen_created ON seen (created_at);
 CREATE INDEX IF NOT EXISTS idx_seen_importance ON seen (importance);
@@ -127,6 +131,8 @@ export interface NotificationOutboxRow {
   lastError: string | null;
   createdAt: string;
 }
+
+export type FeedbackLabel = 'false_positive' | 'missed' | 'handled' | 'correct';
 
 function now(): string {
   return new Date().toISOString();
@@ -362,6 +368,41 @@ export class StateStore {
       'SELECT COUNT(*) AS n FROM notification_outbox WHERE delivered_at IS NULL',
     ).get() as Record<string, unknown>;
     return Number(row['n'] ?? 0);
+  }
+
+  recordFeedback(messageId: string, label: FeedbackLabel, note = ''): void {
+    const row = this.db.prepare(
+      'SELECT dedup_key FROM seen WHERE message_id = ? OR dedup_key = ? LIMIT 1',
+    ).get(messageId, messageId) as Record<string, unknown> | undefined;
+    this.db.prepare(
+      'INSERT INTO feedback (message_id, dedup_key, label, note, created_at) VALUES (?, ?, ?, ?, ?)',
+    ).run(messageId, row ? String(row['dedup_key']) : null, label, note.slice(0, 1000), now());
+  }
+
+  feedbackSummary(): Record<string, number> {
+    const summary: Record<string, number> = {};
+    for (const row of this.db.prepare(
+      'SELECT label, COUNT(*) AS n FROM feedback GROUP BY label ORDER BY label',
+    ).all() as Array<Record<string, unknown>>) {
+      summary[String(row['label'])] = Number(row['n']);
+    }
+    return summary;
+  }
+
+  observability(): Record<string, unknown> {
+    const totals = this.db.prepare(
+      `SELECT COUNT(*) AS total, COALESCE(SUM(pushed), 0) AS pushed,
+              COALESCE(SUM(CASE WHEN importance IS NULL THEN 1 ELSE 0 END), 0) AS undecided
+       FROM seen`,
+    ).get() as Record<string, unknown>;
+    return {
+      seenTotal: Number(totals['total']),
+      pushedTotal: Number(totals['pushed']),
+      undecidedTotal: Number(totals['undecided']),
+      deadLetterTotal: this.listDeadLetters(200).length,
+      notificationOutboxPending: this.notificationOutboxPending(),
+      feedback: this.feedbackSummary(),
+    };
   }
 
   // ---- Queries (MCP and troubleshooting) ----
