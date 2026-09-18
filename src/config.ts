@@ -66,6 +66,8 @@ export interface Rules {
   neverImportant: string[];
   keywords: string[];
   context: string;
+  feedbackAlwaysImportant?: string[];
+  feedbackNeverImportant?: string[];
 }
 
 export interface WatchConfig {

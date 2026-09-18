@@ -196,6 +196,11 @@ export class Watcher {
     return message.inSpam ? rank(result) + Math.max(0, bonus) : rank(result);
   }
 
+  private triageRules() {
+    const feedback = this.state.feedbackRuleHints(2);
+    return { ...this.config.rules, feedbackAlwaysImportant: feedback.alwaysImportant, feedbackNeverImportant: feedback.neverImportant };
+  }
+
   private async flushNotificationOutbox(): Promise<void> {
     for (const entry of this.state.pendingNotifications()) {
       const delivered = await this.sink.push(entry.message, entry.result);
@@ -243,7 +248,7 @@ export class Watcher {
       void task.catch((e) => log.error(`Failed to send LLM availability alert: ${e}`));
     };
 
-    for (const [message, result] of await triage(messages, this.config.rules, onLlmResult)) {
+    for (const [message, result] of await triage(messages, this.triageRules(), onLlmResult)) {
       metrics.addCounter('mailsift.messages.triaged', 1, {
         provider: message.provider,
         importance: result.importance,

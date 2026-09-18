@@ -77,6 +77,8 @@ MCP 恢复工具提供 `recovery_status` 和 `retry_dead_letter`。重试只会�
 
 MCP 还提供 `observability` 查看处理、投递、dead-letter 和反馈统计，以及 `record_feedback` 记录 `false_positive`、`missed`、`handled`、`correct`。反馈会保存下来，供后续规则和分类评估使用。
 
+同一发件人累计两次 `missed` 反馈会推断为重要发件人，两次 `false_positive` 会推断为低优先级发件人；显式环境规则优先。可通过 MCP `feedback_rules` 查看推断规则。
+
 状态保存在 SQLite 的 `data/mailsift.db` 中，Docker 使用 `mailsift-data` 命名卷持久化。
 
 ## OpenTelemetry 指标

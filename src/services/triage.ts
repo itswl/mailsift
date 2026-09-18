@@ -138,6 +138,20 @@ export function applyRules(message: MailMessage, rules: Rules): TriageResult | u
       decidedBy: 'rule', summary: '', reason: `Sender matched never-important rule "${deny}"`, deadline: '',
     };
   }
+  const feedbackAllow = matches(message, rules.feedbackAlwaysImportant ?? []);
+  if (feedbackAllow) {
+    return {
+      importance: 'critical', score: 100, category: 'Feedback rule', actionRequired: true,
+      decidedBy: 'rule', summary: '', reason: `Feedback marked sender important "${feedbackAllow}"`, deadline: '',
+    };
+  }
+  const feedbackDeny = matches(message, rules.feedbackNeverImportant ?? []);
+  if (feedbackDeny) {
+    return {
+      importance: 'info', score: 0, category: 'Feedback rule', actionRequired: false,
+      decidedBy: 'rule', summary: '', reason: `Feedback marked sender low priority "${feedbackDeny}"`, deadline: '',
+    };
+  }
   return undefined;
 }
 

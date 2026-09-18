@@ -135,6 +135,19 @@ describe('maintenance', () => {
     expect(s.observability()).toMatchObject({ seenTotal: 1, pushedTotal: 1, feedback: { false_positive: 1, handled: 1 } });
   });
 
+  it('infers sender rules only after repeated feedback', () => {
+    const s = store();
+    for (const [key, label] of [['missed-1', 'missed'], ['missed-2', 'missed'], ['false-1', 'false_positive'], ['false-2', 'false_positive']] as const) {
+      s.markSeen(key, 'me@qq.com', key);
+      s.recordOutcome(key, 'info', false, { messageId: `<${key}@x>`, sender: label === 'missed' ? 'important@example.com' : 'noise@example.com' });
+      s.recordFeedback(`<${key}@x>`, label);
+    }
+    expect(s.feedbackRuleHints(2)).toEqual({
+      alwaysImportant: ['important@example.com'],
+      neverImportant: ['noise@example.com'],
+    });
+  });
+
   it('finds and clears interrupted records without outcomes', () => {
     const s = store();
     s.markSeen('stuck', 'me@qq.com', '被中断');

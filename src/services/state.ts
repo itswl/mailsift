@@ -389,6 +389,24 @@ export class StateStore {
     return summary;
   }
 
+  feedbackRuleHints(minSamples = 2): { alwaysImportant: string[]; neverImportant: string[] } {
+    const rows = this.db.prepare(
+      `SELECT s.sender, f.label, COUNT(*) AS n
+       FROM feedback f JOIN seen s ON s.dedup_key = f.dedup_key
+       WHERE s.sender IS NOT NULL AND s.sender != ''
+         AND f.label IN ('missed', 'false_positive')
+       GROUP BY s.sender, f.label HAVING COUNT(*) >= ?`,
+    ).all(Math.max(1, minSamples)) as Array<Record<string, unknown>>;
+    const alwaysImportant: string[] = [];
+    const neverImportant: string[] = [];
+    for (const row of rows) {
+      const sender = String(row['sender']).toLowerCase();
+      if (row['label'] === 'missed') alwaysImportant.push(sender);
+      if (row['label'] === 'false_positive') neverImportant.push(sender);
+    }
+    return { alwaysImportant, neverImportant };
+  }
+
   observability(): Record<string, unknown> {
     const totals = this.db.prepare(
       `SELECT COUNT(*) AS total, COALESCE(SUM(pushed), 0) AS pushed,

@@ -229,6 +229,13 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
   );
 
   server.tool(
+    'feedback_rules',
+    'Show sender rules inferred from at least two missed or false-positive feedback records.',
+    {},
+    async () => json(store.feedbackRuleHints(2)),
+  );
+
+  server.tool(
     'list_accounts',
     'List monitored accounts, folders, and authentication methods.',
     {},

@@ -53,6 +53,16 @@ describe('rule layer', () => {
   it('passes unmatched messages to the next layer', () => {
     expect(applyRules(makeMessage({ fromAddr: 'random@x.com' }), RULES)).toBeUndefined();
   });
+
+  it('keeps explicit sender rules ahead of feedback rules', () => {
+    const message = makeMessage({ fromAddr: 'explicit@example.com' });
+    const result = applyRules(message, {
+      ...RULES,
+      neverImportant: ['explicit@example.com'],
+      feedbackAlwaysImportant: ['explicit@example.com'],
+    });
+    expect(result?.importance).toBe('info');
+  });
 });
 
 describe('keyword fallback', () => {

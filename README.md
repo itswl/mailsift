@@ -90,6 +90,8 @@ The MCP recovery tools expose `recovery_status` and `retry_dead_letter`. Retryin
 
 MCP also provides `observability` for processing, delivery, dead-letter, and feedback totals, plus `record_feedback` with `false_positive`, `missed`, `handled`, and `correct` labels. Feedback is stored for later rule and triage evaluation.
 
+After two feedback records for the same sender, `missed` feedback infers an always-important rule and `false_positive` feedback infers a never-important rule. Explicit environment rules take precedence; inspect inferred rules with MCP `feedback_rules`.
+
 State is stored in SQLite (`data/mailsift.db`). Docker persists it in the `mailsift-data` named volume.
 
 ## OpenTelemetry metrics
