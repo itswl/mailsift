@@ -1,7 +1,7 @@
 /**
- * Outputs: Feishu and WebhookWise can be enabled together.
+ * Outputs: Feishu and a generic webhook can be enabled together.
  *
- * WebhookWise authentication uses a token header. Its signature modes sign
+ * The webhook authentication uses a token header. Its signature modes sign
  * different payloads, so one header cannot satisfy both replay protection checks.
  */
 import { snippet, type MailMessage } from '../imap/message.js';
@@ -15,7 +15,7 @@ const log = getLogger('sink');
 const MAX_SNIPPET = 600;
 
 /**
- * Build a WebhookWise inbound event.
+ * Build a generic webhook inbound event.
  *
  * Keep fields under mail / triage to avoid generic_json adapter detection and
  * keep mailsift.yaml detection specific. The source-neutral signal is additive
@@ -68,7 +68,7 @@ export class WebhookWiseSink implements Sink {
 
   async push(message: MailMessage, result: TriageResult): Promise<boolean> {
     if ((process.env.DRY_RUN ?? '').toLowerCase() === 'true') {
-      log.info(`[dry-run] Would send to WebhookWise | ${result.importance} | ${message.subject}`);
+      log.info(`[dry-run] Would send to generic webhook | ${result.importance} | ${message.subject}`);
       return true;
     }
     if (!this.configured) return false;
@@ -84,13 +84,13 @@ export class WebhookWiseSink implements Sink {
         signal: AbortSignal.timeout(30_000),
       });
       if (!response.ok) {
-        log.error(`WebhookWise push rejected | HTTP ${response.status} | ${message.subject}`);
+        log.error(`Generic webhook push rejected | HTTP ${response.status} | ${message.subject}`);
         return false;
       }
-      log.info(`WebhookWise delivered | ${result.importance} | ${message.subject}`);
+      log.info(`Generic webhook delivered | ${result.importance} | ${message.subject}`);
       return true;
     } catch (error) {
-      log.error(`WebhookWise push failed | ${message.subject} | ${error}`);
+      log.error(`Generic webhook push failed | ${message.subject} | ${error}`);
       return false;
     }
   }

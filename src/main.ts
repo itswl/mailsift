@@ -69,7 +69,7 @@ async function checkConfig(): Promise<number> {
     outlets += 1;
     let host = 'configured';
     try { host = new URL(new WebhookWiseSink().endpoint).host; } catch { /* report configured only */ }
-    console.log(`✅ Output WebhookWise: configured (${host})`);
+    console.log(`✅ Output generic webhook: configured (${host})`);
     if (!process.env.WEBHOOKWISE_TOKEN?.trim()) {
       console.log('   ⚠️  WEBHOOKWISE_TOKEN is not set; an authenticated endpoint will reject requests.');
     }

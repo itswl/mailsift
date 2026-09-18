@@ -2,7 +2,7 @@ import { dedupKey, type MailMessage } from '../imap/message.js';
 import { headline, type TriageResult } from './triage.js';
 
 /**
- * The source-neutral event sent alongside the legacy WebhookWise payload.
+ * The source-neutral event sent alongside the legacy webhook payload.
  *
  * It deliberately contains a useful summary but no message body. Consumers
  * that need more context can use the MCP evidence reference to query mailsift.

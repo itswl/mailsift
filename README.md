@@ -1,10 +1,10 @@
 # mailsift
 
-Unified IMAP monitoring for important email. mailsift scans every configured mailbox—including spam folders—uses an LLM plus local rules to classify messages, and sends important results to Feishu or WebhookWise.
+Unified IMAP monitoring for important email. mailsift scans every configured mailbox—including spam folders—uses an LLM plus local rules to classify messages, and sends important results to Feishu or a generic webhook.
 
 > mailsift is an assistant, not a mail client. It is read-only: it does not send, reply to, organize, or mark messages as read. Classification can be wrong, so keep using your mail client as the source of truth.
 
-Chinese documentation: [README.zh-CN.md](README.zh-CN.md).
+中文文档：[README.zh-CN.md](README.zh-CN.md)。
 
 ## Features
 
@@ -102,7 +102,7 @@ Metrics are instrumented with OpenTelemetry and disabled by default. Set `OTEL_E
 
 ### Signal events
 
-WebhookWise deliveries retain the existing `mail` / `triage` payload and add a
+Webhook deliveries retain the existing `mail` / `triage` payload and add a
 small source-neutral `signal.v1` event. It carries the triage summary and an
 authenticated MCP lookup reference instead of copying the raw message body. The
 MCP reference can fetch a bounded normalized body from IMAP on demand without

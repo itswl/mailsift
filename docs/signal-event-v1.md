@@ -1,6 +1,6 @@
 # mailsift signal event v1
 
-mailsift keeps the existing `mail` / `triage` WebhookWise payload and adds a
+mailsift keeps the existing `mail` / `triage` webhook payload and adds a
 source-neutral `signal` object. This lets a downstream work system consume a
 small event without copying the message body through every hop.
 
