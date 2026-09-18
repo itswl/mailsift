@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import './setup.js';
 import { makeMessage, makeResult } from './helpers.js';
-import { buildCard, sign } from '../src/services/feishu.js';
-import { buildWebhookPayload } from '../src/services/sink.js';
+import { buildCard, FeishuSink, sign } from '../src/services/feishu.js';
+import { buildWebhookPayload, CompositeSink } from '../src/services/sink.js';
 import { buildLink } from '../src/links.js';
 
 function cardBody(card: Record<string, unknown>): string {
@@ -114,5 +114,20 @@ describe('signatures and WebhookWise payloads', () => {
 
   it('keeps the legacy mail / triage shape while adding the source-neutral signal', () => {
     expect(Object.keys(buildWebhookPayload(makeMessage(), makeResult())).sort()).toEqual(['mail', 'signal', 'triage']);
+  });
+});
+
+describe('delivery semantics', () => {
+  it('reports a Feishu-filtered message as not delivered', async () => {
+    process.env.FEISHU_MIN_IMPORTANCE = 'critical';
+    const sink = new FeishuSink('https://example.invalid/hook');
+    expect(await sink.push(makeMessage(), makeResult({ importance: 'warning' }))).toBe(false);
+  });
+
+  it('does not let a declined output mask a failed output', async () => {
+    const declined = { configured: true, push: async () => false };
+    const failed = { configured: true, push: async () => false };
+    const sink = new CompositeSink([declined, failed]);
+    expect(await sink.push(makeMessage(), makeResult())).toBe(false);
   });
 });

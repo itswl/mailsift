@@ -16,7 +16,7 @@ describe('IMAP fetch caps', () => {
     expect(selectFetchUids([1, 2, 3], 0, 0)).toEqual([]);
   });
 
-  it('skips an oversized fresh lookback instead of partially backfilling it', () => {
+  it('detects an oversized fresh lookback for bounded backfill', () => {
     expect(isOversizedLookback(Array.from({ length: 500 }, (_, i) => i + 1), 500)).toBe(false);
     expect(isOversizedLookback(Array.from({ length: 501 }, (_, i) => i + 1), 500)).toBe(true);
   });

@@ -78,8 +78,9 @@ export class Watcher {
     try {
       const folders = await targetFolders(client, account);
       if (folders.length === 0) {
-        log.warn(`[${account.name}] no selectable folders to scan`);
-        return { messages, cursors };
+        const failure = `no selectable folders to scan; configured folders: ${account.folders.join(', ')}`;
+        log.error(`[${account.name}] ${failure}`);
+        return { messages, cursors, failures: [failure] };
       }
       log.info(
         `[${account.name}] scanning folders: ${folders

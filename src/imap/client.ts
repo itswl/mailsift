@@ -205,21 +205,20 @@ export async function fetchNew(
     const found = await client.search(fresh ? { since } : { uid: `${floor + 1}:*` }, { uid: true });
     const foundUids = found || [];
 
-    if (fresh) {
-      const maxLookback = intEnv('MAX_MESSAGES_PER_LOOKBACK', 500);
-      if (isOversizedLookback(foundUids, maxLookback)) {
-        const lastUid = Math.max(...foundUids);
-        log.warn(
-          `[${account.name}/${folder.path}] lookback returned ${foundUids.length} messages, over the ${maxLookback} limit; ` +
-            `skipping the batch and advancing the cursor to UID ${lastUid}`,
-        );
-        return { messages: [], cursor: { uidValidity, lastUid } };
-      }
-    }
-
     // `UID n:*` can include the last message as a fallback. Filter again here.
     // Take the oldest batch so a cap cannot skip older mail.
-    const limit = Math.min(maxPerPoll, budget?.remaining ?? maxPerPoll);
+    const maxLookback = intEnv('MAX_MESSAGES_PER_LOOKBACK', 500);
+    let limit = Math.min(maxPerPoll, budget?.remaining ?? maxPerPoll);
+    if (fresh && isOversizedLookback(foundUids, maxLookback)) {
+      // Do not advance past an oversized initial backlog. Fetch the oldest
+      // bounded chunk instead; the returned cursor turns the next poll into a
+      // normal UID-incremental poll, so every message is eventually covered.
+      limit = Math.min(limit, maxLookback);
+      log.warn(
+        `[${account.name}/${folder.path}] lookback returned ${foundUids.length} messages, over the ${maxLookback} limit; ` +
+          `processing the oldest chunk of ${limit} instead of skipping the backlog`,
+      );
+    }
     const uids = selectFetchUids(foundUids, floor, limit);
     if (budget) budget.remaining -= uids.length;
     if (uids.length === 0) {

@@ -100,7 +100,7 @@ async function checkConfig(): Promise<number> {
       `digest: ${(process.env.DIGEST_ENABLED ?? 'true') === 'false' ? 'disabled' : `daily at ${process.env.DIGEST_HOUR ?? 9}:00`}`,
   );
   console.log(`   Total per-poll backfill limit: ${process.env.MAX_MESSAGES_PER_POLL_TOTAL ?? 500}`);
-  console.log(`   Fresh lookbacks over ${process.env.MAX_MESSAGES_PER_LOOKBACK ?? 500} are skipped`);
+  console.log(`   Fresh lookbacks are backfilled in chunks of ${process.env.MAX_MESSAGES_PER_LOOKBACK ?? 500}`);
 
   return problems ? 1 : 0;
 }

@@ -7,7 +7,7 @@
  * access_token values are short-lived; refresh_token values are persisted.
  * Initial authorization is handled by scripts/oauth-setup.ts.
  */
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { getLogger } from '../logger.js';
@@ -35,6 +35,28 @@ export interface TokenRecord {
   refreshToken: string;
   accessToken: string;
   expiresAt: number;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseTokenStore(value: unknown): Record<string, TokenRecord> {
+  if (!isRecord(value)) throw new AuthError('Token store must contain a JSON object');
+  const records: Record<string, TokenRecord> = {};
+  for (const [username, raw] of Object.entries(value)) {
+    if (!isRecord(raw) || typeof raw.refreshToken !== 'string' || !raw.refreshToken ||
+        typeof raw.accessToken !== 'string' || typeof raw.expiresAt !== 'number' ||
+        !Number.isFinite(raw.expiresAt)) {
+      throw new AuthError(`Token store record for ${username} is invalid`);
+    }
+    records[username] = {
+      refreshToken: raw.refreshToken,
+      accessToken: raw.accessToken,
+      expiresAt: raw.expiresAt,
+    };
+  }
+  return records;
 }
 
 export function tokenStorePath(): string {
@@ -98,12 +120,21 @@ export class TokenStore {
   constructor(private readonly path: string = tokenStorePath()) {}
 
   private async readAll(): Promise<Record<string, TokenRecord>> {
+    let raw: string;
     try {
-      return JSON.parse(await readFile(this.path, 'utf8')) as Record<string, TokenRecord>;
+      raw = await readFile(this.path, 'utf8');
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code !== 'ENOENT') log.error(`Cannot read token file; treating it as empty: ${this.path} -> ${error}`);
-      return {};
+      if (code === 'ENOENT') return {};
+      log.error(`Cannot read token file safely: ${this.path} -> ${error}`);
+      throw new AuthError('Token store cannot be read; refusing to replace it');
+    }
+    try {
+      return parseTokenStore(JSON.parse(raw) as unknown);
+    } catch (error) {
+      if (error instanceof AuthError) throw error;
+      log.error(`Cannot parse token file safely: ${this.path} -> ${error}`);
+      throw new AuthError('Token store is not valid JSON; refusing to replace it');
     }
   }
 
@@ -115,23 +146,58 @@ export class TokenStore {
     const previous = TokenStore.saveQueues.get(this.path) ?? Promise.resolve();
     let current: Promise<void>;
     current = previous.catch(() => undefined).then(async () => {
-      const all = await this.readAll();
-      all[username] = record;
+      // The lock directory lives beside the token file, so create its parent
+      // before attempting to acquire it on first use.
       await mkdir(dirname(this.path), { recursive: true });
-      const tmp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
-      try {
-        await writeFile(tmp, JSON.stringify(all, null, 2), 'utf8');
-        await chmod(tmp, 0o600);
-        await rename(tmp, this.path);
-      } finally {
-        await unlink(tmp).catch(() => undefined);
-      }
+      await this.withFileLock(async () => {
+        const all = await this.readAll();
+        all[username] = record;
+        const tmp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
+        try {
+          await writeFile(tmp, JSON.stringify(all, null, 2), 'utf8');
+          await chmod(tmp, 0o600);
+          await rename(tmp, this.path);
+        } finally {
+          await unlink(tmp).catch(() => undefined);
+        }
+      });
     });
     TokenStore.saveQueues.set(this.path, current);
     try {
       await current;
     } finally {
       if (TokenStore.saveQueues.get(this.path) === current) TokenStore.saveQueues.delete(this.path);
+    }
+  }
+
+  private async withFileLock<T>(work: () => Promise<T>): Promise<T> {
+    const lockPath = `${this.path}.lock`;
+    const started = Date.now();
+    for (;;) {
+      try {
+        await mkdir(lockPath);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        try {
+          const age = Date.now() - (await stat(lockPath)).mtimeMs;
+          if (age > 60_000) {
+            await rm(lockPath, { recursive: true, force: true });
+            continue;
+          }
+        } catch {
+          // The owner may have released the lock between stat and retry.
+        }
+        if (Date.now() - started > 30_000) {
+          throw new AuthError('Timed out waiting for the token store lock');
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    try {
+      return await work();
+    } finally {
+      await rm(lockPath, { recursive: true, force: true });
     }
   }
 
@@ -179,15 +245,23 @@ export function exchangeCode(
  * previous value or one refresh would lose the long-lived credential.
  */
 export function buildTokenRecord(payload: unknown, previous?: TokenRecord): TokenRecord {
-  const data = payload as { refresh_token?: string; access_token?: string; expires_in?: number };
+  if (!isRecord(payload)) throw new AuthError('Authorization response is not an object');
+  const data = payload as { refresh_token?: unknown; access_token?: unknown; expires_in?: unknown };
   const refreshToken = data.refresh_token ?? previous?.refreshToken;
-  if (!refreshToken) {
+  if (typeof refreshToken !== 'string' || !refreshToken) {
     throw new AuthError('Authorization response has no refresh_token and no previous value is available');
+  }
+  if (typeof data.access_token !== 'string' || !data.access_token) {
+    throw new AuthError('Authorization response has no access_token');
+  }
+  const expiresIn = data.expires_in === undefined ? 3600 : Number(data.expires_in);
+  if (!Number.isFinite(expiresIn) || expiresIn <= 0) {
+    throw new AuthError('Authorization response has an invalid expires_in');
   }
   return {
     refreshToken,
-    accessToken: data.access_token ?? '',
-    expiresAt: Date.now() / 1000 + (data.expires_in ?? 3600),
+    accessToken: data.access_token,
+    expiresAt: Date.now() / 1000 + expiresIn,
   };
 }
 

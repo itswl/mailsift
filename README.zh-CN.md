@@ -67,7 +67,7 @@ docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual
 
 ## 轮询和补账限制
 
-首次扫描使用 `INITIAL_LOOKBACK_DAYS`（默认 3 天）。如果首次扫描或 UIDVALIDITY 变化后的单个文件夹回看超过 `MAX_MESSAGES_PER_LOOKBACK`（默认 500）封，整批跳过并将游标推进到返回结果中的最大 UID，避免反复补账。
+首次扫描使用 `INITIAL_LOOKBACK_DAYS`（默认 3 天）。如果首次扫描或 UIDVALIDITY 变化后的单个文件夹回看超过 `MAX_MESSAGES_PER_LOOKBACK`（默认 500）封，mailsift 会先处理最旧的一批，后续轮询继续补账；不会为了避免重复补账而越过尚未处理的邮件。
 
 单个文件夹每轮最多处理 `MAX_MESSAGES_PER_POLL`（默认 200）封。所有账号和文件夹合计受 `MAX_MESSAGES_PER_POLL_TOTAL`（默认 500）限制。普通全局上限触发时，尚未处理的文件夹保留游标，下一轮继续。UID 按从老到新处理，避免截断时跳过旧邮件。
 

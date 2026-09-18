@@ -121,7 +121,10 @@ export class FeishuSink implements Sink {
 
   async push(message: MailMessage, result: TriageResult): Promise<boolean> {
     const isDigest = Boolean(message.extra?.['digest']);
-    if (!isDigest && rank(result) < this.threshold) return true;
+    // This output intentionally did not send the message. Returning false lets
+    // CompositeSink try other outputs and lets the watcher queue a digest when
+    // every configured output declines or fails.
+    if (!isDigest && rank(result) < this.threshold) return false;
 
     const payload = buildCard(message, result) as Record<string, unknown>;
     if (this.secret) {
