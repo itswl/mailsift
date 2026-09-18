@@ -92,6 +92,10 @@ MCP also provides `observability` for processing, delivery, dead-letter, and fee
 
 State is stored in SQLite (`data/mailsift.db`). Docker persists it in the `mailsift-data` named volume.
 
+## OpenTelemetry metrics
+
+Metrics are instrumented with OpenTelemetry and disabled by default. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to send OTLP metrics to an OpenTelemetry Collector. The instruments cover poll duration, account outcomes, triage decisions, notifications, dead letters, and the outbox. Attributes intentionally use only low-cardinality values such as provider, outcome, channel, importance, and decision source.
+
 ### Signal events
 
 WebhookWise deliveries retain the existing `mail` / `triage` payload and add a

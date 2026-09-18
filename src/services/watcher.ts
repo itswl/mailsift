@@ -19,6 +19,7 @@ import * as health from './health.js';
 import type { Sink } from './sink.js';
 import type { StateStore } from './state.js';
 import { getLogger } from '../logger.js';
+import { metrics } from '../metrics.js';
 
 const log = getLogger('watcher');
 
@@ -145,6 +146,10 @@ export class Watcher {
           }
           messages.push(...result.messages);
           cursors.push(...result.cursors);
+          metrics.addCounter('mailsift.accounts.processed', 1, {
+            provider: account.provider,
+            outcome: failures.length === 0 ? 'success' : 'partial_failure',
+          });
           for (const dead of result.deadLetters ?? []) {
             deadLetters.push({ ...dead, account: account.username });
           }
@@ -160,6 +165,7 @@ export class Watcher {
           await health
             .recordAccountFailure(this.state, this.sink, account, error)
             .catch((e) => log.error(`Failed to send account failure alert: ${e}`));
+          metrics.addCounter('mailsift.accounts.processed', 1, { provider: account.provider, outcome: 'failure' });
         }
       }
     };
@@ -196,8 +202,10 @@ export class Watcher {
       if (delivered) {
         this.state.markNotificationDelivered(entry.notificationKey);
         this.state.clearDigest([entry.notificationKey]);
+        metrics.addCounter('mailsift.notifications.delivered', 1, { channel: 'outbox_retry' });
       } else {
         this.state.markNotificationFailed(entry.notificationKey, 'sink delivery failed');
+        metrics.addCounter('mailsift.notifications.failed', 1, { channel: 'outbox_retry' });
       }
     }
   }
@@ -236,6 +244,11 @@ export class Watcher {
     };
 
     for (const [message, result] of await triage(messages, this.config.rules, onLlmResult)) {
+      metrics.addCounter('mailsift.messages.triaged', 1, {
+        provider: message.provider,
+        importance: result.importance,
+        decided_by: result.decidedBy,
+      });
       // Create the seen row before the outcome. An interruption before completion
       // leaves the message eligible for the next poll.
       const key = dedupKey(message);
@@ -252,10 +265,12 @@ export class Watcher {
         const delivered = await this.sink.push(message, result);
         if (delivered) {
           this.state.markNotificationDelivered(key);
+          metrics.addCounter('mailsift.notifications.delivered', 1, { channel: 'realtime' });
           stats.pushed += 1;
           if (message.inSpam) stats.spamRescued += 1;
         } else {
           this.state.markNotificationFailed(key, 'sink delivery failed');
+          metrics.addCounter('mailsift.notifications.failed', 1, { channel: 'realtime' });
         }
         this.state.recordOutcome(key, result.importance, delivered, fields);
         if (delivered) continue;
@@ -293,6 +308,8 @@ export class Watcher {
 
   async pollOnce(): Promise<PollStats> {
     const stats = newStats();
+    const started = performance.now();
+    metrics.addCounter('mailsift.polls.started');
     await this.flushNotificationOutbox();
     const { messages, cursors, deadLetters } = await this.collectAll(stats);
 
@@ -312,6 +329,7 @@ export class Watcher {
         subject: dead.subject,
         reason: dead.reason,
       });
+      metrics.addCounter('mailsift.dead_letters.created', 1, { reason: dead.reason.includes('size') ? 'oversized' : 'parse' });
     }
 
     // Only after triage and delivery complete are these UIDs safe to advance.
@@ -334,6 +352,8 @@ export class Watcher {
 
     // Write the heartbeat last: a poll stuck in IMAP must not appear healthy.
     this.state.setMeta(HEARTBEAT_KEY, new Date().toISOString());
+    metrics.recordHistogram('mailsift.poll.duration_ms', performance.now() - started);
+    metrics.addCounter('mailsift.polls.completed');
     log.info(summarizeStats(stats));
     return stats;
   }

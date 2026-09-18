@@ -79,6 +79,10 @@ MCP 还提供 `observability` 查看处理、投递、dead-letter 和反馈统�
 
 状态保存在 SQLite 的 `data/mailsift.db` 中，Docker 使用 `mailsift-data` 命名卷持久化。
 
+## OpenTelemetry 指标
+
+指标使用 OpenTelemetry，默认关闭。设置 `OTEL_EXPORTER_OTLP_ENDPOINT` 后即可把 OTLP 指标发送到 OpenTelemetry Collector，覆盖轮询耗时、账号结果、分类决策、通知、dead-letter 和 outbox。指标属性只使用 provider、结果、通道、重要性和决策来源等低基数值，不放邮箱地址、Message-ID 或主题。
+
 ## 运行和恢复
 
 ```bash

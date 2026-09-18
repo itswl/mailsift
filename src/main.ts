@@ -17,6 +17,7 @@ import { sendDigest } from './services/digest.js';
 import { recordStartupFailure } from './services/health.js';
 import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
 import { getLogger } from './logger.js';
+import { metrics } from './metrics.js';
 
 const log = getLogger('main');
 
@@ -215,6 +216,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     process.on(signal, () => {
       log.info(`Received ${signal}; exiting after the current poll.`);
       stopping = true;
+      void metrics.shutdown().catch((error) => log.warn(`Failed to flush OTel metrics: ${error}`));
     });
   }
   await runForever(watcher);
