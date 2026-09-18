@@ -64,6 +64,16 @@ describe('rendering', () => {
     expect(body.indexOf('需要今天处理')).toBeLessThan(body.indexOf('仅供了解'));
   });
 
+  it('collapses messages that share an IMAP reply thread', () => {
+    const body = renderDigest([
+      toDigestItem(makeMessage({ messageId: '<root@x>', threadKey: 'me@qq.com|<root@x>' }), makeResult({ summary: '原始问题' })),
+      toDigestItem(makeMessage({ messageId: '<reply@x>', threadKey: 'me@qq.com|<root@x>', date: '2026-09-17T10:00:00.000Z' }), makeResult({ summary: '最新回复' })),
+    ]);
+    expect(body).toContain('2 messages');
+    expect(body).toContain('最新回复');
+    expect(body).not.toContain('原始问题');
+  });
+
   it('escapes Markdown control characters from mail data', () => {
     const row = toDigestItem(
       makeMessage({ fromName: '*sender* [external]' }),

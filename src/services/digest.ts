@@ -28,6 +28,8 @@ export interface DigestItem {
   summary: string;
   deadline: string;
   actionRequired: boolean;
+  threadKey?: string;
+  threadCount: number;
   date: string;
 }
 
@@ -44,6 +46,8 @@ export function toDigestItem(message: MailMessage, result: TriageResult): Digest
     summary: headline(result),
     deadline: result.deadline,
     actionRequired: result.actionRequired,
+    ...(message.threadKey ? { threadKey: message.threadKey } : {}),
+    threadCount: 1,
     date: message.date,
   };
 }
@@ -53,7 +57,23 @@ function line(item: DigestItem): string {
   const gist = (item.summary || '').trim();
   const shown = gist.length > 90 ? `${gist.slice(0, 90)}…` : gist;
   const marker = item.actionRequired ? '⚠️ ' : '';
-  return `- ${marker}**${markdownText(sender)}**: ${markdownText(shown)}${item.deadline ? ` ⏰${markdownText(item.deadline)}` : ''}`;
+  const count = item.threadCount > 1 ? ` (${item.threadCount} messages)` : '';
+  return `- ${marker}**${markdownText(sender)}**: ${markdownText(shown)}${count}${item.deadline ? ` ⏰${markdownText(item.deadline)}` : ''}`;
+}
+
+function collapseThreads(items: DigestItem[]): DigestItem[] {
+  const grouped = new Map<string, DigestItem>();
+  for (const [index, item] of items.entries()) {
+    const key = item.threadKey || `unthreaded-${index}`;
+    const existing = grouped.get(key);
+    if (!existing) {
+      grouped.set(key, { ...item, threadCount: item.threadCount || 1 });
+      continue;
+    }
+    existing.threadCount += item.threadCount || 1;
+    if (item.date > existing.date) grouped.set(key, { ...item, threadCount: existing.threadCount });
+  }
+  return [...grouped.values()];
 }
 
 function urgency(item: DigestItem): number {
@@ -64,18 +84,20 @@ function urgency(item: DigestItem): number {
 export function renderDigest(items: DigestItem[]): string {
   if (items.length === 0) return 'No messages require review from the past day.';
 
-  const spam = items.filter((i) => i.inSpam);
-  const inbox = items.filter((i) => !i.inSpam);
+  const visibleItems = collapseThreads(items);
+
+  const spam = visibleItems.filter((i) => i.inSpam);
+  const inbox = visibleItems.filter((i) => !i.inSpam);
 
   const counts = new Map<string, number>();
-  for (const item of items) {
+  for (const item of visibleItems) {
     const key = item.category || 'Uncategorized';
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   const ordered = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 
   const lines = [
-    `**${items.length} messages**  inbox ${inbox.length} · spam ${spam.length}`,
+    `**${items.length} messages**  ${visibleItems.length} threads · inbox ${inbox.length} · spam ${spam.length}`,
     ordered.slice(0, 8).map(([name, n]) => `${markdownText(name)} ${n}`).join('  '),
   ];
 

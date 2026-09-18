@@ -183,6 +183,9 @@ async function toMailMessage(
       .filter(Boolean),
     date: normalizeDate(envelope?.date),
     body,
+    ...(envelope?.inReplyTo?.trim()
+      ? { threadKey: `${account.username}|${envelope.inReplyTo.trim().toLowerCase()}` }
+      : { threadKey: `${account.username}|${messageId.toLowerCase()}` }),
     hasAttachments,
     listUnsubscribe: /^list-unsubscribe:/im.test(headers),
   };

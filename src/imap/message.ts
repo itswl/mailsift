@@ -12,6 +12,8 @@ export interface MailMessage {
   inSpam: boolean;
   uid: number;
   messageId: string;
+  /** Stable conversation key from In-Reply-To, or the message itself when absent. */
+  threadKey?: string;
   subject: string;
   fromAddr: string;
   fromName: string;
