@@ -176,7 +176,7 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
       return {
         contents: [{
           uri: uri.href,
-          mimeType: 'text/plain',
+          mimeType: 'application/json',
           text: JSON.stringify({
             account: message.account,
             messageId: message.messageId,

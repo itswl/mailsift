@@ -308,6 +308,13 @@ async function classifyBatch(
     const content = (raw as { choices?: Array<{ message?: { content?: string } }> }).choices?.[0]?.message
       ?.content;
     parsed = LlmResponse.parse(extractJson(content ?? ''));
+    const indices = new Set<number>();
+    for (const item of parsed.results) {
+      if (item.index >= messages.length || indices.has(item.index)) {
+        throw new Error(`LLM returned duplicate or out-of-range index=${item.index}`);
+      }
+      indices.add(item.index);
+    }
   } catch (error) {
     log.error(`LLM triage failed; using keyword fallback for the batch: ${error}`);
     onLlmResult?.(error);

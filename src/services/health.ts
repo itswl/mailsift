@@ -217,7 +217,7 @@ export async function recordLlmFailure(state: StateStore, sink: Sink, error: unk
     healthMessage('⚠️ LLM unavailable: triage downgraded', body, 'llm', hourStamp()),
     critical(`${process.env.LLM_MODEL ?? 'LLM'} failed ${failures} consecutive times; triage uses keyword fallback`),
   );
-  state.setMeta(LLM_ALERTED_AT_KEY, new Date().toISOString());
+  if (sent) state.setMeta(LLM_ALERTED_AT_KEY, new Date().toISOString());
   log.error(`LLM outage alert sent=${sent}: ${error}`);
   return true;
 }

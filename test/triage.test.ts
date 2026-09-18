@@ -116,6 +116,19 @@ describe('LLM layer', () => {
     expect(results[1]![1].decidedBy).toBe('fallback');
   });
 
+  it('falls back for a batch with duplicate model indices', async () => {
+    mockLlm([
+      { index: 0, importance: 'critical', score: 90, reason: 'first' },
+      { index: 0, importance: 'info', score: 1, reason: 'duplicate' },
+    ]);
+    process.env.LLM_API_KEY = 'k';
+    const results = await triage(
+      [makeMessage({ subject: '验证码', messageId: '<1@x>' }), makeMessage({ messageId: '<2@x>' })],
+      RULES,
+    );
+    expect(results.every(([, result]) => result.decidedBy === 'fallback')).toBe(true);
+  });
+
   it('uses fallback for the batch and invokes the callback on failure', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 500 })));
     process.env.LLM_API_KEY = 'k';
