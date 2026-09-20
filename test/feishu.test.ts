@@ -54,6 +54,22 @@ describe('self-contained cards', () => {
     expect(cardBody(buildCard(makeMessage({ fromAddr: 'a@b.com' }), makeResult()))).toContain('\\<a@b.com\\>');
   });
 
+  it('escapes backslashes too, so a crafted sender cannot neutralize the escape', () => {
+    // `\` + `<` would otherwise render as the escape sequence `\<` and leave a live `<`
+    // behind; backslashes must be doubled before the angle brackets are escaped.
+    const body = cardBody(
+      buildCard(makeMessage({ fromName: 'evil\\<img src=x onerror=alert(1)>', fromAddr: 'x\\<a@b.com' }), makeResult()),
+    );
+    let slashes = 0;
+    let live = false;
+    for (const ch of body) {
+      if (ch === '\\') { slashes++; continue; }
+      if ((ch === '<' || ch === '>') && slashes % 2 === 0) live = true;
+      slashes = 0;
+    }
+    expect(live).toBe(false);
+  });
+
   it('formats timestamps for readability', () => {
     const body = cardBody(buildCard(makeMessage({ date: '2026-09-16T06:32:00.000Z' }), makeResult()));
     expect(body).not.toContain('T06:32:00');
