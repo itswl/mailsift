@@ -35,7 +35,14 @@ small event without copying the message body through every hop.
 ```
 
 The event contains a decision-ready summary and metadata, not the raw body.
-Consumers that need more context use the `evidence_ref` URI with the authenticated
-mailsift MCP server's Resource API. The IMAP Resource fetches a bounded normalized
-body on demand, in read-only mode, and does not persist it. The reference contains
-identifiers only; it never carries credentials or tokens.
+Consumers that need more context use the `evidence_ref` URI with the mailsift MCP
+server's Resource API. The reference is Bearer-authenticated only when
+`MCP_TOKEN` is configured. A loopback listener with an empty token is intentionally
+unauthenticated and must not be exposed beyond the host.
+
+The IMAP Resource fetches a bounded normalized body on demand, in read-only mode,
+and does not persist it. Lookup is bounded by `MCP_LIVE_BODY_CHARS`,
+`MCP_LIVE_SOURCE_BYTES`, `MCP_LIVE_LOOKBACK_DAYS`, and
+`MCP_LIVE_SEARCH_MAX_MESSAGES`; an over-limit lookup fails rather than scanning
+without a bound. The reference contains identifiers only; it never carries
+credentials or tokens.

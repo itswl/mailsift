@@ -36,7 +36,7 @@ WEBHOOKWISE_URL=
 WEBHOOKWISE_TOKEN=
 
 LLM_PROVIDER=deepseek
-LLM_MODEL=deepseek-chat
+LLM_MODEL=deepseek-flash
 LLM_API_KEY=
 
 PUSH_MIN_IMPORTANCE=warning
@@ -87,6 +87,12 @@ MCP 还提供 `observability` 查看处理、投递、dead-letter 和反馈统�
 
 `LLM_SKIP_SENSITIVE=true` 会让验证码、一次性密码和认证码邮件始终走本地规则/关键词路径，不发送给 LLM；它们仍可正常触发通知。
 
+`LLM_REDACT_PII=true`（默认）会在发送给 LLM 前脱敏邮件地址、电话号码、疑似银行卡号和身份证号；本地状态及通知保留原始值。只有在确认网关可信且确实需要更多上下文时，才考虑关闭它。
+
+LLM 接口必须兼容 OpenAI 的 `/chat/completions`：请求使用 `model`、`messages`，并在启用时带上 `response_format: {"type":"json_object"}`；响应需要在 `choices[0].message.content` 中返回 JSON，并为每封输入邮件提供对应的 `index`。如果服务商不支持 `response_format`，可设置 `LLM_JSON_MODE=false`；服务商明确拒绝时 mailsift 也会自动重试一次。
+
+如果 LLM 请求失败、返回无效 JSON/结构，或遗漏输入序号，该批邮件会使用本地 fallback。命中高风险关键词的邮件仍按 warning 处理并可能实时推送；未命中的邮件按 info 处理，进入日报/待复核队列。fallback 不会停止轮询。连续失败达到 `LLM_ALERT_AFTER_FAILURES` 后会发送故障告警，恢复后发送恢复通知；已经在 fallback 期间处理的邮件不会自动重新分诊，应检查对应时段的日报。
+
 ## 运行和恢复
 
 ```bash
@@ -96,37 +102,50 @@ npm run check
 npm run dev -- --once
 npm run dev -- --once --dry-run
 npm run probe
+npm run probe -- --account me@example.com --no-counts
+npm run oauth -- --account me@example.com --manual --force
+npm run dev -- --digest-now
+npm run dev -- --healthcheck
+npm run dev -- --recover
 ```
 
-systemd 模板见 [deploy/mailsift.service](deploy/mailsift.service)。处理过程中被中断时：
+`--once` 执行一次轮询；`--check` 校验配置和 OAuth 授权；`--dry-run` 只记录通知、不发送；`--digest-now` 立即发送当前日报；`--healthcheck` 只检查最近是否有轮询心跳；`--recover` 在中断后清理未完成记录并回退游标。`probe` 默认检查文件夹和近期数量，`--no-counts` 可省略数量查询，`--account` 可只检查一个账号。OAuth 支持 `--account`、`--manual` 和 `--force`。
+
+Compose 默认使用已发布的 `1.0.0` 镜像。升级时在 `.env` 设置 `MAILSIFT_VERSION`，避免使用可变的 `latest` 标签。容器把 SQLite 状态和 OAuth refresh token 保存在 `mailsift-data` 命名卷中。宿主机直接执行 `npm run oauth` 写入的是 `./data/tokens.json`，不会自动进入 Docker 命名卷；给容器账号授权时应使用：
+
+```bash
+docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual
+```
+
+从当前源码构建而不是拉取镜像：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+systemd 模板见 [deploy/mailsift.service](deploy/mailsift.service)。先执行 `npm install` 和 `npm run build`，再把 `WorkingDirectory` 改为包含 `.env` 和 `data/` 的目录；如果 `which node` 不是 `/usr/bin/node`，还要修改 `ExecStart`。运行用户必须能写入 data 目录，建议使用低权限专用用户。处理过程中被中断时：
 
 ```bash
 docker compose run --rm mailsift node dist/src/main.js --recover
 ```
 
-Compose 默认使用已发布的 `1.0.0` 镜像。升级时在 `.env` 设置 `MAILSIFT_VERSION`，避免使用可变的 `latest` 标签。
-
 ## MCP
 
-内置 MCP 默认在主容器中开启，并绑定回环地址：
-
-```bash
-MCP_ENABLED=true MCP_TOKEN=<随机长 token> docker compose up -d
-```
-
-需要公网访问时，设置强 token、显式绑定 `MCP_BIND`，并发布或反代 `MCP_PORT`：
-
-默认 compose 只映射到本机回环地址。若确实需要公网访问，请设置强 token 并显式绑定主机端口：
+内置 MCP 默认在主进程中开启。Docker 中，`MCP_BIND` 是容器内监听地址，`MCP_PUBLIC_HOST` 是宿主机发布地址；Compose 会让宿主机端口和容器端口都使用 `MCP_PORT`。默认只在宿主机回环地址提供服务：
 
 ```dotenv
 MCP_ENABLED=true
+MCP_PUBLIC_HOST=127.0.0.1
 MCP_BIND=0.0.0.0
 MCP_PORT=8410
 MCP_TOKEN=<随机长 token>
 ```
 
-请通过反向代理或隧道使用 HTTPS；MCP 会返回邮箱数据，不能让 bearer token 通过公网明文 HTTP 传输。非回环模式没有 `MCP_TOKEN` 时会拒绝启动。MCP 与主进程合并运行，提供查询和本地恢复工具。
-MCP 默认按客户端每分钟 120 次请求限流，可通过 `MCP_RATE_LIMIT_PER_MINUTE` 调整。
+需要公网访问时，必须显式设置 `MCP_PUBLIC_HOST` 并使用强 token。非回环 `MCP_BIND` 没有 `MCP_TOKEN` 时会拒绝启动；回环监听且 token 为空时是有意的不鉴权模式，因此不能把它暴露到主机之外。端点是 `/mcp`，使用无状态 Streamable HTTP，并默认按客户端每分钟 120 次请求限流，可通过 `MCP_RATE_LIMIT_PER_MINUTE` 调整。
+
+请通过反向代理或隧道使用 HTTPS；MCP 会返回邮箱数据，不能让 bearer token 通过公网明文 HTTP 传输。它提供只读查询和本地恢复工具。`health` 只反映最近一次轮询心跳、账号失败、LLM 失败计数和待处理队列；Docker healthcheck 只检查轮询心跳，healthy 不代表所有账号、LLM 和通知出口都正常，应通过 MCP `health` 和 `recovery_status` 查看详细状态。
+
+Signal Events 中的 MCP 引用只有设置 `MCP_TOKEN` 后才是 Bearer 鉴权引用；实时 IMAP 正文读取是有上限、只读、按需执行的，不会持久化原始正文。
 
 ## 开发
 

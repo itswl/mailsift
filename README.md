@@ -10,7 +10,7 @@ Unified IMAP monitoring for important email. mailsift scans every configured mai
 
 - Any IMAP provider, with multiple accounts.
 - Spam-folder monitoring with provider-specific folder-name detection.
-- Personal rules plus LLM classification; keyword fallback when no LLM is configured.
+- Personal rules plus LLM classification; keyword fallback when the LLM is not configured or fails.
 - Real-time push notifications and a daily digest.
 - Crash-safe cursor handling and recovery for interrupted processing.
 - Optional MCP server for querying local triage results.
@@ -49,7 +49,7 @@ WEBHOOKWISE_URL=
 WEBHOOKWISE_TOKEN=
 
 LLM_PROVIDER=deepseek
-LLM_MODEL=deepseek-chat
+LLM_MODEL=deepseek-flash
 LLM_API_KEY=
 
 PUSH_MIN_IMPORTANCE=warning
@@ -100,14 +100,26 @@ Metrics are instrumented with OpenTelemetry and disabled by default. Set `OTEL_E
 
 `LLM_SKIP_SENSITIVE=true` keeps verification codes, one-time passwords, and auth-code messages in the local keyword/rule path. They remain eligible for normal notifications, but their content is never sent to the configured LLM.
 
+`LLM_REDACT_PII=true` (the default) redacts email addresses, phone numbers, payment-card-like numbers, and ID numbers from fields sent to the LLM. Local state and notifications keep the original values. Set it to `false` only when the configured endpoint is trusted and the additional context is necessary.
+
+The LLM integration is OpenAI-compatible: mailsift posts to `${LLM_BASE_URL}/chat/completions` with `model`, `messages`, and (when enabled) `response_format: {"type":"json_object"}`. The response must provide JSON in `choices[0].message.content` with one result per input index. Set `LLM_JSON_MODE=false` for providers that reject `response_format`; mailsift also retries once without it when the rejection is explicit.
+
+If an LLM request fails, returns invalid JSON/schema, or omits an input index, the affected batch uses the local fallback. Keyword matches remain warning-level and can be pushed; messages without a high-risk keyword become info and are queued for digest/review. Fallback does not stop polling. After `LLM_ALERT_AFTER_FAILURES` consecutive failures, mailsift sends an outage alert; when calls recover it sends a recovery notice. Messages already processed during fallback are not automatically re-triaged, so review that period's digest.
+
 ### Signal events
 
 Webhook deliveries retain the existing `mail` / `triage` payload and add a
-small source-neutral `signal.v1` event. It carries the triage summary and an
-authenticated MCP lookup reference instead of copying the raw message body. The
-MCP reference can fetch a bounded normalized body from IMAP on demand without
-persisting it; set `MCP_LIVE_BODY_CHARS` to tune the cap.
-See [docs/signal-event-v1.md](docs/signal-event-v1.md) for the contract.
+small source-neutral `signal.v1` event. It carries the triage summary and an MCP
+lookup reference instead of copying the raw message body. The reference can fetch
+a bounded normalized body from IMAP on demand without persisting it; set
+`MCP_LIVE_BODY_CHARS` to tune the returned body cap. Live lookup is read-only and
+bounded by `MCP_LIVE_SOURCE_BYTES`, `MCP_LIVE_LOOKBACK_DAYS`, and
+`MCP_LIVE_SEARCH_MAX_MESSAGES`.
+
+The reference is Bearer-authenticated only when `MCP_TOKEN` is configured. A
+loopback MCP listener with an empty token is intentionally unauthenticated, so
+do not expose it beyond the host. See [docs/signal-event-v1.md](docs/signal-event-v1.md)
+for the contract.
 
 ## Running
 
@@ -120,11 +132,43 @@ npm run check
 npm run dev -- --once
 npm run dev -- --once --dry-run
 npm run probe
+npm run probe -- --account me@example.com --no-counts
+npm run oauth -- --account me@example.com --manual --force
+npm run dev -- --digest-now
+npm run dev -- --healthcheck
+npm run dev -- --recover
 ```
 
-Compose uses the released image version `1.0.0` by default. Set `MAILSIFT_VERSION` in `.env` when upgrading; this keeps deployments away from the mutable `latest` tag.
+`--once` polls once and exits with status `2` if an account fetch fails. `--check`
+validates configuration and OAuth authorization; `--dry-run` logs notifications
+without sending them; `--digest-now` sends the current digest; `--healthcheck`
+checks only whether a recent poll heartbeat exists; and `--recover` drops
+undispatched records and rewinds cursors after an interrupted run.
 
-For systemd, use [deploy/mailsift.service](deploy/mailsift.service). Recovery after an interrupted dispatch:
+`probe` checks folders and recent counts by default. Use `--no-counts` for a
+lighter connectivity/folder check, or `--account` to select one account. OAuth
+supports `--account`, `--manual`, and `--force`.
+
+Compose uses the released image version `1.0.0` by default. Set `MAILSIFT_VERSION`
+in `.env` when upgrading; this keeps deployments away from the mutable `latest`
+tag. The container stores SQLite state and OAuth refresh tokens in the
+`mailsift-data` named volume. A host-side `npm run oauth` writes to
+`./data/tokens.json`, which is not the Docker volume; run the OAuth command
+through `docker compose run --rm mailsift ...` when authorizing the container's
+accounts.
+
+To build from the checked-out source instead of pulling the image:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+For systemd, first run `npm install` and `npm run build`, then use
+[deploy/mailsift.service](deploy/mailsift.service). Change `WorkingDirectory` to
+the directory containing `.env` and `data/`, and change `ExecStart` if `which node`
+is not `/usr/bin/node`. The service user must own or be able to write the data
+directory; a dedicated low-privilege user is recommended. Recovery after an
+interrupted dispatch:
 
 ```bash
 docker compose run --rm mailsift node dist/src/main.js --recover
@@ -132,29 +176,39 @@ docker compose run --rm mailsift node dist/src/main.js --recover
 
 ## MCP
 
-The embedded MCP server is enabled by default on loopback in the main container:
-
-```bash
-MCP_ENABLED=true MCP_TOKEN=<random-long-token> docker compose up -d
-```
-
-For public HTTP access, set a strong token, bind `MCP_BIND` explicitly, and publish or reverse-proxy `MCP_PORT`:
+The embedded MCP server is enabled by default in the main process. In Docker,
+`MCP_BIND` is the container listen address and `MCP_PUBLIC_HOST` is the host-side
+publish address. The Compose file uses `MCP_PORT` for both host and container
+ports; by default it is reachable only at `127.0.0.1:8410` on the host:
 
 ```dotenv
 MCP_ENABLED=true
+MCP_PUBLIC_HOST=127.0.0.1
 MCP_BIND=0.0.0.0
 MCP_PORT=8410
 MCP_TOKEN=<random-long-token>
 ```
 
-Use HTTPS through a reverse proxy or tunnel; the MCP endpoint carries mailbox data and bearer tokens must not cross the public internet over plain HTTP. Non-loopback mode refuses to start without `MCP_TOKEN` and applies `MCP_RATE_LIMIT_PER_MINUTE` (default `120`). It exposes read-only query tools and local recovery tools. For local stdio clients, point the command at `dist/src/mcp.js`.
+For public HTTP access, use a strong token and set `MCP_PUBLIC_HOST` deliberately.
+A non-loopback `MCP_BIND` refuses to start without `MCP_TOKEN`; loopback with an
+empty token is unauthenticated by design. The endpoint is `/mcp`, uses stateless
+Streamable HTTP, and applies `MCP_RATE_LIMIT_PER_MINUTE` (default `120`). Use
+HTTPS through a reverse proxy or tunnel because MCP carries mailbox data and
+bearer tokens must not cross the public internet over plain HTTP. It exposes
+read-only query/recovery tools; for local stdio clients, point the command at
+`dist/src/mcp.js`.
+
+`health` reports the last poll heartbeat, account failures, LLM failure count,
+and pending queues. The Docker healthcheck checks only the poll heartbeat; a
+healthy container does not prove that every account, LLM call, or notification
+sink is healthy. Use MCP `health` and `recovery_status` for those details.
 
 ## Troubleshooting
 
 - **Repeated notifications:** messages are deduplicated by account plus Message-ID. `--recover` is for interrupted, undecided records.
 - **QQ scans many messages:** some QQ IMAP endpoints ignore `SINCE`; the local UID cursor still preserves correctness.
 - **Messages marked read:** mailsift uses read-only mailbox locks and `BODY.PEEK[]`.
-- **LLM privacy:** by default the sender, subject, and the first `LLM_BODY_CHARS` characters are sent to the configured LLM. Omit `LLM_API_KEY` for local keyword fallback or use a self-hosted endpoint.
+- **LLM privacy:** `LLM_SKIP_SENSITIVE=true` keeps verification-code messages local, and `LLM_REDACT_PII=true` redacts common direct identifiers before sending fields to the LLM. Omit `LLM_API_KEY` for local keyword fallback or use a self-hosted endpoint.
 - **OAuth expiry:** access tokens refresh automatically. Re-authorize with `npm run oauth -- --account user@example.com --force` after revocation or credential changes.
 
 ## Development

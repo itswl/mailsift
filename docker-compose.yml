@@ -7,13 +7,14 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      # MCP is optional; the port is loopback-only by default.
-      - "${MCP_PUBLIC_HOST:-127.0.0.1}:${MCP_PORT:-8410}:8410"
+      # Publish on the host loopback by default; the application listens on all
+      # container interfaces so Docker can forward the published port.
+      - "${MCP_PUBLIC_HOST:-127.0.0.1}:${MCP_PORT:-8410}:${MCP_PORT:-8410}"
     environment:
       - TZ=${TZ:-Asia/Shanghai}
-      # MCP is embedded in the main process and disabled by default.
+      # MCP is embedded in the main process and enabled by default.
       - MCP_ENABLED=${MCP_ENABLED:-true}
-      - MCP_BIND=${MCP_BIND:-127.0.0.1}
+      - MCP_BIND=${MCP_BIND:-0.0.0.0}
       - MCP_PORT=${MCP_PORT:-8410}
       - MCP_TOKEN=${MCP_TOKEN:-}
 
