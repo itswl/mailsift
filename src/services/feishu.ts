@@ -17,9 +17,15 @@ const TEMPLATE: Record<Importance, string> = { critical: 'red', warning: 'orange
 const PREFIX: Record<Importance, string> = { critical: '🔴', warning: '🟠', info: '🔵' };
 const MAX_CARD_CHARS = 3000;
 
-/** Bare angle brackets are swallowed by card Markdown, but addresses contain them. */
+/**
+ * Bare angle brackets are swallowed by card Markdown, but addresses contain them.
+ *
+ * The backslash escape is itself escapable, so any backslash in the text has to be
+ * doubled first — otherwise a sender-controlled subject or address ending in `\`
+ * turns the following `\<` back into a live `<`.
+ */
 function esc(text: string): string {
-  return text.replace(/</g, '\\<').replace(/>/g, '\\>');
+  return text.replace(/\\/g, '\\\\').replace(/</g, '\\<').replace(/>/g, '\\>');
 }
 
 /** Convert an ISO timestamp to a compact local-time display. */

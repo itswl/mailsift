@@ -19,6 +19,7 @@ import { createServer } from 'node:http';
 import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { loadConfig, needsOAuth, type Account } from '../src/config.js';
+import { escapeHtml } from '../src/html.js';
 import {
   AuthError, buildTokenRecord, exchangeCode, getOAuthProvider, TokenStore, type OAuthProvider,
 } from '../src/imap/auth.js';
@@ -98,9 +99,12 @@ async function waitForCallback(port: number, expectedState: string): Promise<str
         return;
       }
       const code = url.searchParams.get('code') ?? undefined;
+      // `error` comes straight off the URL: anything on this machine can navigate the
+      // browser here with a crafted value, so it must not be pasted into HTML raw.
+      const reason = escapeHtml((url.searchParams.get('error') ?? 'Unknown error').slice(0, 200));
       const body = code
         ? '<h2>✅ Authorization succeeded</h2><p>refresh_token was saved. You can close this page.</p>'
-        : `<h2>❌ Authorization failed</h2><p>${url.searchParams.get('error') ?? 'Unknown error'}</p>`;
+        : `<h2>❌ Authorization failed</h2><p>${reason}</p>`;
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;padding:3rem;text-align:center">${body}</body>`);
       server.close();
