@@ -12,6 +12,7 @@ services:
       - "${MCP_PUBLIC_HOST:-127.0.0.1}:${MCP_PORT:-8410}:${MCP_PORT:-8410}"
     environment:
       - TZ=${TZ:-Asia/Shanghai}
+      - NODE_OPTIONS=--dns-result-order=ipv4first
       # MCP is embedded in the main process and enabled by default.
       - MCP_ENABLED=${MCP_ENABLED:-true}
       - MCP_BIND=${MCP_BIND:-0.0.0.0}
