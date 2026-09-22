@@ -6,10 +6,27 @@ on:
     tags: ['v*']
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # node:sqlite requires >= 22.5.
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm_config_allow_scripts='' npm audit --omit=dev --audit-level=high
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
   image:
+    needs: test
+    if: ${{ github.event.created }}
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +47,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
             type=raw,value=latest
 
       - uses: docker/build-push-action@v6
@@ -42,7 +60,24 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  release:
+    needs: [test, image]
+    if: ${{ github.event.created }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; leaving it as it is"
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --notes "Container image: ghcr.io/${GITHUB_REPOSITORY}:$version (also latest), linux/amd64 + linux/arm64."
