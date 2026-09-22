@@ -35,7 +35,7 @@ Use `record_feedback` only when the user clearly labels a processed message as `
 
 ## Privacy and classification
 
-Verification codes, one-time passwords, and authentication codes are classified locally and should not be sent to the LLM. Other LLM payloads redact common direct identifiers such as email addresses, phone numbers, payment card numbers, and national IDs. Local notifications and authorized MCP message reads may still contain the original content, so minimize quotation.
+Verification codes, one-time passwords, and authentication codes are classified locally and should not be sent to the LLM. Other LLM payloads redact common direct identifiers such as email addresses, phone numbers, payment card numbers, and national IDs; card and ID numbers are redacted only when their checksum holds, so order and waybill numbers usually remain. Local notifications and authorized MCP message reads may still contain the original content, so minimize quotation.
 
 The daily digest may collapse messages only when IMAP `In-Reply-To` / Message-ID references prove they are in the same thread. Do not merge unrelated messages based only on similar subjects.
 

@@ -178,6 +178,12 @@ export class StateStore {
   constructor(path: string = process.env.STATE_DB_PATH ?? 'data/mailsift.db') {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
+    // The poller, its embedded MCP handler, the Docker healthcheck, and a
+    // standalone stdio MCP process can all open this file. WAL separates readers
+    // from the writer, but a second writer must wait for the lock instead of
+    // failing immediately with SQLITE_BUSY. Set the timeout before switching the
+    // journal mode, because that switch also needs the write lock.
+    this.db.exec('PRAGMA busy_timeout = 5000');
     this.db.exec('PRAGMA journal_mode = WAL');
     this.db.exec(SCHEMA);
   }

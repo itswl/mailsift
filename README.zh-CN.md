@@ -47,7 +47,7 @@ DIGEST_HOUR=9
 
 完整配置见 [.env.example](.env.example)。`MAIL_ACCOUNT_N_FOLDERS` 可填 `all`、`INBOX,spam` 或具体文件夹名；`all` 会排除已发送、草稿、回收站和服务商的虚拟视图，`spam` 会自动识别垃圾箱。
 
-`MAIL_CONTEXT`、`MAIL_ALWAYS_IMPORTANT`、`MAIL_NEVER_IMPORTANT` 和 `MAIL_KEYWORDS` 可用于定制分类规则。不要把 `MAIL_CONTEXT` 写成多行。
+`MAIL_CONTEXT`、`MAIL_ALWAYS_IMPORTANT`、`MAIL_NEVER_IMPORTANT` 和 `MAIL_KEYWORDS` 可用于定制分类规则。不要把 `MAIL_CONTEXT` 写成多行。发件人规则有三种写法：`@bank.com` 匹配发件地址的域名及其子域，`alerts@bank.com` 精确匹配该地址，其它写法按子串匹配地址和显示名。前两种不看显示名，避免仿冒域名或伪造显示名触发"始终重要"规则。
 
 ## Gmail / Outlook OAuth
 
@@ -87,11 +87,13 @@ MCP 还提供 `observability` 查看处理、投递、dead-letter 和反馈统�
 
 `LLM_SKIP_SENSITIVE=true` 会让验证码、一次性密码和认证码邮件始终走本地规则/关键词路径，不发送给 LLM；它们仍可正常触发通知。
 
-`LLM_REDACT_PII=true`（默认）会在发送给 LLM 前脱敏邮件地址、电话号码、疑似银行卡号和身份证号；本地状态及通知保留原始值。只有在确认网关可信且确实需要更多上下文时，才考虑关闭它。
+`LLM_REDACT_PII=true`（默认）会在发送给 LLM 前脱敏邮件地址、电话号码、银行卡号和身份证号；银行卡号和身份证号只在校验位成立时才脱敏，因此运单号、订单号、发票号通常会保留在摘要里。本地状态及通知保留原始值。只有在确认网关可信且确实需要更多上下文时，才考虑关闭它。
 
 LLM 接口必须兼容 OpenAI 的 `/chat/completions`：请求使用 `model`、`messages`，并在启用时带上 `response_format: {"type":"json_object"}`；响应需要在 `choices[0].message.content` 中返回 JSON，并为每封输入邮件提供对应的 `index`。如果服务商不支持 `response_format`，可设置 `LLM_JSON_MODE=false`；服务商明确拒绝时 mailsift 也会自动重试一次。
 
-如果 LLM 请求失败、返回无效 JSON/结构，或遗漏输入序号，该批邮件会使用本地 fallback。命中高风险关键词的邮件仍按 warning 处理并可能实时推送；未命中的邮件按 info 处理，进入日报/待复核队列。fallback 不会停止轮询。连续失败达到 `LLM_ALERT_AFTER_FAILURES` 后会发送故障告警，恢复后发送恢复通知；已经在 fallback 期间处理的邮件不会自动重新分诊，应检查对应时段的日报。
+`LLM_OUTPUT_LANGUAGE` 决定摘要、原因和分类的语言：`en`（默认）、`zh-CN`、`zh-TW`、`auto`（跟随每封邮件的语言）或任意语言名称。分类也使用同一语言，因此 `auto` 可能把日报的分类分组拆成多种语言。
+
+如果 LLM 请求失败、返回无效 JSON/结构，或返回重复/越界的序号，该批邮件会整体使用本地 fallback，因为序号错位后整批结果都不可信。仅遗漏了个别序号时，只有被遗漏的那封邮件走 fallback。命中高风险关键词的邮件仍按 warning 处理并可能实时推送；未命中的邮件按 info 处理，进入日报/待复核队列。fallback 不会停止轮询。连续失败达到 `LLM_ALERT_AFTER_FAILURES` 后会发送故障告警，恢复后发送恢复通知；已经在 fallback 期间处理的邮件不会自动重新分诊，应检查对应时段的日报。
 
 ## 运行和恢复
 
@@ -128,6 +130,10 @@ systemd 模板见 [deploy/mailsift.service](deploy/mailsift.service)。先执行
 ```bash
 docker compose run --rm mailsift node dist/src/main.js --recover
 ```
+
+## 通知重试
+
+推送因网络错误、超时或 HTTP 408/429/5xx 失败时，会先按 `SINK_RETRY_ATTEMPTS`（默认 `3`，间隔数秒）立即重试，仍失败再进入持久化 outbox，由下一轮轮询继续投递；其它拒绝直接进入 outbox。端点持续不可用时，每次推送只尝试一次，直到有一次投递成功，避免拖长轮询。
 
 ## MCP
 

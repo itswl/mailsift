@@ -3,7 +3,8 @@ import './setup.js';
 import { makeMessage } from './helpers.js';
 import type { Rules } from '../src/config.js';
 import {
-  applyRules, FALLBACK_KEYWORDS, headline, keywordFallback, redactForLlm, resolveLlmBaseUrl, triage,
+  applyRules, FALLBACK_KEYWORDS, headline, keywordFallback, matchesSenderRule, outputLanguageDirective,
+  redactForLlm, resolveLlmBaseUrl, triage,
 } from '../src/services/triage.js';
 
 const RULES: Rules = {
@@ -52,6 +53,26 @@ describe('rule layer', () => {
 
   it('passes unmatched messages to the next layer', () => {
     expect(applyRules(makeMessage({ fromAddr: 'random@x.com' }), RULES)).toBeUndefined();
+  });
+
+  it('anchors @domain rules to the address domain and its subdomains', () => {
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'alerts@bank.com' }), '@bank.com')).toBe(true);
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'alerts@mail.bank.com' }), '@bank.com')).toBe(true);
+    // A look-alike domain or a crafted display name must not trigger an always-important rule.
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'alerts@bank.com.evil.io' }), '@bank.com')).toBe(false);
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'alerts@notbank.com' }), '@bank.com')).toBe(false);
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'x@evil.io', fromName: 'Alerts @bank.com' }), '@bank.com')).toBe(false);
+  });
+
+  it('treats a full address as an exact match', () => {
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'Alerts@Bank.com' }), 'alerts@bank.com')).toBe(true);
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'xalerts@bank.com' }), 'alerts@bank.com')).toBe(false);
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'alerts@bank.com.cn' }), 'alerts@bank.com')).toBe(false);
+  });
+
+  it('keeps plain keywords as substring matches on address and name', () => {
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'x@y.com', fromName: 'Weekly Newsletter' }), 'newsletter')).toBe(true);
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'customer-service@bank.com' }), 'service')).toBe(true);
   });
 
   it('keeps explicit sender rules ahead of feedback rules', () => {
@@ -197,6 +218,57 @@ describe('LLM layer', () => {
   it('redacts direct identifiers before LLM use', () => {
     expect(redactForLlm('Contact a@example.com or +86 138-1234-5678; card 4111 1111 1111 1111.'))
       .toBe('Contact [EMAIL] or [PHONE]; card [CARD].');
+  });
+
+  it('redacts card and ID numbers only when their checksum holds', () => {
+    // A bank card carries a Luhn check digit and a resident ID carries an ISO 7064
+    // check character; waybill and order numbers of the same length do not, and
+    // the summary must keep them so the user can act on a delivery or an order.
+    expect(redactForLlm('UnionPay 6200 0000 0000 0005; ID 11010519491231002X')).toBe('UnionPay [CARD]; ID [ID]');
+    expect(redactForLlm('顺丰运单 SF1234567890123 已发出')).toBe('顺丰运单 SF1234567890123 已发出');
+    expect(redactForLlm('订单 2345678901234567890 已支付，发票 123456789012345678'))
+      .toBe('订单 2345678901234567890 已支付，发票 123456789012345678');
+    // A valid check character with an impossible birth month is not an ID.
+    expect(redactForLlm('11010520261301002X')).toBe('11010520261301002X');
+  });
+});
+
+describe('output language', () => {
+  function systemPromptOf(call: unknown): string {
+    const init = (call as [unknown, { body: string }])[1];
+    const body = JSON.parse(init.body) as { messages: Array<{ role: string; content: string }> };
+    return body.messages.find((m) => m.role === 'system')!.content;
+  }
+
+  it('asks for English by default so existing deployments keep their output', async () => {
+    mockLlm([{ index: 0, importance: 'info', score: 1, reason: 'x' }]);
+    process.env.LLM_API_KEY = 'k';
+    await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
+    expect(systemPromptOf((fetch as unknown as { mock: { calls: unknown[] } }).mock.calls[0])).toContain('Write all output in English.');
+  });
+
+  it('injects the configured language into the prompt', async () => {
+    mockLlm([{ index: 0, importance: 'info', score: 1, reason: 'x' }]);
+    process.env.LLM_API_KEY = 'k';
+    process.env.LLM_OUTPUT_LANGUAGE = 'zh-CN';
+    await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
+    const prompt = systemPromptOf((fetch as unknown as { mock: { calls: unknown[] } }).mock.calls[0]);
+    expect(prompt).toContain('Write all output in Simplified Chinese.');
+    expect(prompt).not.toContain('English sentences');
+  });
+
+  it.each([
+    ['zh-TW', 'Write all output in Traditional Chinese.'],
+    ['Japanese', 'Write all output in Japanese.'],
+    ['', 'Write all output in English.'],
+  ])('maps %j to a directive', (value, expected) => {
+    process.env.LLM_OUTPUT_LANGUAGE = value;
+    expect(outputLanguageDirective()).toBe(expected);
+  });
+
+  it('can follow the language of each message', () => {
+    process.env.LLM_OUTPUT_LANGUAGE = 'auto';
+    expect(outputLanguageDirective()).toContain('the language the message itself is written in');
   });
 });
 

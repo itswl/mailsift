@@ -184,6 +184,16 @@ describe('maintenance', () => {
     expect(s.drainDigest()).toEqual([]);
   });
 
+  it('waits for a concurrent writer instead of failing immediately', () => {
+    // Other processes (healthcheck, stdio MCP) share the file; without a busy
+    // timeout a write that collides with the poller throws SQLITE_BUSY at once.
+    const s = store();
+    const row = (s as unknown as { db: { prepare(sql: string): { get(): Record<string, unknown> } } }).db
+      .prepare('PRAGMA busy_timeout')
+      .get();
+    expect(Number(row['timeout'])).toBe(5000);
+  });
+
   it('overwrites metadata values', () => {
     const s = store();
     expect(s.getMeta('x')).toBeUndefined();

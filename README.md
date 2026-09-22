@@ -60,7 +60,7 @@ DIGEST_HOUR=9
 
 `MAIL_ACCOUNT_N_FOLDERS` accepts `all`, `INBOX,spam`, or explicit folder names. The `all` token excludes sent, drafts, trash, and provider-wide virtual views. The `spam` token detects the provider's spam folder.
 
-`MAIL_CONTEXT`, `MAIL_ALWAYS_IMPORTANT`, `MAIL_NEVER_IMPORTANT`, and `MAIL_KEYWORDS` customize classification. Keep `MAIL_CONTEXT` on one line in `.env`.
+`MAIL_CONTEXT`, `MAIL_ALWAYS_IMPORTANT`, `MAIL_NEVER_IMPORTANT`, and `MAIL_KEYWORDS` customize classification. Keep `MAIL_CONTEXT` on one line in `.env`. Sender rules take three forms: `@bank.com` matches the address domain or a subdomain of it, `alerts@bank.com` matches exactly that address, and anything else is a substring test on the address and display name. The first two ignore the display name so a look-alike domain or a crafted name cannot trigger an always-important rule.
 
 ### Gmail and Outlook OAuth
 
@@ -100,11 +100,13 @@ Metrics are instrumented with OpenTelemetry and disabled by default. Set `OTEL_E
 
 `LLM_SKIP_SENSITIVE=true` keeps verification codes, one-time passwords, and auth-code messages in the local keyword/rule path. They remain eligible for normal notifications, but their content is never sent to the configured LLM.
 
-`LLM_REDACT_PII=true` (the default) redacts email addresses, phone numbers, payment-card-like numbers, and ID numbers from fields sent to the LLM. Local state and notifications keep the original values. Set it to `false` only when the configured endpoint is trusted and the additional context is necessary.
+`LLM_REDACT_PII=true` (the default) redacts email addresses, phone numbers, payment card numbers, and resident ID numbers from fields sent to the LLM. Card and ID numbers are only redacted when their checksum holds, so waybill, order, and invoice numbers stay readable in summaries. Local state and notifications keep the original values. Set it to `false` only when the configured endpoint is trusted and the additional context is necessary.
 
 The LLM integration is OpenAI-compatible: mailsift posts to `${LLM_BASE_URL}/chat/completions` with `model`, `messages`, and (when enabled) `response_format: {"type":"json_object"}`. The response must provide JSON in `choices[0].message.content` with one result per input index. Set `LLM_JSON_MODE=false` for providers that reject `response_format`; mailsift also retries once without it when the rejection is explicit.
 
-If an LLM request fails, returns invalid JSON/schema, or omits an input index, the affected batch uses the local fallback. Keyword matches remain warning-level and can be pushed; messages without a high-risk keyword become info and are queued for digest/review. Fallback does not stop polling. After `LLM_ALERT_AFTER_FAILURES` consecutive failures, mailsift sends an outage alert; when calls recover it sends a recovery notice. Messages already processed during fallback are not automatically re-triaged, so review that period's digest.
+`LLM_OUTPUT_LANGUAGE` sets the language of summaries, reasons, and categories: `en` (default), `zh-CN`, `zh-TW`, `auto` to follow each message, or any language name. Categories use the same language, so `auto` can split the digest's category groups.
+
+If an LLM request fails, returns invalid JSON/schema, or returns duplicate or out-of-range indices, the affected batch uses the local fallback, because a misaligned index list cannot be trusted for any message in it. A message that is merely omitted from an otherwise valid response falls back on its own. Keyword matches remain warning-level and can be pushed; messages without a high-risk keyword become info and are queued for digest/review. Fallback does not stop polling. After `LLM_ALERT_AFTER_FAILURES` consecutive failures, mailsift sends an outage alert; when calls recover it sends a recovery notice. Messages already processed during fallback are not automatically re-triaged, so review that period's digest.
 
 ### Signal events
 
@@ -206,6 +208,7 @@ sink is healthy. Use MCP `health` and `recovery_status` for those details.
 ## Troubleshooting
 
 - **Repeated notifications:** messages are deduplicated by account plus Message-ID. `--recover` is for interrupted, undecided records.
+- **Delivery failures:** a push that fails with a network error, a timeout, or HTTP 408/429/5xx is retried up to `SINK_RETRY_ATTEMPTS` times (default `3`, seconds apart) and then waits in the durable outbox for the next poll. Other rejections go straight to the outbox. An endpoint that stays down gets one attempt per push until a delivery succeeds, so a dead endpoint does not stretch the poll.
 - **QQ scans many messages:** some QQ IMAP endpoints ignore `SINCE`; the local UID cursor still preserves correctness.
 - **Messages marked read:** mailsift uses read-only mailbox locks and `BODY.PEEK[]`.
 - **LLM privacy:** `LLM_SKIP_SENSITIVE=true` keeps verification-code messages local, and `LLM_REDACT_PII=true` redacts common direct identifiers before sending fields to the LLM. Omit `LLM_API_KEY` for local keyword fallback or use a self-hosted endpoint.
