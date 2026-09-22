@@ -216,6 +216,26 @@ export class StateStore {
       .run(account, folder, uidValidity, lastUid, now());
   }
 
+  /**
+   * Move a cursor forward. Unlike saveCursor it never rewinds within the same
+   * UIDVALIDITY: a wake-up fetch and a scheduled poll can commit the same
+   * folder in either order, and the later one may have seen fewer messages.
+   */
+  advanceCursor(account: string, folder: string, uidValidity: string, lastUid: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO cursors (account, folder, uid_validity, last_uid, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(account, folder) DO UPDATE SET
+           last_uid = CASE WHEN cursors.uid_validity = excluded.uid_validity
+                           THEN MAX(cursors.last_uid, excluded.last_uid)
+                           ELSE excluded.last_uid END,
+           uid_validity = excluded.uid_validity,
+           updated_at = excluded.updated_at`,
+      )
+      .run(account, folder, uidValidity, lastUid, now());
+  }
+
   clearCursors(account?: string): number {
     const result = account
       ? this.db.prepare('DELETE FROM cursors WHERE account = ?').run(account)

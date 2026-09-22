@@ -14,6 +14,7 @@ const MANAGED = [
   'MAX_MESSAGE_SOURCE_BYTES',
   'POLL_INTERVAL_SECONDS', 'STATE_RETENTION_DAYS',
   'ACCOUNT_ALERT_AFTER_FAILURES', 'ACCOUNT_ALERT_COOLDOWN_SECONDS', 'SINK_RETRY_ATTEMPTS',
+  'IMAP_IDLE_ENABLED', 'IMAP_IDLE_FOLDERS',
 ];
 
 /** Start every test with a clean environment to avoid cross-test contamination. */

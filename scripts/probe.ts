@@ -35,6 +35,11 @@ async function probeAccount(account: Account, withCounts: boolean): Promise<bool
     const specialUseByPath = new Map(entries.map((e) => [e.path, e.specialUse ?? '']));
     const watched = new Set((await targetFolders(client, account)).map((f) => f.path));
     console.log(`Connected; ${folders.length} folders found.`);
+    console.log(
+      client.capabilities.has('IDLE')
+        ? 'IDLE: supported (IMAP_IDLE_ENABLED=true gives real-time wake-ups for this account)'
+        : 'IDLE: not advertised (this account stays on scheduled polling even with IMAP_IDLE_ENABLED=true)',
+    );
     console.log(`${pad('Folder', 30)}${pad('Total', 8)}${pad(`Last ${RECENT_DAYS}d`, 10)}Status`);
 
     let missed = 0;
