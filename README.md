@@ -106,7 +106,7 @@ The LLM integration is OpenAI-compatible: mailsift posts to `${LLM_BASE_URL}/cha
 
 `LLM_OUTPUT_LANGUAGE` sets the language of summaries, reasons, and categories: `en` (default), `zh-CN`, `zh-TW`, `auto` to follow each message, or any language name. Categories use the same language, so `auto` can split the digest's category groups.
 
-If an LLM request fails, returns invalid JSON/schema, or omits an input index, the affected batch uses the local fallback. Keyword matches remain warning-level and can be pushed; messages without a high-risk keyword become info and are queued for digest/review. Fallback does not stop polling. After `LLM_ALERT_AFTER_FAILURES` consecutive failures, mailsift sends an outage alert; when calls recover it sends a recovery notice. Messages already processed during fallback are not automatically re-triaged, so review that period's digest.
+If an LLM request fails, returns invalid JSON/schema, or returns duplicate or out-of-range indices, the affected batch uses the local fallback, because a misaligned index list cannot be trusted for any message in it. A message that is merely omitted from an otherwise valid response falls back on its own. Keyword matches remain warning-level and can be pushed; messages without a high-risk keyword become info and are queued for digest/review. Fallback does not stop polling. After `LLM_ALERT_AFTER_FAILURES` consecutive failures, mailsift sends an outage alert; when calls recover it sends a recovery notice. Messages already processed during fallback are not automatically re-triaged, so review that period's digest.
 
 ### Signal events
 

@@ -93,7 +93,7 @@ LLM 接口必须兼容 OpenAI 的 `/chat/completions`：请求使用 `model`、`
 
 `LLM_OUTPUT_LANGUAGE` 决定摘要、原因和分类的语言：`en`（默认）、`zh-CN`、`zh-TW`、`auto`（跟随每封邮件的语言）或任意语言名称。分类也使用同一语言，因此 `auto` 可能把日报的分类分组拆成多种语言。
 
-如果 LLM 请求失败、返回无效 JSON/结构，或遗漏输入序号，该批邮件会使用本地 fallback。命中高风险关键词的邮件仍按 warning 处理并可能实时推送；未命中的邮件按 info 处理，进入日报/待复核队列。fallback 不会停止轮询。连续失败达到 `LLM_ALERT_AFTER_FAILURES` 后会发送故障告警，恢复后发送恢复通知；已经在 fallback 期间处理的邮件不会自动重新分诊，应检查对应时段的日报。
+如果 LLM 请求失败、返回无效 JSON/结构，或返回重复/越界的序号，该批邮件会整体使用本地 fallback，因为序号错位后整批结果都不可信。仅遗漏了个别序号时，只有被遗漏的那封邮件走 fallback。命中高风险关键词的邮件仍按 warning 处理并可能实时推送；未命中的邮件按 info 处理，进入日报/待复核队列。fallback 不会停止轮询。连续失败达到 `LLM_ALERT_AFTER_FAILURES` 后会发送故障告警，恢复后发送恢复通知；已经在 fallback 期间处理的邮件不会自动重新分诊，应检查对应时段的日报。
 
 ## 运行和恢复
 
