@@ -89,7 +89,12 @@ export function isOversizedLookback(found: readonly number[], limit: number): bo
   return found.length > limit;
 }
 
-export async function connect(account: Account): Promise<ImapFlow> {
+export interface ConnectOptions {
+  /** Tune the connection for a long-lived IDLE listener instead of a short poll. */
+  idle?: boolean;
+}
+
+export async function connect(account: Account, options: ConnectOptions = {}): Promise<ImapFlow> {
   const auth = needsOAuth(account)
     ? { user: account.username, accessToken: await getAccessToken(account.username, account.auth) }
     : { user: account.username, pass: account.password ?? '' };
@@ -107,6 +112,17 @@ export async function connect(account: Account): Promise<ImapFlow> {
       logger: false,
       // Observe only; do not modify mailbox state.
       emitLogs: false,
+      ...(options.idle
+        ? {
+            // Re-enter IDLE soon after a wake-up fetch so the listening gap stays
+            // short; this connection issues few commands, so the extra round
+            // trips do not matter. RFC 2177 lets servers drop an IDLE after 29
+            // minutes, so restart it well before that.
+            autoIdleDelay: 1_000,
+            maxIdleTime: 20 * 60_000,
+            missingIdleCommand: 'NOOP' as const,
+          }
+        : {}),
     });
     // ImapFlow can emit a later socket error after connect() has rejected. Node
     // treats an EventEmitter "error" without a listener as process-fatal, which

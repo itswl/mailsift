@@ -20,7 +20,8 @@ import { fetchByMessageId } from './imap/client.js';
 import { StateStore } from './services/state.js';
 import type { FeedbackLabel } from './services/state.js';
 import { resolveLlmBaseUrl } from './services/triage.js';
-import { HEARTBEAT_KEY } from './services/watcher.js';
+import { HEARTBEAT_KEY, IDLE_WAKE_KEY } from './services/watcher.js';
+import { idleEnabled, idleFolderTokens } from './imap/idle.js';
 import {
   ACCOUNT_LAST_ERROR_KEY, ACCOUNT_LAST_FAILURE_KEY, ACCOUNT_LAST_SUCCESS_KEY,
   FAIL_COUNT_KEY, LLM_FAIL_COUNT_KEY,
@@ -333,10 +334,12 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
       const interval = Number(process.env.POLL_INTERVAL_SECONDS ?? 300);
 
       const failing: Array<Record<string, unknown>> = [];
+      const idleWakes: Record<string, string | null> = {};
       try {
         for (const account of loadConfig().accounts) {
           const count = store.getMeta(FAIL_COUNT_KEY + account.username);
           if (count) failing.push({ account: account.name, consecutiveFailures: Number(count) });
+          idleWakes[account.name] = store.getMeta(IDLE_WAKE_KEY + account.username) ?? null;
         }
       } catch (error) {
         failing.push({ error: String(error) });
@@ -359,6 +362,7 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
           })(),
           consecutiveFailures: Number(store.getMeta(LLM_FAIL_COUNT_KEY) ?? 0),
         },
+        idle: { enabled: idleEnabled(), folders: idleFolderTokens(), lastWakeAt: idleWakes },
         digestPending: store.digestPending(),
         notificationOutboxPending: store.notificationOutboxPending(),
       });

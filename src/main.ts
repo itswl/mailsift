@@ -17,6 +17,7 @@ import { resolveLlmBaseUrl } from './services/triage.js';
 import { sendDigest } from './services/digest.js';
 import { recordStartupFailure } from './services/health.js';
 import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
+import { IdleSupervisor, idleEnabled, idleFolderTokens } from './imap/idle.js';
 import { getLogger } from './logger.js';
 import { metrics } from './metrics.js';
 import { startMcpHttp } from './mcp.js';
@@ -103,6 +104,15 @@ async function checkConfig(): Promise<number> {
     `   Poll interval: ${process.env.POLL_INTERVAL_SECONDS ?? 300}s; ` +
       `digest: ${(process.env.DIGEST_ENABLED ?? 'true') === 'false' ? 'disabled' : `daily at ${process.env.DIGEST_HOUR ?? 9}:00`}`,
   );
+  if (idleEnabled()) {
+    const interval = Number(process.env.POLL_INTERVAL_SECONDS ?? 300);
+    console.log(`   IMAP IDLE: enabled for ${idleFolderTokens().join(', ')}; the poll interval is the reconciliation pass`);
+    if (interval < 900) {
+      console.log('   ℹ️  With IDLE on, POLL_INTERVAL_SECONDS can usually be raised to 900-1800.');
+    }
+  } else {
+    console.log('   IMAP IDLE: disabled (set IMAP_IDLE_ENABLED=true for real-time wake-ups)');
+  }
   console.log(`   Total per-poll backfill limit: ${process.env.MAX_MESSAGES_PER_POLL_TOTAL ?? 500}`);
   console.log(`   Fresh lookbacks are backfilled in chunks of ${process.env.MAX_MESSAGES_PER_LOOKBACK ?? 500}`);
 
@@ -225,15 +235,26 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
   }
 
+  let idle: IdleSupervisor | undefined;
+  if (idleEnabled()) {
+    idle = new IdleSupervisor(watcher.config.accounts, async (account, folder, client) => {
+      await watcher.pollFolder(account, folder, client);
+    });
+    idle.start();
+  }
+
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
       log.info(`Received ${signal}; exiting after the current poll.`);
       stopping = true;
       if (mcpServer) mcpServer.close();
+      // Log the IDLE sessions out now so the server keeps no zombie connections.
+      void idle?.stop().catch((error) => log.warn(`Failed to stop IDLE listeners: ${error}`));
       void metrics.shutdown().catch((error) => log.warn(`Failed to flush OTel metrics: ${error}`));
     });
   }
   await runForever(watcher);
+  await idle?.stop().catch((error) => log.warn(`Failed to stop IDLE listeners: ${error}`));
   return 0;
 }
 
