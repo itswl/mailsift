@@ -87,7 +87,7 @@ MCP 还提供 `observability` 查看处理、投递、dead-letter 和反馈统�
 
 `LLM_SKIP_SENSITIVE=true` 会让验证码、一次性密码和认证码邮件始终走本地规则/关键词路径，不发送给 LLM；它们仍可正常触发通知。
 
-`LLM_REDACT_PII=true`（默认）会在发送给 LLM 前脱敏邮件地址、电话号码、疑似银行卡号和身份证号；本地状态及通知保留原始值。只有在确认网关可信且确实需要更多上下文时，才考虑关闭它。
+`LLM_REDACT_PII=true`（默认）会在发送给 LLM 前脱敏邮件地址、电话号码、银行卡号和身份证号；银行卡号和身份证号只在校验位成立时才脱敏，因此运单号、订单号、发票号通常会保留在摘要里。本地状态及通知保留原始值。只有在确认网关可信且确实需要更多上下文时，才考虑关闭它。
 
 LLM 接口必须兼容 OpenAI 的 `/chat/completions`：请求使用 `model`、`messages`，并在启用时带上 `response_format: {"type":"json_object"}`；响应需要在 `choices[0].message.content` 中返回 JSON，并为每封输入邮件提供对应的 `index`。如果服务商不支持 `response_format`，可设置 `LLM_JSON_MODE=false`；服务商明确拒绝时 mailsift 也会自动重试一次。
 

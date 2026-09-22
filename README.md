@@ -100,7 +100,7 @@ Metrics are instrumented with OpenTelemetry and disabled by default. Set `OTEL_E
 
 `LLM_SKIP_SENSITIVE=true` keeps verification codes, one-time passwords, and auth-code messages in the local keyword/rule path. They remain eligible for normal notifications, but their content is never sent to the configured LLM.
 
-`LLM_REDACT_PII=true` (the default) redacts email addresses, phone numbers, payment-card-like numbers, and ID numbers from fields sent to the LLM. Local state and notifications keep the original values. Set it to `false` only when the configured endpoint is trusted and the additional context is necessary.
+`LLM_REDACT_PII=true` (the default) redacts email addresses, phone numbers, payment card numbers, and resident ID numbers from fields sent to the LLM. Card and ID numbers are only redacted when their checksum holds, so waybill, order, and invoice numbers stay readable in summaries. Local state and notifications keep the original values. Set it to `false` only when the configured endpoint is trusted and the additional context is necessary.
 
 The LLM integration is OpenAI-compatible: mailsift posts to `${LLM_BASE_URL}/chat/completions` with `model`, `messages`, and (when enabled) `response_format: {"type":"json_object"}`. The response must provide JSON in `choices[0].message.content` with one result per input index. Set `LLM_JSON_MODE=false` for providers that reject `response_format`; mailsift also retries once without it when the rejection is explicit.
 

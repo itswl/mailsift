@@ -302,13 +302,51 @@ function requestBody(messages: MailMessage[], rules: Rules, jsonMode: boolean): 
   };
 }
 
-/** Remove common direct identifiers before a message is sent to an LLM. */
+/**
+ * Payment card numbers carry a Luhn check digit. Order, tracking, and invoice
+ * numbers of the same length almost never do, so checking it keeps those
+ * business identifiers readable for the LLM instead of redacting every long
+ * digit run.
+ */
+export function passesLuhn(candidate: string): boolean {
+  const digits = candidate.replace(/[ -]/g, '');
+  let sum = 0;
+  let double = false;
+  for (let i = digits.length - 1; i >= 0; i -= 1) {
+    let digit = digits.charCodeAt(i) - 48;
+    if (double && (digit *= 2) > 9) digit -= 9;
+    sum += digit;
+    double = !double;
+  }
+  return sum % 10 === 0;
+}
+
+const CN_ID_WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2];
+const CN_ID_CHECK = '10X98765432';
+
+/** GB 11643 resident ID: a plausible birth date in positions 7-14 plus the ISO 7064 check character. */
+export function looksLikeChineseId(candidate: string): boolean {
+  const month = Number(candidate.slice(10, 12));
+  const day = Number(candidate.slice(12, 14));
+  if (!/^(?:19|20)\d{2}$/.test(candidate.slice(6, 10)) || month < 1 || month > 12 || day < 1 || day > 31) {
+    return false;
+  }
+  const sum = CN_ID_WEIGHTS.reduce((acc, weight, i) => acc + weight * (candidate.charCodeAt(i) - 48), 0);
+  return CN_ID_CHECK[sum % 11] === candidate[17]!.toUpperCase();
+}
+
+/**
+ * Remove common direct identifiers before a message is sent to an LLM.
+ *
+ * Long digit runs are only treated as card or ID numbers when their checksum
+ * holds, so waybill, order, and invoice numbers usually survive redaction.
+ */
 export function redactForLlm(value: string): string {
   return value
     .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, '[EMAIL]')
     .replace(/(?<!\d)\+\d{1,3}[ -]\d{3}[- ]\d{4}[- ]\d{4}(?!\d)/g, '[PHONE]')
-    .replace(/(?<!\d)(?:\d[ -]?){13,19}(?!\d)/g, '[CARD]')
-    .replace(/(?<!\d)\d{17}[\dXx](?!\d)/g, '[ID]')
+    .replace(/(?<!\d)(?:\d[ -]?){13,19}(?!\d)/g, (run) => (passesLuhn(run) ? '[CARD]' : run))
+    .replace(/(?<!\d)\d{17}[\dXx](?!\d)/g, (run) => (looksLikeChineseId(run) ? '[ID]' : run))
     .replace(/(?<!\d)(?:\+?\d{1,3}[- ]?)?(?:\d{3}[- ]\d{3}[- ]\d{4}|\d{3}[- ]\d{4}|\d{3}[- ]\d{4}[- ]\d{4})(?!\d)/g, '[PHONE]');
 }
 

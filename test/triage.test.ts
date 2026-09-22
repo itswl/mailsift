@@ -198,6 +198,18 @@ describe('LLM layer', () => {
     expect(redactForLlm('Contact a@example.com or +86 138-1234-5678; card 4111 1111 1111 1111.'))
       .toBe('Contact [EMAIL] or [PHONE]; card [CARD].');
   });
+
+  it('redacts card and ID numbers only when their checksum holds', () => {
+    // A bank card carries a Luhn check digit and a resident ID carries an ISO 7064
+    // check character; waybill and order numbers of the same length do not, and
+    // the summary must keep them so the user can act on a delivery or an order.
+    expect(redactForLlm('UnionPay 6200 0000 0000 0005; ID 11010519491231002X')).toBe('UnionPay [CARD]; ID [ID]');
+    expect(redactForLlm('顺丰运单 SF1234567890123 已发出')).toBe('顺丰运单 SF1234567890123 已发出');
+    expect(redactForLlm('订单 2345678901234567890 已支付，发票 123456789012345678'))
+      .toBe('订单 2345678901234567890 已支付，发票 123456789012345678');
+    // A valid check character with an impossible birth month is not an ID.
+    expect(redactForLlm('11010520261301002X')).toBe('11010520261301002X');
+  });
 });
 
 describe('provider presets', () => {
