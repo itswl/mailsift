@@ -1,4 +1,5 @@
 import type { MailMessage } from '../src/imap/message.js';
+import type { PushOutcome, Sink } from '../src/services/sink.js';
 import type { TriageResult } from '../src/services/triage.js';
 
 export function makeMessage(overrides: Partial<MailMessage> = {}): MailMessage {
@@ -36,12 +37,12 @@ export function makeResult(overrides: Partial<TriageResult> = {}): TriageResult 
   };
 }
 
-export class RecordingSink {
+export class RecordingSink implements Sink {
   readonly pushed: Array<[MailMessage, TriageResult]> = [];
   configured = true;
-  constructor(private readonly ok = true) {}
-  async push(message: MailMessage, result: TriageResult): Promise<boolean> {
+  constructor(private readonly outcome: PushOutcome = 'delivered') {}
+  async push(message: MailMessage, result: TriageResult): Promise<PushOutcome> {
     this.pushed.push([message, result]);
-    return this.ok;
+    return this.outcome;
   }
 }

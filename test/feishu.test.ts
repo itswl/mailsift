@@ -1,8 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
 import { makeMessage, makeResult } from './helpers.js';
 import { buildCard, FeishuSink, sign } from '../src/services/feishu.js';
-import { buildWebhookPayload, CompositeSink } from '../src/services/sink.js';
+import { buildWebhookPayload, CompositeSink, type PushOutcome, type Sink } from '../src/services/sink.js';
 import { buildLink } from '../src/links.js';
 
 function cardBody(card: Record<string, unknown>): string {
@@ -16,6 +16,8 @@ function cardTitle(card: Record<string, unknown>): string {
   const header = (card['card'] as { header: { title: { content: string } } }).header;
   return header.title.content;
 }
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe('self-contained cards', () => {
   it('puts the summary first', () => {
@@ -134,16 +136,43 @@ describe('signatures and WebhookWise payloads', () => {
 });
 
 describe('delivery semantics', () => {
-  it('reports a Feishu-filtered message as not delivered', async () => {
+  const stub = (outcome: PushOutcome): Sink => ({ configured: true, push: async () => outcome });
+
+  it('declines rather than fails a Feishu-filtered message', async () => {
+    // A decline is this output's own policy, so no retry can ever change it.
     process.env.FEISHU_MIN_IMPORTANCE = 'critical';
     const sink = new FeishuSink('https://example.invalid/hook');
-    expect(await sink.push(makeMessage(), makeResult({ importance: 'warning' }))).toBe(false);
+    expect(await sink.push(makeMessage(), makeResult({ importance: 'warning' }))).toBe('declined');
+  });
+
+  it('compares the spam bonus against its own threshold, as the watcher does', async () => {
+    // The watcher pushed spam because of the bonus while this output judged the
+    // raw rank, so it refused every such message and the outbox never drained.
+    process.env.FEISHU_MIN_IMPORTANCE = 'warning';
+    const sink = new FeishuSink('https://example.invalid/hook');
+    const spam = makeMessage({ inSpam: true });
+    const info = makeResult({ importance: 'info' });
+    expect(await sink.push(spam, info)).toBe('declined');
+
+    process.env.SPAM_RANK_BONUS = '1';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"code":0}', { status: 200 })));
+    expect(await sink.push(spam, info)).toBe('delivered');
+    // The bonus is for spam only; an ordinary info message is still declined.
+    expect(await sink.push(makeMessage(), info)).toBe('declined');
   });
 
   it('does not let a declined output mask a failed output', async () => {
-    const declined = { configured: true, push: async () => false };
-    const failed = { configured: true, push: async () => false };
-    const sink = new CompositeSink([declined, failed]);
-    expect(await sink.push(makeMessage(), makeResult())).toBe(false);
+    expect(await new CompositeSink([stub('declined'), stub('failed')]).push(makeMessage(), makeResult()))
+      .toBe('failed');
+  });
+
+  it('settles a message only when every output declines it', async () => {
+    expect(await new CompositeSink([stub('declined'), stub('declined')]).push(makeMessage(), makeResult()))
+      .toBe('declined');
+  });
+
+  it('still reports delivery when one output succeeds', async () => {
+    expect(await new CompositeSink([stub('failed'), stub('delivered')]).push(makeMessage(), makeResult()))
+      .toBe('delivered');
   });
 });

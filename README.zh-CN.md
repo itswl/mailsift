@@ -137,7 +137,9 @@ docker compose run --rm mailsift node dist/src/main.js --recover
 
 ## 通知重试
 
-推送因网络错误、超时或 HTTP 408/429/5xx 失败时，会先按 `SINK_RETRY_ATTEMPTS`（默认 `3`，间隔数秒）立即重试，仍失败再进入持久化 outbox，由下一轮轮询继续投递；其它拒绝直接进入 outbox。端点持续不可用时，每次推送只尝试一次，直到有一次投递成功，避免拖长轮询。
+推送因网络错误、超时或 HTTP 408/429/5xx 失败时，会先按 `SINK_RETRY_ATTEMPTS`（默认 `3`，间隔数秒）立即重试，仍失败再进入持久化 outbox，由下一轮轮询继续投递。端点持续不可用时，每次推送只尝试一次，直到有一次投递成功，避免拖长轮询。
+
+只有真正的投递失败会留在 outbox。出口按自身阈值（如 `FEISHU_MIN_IMPORTANCE`）主动拒绝的消息会当场了结并交给日报，因此 MCP `health` 里的待投递数量始终代表真实积压。`SPAM_RANK_BONUS` 对所有投递决策生效，包括飞书自身阈值，调高它确实会把更多垃圾箱邮件推送到通知渠道。
 
 ## MCP
 

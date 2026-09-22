@@ -118,7 +118,7 @@ describe('account outages', () => {
 
   it('does not notify recovery for an undelivered outage alert', async () => {
     const s = store();
-    const sink = new RecordingSink(false);
+    const sink = new RecordingSink('failed');
     await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     expect(await recordAccountSuccess(s, sink, GMAIL)).toBe(false);

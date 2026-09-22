@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
-import { makeMessage } from './helpers.js';
+import { makeMessage, makeResult } from './helpers.js';
 import type { Rules } from '../src/config.js';
 import {
-  applyRules, FALLBACK_KEYWORDS, headline, keywordFallback, matchesSenderRule, outputLanguageDirective,
-  redactForLlm, resolveLlmBaseUrl, triage,
+  applyRules, effectiveRank, FALLBACK_KEYWORDS, headline, keywordFallback, matchesSenderRule,
+  outputLanguageDirective, redactForLlm, resolveLlmBaseUrl, triage,
 } from '../src/services/triage.js';
 
 const RULES: Rules = {
@@ -230,6 +230,20 @@ describe('LLM layer', () => {
       .toBe('订单 2345678901234567890 已支付，发票 123456789012345678');
     // A valid check character with an impossible birth month is not an ID.
     expect(redactForLlm('11010520261301002X')).toBe('11010520261301002X');
+  });
+});
+
+describe('effective rank', () => {
+  it('adds the spam bonus only to spam and ignores a malformed setting', () => {
+    const info = makeResult({ importance: 'info' });
+    expect(effectiveRank(makeMessage({ inSpam: true }), info)).toBe(0);
+
+    process.env.SPAM_RANK_BONUS = '1';
+    expect(effectiveRank(makeMessage({ inSpam: true }), info)).toBe(1);
+    expect(effectiveRank(makeMessage(), info)).toBe(0);
+
+    process.env.SPAM_RANK_BONUS = 'nonsense';
+    expect(effectiveRank(makeMessage({ inSpam: true }), info)).toBe(0);
   });
 });
 

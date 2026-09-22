@@ -141,7 +141,7 @@ describe('sending', () => {
     const state = new StateStore(':memory:');
     state.queueDigest('failed', items(0, 1)[0]!);
     const at = new Date('2026-09-16T09:00:00');
-    expect(await sendDigest(state, new RecordingSink(false), at)).toBe(false);
+    expect(await sendDigest(state, new RecordingSink('failed'), at)).toBe(false);
     expect(state.digestPending()).toBe(1);
     expect(state.getMeta('digest_last_sent_date')).toBeUndefined();
   });

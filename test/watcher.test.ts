@@ -151,7 +151,7 @@ describe('deduplication', () => {
 describe('delivery failures', () => {
   it('does not count failed deliveries as pushes', async () => {
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
-    const { w } = watcher(new RecordingSink(false));
+    const { w } = watcher(new RecordingSink('failed'));
     stubTriage({ '<c@x>': makeResult({ importance: 'critical' }) });
     const s = stats();
     await w.dispatch([makeMessage({ messageId: '<c@x>' })], s);
@@ -161,7 +161,7 @@ describe('delivery failures', () => {
   it('records undelivered messages accurately', async () => {
     // If success is reported incorrectly, there is no way to find the missing message later.
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
-    const { w, state } = watcher(new RecordingSink(false));
+    const { w, state } = watcher(new RecordingSink('failed'));
     stubTriage({ '<c@x>': makeResult({ importance: 'critical' }) });
     await w.dispatch(w.filterFresh([makeMessage({ messageId: '<c@x>' })]), stats());
     expect(state.queryMail({ pushedOnly: true })).toHaveLength(0);
@@ -170,12 +170,66 @@ describe('delivery failures', () => {
   it('queues failed deliveries in the digest instead of losing them', async () => {
     // The message is marked seen and will not be fetched next round, so failures need a destination.
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
-    const { w, state } = watcher(new RecordingSink(false));
+    const { w, state } = watcher(new RecordingSink('failed'));
     stubTriage({ '<c@x>': makeResult({ importance: 'critical' }) });
     const s = stats();
     await w.dispatch([makeMessage({ messageId: '<c@x>' })], s);
     expect(s.queued).toBe(1);
     expect(state.digestPending()).toBe(1);
+  });
+});
+
+describe('declined deliveries', () => {
+  it('does not leave a declined message in the retry outbox', async () => {
+    // The spam bonus made the watcher push a message the output refused by its
+    // own policy. Marking that refusal as a failure left an entry that retried
+    // on every poll forever and showed up as a permanent delivery backlog.
+    process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    process.env.SPAM_RANK_BONUS = '1';
+    const { w, state } = watcher(new RecordingSink('declined'));
+    stubTriage({ '<s@x>': makeResult({ importance: 'info' }) });
+    const s = stats();
+
+    await w.dispatch([makeMessage({ messageId: '<s@x>', inSpam: true })], s);
+
+    expect(state.notificationOutboxPending()).toBe(0);
+    expect(s.pushed).toBe(0);
+    // The message still reaches the user through the digest.
+    expect(state.digestPending()).toBe(1);
+    expect(s.queued).toBe(1);
+  });
+
+  it('keeps a failed delivery queued for the next poll', async () => {
+    process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    const { w, state } = watcher(new RecordingSink('failed'));
+    stubTriage({ '<c@x>': makeResult({ importance: 'critical' }) });
+
+    await w.dispatch([makeMessage({ messageId: '<c@x>' })], stats());
+
+    expect(state.notificationOutboxPending()).toBe(1);
+  });
+
+  it('drains an outbox entry that every output now declines', async () => {
+    // Entries stranded by the older behaviour clear themselves on the next poll.
+    const { w, state } = watcher(new RecordingSink('declined'));
+    state.enqueueNotification('stranded', makeMessage(), makeResult());
+    vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [], cursors: [] });
+    expect(state.notificationOutboxPending()).toBe(1);
+
+    await w.pollOnce();
+
+    expect(state.notificationOutboxPending()).toBe(0);
+  });
+
+  it('retries an outbox entry whose delivery failed', async () => {
+    const { w, state } = watcher(new RecordingSink('failed'));
+    state.enqueueNotification('pending', makeMessage(), makeResult());
+    vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [], cursors: [] });
+
+    await w.pollOnce();
+
+    expect(state.notificationOutboxPending()).toBe(1);
+    expect(state.pendingNotifications()[0]?.attempts).toBe(1);
   });
 });
 

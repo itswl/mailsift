@@ -5,7 +5,7 @@
  * different payloads, so one header cannot satisfy both replay protection checks.
  */
 import { snippet, type MailMessage } from '../imap/message.js';
-import { FeishuSink, type Sink } from './feishu.js';
+import { FeishuSink, type PushOutcome, type Sink } from './feishu.js';
 import type { TriageResult } from './triage.js';
 import { buildMailSignalEvent } from './signal.js';
 import { deliverWithRetry, isRetryableStatus, type RetryState } from './delivery.js';
@@ -69,14 +69,14 @@ export class WebhookWiseSink implements Sink {
     return `${this.baseUrl}/api/v1/webhook/${this.source}`;
   }
 
-  async push(message: MailMessage, result: TriageResult): Promise<boolean> {
+  async push(message: MailMessage, result: TriageResult): Promise<PushOutcome> {
     if ((process.env.DRY_RUN ?? '').toLowerCase() === 'true') {
       log.info(`[dry-run] Would send to generic webhook | ${result.importance} | ${message.subject}`);
-      return true;
+      return 'delivered';
     }
-    if (!this.configured) return false;
+    if (!this.configured) return 'declined';
 
-    return deliverWithRetry(`Generic webhook | ${message.subject}`, this.retry, async () => {
+    const delivered = await deliverWithRetry(`Generic webhook | ${message.subject}`, this.retry, async () => {
       try {
         const response = await fetch(this.endpoint, {
           method: 'POST',
@@ -96,6 +96,7 @@ export class WebhookWiseSink implements Sink {
         return { delivered: false, retryable: true, detail: String(error) };
       }
     });
+    return delivered ? 'delivered' : 'failed';
   }
 }
 
@@ -111,14 +112,18 @@ export class CompositeSink implements Sink {
     return this.sinks.some((s) => s.configured);
   }
 
-  async push(message: MailMessage, result: TriageResult): Promise<boolean> {
+  async push(message: MailMessage, result: TriageResult): Promise<PushOutcome> {
     if (this.sinks.length === 0) {
+      // Not a decline: nothing refused the message, the service is misconfigured.
       log.error(`No configured output; message dropped | ${message.subject}`);
-      return false;
+      return 'failed';
     }
     // Do not short-circuit: try every output even when one fails.
-    const results = await Promise.all(this.sinks.map((sink) => sink.push(message, result)));
-    return results.some(Boolean);
+    const outcomes = await Promise.all(this.sinks.map((sink) => sink.push(message, result)));
+    if (outcomes.includes('delivered')) return 'delivered';
+    // One output declining must not settle a message another output failed to
+    // send; only a unanimous decline means no retry can ever help.
+    return outcomes.includes('failed') ? 'failed' : 'declined';
   }
 }
 
@@ -129,4 +134,4 @@ export function buildSink(): Sink {
   return sinks.length === 1 ? sinks[0]! : new CompositeSink(sinks);
 }
 
-export type { Sink };
+export type { PushOutcome, Sink };

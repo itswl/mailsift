@@ -386,6 +386,16 @@ export class StateStore {
     ).run(now(), notificationKey);
   }
 
+  /**
+   * Forget an entry no output will ever accept.
+   *
+   * A declined notification is not a failed one: leaving it pending would grow
+   * a backlog that never drains, and prune() only removes delivered rows.
+   */
+  dropNotification(notificationKey: string): void {
+    this.db.prepare('DELETE FROM notification_outbox WHERE notification_key = ?').run(notificationKey);
+  }
+
   markNotificationFailed(notificationKey: string, error: unknown): void {
     this.db.prepare(
       `UPDATE notification_outbox SET attempts = attempts + 1, last_error = ?
