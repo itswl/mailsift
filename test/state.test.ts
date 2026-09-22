@@ -33,6 +33,17 @@ describe('cursors', () => {
     expect(s.getCursor('a@qq.com', 'Junk')).toEqual({ uidValidity: '1', lastUid: 5 });
   });
 
+  it('advanceCursor never rewinds within one UIDVALIDITY but follows a new one', () => {
+    // A wake-up fetch and a scheduled poll may commit the same folder in either
+    // order; the one that saw fewer messages must not move the cursor back.
+    const s = store();
+    s.advanceCursor('a@qq.com', 'INBOX', '1', 100);
+    s.advanceCursor('a@qq.com', 'INBOX', '1', 90);
+    expect(s.getCursor('a@qq.com', 'INBOX')).toEqual({ uidValidity: '1', lastUid: 100 });
+    s.advanceCursor('a@qq.com', 'INBOX', '2', 5);
+    expect(s.getCursor('a@qq.com', 'INBOX')).toEqual({ uidValidity: '2', lastUid: 5 });
+  });
+
   it('can roll back all cursors for --recover', () => {
     const s = store();
     s.saveCursor('a@qq.com', 'INBOX', '1', 100);
