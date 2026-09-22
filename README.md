@@ -104,6 +104,8 @@ Metrics are instrumented with OpenTelemetry and disabled by default. Set `OTEL_E
 
 The LLM integration is OpenAI-compatible: mailsift posts to `${LLM_BASE_URL}/chat/completions` with `model`, `messages`, and (when enabled) `response_format: {"type":"json_object"}`. The response must provide JSON in `choices[0].message.content` with one result per input index. Set `LLM_JSON_MODE=false` for providers that reject `response_format`; mailsift also retries once without it when the rejection is explicit.
 
+`LLM_OUTPUT_LANGUAGE` sets the language of summaries, reasons, and categories: `en` (default), `zh-CN`, `zh-TW`, `auto` to follow each message, or any language name. Categories use the same language, so `auto` can split the digest's category groups.
+
 If an LLM request fails, returns invalid JSON/schema, or omits an input index, the affected batch uses the local fallback. Keyword matches remain warning-level and can be pushed; messages without a high-risk keyword become info and are queued for digest/review. Fallback does not stop polling. After `LLM_ALERT_AFTER_FAILURES` consecutive failures, mailsift sends an outage alert; when calls recover it sends a recovery notice. Messages already processed during fallback are not automatically re-triaged, so review that period's digest.
 
 ### Signal events

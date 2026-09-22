@@ -84,7 +84,8 @@ async function checkConfig(): Promise<number> {
       const provider = process.env.LLM_PROVIDER?.trim();
       console.log(
         `✅ LLM: ${process.env.LLM_MODEL ?? 'deepseek-flash'} @ ` +
-          `${provider ? `${provider} -> ` : ''}${resolveLlmBaseUrl()}`,
+          `${provider ? `${provider} -> ` : ''}${resolveLlmBaseUrl()}; ` +
+          `output language: ${process.env.LLM_OUTPUT_LANGUAGE?.trim() || 'en'}`,
       );
     } catch (error) {
       console.log(`❌ ${error instanceof Error ? error.message : error}`);

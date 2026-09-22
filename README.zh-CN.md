@@ -91,6 +91,8 @@ MCP 还提供 `observability` 查看处理、投递、dead-letter 和反馈统�
 
 LLM 接口必须兼容 OpenAI 的 `/chat/completions`：请求使用 `model`、`messages`，并在启用时带上 `response_format: {"type":"json_object"}`；响应需要在 `choices[0].message.content` 中返回 JSON，并为每封输入邮件提供对应的 `index`。如果服务商不支持 `response_format`，可设置 `LLM_JSON_MODE=false`；服务商明确拒绝时 mailsift 也会自动重试一次。
 
+`LLM_OUTPUT_LANGUAGE` 决定摘要、原因和分类的语言：`en`（默认）、`zh-CN`、`zh-TW`、`auto`（跟随每封邮件的语言）或任意语言名称。分类也使用同一语言，因此 `auto` 可能把日报的分类分组拆成多种语言。
+
 如果 LLM 请求失败、返回无效 JSON/结构，或遗漏输入序号，该批邮件会使用本地 fallback。命中高风险关键词的邮件仍按 warning 处理并可能实时推送；未命中的邮件按 info 处理，进入日报/待复核队列。fallback 不会停止轮询。连续失败达到 `LLM_ALERT_AFTER_FAILURES` 后会发送故障告警，恢复后发送恢复通知；已经在 fallback 期间处理的邮件不会自动重新分诊，应检查对应时段的日报。
 
 ## 运行和恢复

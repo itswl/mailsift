@@ -3,7 +3,8 @@ import './setup.js';
 import { makeMessage } from './helpers.js';
 import type { Rules } from '../src/config.js';
 import {
-  applyRules, FALLBACK_KEYWORDS, headline, keywordFallback, redactForLlm, resolveLlmBaseUrl, triage,
+  applyRules, FALLBACK_KEYWORDS, headline, keywordFallback, outputLanguageDirective, redactForLlm,
+  resolveLlmBaseUrl, triage,
 } from '../src/services/triage.js';
 
 const RULES: Rules = {
@@ -209,6 +210,45 @@ describe('LLM layer', () => {
       .toBe('订单 2345678901234567890 已支付，发票 123456789012345678');
     // A valid check character with an impossible birth month is not an ID.
     expect(redactForLlm('11010520261301002X')).toBe('11010520261301002X');
+  });
+});
+
+describe('output language', () => {
+  function systemPromptOf(call: unknown): string {
+    const init = (call as [unknown, { body: string }])[1];
+    const body = JSON.parse(init.body) as { messages: Array<{ role: string; content: string }> };
+    return body.messages.find((m) => m.role === 'system')!.content;
+  }
+
+  it('asks for English by default so existing deployments keep their output', async () => {
+    mockLlm([{ index: 0, importance: 'info', score: 1, reason: 'x' }]);
+    process.env.LLM_API_KEY = 'k';
+    await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
+    expect(systemPromptOf((fetch as unknown as { mock: { calls: unknown[] } }).mock.calls[0])).toContain('Write all output in English.');
+  });
+
+  it('injects the configured language into the prompt', async () => {
+    mockLlm([{ index: 0, importance: 'info', score: 1, reason: 'x' }]);
+    process.env.LLM_API_KEY = 'k';
+    process.env.LLM_OUTPUT_LANGUAGE = 'zh-CN';
+    await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
+    const prompt = systemPromptOf((fetch as unknown as { mock: { calls: unknown[] } }).mock.calls[0]);
+    expect(prompt).toContain('Write all output in Simplified Chinese.');
+    expect(prompt).not.toContain('English sentences');
+  });
+
+  it.each([
+    ['zh-TW', 'Write all output in Traditional Chinese.'],
+    ['Japanese', 'Write all output in Japanese.'],
+    ['', 'Write all output in English.'],
+  ])('maps %j to a directive', (value, expected) => {
+    process.env.LLM_OUTPUT_LANGUAGE = value;
+    expect(outputLanguageDirective()).toBe(expected);
+  });
+
+  it('can follow the language of each message', () => {
+    process.env.LLM_OUTPUT_LANGUAGE = 'auto';
+    expect(outputLanguageDirective()).toContain('the language the message itself is written in');
   });
 });
 

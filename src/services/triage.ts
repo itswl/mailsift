@@ -81,13 +81,38 @@ const LlmResult = z.object({
 });
 const LlmResponse = z.object({ results: z.array(LlmResult).default([]) });
 
-const SYSTEM_PROMPT = `You are an email triage assistant. The user's output is often the
+const OUTPUT_LANGUAGES: Record<string, string> = {
+  en: 'English',
+  'zh-cn': 'Simplified Chinese',
+  'zh-hans': 'Simplified Chinese',
+  zh: 'Simplified Chinese',
+  'zh-tw': 'Traditional Chinese',
+  'zh-hk': 'Traditional Chinese',
+  'zh-hant': 'Traditional Chinese',
+};
+
+/**
+ * The prompt sentence that fixes the language of summaries, reasons, and categories.
+ *
+ * English stays the default so existing deployments keep their output. Categories
+ * follow the same setting, so `auto` can split digest groups across languages.
+ */
+export function outputLanguageDirective(): string {
+  const raw = (process.env.LLM_OUTPUT_LANGUAGE ?? '').trim().slice(0, 40);
+  const key = raw.toLowerCase();
+  if (key === 'auto') {
+    return 'Write all output in the language the message itself is written in; use English when that is unclear.';
+  }
+  return `Write all output in ${OUTPUT_LANGUAGES[key] ?? (raw || 'English')}.`;
+}
+
+const systemPrompt = (): string => `You are an email triage assistant. The user's output is often the
 only part of a message they see, so explain what the message says and what action is needed,
 not just its importance level.
 
 # Language
 Messages may be in Simplified Chinese, Traditional Chinese, or English; understand all three.
-Write all output in English. Preserve proper nouns, product names, order numbers, amounts, and URLs.
+${outputLanguageDirective()} Preserve proper nouns, product names, order numbers, amounts, and URLs.
 
 # Importance levels
 Judge whether ignoring the message could cause real harm. Work and personal matters are equally important.
@@ -112,11 +137,11 @@ Judge whether ignoring the message could cause real harm. Work and personal matt
   direct mentions, assignments, review requests, security notices, or failures in the user's own repository.
 
 # Output fields
-- summary: the most important field. In 1-2 English sentences, state what the message says and what action
+- summary: the most important field. In 1-2 sentences, state what the message says and what action
   is needed. Include amounts, IDs, times, locations, and deadlines. Do not repeat the subject or add filler.
 - reason: one sentence explaining the importance level.
 - deadline: an explicit deadline or effective time, otherwise an empty string.
-- category: a concise English category.
+- category: a concise category.
 
 Return only JSON:
 {"results": [{"index": 0, "importance": "critical", "score": 0-100, "category": "category",
@@ -296,7 +321,7 @@ function requestBody(messages: MailMessage[], rules: Rules, jsonMode: boolean): 
     temperature: 0,
     ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
     messages: [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: systemPrompt() },
       { role: 'user', content: JSON.stringify(payload) },
     ],
   };
