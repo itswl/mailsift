@@ -8,6 +8,7 @@ import { snippet, type MailMessage } from '../imap/message.js';
 import { FeishuSink, type Sink } from './feishu.js';
 import type { TriageResult } from './triage.js';
 import { buildMailSignalEvent } from './signal.js';
+import { deliverWithRetry, isRetryableStatus, type RetryState } from './delivery.js';
 import { getLogger } from '../logger.js';
 
 const log = getLogger('sink');
@@ -52,6 +53,8 @@ export function buildWebhookPayload(message: MailMessage, result: TriageResult):
 }
 
 export class WebhookWiseSink implements Sink {
+  private readonly retry: RetryState = { exhausted: false };
+
   constructor(
     private readonly baseUrl = (process.env.WEBHOOKWISE_URL ?? '').replace(/\/$/, ''),
     private readonly token = process.env.WEBHOOKWISE_TOKEN ?? '',
@@ -73,26 +76,26 @@ export class WebhookWiseSink implements Sink {
     }
     if (!this.configured) return false;
 
-    try {
-      const response = await fetch(this.endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(this.token ? { token: this.token } : {}),
-        },
-        body: JSON.stringify(buildWebhookPayload(message, result)),
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!response.ok) {
-        log.error(`Generic webhook push rejected | HTTP ${response.status} | ${message.subject}`);
-        return false;
+    return deliverWithRetry(`Generic webhook | ${message.subject}`, this.retry, async () => {
+      try {
+        const response = await fetch(this.endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(this.token ? { token: this.token } : {}),
+          },
+          body: JSON.stringify(buildWebhookPayload(message, result)),
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (!response.ok) {
+          return { delivered: false, retryable: isRetryableStatus(response.status), detail: `HTTP ${response.status}` };
+        }
+        log.info(`Generic webhook delivered | ${result.importance} | ${message.subject}`);
+        return { delivered: true, retryable: false, detail: '' };
+      } catch (error) {
+        return { delivered: false, retryable: true, detail: String(error) };
       }
-      log.info(`Generic webhook delivered | ${result.importance} | ${message.subject}`);
-      return true;
-    } catch (error) {
-      log.error(`Generic webhook push failed | ${message.subject} | ${error}`);
-      return false;
-    }
+    });
   }
 }
 

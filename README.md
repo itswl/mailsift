@@ -208,6 +208,7 @@ sink is healthy. Use MCP `health` and `recovery_status` for those details.
 ## Troubleshooting
 
 - **Repeated notifications:** messages are deduplicated by account plus Message-ID. `--recover` is for interrupted, undecided records.
+- **Delivery failures:** a push that fails with a network error, a timeout, or HTTP 408/429/5xx is retried up to `SINK_RETRY_ATTEMPTS` times (default `3`, seconds apart) and then waits in the durable outbox for the next poll. Other rejections go straight to the outbox. An endpoint that stays down gets one attempt per push until a delivery succeeds, so a dead endpoint does not stretch the poll.
 - **QQ scans many messages:** some QQ IMAP endpoints ignore `SINCE`; the local UID cursor still preserves correctness.
 - **Messages marked read:** mailsift uses read-only mailbox locks and `BODY.PEEK[]`.
 - **LLM privacy:** `LLM_SKIP_SENSITIVE=true` keeps verification-code messages local, and `LLM_REDACT_PII=true` redacts common direct identifiers before sending fields to the LLM. Omit `LLM_API_KEY` for local keyword fallback or use a self-hosted endpoint.

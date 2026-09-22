@@ -9,9 +9,13 @@ import { IMPORTANCE_RANK, type Importance } from '../config.js';
 import { buildLink } from '../links.js';
 import { snippet, type MailMessage } from '../imap/message.js';
 import { headline, rank, type TriageResult } from './triage.js';
+import { deliverWithRetry, isRetryableStatus, type RetryState } from './delivery.js';
 import { getLogger } from '../logger.js';
 
 const log = getLogger('feishu');
+
+/** Returned with HTTP 200 when a custom bot exceeds its request rate. */
+const FEISHU_RATE_LIMIT_CODE = 11232;
 
 const TEMPLATE: Record<Importance, string> = { critical: 'red', warning: 'orange', info: 'blue' };
 const PREFIX: Record<Importance, string> = { critical: '🔴', warning: '🟠', info: '🔵' };
@@ -108,6 +112,8 @@ export interface Sink {
 }
 
 export class FeishuSink implements Sink {
+  private readonly retry: RetryState = { exhausted: false };
+
   constructor(
     private readonly url = process.env.FEISHU_WEBHOOK_URL ?? '',
     private readonly secret = process.env.FEISHU_WEBHOOK_SECRET ?? '',
@@ -132,44 +138,47 @@ export class FeishuSink implements Sink {
     // every configured output declines or fails.
     if (!isDigest && rank(result) < this.threshold) return false;
 
-    const payload = buildCard(message, result) as Record<string, unknown>;
-    if (this.secret) {
-      const timestamp = Math.floor(Date.now() / 1000);
-      payload['timestamp'] = String(timestamp);
-      payload['sign'] = sign(this.secret, timestamp);
-    }
-
     if ((process.env.DRY_RUN ?? '').toLowerCase() === 'true') {
       log.info(`[dry-run] Would send to Feishu | ${result.importance} | ${message.subject}`);
       return true;
     }
     if (!this.configured) return false;
 
-    try {
-      const response = await fetch(this.url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!response.ok) {
-        log.error(`Feishu push failed | HTTP ${response.status} | ${message.subject}`);
-        return false;
+    return deliverWithRetry(`Feishu | ${message.subject}`, this.retry, async () => {
+      // Sign inside the attempt so a retry never reuses a stale timestamp.
+      const payload = buildCard(message, result) as Record<string, unknown>;
+      if (this.secret) {
+        const timestamp = Math.floor(Date.now() / 1000);
+        payload['timestamp'] = String(timestamp);
+        payload['sign'] = sign(this.secret, timestamp);
       }
-      // Feishu may return HTTP 200 for business errors; inspect the response code.
-      const data = (await response.json()) as { code?: number; msg?: string; StatusCode?: number };
-      const code = data.code ?? data.StatusCode ?? 0;
-      if (code !== 0) {
-        log.error(`Feishu rejected message | code=${code} msg=${data.msg ?? ''}`);
-        return false;
+      try {
+        const response = await fetch(this.url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (!response.ok) {
+          return { delivered: false, retryable: isRetryableStatus(response.status), detail: `HTTP ${response.status}` };
+        }
+        // Feishu may return HTTP 200 for business errors; inspect the response code.
+        const data = (await response.json()) as { code?: number; msg?: string; StatusCode?: number };
+        const code = data.code ?? data.StatusCode ?? 0;
+        if (code !== 0) {
+          return {
+            delivered: false,
+            retryable: code === FEISHU_RATE_LIMIT_CODE,
+            detail: `code=${code} msg=${data.msg ?? ''}`,
+          };
+        }
+        log.info(
+          `Feishu delivered | ${result.importance} | ${message.subject}${message.inSpam ? ' (recovered from spam)' : ''}`,
+        );
+        return { delivered: true, retryable: false, detail: '' };
+      } catch (error) {
+        return { delivered: false, retryable: true, detail: String(error) };
       }
-      log.info(
-        `Feishu delivered | ${result.importance} | ${message.subject}${message.inSpam ? ' (recovered from spam)' : ''}`,
-      );
-      return true;
-    } catch (error) {
-      log.error(`Feishu push failed | ${message.subject} | ${error}`);
-      return false;
-    }
+    });
   }
 }

@@ -131,6 +131,10 @@ systemd 模板见 [deploy/mailsift.service](deploy/mailsift.service)。先执行
 docker compose run --rm mailsift node dist/src/main.js --recover
 ```
 
+## 通知重试
+
+推送因网络错误、超时或 HTTP 408/429/5xx 失败时，会先按 `SINK_RETRY_ATTEMPTS`（默认 `3`，间隔数秒）立即重试，仍失败再进入持久化 outbox，由下一轮轮询继续投递；其它拒绝直接进入 outbox。端点持续不可用时，每次推送只尝试一次，直到有一次投递成功，避免拖长轮询。
+
 ## MCP
 
 内置 MCP 默认在主进程中开启。Docker 中，`MCP_BIND` 是容器内监听地址，`MCP_PUBLIC_HOST` 是宿主机发布地址；Compose 会让宿主机端口和容器端口都使用 `MCP_PORT`。默认只在宿主机回环地址提供服务：
