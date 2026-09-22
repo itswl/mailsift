@@ -94,6 +94,10 @@ After two feedback records for the same sender, `missed` feedback infers an alwa
 
 State is stored in SQLite (`data/mailsift.db`). Docker persists it in the `mailsift-data` named volume.
 
+### Real-time wake-ups with IMAP IDLE
+
+`IMAP_IDLE_ENABLED=true` keeps one read-only connection per account and IDLE folder (`IMAP_IDLE_FOLDERS`, default `INBOX`) open. When the server reports new mail, mailsift fetches that folder at once on the same connection and runs the usual deduplicate, triage, and deliver pipeline, so a wake-up costs no extra login. Polling continues as the reconciliation pass and catches anything a notification missed; with IDLE on, `POLL_INTERVAL_SECONDS` can usually be raised to 900-1800. `npm run probe` shows whether a server advertises IDLE; accounts without it stay on polling. Listeners reconnect with backoff after a drop, log out cleanly on shutdown, and the MCP `health` tool reports the last wake-up per account.
+
 ## OpenTelemetry metrics
 
 Metrics are instrumented with OpenTelemetry and disabled by default. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to send OTLP metrics to an OpenTelemetry Collector. The instruments cover poll duration, account outcomes, triage decisions, notifications, dead letters, and the outbox. Attributes intentionally use only low-cardinality values such as provider, outcome, channel, importance, and decision source.

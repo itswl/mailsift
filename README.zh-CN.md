@@ -81,6 +81,10 @@ MCP 还提供 `observability` 查看处理、投递、dead-letter 和反馈统�
 
 状态保存在 SQLite 的 `data/mailsift.db` 中，Docker 使用 `mailsift-data` 命名卷持久化。
 
+## IMAP IDLE 实时唤醒
+
+`IMAP_IDLE_ENABLED=true` 会为每个账号的每个 IDLE 文件夹（`IMAP_IDLE_FOLDERS`，默认 `INBOX`）保持一条只读长连接。服务器通知有新邮件时，mailsift 立刻在同一条连接上抓取该文件夹，并走正常的去重、分诊、投递流水线，因此一次唤醒不产生额外登录。定时轮询继续作为对账机制运行，兜住通知漏掉的邮件；开启 IDLE 后通常可以把 `POLL_INTERVAL_SECONDS` 调到 900～1800。`npm run probe` 会显示服务器是否支持 IDLE，不支持的账号继续使用轮询。长连接断开后按退避重连，进程退出时会正常 LOGOUT，MCP `health` 会报告每个账号最近一次唤醒时间。
+
 ## OpenTelemetry 指标
 
 指标使用 OpenTelemetry，默认关闭。设置 `OTEL_EXPORTER_OTLP_ENDPOINT` 后即可把 OTLP 指标发送到 OpenTelemetry Collector，覆盖轮询耗时、账号结果、分类决策、通知、dead-letter 和 outbox。指标属性只使用 provider、结果、通道、重要性和决策来源等低基数值，不放邮箱地址、Message-ID 或主题。
