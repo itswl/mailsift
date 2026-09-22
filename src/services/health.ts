@@ -155,7 +155,7 @@ export async function recordAccountFailure(
     '⚠️ New mail from this account, including spam, will not be checked until recovery.',
   ].join('\n');
 
-  const sent = await deliver(sink, 
+  const sent = await deliver(sink,
     healthMessage(`⚠️ Mail account unavailable: ${account.name}`, body, account.username, hourStamp()),
     critical(`${account.name} ${authFailure ? 'authentication' : 'connection'} failure; monitoring coverage is lost`),
   );
@@ -179,7 +179,7 @@ export async function recordAccountSuccess(
     log.info(`[${account.name}] recovered (no alert was sent).`);
     return false;
   }
-  const sent = await deliver(sink, 
+  const sent = await deliver(sink,
     healthMessage(
       `✅ Mail account recovered: ${account.name}`,
       `**Monitoring restored for ${account.name} (${account.username}).**\n\n` +
@@ -224,7 +224,7 @@ export async function recordLlmFailure(state: StateStore, sink: Sink, error: unk
     'Other messages, including human inquiries, are queued for the daily digest instead of real-time alerts.',
   ].join('\n');
 
-  const sent = await deliver(sink, 
+  const sent = await deliver(sink,
     healthMessage('⚠️ LLM unavailable: triage downgraded', body, 'llm', hourStamp()),
     critical(`${process.env.LLM_MODEL ?? 'LLM'} failed ${failures} consecutive times; triage uses keyword fallback`),
   );
@@ -242,7 +242,7 @@ export async function recordLlmSuccess(state: StateStore, sink: Sink): Promise<b
     log.info('LLM recovered (no alert was sent).');
     return false;
   }
-  const sent = await deliver(sink, 
+  const sent = await deliver(sink,
     healthMessage(
       '✅ LLM recovered',
       '**Triage is back to normal.**\n\nMessages queued during fallback are not re-triaged; ' +
@@ -294,7 +294,7 @@ export async function recordStartupFailure(error: unknown, sink: Sink): Promise<
     '⚠️ No mailbox, including spam, will be checked until this is fixed.',
   ].join('\n');
 
-  const sent = await deliver(sink, 
+  const sent = await deliver(sink,
     healthMessage('🛑 mailsift startup failed', body, 'startup', hourStamp()),
     critical('Service startup failed; mailbox monitoring is stopped'),
   );
