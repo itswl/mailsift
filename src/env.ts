@@ -10,6 +10,15 @@
  */
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { setDefaultResultOrder } from 'node:dns';
+
+// Default DNS resolution to IPv4 first to avoid unreachable IPv6 routes in
+// dual-stack environments and Docker bridge networks without IPv6 egress.
+try {
+  setDefaultResultOrder('ipv4first');
+} catch {
+  // best effort across node environments
+}
 
 const path = resolve(process.cwd(), process.env.ENV_FILE ?? '.env');
 if (existsSync(path)) {
