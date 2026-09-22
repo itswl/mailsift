@@ -5,6 +5,10 @@ import { StateStore } from '../src/services/state.js';
 import { Watcher } from '../src/services/watcher.js';
 import type { WatchConfig } from '../src/config.js';
 import * as triageModule from '../src/services/triage.js';
+import * as clientModule from '../src/imap/client.js';
+import type { ImapFlow } from 'imapflow';
+import type { Account } from '../src/config.js';
+import type { Folder } from '../src/imap/folders.js';
 import type { MailMessage } from '../src/imap/message.js';
 import type { TriageResult } from '../src/services/triage.js';
 
@@ -172,6 +176,54 @@ describe('delivery failures', () => {
     await w.dispatch([makeMessage({ messageId: '<c@x>' })], s);
     expect(s.queued).toBe(1);
     expect(state.digestPending()).toBe(1);
+  });
+});
+
+describe('IDLE wake-ups', () => {
+  const ACCOUNT: Account = {
+    name: 'qq', provider: 'qq', username: 'me@qq.com', host: 'imap.qq.com', port: 993,
+    auth: 'password', password: 'x', folders: ['INBOX'], useSsl: true,
+  };
+  const INBOX: Folder = { path: 'INBOX', rawPath: 'INBOX', flags: new Set(), isSpam: false, selectable: true };
+  const CLIENT = {} as ImapFlow;
+
+  it('leaves a folder without a cursor to the scheduled poll', async () => {
+    // The poll's bounded lookback handles first contact; a wake-up must not double it.
+    const { w } = watcher();
+    const fetch = vi.spyOn(clientModule, 'fetchNew');
+    const stats = await w.pollFolder(ACCOUNT, INBOX, CLIENT);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(stats.fetched).toBe(0);
+  });
+
+  it('pushes a message once when a wake-up and a poll both carry it', async () => {
+    process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    const { w, sink, state } = watcher();
+    state.saveCursor('me@qq.com', 'INBOX', '1', 100);
+    const message = makeMessage({ messageId: '<a@x>' });
+    stubTriage({ '<a@x>': makeResult({ importance: 'critical' }) });
+    vi.spyOn(clientModule, 'fetchNew').mockResolvedValue({
+      messages: [message], cursor: { uidValidity: '1', lastUid: 101 }, failures: [],
+    });
+    vi.spyOn(w, 'collectAll').mockResolvedValue({
+      messages: [message], cursors: [['me@qq.com', 'INBOX', '1', 103]],
+    });
+
+    await Promise.all([w.pollFolder(ACCOUNT, INBOX, CLIENT), w.pollOnce()]);
+
+    expect(sink.pushed).toHaveLength(1);
+    // Whichever commits second saw fewer messages and must not rewind the cursor.
+    expect(state.getCursor('me@qq.com', 'INBOX')).toEqual({ uidValidity: '1', lastUid: 103 });
+  });
+
+  it('records the wake-up time for health reporting', async () => {
+    const { w, state } = watcher();
+    state.saveCursor('me@qq.com', 'INBOX', '1', 100);
+    vi.spyOn(clientModule, 'fetchNew').mockResolvedValue({
+      messages: [], cursor: { uidValidity: '1', lastUid: 100 }, failures: [],
+    });
+    await w.pollFolder(ACCOUNT, INBOX, CLIENT);
+    expect(state.getMeta('idle_last_wake_at:me@qq.com')).toBeTruthy();
   });
 });
 
