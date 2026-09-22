@@ -3,8 +3,8 @@ import './setup.js';
 import { makeMessage } from './helpers.js';
 import type { Rules } from '../src/config.js';
 import {
-  applyRules, FALLBACK_KEYWORDS, headline, keywordFallback, outputLanguageDirective, redactForLlm,
-  resolveLlmBaseUrl, triage,
+  applyRules, FALLBACK_KEYWORDS, headline, keywordFallback, matchesSenderRule, outputLanguageDirective,
+  redactForLlm, resolveLlmBaseUrl, triage,
 } from '../src/services/triage.js';
 
 const RULES: Rules = {
@@ -53,6 +53,26 @@ describe('rule layer', () => {
 
   it('passes unmatched messages to the next layer', () => {
     expect(applyRules(makeMessage({ fromAddr: 'random@x.com' }), RULES)).toBeUndefined();
+  });
+
+  it('anchors @domain rules to the address domain and its subdomains', () => {
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'alerts@bank.com' }), '@bank.com')).toBe(true);
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'alerts@mail.bank.com' }), '@bank.com')).toBe(true);
+    // A look-alike domain or a crafted display name must not trigger an always-important rule.
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'alerts@bank.com.evil.io' }), '@bank.com')).toBe(false);
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'alerts@notbank.com' }), '@bank.com')).toBe(false);
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'x@evil.io', fromName: 'Alerts @bank.com' }), '@bank.com')).toBe(false);
+  });
+
+  it('treats a full address as an exact match', () => {
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'Alerts@Bank.com' }), 'alerts@bank.com')).toBe(true);
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'xalerts@bank.com' }), 'alerts@bank.com')).toBe(false);
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'alerts@bank.com.cn' }), 'alerts@bank.com')).toBe(false);
+  });
+
+  it('keeps plain keywords as substring matches on address and name', () => {
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'x@y.com', fromName: 'Weekly Newsletter' }), 'newsletter')).toBe(true);
+    expect(matchesSenderRule(makeMessage({ fromAddr: 'customer-service@bank.com' }), 'service')).toBe(true);
   });
 
   it('keeps explicit sender rules ahead of feedback rules', () => {

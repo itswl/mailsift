@@ -148,9 +148,31 @@ Return only JSON:
 "action_required": true, "summary": "what it says and what to do", "reason": "why this level", "deadline": ""}]}
 Return exactly one result per message, with indices matching the input order.`;
 
+/**
+ * Sender rule forms:
+ * - `@domain`     the address domain, or a subdomain of it
+ * - `user@domain` that exact address
+ * - anything else a substring of the address or display name
+ *
+ * Domain and address forms deliberately ignore the display name: it is fully
+ * attacker-controlled, and a substring test would let `@bank.com` in a display
+ * name or a look-alike `bank.com.evil.io` address trigger an always-important rule.
+ */
+export function matchesSenderRule(message: MailMessage, pattern: string): boolean {
+  if (!pattern) return false;
+  const address = message.fromAddr.toLowerCase();
+  const at = pattern.indexOf('@');
+  if (at === 0 && pattern.length > 1) {
+    const domain = address.slice(address.lastIndexOf('@') + 1);
+    const wanted = pattern.slice(1);
+    return domain === wanted || domain.endsWith(`.${wanted}`);
+  }
+  if (at > 0 && at < pattern.length - 1) return address === pattern;
+  return `${address} ${message.fromName}`.toLowerCase().includes(pattern);
+}
+
 function matches(message: MailMessage, patterns: string[]): string | undefined {
-  const haystack = `${message.fromAddr} ${message.fromName}`.toLowerCase();
-  return patterns.find((p) => p && haystack.includes(p));
+  return patterns.find((p) => matchesSenderRule(message, p));
 }
 
 /** Apply sender rules directly; undefined delegates to the next layer. */
