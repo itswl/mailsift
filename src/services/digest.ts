@@ -197,7 +197,7 @@ export async function sendDigest(state: StateStore, sink: Sink, at: Date = new D
     decidedBy: 'digest',
   };
 
-  const sent = await sink.push(message, result);
+  const sent = (await sink.push(message, result)) === 'delivered';
   if (sent) {
     state.clearDigest(entries.map((entry) => entry.dedupKey));
     state.setMeta(DIGEST_SENT_KEY, today);

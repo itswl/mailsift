@@ -17,7 +17,7 @@ import {
 } from '../imap/client.js';
 import type { Folder } from '../imap/folders.js';
 import { dedupKey, snippet, type MailMessage } from '../imap/message.js';
-import { triage, rank, type TriageResult } from './triage.js';
+import { triage, effectiveRank, rank, type TriageResult } from './triage.js';
 import * as digest from './digest.js';
 import * as health from './health.js';
 import type { Sink } from './sink.js';
@@ -219,11 +219,6 @@ export class Watcher {
     return fresh;
   }
 
-  private effectiveRank(message: MailMessage, result: TriageResult): number {
-    const bonus = Number(process.env.SPAM_RANK_BONUS ?? 0);
-    return message.inSpam ? rank(result) + Math.max(0, bonus) : rank(result);
-  }
-
   private triageRules() {
     const feedback = this.state.feedbackRuleHints(2);
     return { ...this.config.rules, feedbackAlwaysImportant: feedback.alwaysImportant, feedbackNeverImportant: feedback.neverImportant };
@@ -231,11 +226,16 @@ export class Watcher {
 
   private async flushNotificationOutbox(): Promise<void> {
     for (const entry of this.state.pendingNotifications()) {
-      const delivered = await this.sink.push(entry.message, entry.result);
-      if (delivered) {
+      const outcome = await this.sink.push(entry.message, entry.result);
+      if (outcome === 'delivered') {
         this.state.markNotificationDelivered(entry.notificationKey);
         this.state.clearDigest([entry.notificationKey]);
         metrics.addCounter('mailsift.notifications.delivered', 1, { channel: 'outbox_retry' });
+      } else if (outcome === 'declined') {
+        // Policy, not a failure: every later retry would decline it too. The
+        // digest already carries it, so drop it instead of reporting a backlog.
+        this.state.dropNotification(entry.notificationKey);
+        log.info(`Every output declines ${entry.notificationKey}; leaving it to the digest.`);
       } else {
         this.state.markNotificationFailed(entry.notificationKey, 'sink delivery failed');
         metrics.addCounter('mailsift.notifications.failed', 1, { channel: 'outbox_retry' });
@@ -288,27 +288,32 @@ export class Watcher {
       this.state.markSeen(key, message.account, message.subject);
       const fields = this.outcomeFields(message, result);
 
-      if (this.effectiveRank(message, result) >= pushThreshold) {
+      if (effectiveRank(message, result) >= pushThreshold) {
         // Persist a bounded, resendable copy before the external write. The
         // outbox is at-least-once: a crash after provider acceptance and before
         // the delivered mark can still duplicate a notification, so adapters
         // should use notificationKey for idempotency where supported.
         const outboxMessage = { ...message, body: snippet(message) };
         this.state.enqueueNotification(key, outboxMessage, result);
-        const delivered = await this.sink.push(message, result);
-        if (delivered) {
+        const outcome = await this.sink.push(message, result);
+        if (outcome === 'delivered') {
           this.state.markNotificationDelivered(key);
           metrics.addCounter('mailsift.notifications.delivered', 1, { channel: 'realtime' });
           stats.pushed += 1;
           if (message.inSpam) stats.spamRescued += 1;
+        } else if (outcome === 'declined') {
+          // No retry can change an output's own policy, so drop the queued copy
+          // rather than leaving a notification that can never be delivered.
+          this.state.dropNotification(key);
+          log.info(`Every output declined the message; queued for digest: ${message.subject}`);
         } else {
           this.state.markNotificationFailed(key, 'sink delivery failed');
           metrics.addCounter('mailsift.notifications.failed', 1, { channel: 'realtime' });
+          log.warn(`Delivery failed; queued for digest: ${message.subject}`);
         }
-        this.state.recordOutcome(key, result.importance, delivered, fields);
-        if (delivered) continue;
-        // A failed delivery is already marked seen, so queue it for the digest.
-        log.warn(`Delivery failed; queued for digest: ${message.subject}`);
+        this.state.recordOutcome(key, result.importance, outcome === 'delivered', fields);
+        if (outcome === 'delivered') continue;
+        // Undelivered and already marked seen, so the digest is its only route.
         this.state.queueDigest(key, digest.toDigestItem(message, result));
         stats.queued += 1;
         continue;

@@ -55,6 +55,21 @@ export function rank(result: TriageResult): number {
   return IMPORTANCE_RANK[result.importance];
 }
 
+/**
+ * The rank every delivery decision must use.
+ *
+ * Spam carries an optional bonus: a message the provider filed as spam is the
+ * one most likely to be a costly false positive. Both the watcher's push
+ * threshold and an output's own threshold read this, never the raw rank. When
+ * they disagreed, the watcher queued notifications that the output refused for
+ * good, and those piled up in the retry outbox forever.
+ */
+export function effectiveRank(message: MailMessage, result: TriageResult): number {
+  const configured = Number(process.env.SPAM_RANK_BONUS ?? 0);
+  const bonus = Number.isFinite(configured) ? Math.max(0, configured) : 0;
+  return message.inSpam ? rank(result) + bonus : rank(result);
+}
+
 /** The sentence shown first in cards and digests. */
 export function headline(result: TriageResult): string {
   return result.summary || result.reason;

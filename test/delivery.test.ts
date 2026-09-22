@@ -81,14 +81,14 @@ describe('sink wiring', () => {
     vi.stubGlobal('fetch', fetchMock);
     const pending = new FeishuSink('https://example.invalid/hook').push(makeMessage(), makeResult());
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(await pending).toBe(true);
+    expect(await pending).toBe('delivered');
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('Feishu does not retry a business error other than rate limiting', async () => {
     const fetchMock = vi.fn(async () => new Response('{"code":19001,"msg":"param invalid"}', { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
-    expect(await new FeishuSink('https://example.invalid/hook').push(makeMessage(), makeResult())).toBe(false);
+    expect(await new FeishuSink('https://example.invalid/hook').push(makeMessage(), makeResult())).toBe('failed');
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -100,7 +100,7 @@ describe('sink wiring', () => {
     vi.stubGlobal('fetch', fetchMock);
     const pending = new FeishuSink('https://example.invalid/hook').push(makeMessage(), makeResult());
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(await pending).toBe(true);
+    expect(await pending).toBe('delivered');
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -113,11 +113,11 @@ describe('sink wiring', () => {
     const sink = new WebhookWiseSink('https://example.invalid', 'token');
     const pending = sink.push(makeMessage(), makeResult());
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(await pending).toBe(true);
+    expect(await pending).toBe('delivered');
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
     fetchMock.mockResolvedValueOnce(new Response('bad', { status: 400 }));
-    expect(await sink.push(makeMessage(), makeResult())).toBe(false);
+    expect(await sink.push(makeMessage(), makeResult())).toBe('failed');
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 });

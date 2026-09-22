@@ -8,7 +8,7 @@ import { createHmac } from 'node:crypto';
 import { IMPORTANCE_RANK, type Importance } from '../config.js';
 import { buildLink } from '../links.js';
 import { snippet, type MailMessage } from '../imap/message.js';
-import { headline, rank, type TriageResult } from './triage.js';
+import { effectiveRank, headline, type TriageResult } from './triage.js';
 import { deliverWithRetry, isRetryableStatus, type RetryState } from './delivery.js';
 import { getLogger } from '../logger.js';
 
@@ -106,9 +106,19 @@ export function sign(secret: string, timestamp: number): string {
   return createHmac('sha256', `${timestamp}\n${secret}`).update('').digest('base64');
 }
 
+/**
+ * What one delivery attempt settled on.
+ *
+ * `declined` and `failed` have to stay apart. A decline is the output's own
+ * policy, so the same message would be declined again on every retry; keeping
+ * it queued builds a backlog that never drains and hides a real one. A failure
+ * is worth retrying.
+ */
+export type PushOutcome = 'delivered' | 'declined' | 'failed';
+
 export interface Sink {
   readonly configured: boolean;
-  push(message: MailMessage, result: TriageResult): Promise<boolean>;
+  push(message: MailMessage, result: TriageResult): Promise<PushOutcome>;
 }
 
 export class FeishuSink implements Sink {
@@ -131,20 +141,20 @@ export class FeishuSink implements Sink {
     return IMPORTANCE_RANK[level] ?? 1;
   }
 
-  async push(message: MailMessage, result: TriageResult): Promise<boolean> {
+  async push(message: MailMessage, result: TriageResult): Promise<PushOutcome> {
     const isDigest = Boolean(message.extra?.['digest']);
-    // This output intentionally did not send the message. Returning false lets
-    // CompositeSink try other outputs and lets the watcher queue a digest when
-    // every configured output declines or fails.
-    if (!isDigest && rank(result) < this.threshold) return false;
+    // Feishu may be stricter than the global threshold; digests are exempt.
+    // Compare the same effective rank the watcher used, so the spam bonus
+    // cannot make the two disagree about one message.
+    if (!isDigest && effectiveRank(message, result) < this.threshold) return 'declined';
 
     if ((process.env.DRY_RUN ?? '').toLowerCase() === 'true') {
       log.info(`[dry-run] Would send to Feishu | ${result.importance} | ${message.subject}`);
-      return true;
+      return 'delivered';
     }
-    if (!this.configured) return false;
+    if (!this.configured) return 'declined';
 
-    return deliverWithRetry(`Feishu | ${message.subject}`, this.retry, async () => {
+    const delivered = await deliverWithRetry(`Feishu | ${message.subject}`, this.retry, async () => {
       // Sign inside the attempt so a retry never reuses a stale timestamp.
       const payload = buildCard(message, result) as Record<string, unknown>;
       if (this.secret) {
@@ -180,5 +190,6 @@ export class FeishuSink implements Sink {
         return { delivered: false, retryable: true, detail: String(error) };
       }
     });
+    return delivered ? 'delivered' : 'failed';
   }
 }
