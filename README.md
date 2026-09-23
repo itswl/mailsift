@@ -60,6 +60,8 @@ DIGEST_HOUR=9
 
 `MAIL_ACCOUNT_N_FOLDERS` accepts `all`, `INBOX,spam`, or explicit folder names. The `all` token excludes sent, drafts, trash, and provider-wide virtual views. The `spam` token detects the provider's spam folder.
 
+`SPAM_RANK_BONUS` lifts spam-folder mail by whole importance levels, so with the default `PUSH_MIN_IMPORTANCE=warning` a bonus of `1` pushes every spam-folder message: warning and critical were already above the line and info now sits on it. Leave it at `0` unless `PUSH_MIN_IMPORTANCE` is `critical` and you want spam-folder warnings to break through anyway. Catching a message wrongly filed as spam does not need it, because triage assesses spam normally and rates a real bill or code warning or critical there. `--check` warns about the combinations that deliver the whole spam folder.
+
 `MAIL_CONTEXT`, `MAIL_ALWAYS_IMPORTANT`, `MAIL_NEVER_IMPORTANT`, and `MAIL_KEYWORDS` customize classification. Keep `MAIL_CONTEXT` on one line in `.env`. Sender rules take three forms: `@bank.com` matches the address domain or a subdomain of it, `alerts@bank.com` matches exactly that address, and anything else is a substring test on the address and display name. The first two ignore the display name so a look-alike domain or a crafted name cannot trigger an always-important rule.
 
 ### Gmail and Outlook OAuth

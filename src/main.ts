@@ -13,7 +13,7 @@ import { ConfigError, loadConfig, needsOAuth } from './config.js';
 import { TokenStore } from './imap/auth.js';
 import { StateStore } from './services/state.js';
 import { buildSink, WebhookWiseSink } from './services/sink.js';
-import { resolveLlmBaseUrl } from './services/triage.js';
+import { resolveLlmBaseUrl, spamBonusWarning } from './services/triage.js';
 import { sendDigest } from './services/digest.js';
 import { recordStartupFailure } from './services/health.js';
 import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
@@ -100,6 +100,9 @@ async function checkConfig(): Promise<number> {
     `   Push threshold: ${process.env.PUSH_MIN_IMPORTANCE ?? 'warning'}; ` +
       `spam importance bonus: +${process.env.SPAM_RANK_BONUS ?? 0}`,
   );
+  const spamWarning = spamBonusWarning();
+  // A warning, not a misconfiguration: report it without failing the check.
+  if (spamWarning) console.log(`   ⚠️  ${spamWarning}`);
   console.log(
     `   Poll interval: ${process.env.POLL_INTERVAL_SECONDS ?? 300}s; ` +
       `digest: ${(process.env.DIGEST_ENABLED ?? 'true') === 'false' ? 'disabled' : `daily at ${process.env.DIGEST_HOUR ?? 9}:00`}`,
@@ -215,6 +218,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
     return 1;
   }
+
+  const spamWarning = spamBonusWarning();
+  if (spamWarning) log.warn(spamWarning);
 
   if (values['digest-now']) {
     await sendDigest(watcher.state, watcher.sink);

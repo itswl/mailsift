@@ -17,7 +17,7 @@ import {
 } from '../imap/client.js';
 import type { Folder } from '../imap/folders.js';
 import { dedupKey, snippet, type MailMessage } from '../imap/message.js';
-import { triage, effectiveRank, rank, type TriageResult } from './triage.js';
+import { triage, effectiveRank, pushThreshold, rank, type TriageResult } from './triage.js';
 import * as digest from './digest.js';
 import * as health from './health.js';
 import type { Sink } from './sink.js';
@@ -264,8 +264,7 @@ export class Watcher {
   async dispatch(messages: MailMessage[], stats: PollStats): Promise<void> {
     if (messages.length === 0) return;
 
-    const pushThreshold =
-      IMPORTANCE_RANK[(process.env.PUSH_MIN_IMPORTANCE ?? 'warning') as Importance] ?? 1;
+    const pushLimit = pushThreshold();
     const digestThreshold =
       IMPORTANCE_RANK[(process.env.DIGEST_MIN_IMPORTANCE ?? 'info') as Importance] ?? 0;
 
@@ -288,7 +287,7 @@ export class Watcher {
       this.state.markSeen(key, message.account, message.subject);
       const fields = this.outcomeFields(message, result);
 
-      if (effectiveRank(message, result) >= pushThreshold) {
+      if (effectiveRank(message, result) >= pushLimit) {
         // Persist a bounded, resendable copy before the external write. The
         // outbox is at-least-once: a crash after provider acceptance and before
         // the delivered mark can still duplicate a notification, so adapters
