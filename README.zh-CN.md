@@ -47,6 +47,8 @@ DIGEST_HOUR=9
 
 完整配置见 [.env.example](.env.example)。`MAIL_ACCOUNT_N_FOLDERS` 可填 `all`、`INBOX,spam` 或具体文件夹名；`all` 会排除已发送、草稿、回收站和服务商的虚拟视图，`spam` 会自动识别垃圾箱。
 
+`SPAM_RANK_BONUS` 按整级提升垃圾箱邮件，而 info 是最低一级，因此在默认的 `PUSH_MIN_IMPORTANCE=warning` 下把它设为 `1` 会推送垃圾箱里的每一封邮件：warning 和 critical 本来就在推送线之上，info 现在也正好压线。除非你把 `PUSH_MIN_IMPORTANCE` 调成 `critical` 又希望垃圾箱里的 warning 仍能穿透，否则保持 `0`。防止邮件被误判进垃圾箱并不需要它，因为分诊会正常评估垃圾箱邮件，真正的账单或验证码在那里也会被评为 warning 或 critical。`--check` 会对导致整箱推送的组合给出提示。
+
 `MAIL_CONTEXT`、`MAIL_ALWAYS_IMPORTANT`、`MAIL_NEVER_IMPORTANT` 和 `MAIL_KEYWORDS` 可用于定制分类规则。不要把 `MAIL_CONTEXT` 写成多行。发件人规则有三种写法：`@bank.com` 匹配发件地址的域名及其子域，`alerts@bank.com` 精确匹配该地址，其它写法按子串匹配地址和显示名。前两种不看显示名，避免仿冒域名或伪造显示名触发"始终重要"规则。
 
 ## Gmail / Outlook OAuth

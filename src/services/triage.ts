@@ -65,9 +65,40 @@ export function rank(result: TriageResult): number {
  * good, and those piled up in the retry outbox forever.
  */
 export function effectiveRank(message: MailMessage, result: TriageResult): number {
+  return message.inSpam ? rank(result) + spamBonus() : rank(result);
+}
+
+/** Levels of importance that spam-folder mail is lifted by, never negative. */
+export function spamBonus(): number {
   const configured = Number(process.env.SPAM_RANK_BONUS ?? 0);
-  const bonus = Number.isFinite(configured) ? Math.max(0, configured) : 0;
-  return message.inSpam ? rank(result) + bonus : rank(result);
+  return Number.isFinite(configured) ? Math.max(0, configured) : 0;
+}
+
+/** Minimum rank a message needs before it is delivered in real time. */
+export function pushThreshold(): number {
+  return IMPORTANCE_RANK[(process.env.PUSH_MIN_IMPORTANCE ?? 'warning') as Importance] ?? 1;
+}
+
+/**
+ * Spell out when the spam bonus quietly means "notify me about all spam".
+ *
+ * The bonus lifts spam by whole levels, and `info` is the lowest one, so as
+ * soon as the bonus carries info up to the push threshold nothing in the spam
+ * folder is below the line any more. At the default `warning` threshold a
+ * bonus of 1 already does that: the setting reads as "catch a message wrongly
+ * filed as spam" but delivers the entire spam folder. Returns undefined when
+ * the configuration is harmless, so callers can print it or stay quiet.
+ */
+export function spamBonusWarning(): string | undefined {
+  const bonus = spamBonus();
+  if (bonus <= 0 || IMPORTANCE_RANK.info + bonus < pushThreshold()) return undefined;
+  return (
+    `SPAM_RANK_BONUS=${bonus} with PUSH_MIN_IMPORTANCE=${process.env.PUSH_MIN_IMPORTANCE ?? 'warning'} ` +
+    'notifies you about every spam-folder message, including the ones triage rated info. ' +
+    'Spam always reaches the daily digest anyway, and a message wrongly filed as spam is rated ' +
+    'warning or critical on its own, so it is delivered with SPAM_RANK_BONUS=0 too. ' +
+    'Raise PUSH_MIN_IMPORTANCE or set SPAM_RANK_BONUS=0 unless you want the whole spam folder pushed.'
+  );
 }
 
 /** The sentence shown first in cards and digests. */

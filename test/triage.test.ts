@@ -4,7 +4,7 @@ import { makeMessage, makeResult } from './helpers.js';
 import type { Rules } from '../src/config.js';
 import {
   applyRules, effectiveRank, FALLBACK_KEYWORDS, headline, keywordFallback, matchesSenderRule,
-  outputLanguageDirective, redactForLlm, resolveLlmBaseUrl, triage,
+  outputLanguageDirective, redactForLlm, resolveLlmBaseUrl, spamBonusWarning, triage,
 } from '../src/services/triage.js';
 
 const RULES: Rules = {
@@ -244,6 +244,33 @@ describe('effective rank', () => {
 
     process.env.SPAM_RANK_BONUS = 'nonsense';
     expect(effectiveRank(makeMessage({ inSpam: true }), info)).toBe(0);
+  });
+});
+
+describe('spam bonus guard', () => {
+  it('says nothing when the bonus is off', () => {
+    expect(spamBonusWarning()).toBeUndefined();
+  });
+
+  it('warns that the default threshold plus a bonus pushes the whole spam folder', () => {
+    // info is the lowest level, so lifting it to the push threshold leaves
+    // nothing in the spam folder below the line.
+    process.env.SPAM_RANK_BONUS = '1';
+    expect(spamBonusWarning()).toContain('every spam-folder message');
+  });
+
+  it('stays quiet for the combination the bonus exists for', () => {
+    // A stricter push threshold lets the bonus carry spam the model already
+    // called actionable, without promoting info.
+    process.env.PUSH_MIN_IMPORTANCE = 'critical';
+    process.env.SPAM_RANK_BONUS = '1';
+    expect(spamBonusWarning()).toBeUndefined();
+  });
+
+  it('warns again once a larger bonus clears even a strict threshold', () => {
+    process.env.PUSH_MIN_IMPORTANCE = 'critical';
+    process.env.SPAM_RANK_BONUS = '2';
+    expect(spamBonusWarning()).toContain('every spam-folder message');
   });
 });
 
