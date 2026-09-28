@@ -13,7 +13,7 @@ import { ConfigError, loadConfig, needsOAuth } from './config.js';
 import { TokenStore } from './imap/auth.js';
 import { StateStore } from './services/state.js';
 import { buildSink, WebhookWiseSink } from './services/sink.js';
-import { resolveLlmBaseUrl, spamBonusWarning } from './services/triage.js';
+import { resolveLlmBaseUrl, spamBonusWarning, suppressSelfForwards } from './services/triage.js';
 import { sendDigest } from './services/digest.js';
 import { recordStartupFailure } from './services/health.js';
 import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
@@ -57,6 +57,11 @@ async function checkConfig(): Promise<number> {
 
   const { rules } = config;
   console.log(`   Always-important rules: ${rules.alwaysImportant.length}; never-important rules: ${rules.neverImportant.length}`);
+  console.log(
+    config.accounts.length > 1 && suppressSelfForwards()
+      ? '   Self-forwards: a copy arriving from another monitored mailbox is filed to the digest, not pushed'
+      : `   Self-forwards: not suppressed${config.accounts.length > 1 ? ' (SUPPRESS_SELF_FORWARDS=false)' : ''}`,
+  );
   if (!rules.context) {
     console.log('   ⚠️  MAIL_CONTEXT is empty; the LLM will lack your personal context.');
   }

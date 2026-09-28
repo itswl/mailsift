@@ -3,8 +3,8 @@ import './setup.js';
 import { makeMessage, makeResult } from './helpers.js';
 import type { Rules } from '../src/config.js';
 import {
-  applyRules, effectiveRank, FALLBACK_KEYWORDS, headline, keywordFallback, matchesSenderRule,
-  outputLanguageDirective, redactForLlm, resolveLlmBaseUrl, spamBonusWarning, triage,
+  applyRules, effectiveRank, FALLBACK_KEYWORDS, headline, isSelfForward, keywordFallback,
+  matchesSenderRule, outputLanguageDirective, redactForLlm, resolveLlmBaseUrl, spamBonusWarning, triage,
 } from '../src/services/triage.js';
 
 const RULES: Rules = {
@@ -83,6 +83,49 @@ describe('rule layer', () => {
       feedbackAlwaysImportant: ['explicit@example.com'],
     });
     expect(result?.importance).toBe('info');
+  });
+});
+
+describe('self-forwarded copies', () => {
+  // Two monitored mailboxes, one forwarding into the other.
+  const WITH_SELF: Rules = { ...RULES, selfAddresses: ['me@qq.com', 'me@live.com'] };
+  const forwarded = makeMessage({
+    account: 'me@qq.com', fromAddr: 'me@live.com', subject: '转发: 检测到新的登录',
+  });
+
+  it('files a copy from another monitored mailbox instead of raising a second alert', () => {
+    // The forward is a new message with its own Message-ID, so deduplication
+    // cannot see it; the sender address can.
+    const result = applyRules(forwarded, WITH_SELF);
+    expect(result).toMatchObject({ importance: 'info', decidedBy: 'rule', category: 'Forwarded copy' });
+    expect(result?.reason).toContain('already monitors');
+  });
+
+  it('leaves a note you send to yourself within one mailbox alone', () => {
+    // Nothing else reported this one, so it is not a duplicate of anything.
+    const selfNote = makeMessage({ account: 'me@qq.com', fromAddr: 'me@qq.com' });
+    expect(isSelfForward(selfNote, WITH_SELF)).toBeUndefined();
+    expect(applyRules(selfNote, WITH_SELF)).toBeUndefined();
+  });
+
+  it('matches the address exactly rather than by domain', () => {
+    const lookalike = makeMessage({ account: 'me@qq.com', fromAddr: 'someone@live.com' });
+    expect(isSelfForward(lookalike, WITH_SELF)).toBeUndefined();
+  });
+
+  it('ignores letter case in either address', () => {
+    const shouted = makeMessage({ account: 'me@qq.com', fromAddr: 'ME@Live.com' });
+    expect(isSelfForward(shouted, WITH_SELF)).toBe('me@live.com');
+  });
+
+  it('does nothing when the caller supplies no monitored addresses', () => {
+    expect(isSelfForward(forwarded, RULES)).toBeUndefined();
+    expect(applyRules(forwarded, RULES)).toBeUndefined();
+  });
+
+  it('still honours an explicit always-important sender', () => {
+    const rules = { ...WITH_SELF, alwaysImportant: ['me@live.com'] };
+    expect(applyRules(forwarded, rules)?.importance).toBe('critical');
   });
 });
 

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
 import { makeMessage, makeResult, RecordingSink } from './helpers.js';
 import { StateStore } from '../src/services/state.js';
@@ -27,6 +27,8 @@ function stubTriage(mapping: Record<string, TriageResult>): void {
     async (messages: MailMessage[]) => messages.map((m) => [m, mapping[m.messageId]!] as [MailMessage, TriageResult]),
   );
 }
+
+afterEach(() => vi.unstubAllGlobals());
 
 const stats = () => ({
   accountsOk: 0, accountsFailed: 0, fetched: 0, fresh: 0,
@@ -176,6 +178,59 @@ describe('delivery failures', () => {
     await w.dispatch([makeMessage({ messageId: '<c@x>' })], s);
     expect(s.queued).toBe(1);
     expect(state.digestPending()).toBe(1);
+  });
+});
+
+/** Two monitored mailboxes, so one can forward into the other. */
+function twoMailboxes(): WatchConfig {
+  const base = { port: 993, folders: ['INBOX'], useSsl: true } as const;
+  return {
+    accounts: [
+      { ...base, name: 'qq', provider: 'qq', username: 'me@qq.com', host: 'imap.qq.com', auth: 'password', password: 'x' },
+      { ...base, name: 'live', provider: 'outlook', username: 'me@live.com', host: 'outlook.office365.com', auth: 'outlook_oauth' },
+    ],
+    rules: { alwaysImportant: [], neverImportant: [], keywords: [], context: '' },
+  };
+}
+
+describe('self-forwarded copies', () => {
+  it('files the copy in the digest without pushing or calling the model', async () => {
+    // Earlier tests leave triage() mocked; this one needs the real rule layer.
+    vi.restoreAllMocks();
+    process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    process.env.LLM_API_KEY = 'k';
+    const llm = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', llm);
+    const state = new StateStore(':memory:');
+    const sink = new RecordingSink();
+    const w = new Watcher(twoMailboxes(), state, sink);
+    const s = stats();
+
+    await w.dispatch([makeMessage({
+      messageId: '<fwd@x>', account: 'me@qq.com', fromAddr: 'me@live.com', subject: '转发: 登录提醒',
+    })], s);
+
+    // The rule layer settles it, so the copy costs no tokens.
+    expect(llm).not.toHaveBeenCalled();
+    expect(sink.pushed).toHaveLength(0);
+    expect(s.pushed).toBe(0);
+    // Nothing is lost: the daily digest still carries it.
+    expect(state.digestPending()).toBe(1);
+    expect(state.queryMail({})[0]).toMatchObject({ importance: 'info', decidedBy: 'rule' });
+  });
+
+  it('keeps pushing the copy when suppression is turned off', async () => {
+    process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    process.env.SUPPRESS_SELF_FORWARDS = 'false';
+    const sink = new RecordingSink();
+    const w = new Watcher(twoMailboxes(), new StateStore(':memory:'), sink);
+    stubTriage({ '<fwd@x>': makeResult({ importance: 'critical' }) });
+
+    await w.dispatch([makeMessage({
+      messageId: '<fwd@x>', account: 'me@qq.com', fromAddr: 'me@live.com',
+    })], stats());
+
+    expect(sink.pushed).toHaveLength(1);
   });
 });
 
