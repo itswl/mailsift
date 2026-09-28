@@ -49,8 +49,10 @@ The production MCP endpoint is embedded in the main mailsift container at `/mcp`
 
 Available tools include:
 
-- Queries: `list_mail`, `search_mail`, `get_mail`, `mail_summary`, `list_accounts`, `health`.
+- Queries: `list_mail` (filter by importance, category, account, spam or pushed), `search_mail`, `get_mail`, `list_digest`, `mail_summary`, `list_accounts`, `health`.
 - Recovery: `recovery_status`, `list_dead_letters`, `retry_dead_letter`.
 - Operations and learning: `observability`, `record_feedback`, `feedback_rules`.
+
+`health` also reports the thresholds that decide delivery under `delivery`: push and digest minimum importance, the spam bonus and any warning about it, whether self-forwards are suppressed, and the retry count. Read those before concluding that a missing notification is a fault; the message may simply have been below the threshold. `recovery_status` reports folder UID progress under `cursors` and the queued notifications under `notificationOutbox`, which is where a delivery backlog is diagnosed.
 
 If an MCP call fails or returns incomplete data, say so and do not infer the missing mailbox state.

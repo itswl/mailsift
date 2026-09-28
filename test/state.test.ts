@@ -44,6 +44,16 @@ describe('cursors', () => {
     expect(s.getCursor('a@qq.com', 'INBOX')).toEqual({ uidValidity: '2', lastUid: 5 });
   });
 
+  it('lists every folder cursor so lag can be seen at a glance', () => {
+    const s = store();
+    s.saveCursor('a@qq.com', 'INBOX', '1', 100);
+    s.saveCursor('a@qq.com', 'Junk', '1', 5);
+    s.saveCursor('b@qq.com', 'INBOX', '2', 7);
+    expect(s.listCursors().map((c) => `${c.account}/${c.folder}=${c.lastUid}`).sort())
+      .toEqual(['a@qq.com/INBOX=100', 'a@qq.com/Junk=5', 'b@qq.com/INBOX=7']);
+    expect(s.listCursors()[0]).toMatchObject({ uidValidity: expect.any(String), updatedAt: expect.any(String) });
+  });
+
   it('can roll back all cursors for --recover', () => {
     const s = store();
     s.saveCursor('a@qq.com', 'INBOX', '1', 100);
@@ -78,6 +88,15 @@ describe('rich fields and queries', () => {
     expect(s.queryMail({ spamOnly: true })).toHaveLength(1);
     expect(s.queryMail({ pushedOnly: true })).toHaveLength(2);
     expect(s.queryMail({ search: 'bank' }).map((m) => m.messageId)).toEqual(['<1@x>']);
+  });
+
+  it('filters by category exactly rather than by substring', () => {
+    const s = store();
+    seed(s, 'k1', { messageId: '<1@x>', category: 'Finance' });
+    seed(s, 'k2', { messageId: '<2@x>', category: 'Forwarded copy', summary: 'about Finance' });
+    expect(s.queryMail({ category: 'Finance' }).map((m) => m.messageId)).toEqual(['<1@x>']);
+    expect(s.queryMail({ category: 'Forwarded copy' })).toHaveLength(1);
+    expect(s.queryMail({ category: 'Finan' })).toHaveLength(0);
   });
 
   it('searches summaries and reasons', () => {

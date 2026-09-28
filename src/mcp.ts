@@ -18,8 +18,11 @@ import { z } from 'zod';
 import { loadConfig } from './config.js';
 import { fetchByMessageId } from './imap/client.js';
 import { StateStore } from './services/state.js';
-import type { FeedbackLabel } from './services/state.js';
-import { CATEGORIES, resolveLlmBaseUrl } from './services/triage.js';
+import type { FeedbackLabel, NotificationOutboxRow } from './services/state.js';
+import {
+  CATEGORIES, pushThreshold, resolveLlmBaseUrl, spamBonus, spamBonusWarning, suppressSelfForwards,
+} from './services/triage.js';
+import { retryAttempts } from './services/delivery.js';
 import { HEARTBEAT_KEY, IDLE_WAKE_KEY } from './services/watcher.js';
 import { idleEnabled, idleFolderTokens } from './imap/idle.js';
 import {
@@ -79,6 +82,29 @@ function decodeCursor(raw: string | undefined): MailCursor | undefined {
   }
 }
 
+/**
+ * A queued notification without its body.
+ *
+ * Enough to tell why an entry is stuck (what it is, how often it has been
+ * tried, what the endpoint said) while keeping the bounded-preview rule that
+ * the rest of this surface follows.
+ */
+function outboxSummary(row: NotificationOutboxRow): Record<string, unknown> {
+  return {
+    notificationKey: row.notificationKey,
+    createdAt: row.createdAt,
+    attempts: row.attempts,
+    lastError: row.lastError,
+    account: row.message.account,
+    subject: row.message.subject,
+    sender: row.message.fromAddr,
+    inSpam: row.message.inSpam,
+    importance: row.result.importance,
+    category: row.result.category,
+    decidedBy: row.result.decidedBy,
+  };
+}
+
 function liveBodyLimit(): number {
   const value = Number(process.env.MCP_LIVE_BODY_CHARS ?? 20_000);
   return Number.isFinite(value) ? Math.max(1_000, Math.min(Math.floor(value), 100_000)) : 20_000;
@@ -99,10 +125,13 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
     {
       description:
         'List recently processed mail (24 hours by default). importance accepts critical/warning/info; ' +
-        'spamOnly=true filters spam and pushedOnly=true filters real-time deliveries.',
+        'spamOnly=true filters spam and pushedOnly=true filters real-time deliveries. ' +
+        `category matches exactly, normally one of ${CATEGORIES.join(', ')}, or a rule label such as ` +
+        'Forwarded copy; use search_mail instead for a substring match.',
       inputSchema: {
         hours: z.number().int().positive().default(24),
         importance: IMPORTANCE.optional(),
+        category: z.string().min(1).max(60).optional(),
         spamOnly: z.boolean().default(false),
         pushedOnly: z.boolean().default(false),
         account: z.string().optional(),
@@ -115,6 +144,7 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
       const mail = store.queryMail({
         sinceHours: args.hours,
         ...(args.importance ? { importance: args.importance } : {}),
+        ...(args.category ? { category: args.category } : {}),
         spamOnly: args.spamOnly,
         pushedOnly: args.pushedOnly,
         ...(args.account ? { account: args.account } : {}),
@@ -244,6 +274,21 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
   );
 
   server.registerTool(
+    'list_digest',
+    {
+      description:
+        'Preview the messages waiting for the next daily digest. These were triaged below the push ' +
+        'threshold, or declined by every output, so they were never sent in real time. The queue is ' +
+        'cleared once the digest goes out.',
+      inputSchema: { limit: z.number().int().positive().max(200).default(50) },
+    },
+    async (args) => {
+      const items = store.peekDigest().slice(0, args.limit);
+      return json({ count: items.length, pending: store.digestPending(), items });
+    },
+  );
+
+  server.registerTool(
     'observability',
     {
       description: 'Show processing totals, delivery backlog, dead-letter count, and feedback counts.',
@@ -319,8 +364,14 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
   server.registerTool(
     'recovery_status',
     {
-      description: 'Show account health timelines, dead-letter backlog, and pending notification outbox items.',
-      inputSchema: { deadLetterLimit: z.number().int().positive().max(200).default(50) },
+      description:
+        'Show account health timelines, folder UID progress, the dead-letter backlog, and the ' +
+        'notifications still queued for retry. A queued entry means delivery genuinely failed: an ' +
+        'output declining a message under its own threshold settles it instead of queueing it.',
+      inputSchema: {
+        deadLetterLimit: z.number().int().positive().max(200).default(50),
+        outboxLimit: z.number().int().positive().max(200).default(50),
+      },
     },
     async (args) => {
       const accounts = loadConfig().accounts.map((account) => ({
@@ -332,10 +383,13 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
         lastError: store.getMeta(ACCOUNT_LAST_ERROR_KEY + account.username) ?? null,
       }));
       const deadLetters = store.listDeadLetters(args.deadLetterLimit);
+      const outbox = store.pendingNotifications(args.outboxLimit);
       return json({
         accounts,
+        cursors: store.listCursors(),
         deadLetters,
         deadLetterCount: deadLetters.length,
+        notificationOutbox: outbox.map(outboxSummary),
         notificationOutboxPending: store.notificationOutboxPending(),
       });
     },
@@ -393,6 +447,18 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
           consecutiveFailures: Number(store.getMeta(LLM_FAIL_COUNT_KEY) ?? 0),
         },
         idle: { enabled: idleEnabled(), folders: idleFolderTokens(), lastWakeAt: idleWakes },
+        // The thresholds that decide whether a message is notified. Without
+        // them "why was I not told about this" cannot be answered from here.
+        delivery: {
+          pushMinImportance: process.env.PUSH_MIN_IMPORTANCE ?? 'warning',
+          pushMinRank: pushThreshold(),
+          spamRankBonus: spamBonus(),
+          spamBonusWarning: spamBonusWarning() ?? null,
+          digestMinImportance: process.env.DIGEST_MIN_IMPORTANCE ?? 'info',
+          feishuMinImportanceOverride: process.env.FEISHU_MIN_IMPORTANCE?.trim() || null,
+          suppressSelfForwards: suppressSelfForwards(),
+          sinkRetryAttempts: retryAttempts(),
+        },
         digestPending: store.digestPending(),
         notificationOutboxPending: store.notificationOutboxPending(),
       });
