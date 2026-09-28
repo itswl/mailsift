@@ -38,6 +38,32 @@ export const SENSITIVE_LOCAL_KEYWORDS = [
   'verification code', 'one-time password', 'one time password', 'auth code', 'otp',
 ] as const;
 
+/**
+ * The fixed set of categories the model may return.
+ *
+ * It used to be free text, and the model invented a label per message: one live
+ * mailbox reached 127 distinct categories across 394 messages, with a single
+ * concept split across several names and two languages. The digest groups by
+ * category, so that fragmentation turned its sections into one-line groups and
+ * left callers with no idea what to search for.
+ *
+ * These values are identifiers rather than prose. They are stored, grouped and
+ * searched on, so they stay in English even when summaries are written in
+ * another language.
+ */
+export const CATEGORIES = [
+  'Security', 'Finance', 'Delivery', 'Travel', 'Health', 'Legal',
+  'Work', 'Personal', 'Social', 'Marketing', 'System', 'Other',
+] as const;
+export type Category = (typeof CATEGORIES)[number];
+
+const CATEGORY_BY_NAME = new Map<string, Category>(CATEGORIES.map((c) => [c.toLowerCase(), c]));
+
+/** Map whatever the model returned onto the vocabulary; anything unrecognized becomes Other. */
+export function canonicalCategory(raw: unknown): Category {
+  return CATEGORY_BY_NAME.get(String(raw ?? '').trim().toLowerCase()) ?? 'Other';
+}
+
 export interface TriageResult {
   importance: Importance;
   score: number;
@@ -119,7 +145,8 @@ const LlmResult = z.object({
     .number()
     .catch(50)
     .transform((n) => Math.max(0, Math.min(100, Math.round(n)))),
-  category: z.string().trim().max(60).catch('Uncategorized'),
+  // Anything outside the vocabulary, or not a string at all, becomes Other.
+  category: z.string().trim().max(60).catch('').transform(canonicalCategory),
   action_required: z.coerce.boolean().catch(false),
   summary: z.string().trim().max(800).catch(''),
   reason: z.string().trim().max(500).catch(''),
@@ -159,6 +186,8 @@ not just its importance level.
 # Language
 Messages may be in Simplified Chinese, Traditional Chinese, or English; understand all three.
 ${outputLanguageDirective()} Preserve proper nouns, product names, order numbers, amounts, and URLs.
+The category field is the one exception: it is an identifier, not prose, so return it exactly as
+spelled in the list below no matter which language the rest of the output uses.
 
 # Importance levels
 Judge whether ignoring the message could cause real harm. Work and personal matters are equally important.
@@ -187,10 +216,17 @@ Judge whether ignoring the message could cause real harm. Work and personal matt
   is needed. Include amounts, IDs, times, locations, and deadlines. Do not repeat the subject or add filler.
 - reason: one sentence explaining the importance level.
 - deadline: an explicit deadline or effective time, otherwise an empty string.
-- category: a concise category.
+- category: exactly one of ${CATEGORIES.join(', ')}. Pick by what the message is about, not by who sent it:
+  Security for sign-in alerts, verification codes and account safety; Finance for bills, invoices,
+  payments, refunds and bank activity; Delivery for shipping and pickup; Travel for flights, hotels
+  and bookings; Health for appointments and results; Legal for contracts, official and government
+  notices; Work for code review, builds, tickets and colleagues; Personal for a real person writing
+  to you outside work; Social for platform and community notifications; Marketing for ads,
+  promotions and newsletters; System for automated reports, status and platform updates. Use Other
+  only when none of them fits. Do not invent a category and do not translate these words.
 
 Return only JSON:
-{"results": [{"index": 0, "importance": "critical", "score": 0-100, "category": "category",
+{"results": [{"index": 0, "importance": "critical", "score": 0-100, "category": "Security",
 "action_required": true, "summary": "what it says and what to do", "reason": "why this level", "deadline": ""}]}
 Return exactly one result per message, with indices matching the input order.`;
 
@@ -299,7 +335,7 @@ export function keywordFallback(message: MailMessage, rules: Rules): TriageResul
   // flood the notification channel and reduce its signal-to-noise ratio.
   return {
     importance: 'info', score: message.listUnsubscribe ? 5 : 20,
-    category: 'Uncategorized', actionRequired: false, decidedBy: 'fallback',
+    category: 'Other', actionRequired: false, decidedBy: 'fallback',
     summary: preview, reason: 'LLM unavailable and no high-risk keyword matched; queued for review', deadline: '',
   };
 }
@@ -539,7 +575,7 @@ async function classifyBatch(
       summary: item.summary,
       reason: item.reason || 'The LLM provided no reason',
       deadline: item.deadline,
-      category: item.category || 'Uncategorized',
+      category: item.category,
       actionRequired: item.action_required,
       decidedBy: 'llm',
     };

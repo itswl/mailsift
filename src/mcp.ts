@@ -19,7 +19,7 @@ import { loadConfig } from './config.js';
 import { fetchByMessageId } from './imap/client.js';
 import { StateStore } from './services/state.js';
 import type { FeedbackLabel } from './services/state.js';
-import { resolveLlmBaseUrl } from './services/triage.js';
+import { CATEGORIES, resolveLlmBaseUrl } from './services/triage.js';
 import { HEARTBEAT_KEY, IDLE_WAKE_KEY } from './services/watcher.js';
 import { idleEnabled, idleFolderTokens } from './imap/idle.js';
 import {
@@ -30,7 +30,9 @@ import {
 const INSTRUCTIONS =
   'Query mailsift triage results. It monitors inboxes and spam folders, uses an LLM to assess importance, ' +
   'pushes important messages, and queues the rest for the daily digest.\n' +
-  'inSpam=true means the provider classified a message as spam; when pushed=true, it was rescued as a likely false positive.';
+  'inSpam=true means the provider classified a message as spam; when pushed=true, it was rescued as a likely false positive.\n' +
+  `Triage categories come from a fixed vocabulary: ${CATEGORIES.join(', ')}. Rule-decided mail may also carry ` +
+  'Always important, Never important, Feedback rule or Forwarded copy.';
 
 const IMPORTANCE = z.enum(['critical', 'warning', 'info']);
 
