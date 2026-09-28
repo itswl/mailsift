@@ -218,6 +218,7 @@ sink is healthy. Use MCP `health` and `recovery_status` for those details.
 ## Troubleshooting
 
 - **Repeated notifications:** messages are deduplicated by account plus Message-ID. `--recover` is for interrupted, undecided records.
+- **Nothing was notified:** call MCP `health` first. Its `delivery` block reports the push and digest thresholds, the spam bonus, and whether self-forwards are suppressed, which usually explains the decision without further digging. `recovery_status` then shows folder UID progress and any notification still queued for retry.
 - **Delivery failures:** a push that fails with a network error, a timeout, or HTTP 408/429/5xx is retried up to `SINK_RETRY_ATTEMPTS` times (default `3`, seconds apart) and then waits in the durable outbox for the next poll. An endpoint that stays down gets one attempt per push until a delivery succeeds, so a dead endpoint does not stretch the poll.
 - **Outbox backlog:** only real failures wait there. An output that declines a message under its own threshold, such as `FEISHU_MIN_IMPORTANCE`, settles it immediately and the digest carries it, so a pending count in MCP `health` always means something is genuinely undelivered.
 - **QQ scans many messages:** some QQ IMAP endpoints ignore `SINCE`; the local UID cursor still preserves correctness.

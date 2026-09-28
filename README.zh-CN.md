@@ -149,6 +149,8 @@ docker compose run --rm mailsift node dist/src/main.js --recover
 
 ## MCP
 
+排查"为什么没收到通知"时先调 `health`：它的 `delivery` 段会给出推送与日报阈值、垃圾箱加成及其风险提示、自转发是否被抑制、重试次数，通常不必再往下查就能解释这次判定。`recovery_status` 进一步给出各文件夹的 UID 进度和仍在排队重试的通知条目，是定位投递积压的地方。`list_mail` 支持按分类精确过滤，`list_digest` 可预览待发日报。
+
 内置 MCP 默认在主进程中开启。Docker 中，`MCP_BIND` 是容器内监听地址，`MCP_PUBLIC_HOST` 是宿主机发布地址；Compose 会让宿主机端口和容器端口都使用 `MCP_PORT`。默认只在宿主机回环地址提供服务：
 
 ```dotenv

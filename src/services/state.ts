@@ -106,6 +106,7 @@ export interface MailRow {
 export interface QueryOptions {
   sinceHours?: number;
   importance?: string;
+  category?: string;
   spamOnly?: boolean;
   pushedOnly?: boolean;
   account?: string;
@@ -125,6 +126,14 @@ export interface DeadLetterRow {
   subject: string | null;
   reason: string;
   createdAt: string;
+}
+
+export interface CursorRow {
+  account: string;
+  folder: string;
+  uidValidity: string;
+  lastUid: number;
+  updatedAt: string;
 }
 
 export interface NotificationOutboxRow {
@@ -234,6 +243,26 @@ export class StateStore {
            updated_at = excluded.updated_at`,
       )
       .run(account, folder, uidValidity, lastUid, now());
+  }
+
+  /**
+   * Every folder cursor, newest write first.
+   *
+   * Answers how far each folder has been processed, which is the first thing
+   * to look at when a mailbox seems to be lagging.
+   */
+  listCursors(): CursorRow[] {
+    return (
+      this.db
+        .prepare('SELECT account, folder, uid_validity, last_uid, updated_at FROM cursors ORDER BY updated_at DESC')
+        .all() as Array<Record<string, unknown>>
+    ).map((row) => ({
+      account: String(row['account']),
+      folder: String(row['folder']),
+      uidValidity: String(row['uid_validity']),
+      lastUid: Number(row['last_uid']),
+      updatedAt: String(row['updated_at']),
+    }));
   }
 
   clearCursors(account?: string): number {
@@ -483,6 +512,12 @@ export class StateStore {
     if (options.importance) {
       clauses.push('importance = ?');
       params.push(options.importance);
+    }
+    // Exact match: categories are a fixed vocabulary, so a filter must not
+    // behave like the substring search that `search` provides.
+    if (options.category) {
+      clauses.push('category = ?');
+      params.push(options.category);
     }
     if (options.spamOnly) clauses.push('in_spam = 1');
     if (options.pushedOnly) clauses.push('pushed = 1');
