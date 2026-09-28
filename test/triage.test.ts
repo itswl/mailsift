@@ -3,8 +3,9 @@ import './setup.js';
 import { makeMessage, makeResult } from './helpers.js';
 import type { Rules } from '../src/config.js';
 import {
-  applyRules, effectiveRank, FALLBACK_KEYWORDS, headline, isSelfForward, keywordFallback,
-  matchesSenderRule, outputLanguageDirective, redactForLlm, resolveLlmBaseUrl, spamBonusWarning, triage,
+  applyRules, canonicalCategory, CATEGORIES, effectiveRank, FALLBACK_KEYWORDS, headline, isSelfForward,
+  keywordFallback, matchesSenderRule, outputLanguageDirective, redactForLlm, resolveLlmBaseUrl,
+  spamBonusWarning, triage,
 } from '../src/services/triage.js';
 
 const RULES: Rules = {
@@ -287,6 +288,58 @@ describe('effective rank', () => {
 
     process.env.SPAM_RANK_BONUS = 'nonsense';
     expect(effectiveRank(makeMessage({ inSpam: true }), info)).toBe(0);
+  });
+});
+
+describe('category vocabulary', () => {
+  function systemPromptOf(call: unknown): string {
+    const init = (call as [unknown, { body: string }])[1];
+    const body = JSON.parse(init.body) as { messages: Array<{ role: string; content: string }> };
+    return body.messages.find((m) => m.role === 'system')!.content;
+  }
+
+  it('accepts a listed value whatever its case', () => {
+    expect(canonicalCategory('Security')).toBe('Security');
+    expect(canonicalCategory('  security ')).toBe('Security');
+    expect(canonicalCategory('MARKETING')).toBe('Marketing');
+  });
+
+  it('folds an invented label into Other rather than starting a new group', () => {
+    // These are real labels the model produced before the vocabulary existed.
+    for (const invented of ['GitHub CI failure', '构建失败', 'marketing/spam', 'Gambling promotion', '']) {
+      expect(canonicalCategory(invented)).toBe('Other');
+    }
+    expect(canonicalCategory(undefined)).toBe('Other');
+    expect(canonicalCategory(42)).toBe('Other');
+  });
+
+  it('canonicalizes what the model returns', async () => {
+    mockLlm([{ index: 0, importance: 'warning', score: 60, reason: 'x', category: 'security' }]);
+    process.env.LLM_API_KEY = 'k';
+    const [[, result]] = await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
+    expect(result!.category).toBe('Security');
+  });
+
+  it('replaces an off-vocabulary answer instead of storing it', async () => {
+    mockLlm([{ index: 0, importance: 'info', score: 1, reason: 'x', category: 'GitHub CI notification' }]);
+    process.env.LLM_API_KEY = 'k';
+    const [[, result]] = await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
+    expect(result!.category).toBe('Other');
+  });
+
+  it('lists every value in the prompt and exempts them from translation', async () => {
+    mockLlm([{ index: 0, importance: 'info', score: 1, reason: 'x' }]);
+    process.env.LLM_API_KEY = 'k';
+    process.env.LLM_OUTPUT_LANGUAGE = 'zh-CN';
+    await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
+    const prompt = systemPromptOf((fetch as unknown as { mock: { calls: unknown[] } }).mock.calls[0]);
+    for (const value of CATEGORIES) expect(prompt).toContain(value);
+    expect(prompt).toContain('do not translate these words');
+  });
+
+  it('gives the keyword fallback a vocabulary category too', () => {
+    // Otherwise an outage would add its own grouping label to the digest.
+    expect(keywordFallback(makeMessage({ subject: '关于下周的安排' }), RULES).category).toBe('Other');
   });
 });
 

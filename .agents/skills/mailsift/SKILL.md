@@ -35,6 +35,8 @@ Use `record_feedback` only when the user clearly labels a processed message as `
 
 ## Privacy and classification
 
+Triage categories come from a fixed vocabulary: Security, Finance, Delivery, Travel, Health, Legal, Work, Personal, Social, Marketing, System, Other. Rule-decided mail may instead carry Always important, Never important, Feedback rule or Forwarded copy. Search and group on these values rather than inventing filters; records written before the vocabulary existed may still hold free-form labels.
+
 When several mailboxes are monitored and one forwards into another, the copy is recognised by its sender address and filed to the digest with `decidedBy: rule` and category `Forwarded copy`, so it never raises a second notification. Report such a record as a duplicate of mail already triaged in the source mailbox, not as a missed alert.
 
 Verification codes, one-time passwords, and authentication codes are classified locally and should not be sent to the LLM. Other LLM payloads redact common direct identifiers such as email addresses, phone numbers, payment card numbers, and national IDs; card and ID numbers are redacted only when their checksum holds, so order and waybill numbers usually remain. Local notifications and authorized MCP message reads may still contain the original content, so minimize quotation.
