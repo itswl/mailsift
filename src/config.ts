@@ -68,6 +68,14 @@ export interface Rules {
   context: string;
   feedbackAlwaysImportant?: string[];
   feedbackNeverImportant?: string[];
+  /**
+   * Addresses of the other mailboxes this service monitors.
+   *
+   * Mail sent from one of them into another is a copy of something already
+   * triaged at the source, so it must not raise a second notification. Empty
+   * when the caller has turned that off.
+   */
+  selfAddresses?: string[];
 }
 
 export interface WatchConfig {

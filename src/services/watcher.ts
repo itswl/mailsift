@@ -17,7 +17,9 @@ import {
 } from '../imap/client.js';
 import type { Folder } from '../imap/folders.js';
 import { dedupKey, snippet, type MailMessage } from '../imap/message.js';
-import { triage, effectiveRank, pushThreshold, rank, type TriageResult } from './triage.js';
+import {
+  triage, effectiveRank, pushThreshold, rank, suppressSelfForwards, type TriageResult,
+} from './triage.js';
 import * as digest from './digest.js';
 import * as health from './health.js';
 import type { Sink } from './sink.js';
@@ -221,7 +223,12 @@ export class Watcher {
 
   private triageRules() {
     const feedback = this.state.feedbackRuleHints(2);
-    return { ...this.config.rules, feedbackAlwaysImportant: feedback.alwaysImportant, feedbackNeverImportant: feedback.neverImportant };
+    return {
+      ...this.config.rules,
+      feedbackAlwaysImportant: feedback.alwaysImportant,
+      feedbackNeverImportant: feedback.neverImportant,
+      selfAddresses: suppressSelfForwards() ? this.config.accounts.map((a) => a.username) : [],
+    };
   }
 
   private async flushNotificationOutbox(): Promise<void> {

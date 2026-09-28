@@ -221,6 +221,21 @@ function matches(message: MailMessage, patterns: string[]): string | undefined {
   return patterns.find((p) => matchesSenderRule(message, p));
 }
 
+/**
+ * Was this message forwarded in from another mailbox this service monitors?
+ *
+ * Mailboxes that forward to each other deliver the same mail twice, and the
+ * copy is a new message with its own Message-ID, so deduplication cannot see
+ * it. The sender address can: it is an exact match against the configured
+ * accounts, not a guess from the subject. Mail you send to yourself inside one
+ * mailbox is left alone, since nothing else has reported it.
+ */
+export function isSelfForward(message: MailMessage, rules: Rules): string | undefined {
+  const from = message.fromAddr.trim().toLowerCase();
+  if (!from || from === message.account.trim().toLowerCase()) return undefined;
+  return (rules.selfAddresses ?? []).map((a) => a.trim().toLowerCase()).find((a) => a && a === from);
+}
+
 /** Apply sender rules directly; undefined delegates to the next layer. */
 export function applyRules(message: MailMessage, rules: Rules): TriageResult | undefined {
   const allow = matches(message, rules.alwaysImportant);
@@ -228,6 +243,17 @@ export function applyRules(message: MailMessage, rules: Rules): TriageResult | u
     return {
       importance: 'critical', score: 100, category: 'Always important', actionRequired: true,
       decidedBy: 'rule', summary: '', reason: `Sender matched always-important rule "${allow}"`, deadline: '',
+    };
+  }
+  // After the explicit allowlist, so a sender you called always-important still
+  // wins, and before the model, so a copy costs no tokens.
+  const forwardedFrom = isSelfForward(message, rules);
+  if (forwardedFrom) {
+    return {
+      importance: 'info', score: 0, category: 'Forwarded copy', actionRequired: false,
+      decidedBy: 'rule', summary: '',
+      reason: `Forwarded in from ${forwardedFrom}, a mailbox this service already monitors; the original was triaged there`,
+      deadline: '',
     };
   }
   const deny = matches(message, rules.neverImportant);
@@ -281,6 +307,11 @@ export function keywordFallback(message: MailMessage, rules: Rules): TriageResul
 export function containsSensitiveContent(message: MailMessage): boolean {
   const haystack = `${message.subject}\n${snippet(message)}`.toLowerCase();
   return SENSITIVE_LOCAL_KEYWORDS.some((keyword) => haystack.includes(keyword.toLowerCase()));
+}
+
+/** Whether a copy forwarded in from another monitored mailbox should stay out of notifications. */
+export function suppressSelfForwards(): boolean {
+  return (process.env.SUPPRESS_SELF_FORWARDS ?? 'true').toLowerCase() !== 'false';
 }
 
 function skipSensitiveContent(): boolean {
