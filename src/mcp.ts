@@ -94,18 +94,21 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
     content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
   });
 
-  server.tool(
+  server.registerTool(
     'list_mail',
-    'List recently processed mail (24 hours by default). importance accepts critical/warning/info; ' +
-      'spamOnly=true filters spam and pushedOnly=true filters real-time deliveries.',
     {
-      hours: z.number().int().positive().default(24),
-      importance: IMPORTANCE.optional(),
-      spamOnly: z.boolean().default(false),
-      pushedOnly: z.boolean().default(false),
-      account: z.string().optional(),
-      limit: z.number().int().positive().max(200).default(30),
-      cursor: z.string().optional(),
+      description:
+        'List recently processed mail (24 hours by default). importance accepts critical/warning/info; ' +
+        'spamOnly=true filters spam and pushedOnly=true filters real-time deliveries.',
+      inputSchema: {
+        hours: z.number().int().positive().default(24),
+        importance: IMPORTANCE.optional(),
+        spamOnly: z.boolean().default(false),
+        pushedOnly: z.boolean().default(false),
+        account: z.string().optional(),
+        limit: z.number().int().positive().max(200).default(30),
+        cursor: z.string().optional(),
+      },
     },
     async (args) => {
       const cursor = decodeCursor(args.cursor);
@@ -125,11 +128,14 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
     },
   );
 
-  server.tool(
+  server.registerTool(
     'search_mail',
-    'Search subject, sender, triage category, summary, and reason by keyword. ' +
-      'Use it to answer whether a sender wrote or which messages concern a renewal.',
-    { query: z.string().min(1), hours: z.number().int().positive().optional(), limit: z.number().int().positive().max(200).default(30) },
+    {
+      description:
+        'Search subject, sender, triage category, summary, and reason by keyword. ' +
+        'Use it to answer whether a sender wrote or which messages concern a renewal.',
+      inputSchema: { query: z.string().min(1), hours: z.number().int().positive().optional(), limit: z.number().int().positive().max(200).default(30) },
+    },
     async (args) => {
       const mail = store.queryMail({
         search: args.query,
@@ -140,10 +146,12 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
     },
   );
 
-  server.tool(
+  server.registerTool(
     'get_mail',
-    'Get the stored triage record by Message-ID, including a bounded body preview and triage reason. It does not fetch or return the full raw email.',
-    { messageId: z.string().min(1) },
+    {
+      description: 'Get the stored triage record by Message-ID, including a bounded body preview and triage reason. It does not fetch or return the full raw email.',
+      inputSchema: { messageId: z.string().min(1) },
+    },
     async (args) => {
       const found = store.getMail(args.messageId);
       return json(found ? { found: true, ...found } : { found: false, messageId: args.messageId });
@@ -226,27 +234,33 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
     },
   );
 
-  server.tool(
+  server.registerTool(
     'mail_summary',
-    'Summarize processed and pushed messages in a time window, including spam and spam rescues.',
-    { hours: z.number().int().positive().default(24) },
+    {
+      description: 'Summarize processed and pushed messages in a time window, including spam and spam rescues.',
+      inputSchema: { hours: z.number().int().positive().default(24) },
+    },
     async (args) => json(store.summarize(args.hours)),
   );
 
-  server.tool(
+  server.registerTool(
     'observability',
-    'Show processing totals, delivery backlog, dead-letter count, and feedback counts.',
-    {},
+    {
+      description: 'Show processing totals, delivery backlog, dead-letter count, and feedback counts.',
+      inputSchema: {},
+    },
     async () => json(store.observability()),
   );
 
-  server.tool(
+  server.registerTool(
     'record_feedback',
-    'Record feedback for a processed message so future rules and triage evaluation can use it.',
     {
-      messageId: z.string().min(1).max(1000),
-      label: z.enum(['false_positive', 'missed', 'handled', 'correct']),
-      note: z.string().max(1000).default(''),
+      description: 'Record feedback for a processed message so future rules and triage evaluation can use it.',
+      inputSchema: {
+        messageId: z.string().min(1).max(1000),
+        label: z.enum(['false_positive', 'missed', 'handled', 'correct']),
+        note: z.string().max(1000).default(''),
+      },
     },
     async (args) => {
       store.recordFeedback(args.messageId, args.label as FeedbackLabel, args.note);
@@ -254,17 +268,21 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
     },
   );
 
-  server.tool(
+  server.registerTool(
     'feedback_rules',
-    'Show sender rules inferred from at least two missed or false-positive feedback records.',
-    {},
+    {
+      description: 'Show sender rules inferred from at least two missed or false-positive feedback records.',
+      inputSchema: {},
+    },
     async () => json(store.feedbackRuleHints(2)),
   );
 
-  server.tool(
+  server.registerTool(
     'list_accounts',
-    'List monitored accounts, folders, and authentication methods.',
-    {},
+    {
+      description: 'List monitored accounts, folders, and authentication methods.',
+      inputSchema: {},
+    },
     async () => {
       try {
         const config = loadConfig();
@@ -284,21 +302,26 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
     },
   );
 
-  server.tool(
+  server.registerTool(
     'list_dead_letters',
-    'List messages that were explicitly skipped because they were oversized or could not be parsed. ' +
-      'These records are excluded from normal triage but remain visible for recovery and investigation.',
-    { limit: z.number().int().positive().max(200).default(50) },
+    {
+      description:
+        'List messages that were explicitly skipped because they were oversized or could not be parsed. ' +
+        'These records are excluded from normal triage but remain visible for recovery and investigation.',
+      inputSchema: { limit: z.number().int().positive().max(200).default(50) },
+    },
     async (args) => {
       const deadLetters = store.listDeadLetters(args.limit);
       return json({ count: deadLetters.length, deadLetters });
     },
   );
 
-  server.tool(
+  server.registerTool(
     'recovery_status',
-    'Show account health timelines, dead-letter backlog, and pending notification outbox items.',
-    { deadLetterLimit: z.number().int().positive().max(200).default(50) },
+    {
+      description: 'Show account health timelines, dead-letter backlog, and pending notification outbox items.',
+      inputSchema: { deadLetterLimit: z.number().int().positive().max(200).default(50) },
+    },
     async (args) => {
       const accounts = loadConfig().accounts.map((account) => ({
         name: account.name,
@@ -318,18 +341,23 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
     },
   );
 
-  server.tool(
+  server.registerTool(
     'retry_dead_letter',
-    'Requeue one explicitly skipped message by rewinding its folder cursor. The next poll will retry it.',
-    { deadKey: z.string().min(1).max(500) },
+    {
+      description: 'Requeue one explicitly skipped message by rewinding its folder cursor. The next poll will retry it.',
+      inputSchema: { deadKey: z.string().min(1).max(500) },
+    },
     async (args) => json({ deadKey: args.deadKey, requeued: store.retryDeadLetter(args.deadKey) }),
   );
 
-  server.tool(
+  server.registerTool(
     'health',
-    'Show service health: last poll, account outages, LLM status, and digest backlog. ' +
-      'Check this first when investigating a missing notification.',
-    {},
+    {
+      description:
+        'Show service health: last poll, account outages, LLM status, and digest backlog. ' +
+        'Check this first when investigating a missing notification.',
+      inputSchema: {},
+    },
     async () => {
       const last = store.getMeta(HEARTBEAT_KEY);
       const ageSeconds = last ? Math.round((Date.now() - new Date(last).valueOf()) / 1000) : null;
