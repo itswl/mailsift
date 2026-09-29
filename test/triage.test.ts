@@ -5,7 +5,7 @@ import type { Rules } from '../src/config.js';
 import {
   applyRules, canonicalCategory, CATEGORIES, effectiveRank, FALLBACK_KEYWORDS, headline, isSelfForward,
   keywordFallback, matchesSenderRule, outputLanguageDirective, redactForLlm, resolveLlmBaseUrl,
-  spamBonusWarning, triage,
+  spamBonusWarning, triage, unanchoredSenderRules,
 } from '../src/services/triage.js';
 
 const RULES: Rules = {
@@ -69,6 +69,17 @@ describe('rule layer', () => {
     expect(matchesSenderRule(makeMessage({ fromAddr: 'Alerts@Bank.com' }), 'alerts@bank.com')).toBe(true);
     expect(matchesSenderRule(makeMessage({ fromAddr: 'xalerts@bank.com' }), 'alerts@bank.com')).toBe(false);
     expect(matchesSenderRule(makeMessage({ fromAddr: 'alerts@bank.com.cn' }), 'alerts@bank.com')).toBe(false);
+  });
+
+  it('names the rules that anchoring silently disabled', () => {
+    // A partial address written back when matching was a substring test now
+    // matches nothing at all, so the operator has to be told rather than
+    // discovering it when suppressed mail starts arriving again.
+    expect(unanchoredSenderRules(['noreply@notifications.', 'billing@acme', 'a@b.c.'])).toEqual([
+      'noreply@notifications.', 'billing@acme', 'a@b.c.',
+    ]);
+    // Complete addresses, domain rules and plain keywords are all still fine.
+    expect(unanchoredSenderRules(['alerts@bank.com', '@bank.com', 'newsletter', ''])).toEqual([]);
   });
 
   it('keeps plain keywords as substring matches on address and name', () => {

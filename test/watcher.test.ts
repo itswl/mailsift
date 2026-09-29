@@ -318,6 +318,30 @@ describe('declined deliveries', () => {
     expect(state.notificationOutboxPending()).toBe(0);
   });
 
+  it('queues a declined entry for the digest before dropping it', async () => {
+    // A crash between enqueueNotification and queueDigest leaves a row whose
+    // message is marked seen and queued nowhere; dropping it on the assumption
+    // that the digest carries it would lose the message entirely.
+    const { w, state } = watcher(new RecordingSink('declined'));
+    state.enqueueNotification('orphan', makeMessage(), makeResult());
+    vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [], cursors: [] });
+
+    await w.pollOnce();
+
+    expect(state.notificationOutboxPending()).toBe(0);
+    expect(state.digestPending()).toBe(1);
+  });
+
+  it('skips an outbox payload of the wrong shape instead of failing every reader', async () => {
+    const { state } = watcher();
+    state.enqueueNotification('good', makeMessage(), makeResult());
+    (state as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db
+      .prepare('INSERT INTO notification_outbox (notification_key, payload, created_at) VALUES (?, ?, ?)')
+      .run('broken', JSON.stringify({ nothing: true }), new Date().toISOString());
+
+    expect(state.pendingNotifications().map((e) => e.notificationKey)).toEqual(['good']);
+  });
+
   it('retries an outbox entry whose delivery failed', async () => {
     const { w, state } = watcher(new RecordingSink('failed'));
     state.enqueueNotification('pending', makeMessage(), makeResult());
@@ -374,7 +398,10 @@ describe('IDLE wake-ups', () => {
       messages: [], cursor: { uidValidity: '1', lastUid: 100 }, failures: [],
     });
     await w.pollFolder(ACCOUNT, INBOX, CLIENT);
-    expect(state.getMeta('idle_last_wake_at:me@qq.com')).toBeTruthy();
+    // Keyed by folder: one healthy listener must not vouch for a dead sibling.
+    expect(state.getMeta('idle_last_wake_at:me@qq.com|INBOX')).toBeTruthy();
+    expect(state.listMeta('idle_last_wake_at:').map((r) => r.key))
+      .toEqual(['idle_last_wake_at:me@qq.com|INBOX']);
   });
 });
 

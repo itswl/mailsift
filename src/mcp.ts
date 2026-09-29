@@ -418,15 +418,19 @@ export function createServer(options: { state?: StateStore } = {}): McpServer {
       const interval = Number(process.env.POLL_INTERVAL_SECONDS ?? 300);
 
       const failing: Array<Record<string, unknown>> = [];
-      const idleWakes: Record<string, string | null> = {};
       try {
         for (const account of loadConfig().accounts) {
           const count = store.getMeta(FAIL_COUNT_KEY + account.username);
           if (count) failing.push({ account: account.name, consecutiveFailures: Number(count) });
-          idleWakes[account.name] = store.getMeta(IDLE_WAKE_KEY + account.username) ?? null;
         }
       } catch (error) {
         failing.push({ error: String(error) });
+      }
+      // Keyed by account and folder, because listeners are per folder: a single
+      // per-account entry let a healthy listener vouch for a dead sibling.
+      const idleWakes: Record<string, string> = {};
+      for (const row of store.listMeta(IDLE_WAKE_KEY)) {
+        idleWakes[row.key.slice(IDLE_WAKE_KEY.length)] = row.value;
       }
 
       return json({

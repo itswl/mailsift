@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # Branch pushes are covered by pull_request once a PR is open; listing every
+  # branch here as well ran the whole suite twice for each push.
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
 
 jobs:

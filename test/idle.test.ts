@@ -160,6 +160,56 @@ describe('IDLE listener', () => {
     await expect(Promise.race([listener.stop(), settle(500).then(() => 'timeout')])).resolves.toBeUndefined();
   });
 
+  it('lets a wake-up finish before logging the connection out', async () => {
+    // The wake-up runs the deduplicate, triage and deliver pipeline on this very
+    // connection. Logging out underneath it abandons messages already marked
+    // seen, and the next poll's dedup then drops them for good.
+    const client = new FakeClient();
+    let finish: () => void = () => undefined;
+    const onWake = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const listener = new FolderListener(ACCOUNT, 'INBOX', onWake, harness([client]).deps);
+    listener.start();
+    await settle();
+
+    client.emit('exists', { path: 'INBOX', count: 11, prevCount: 10 });
+    await settle();
+    expect(onWake).toHaveBeenCalledTimes(1);
+
+    const stopping = listener.stop();
+    await settle();
+    expect(client.logout).not.toHaveBeenCalled();
+
+    finish();
+    await stopping;
+    expect(client.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it('escalates the backoff even when the failure itself is slow', async () => {
+    // Reaching an unreachable host takes longer than the healthy threshold, so
+    // timing the session from before the connect scored every failure as a
+    // healthy session and pinned the delay at its 2s floor forever.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const sleeps: number[] = [];
+    const deps: ListenerDeps = {
+      connect: async () => {
+        vi.setSystemTime(Date.now() + 90_000);
+        throw new Error('ETIMEDOUT');
+      },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        if (sleeps.length >= 3) await new Promise<void>(() => undefined);
+      },
+      debounceMs: 5,
+    };
+    const listener = new FolderListener(ACCOUNT, 'INBOX', vi.fn(), deps);
+    listener.start();
+    await settle();
+
+    expect(sleeps.slice(0, 3)).toEqual([2_000, 4_000, 8_000]);
+    await listener.stop();
+    vi.useRealTimers();
+  });
+
   it('caps reconnect delays by failure type', () => {
     expect(reconnectDelayMs(1, true)).toBe(2_000);
     expect(reconnectDelayMs(3, true)).toBe(8_000);

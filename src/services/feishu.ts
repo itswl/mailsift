@@ -31,7 +31,12 @@ const MAX_DIGEST_CARD_CHARS = 6000;
 
 /** Truncate visibly. A body that just stops reads as a complete one. */
 function fit(text: string, limit: number): string {
-  return text.length <= limit ? text : `${text.slice(0, limit - 40)}\n\n_…truncated to fit the card_`;
+  if (text.length <= limit) return text;
+  let cut = limit - 40;
+  // Never split a surrogate pair; half of one renders as a replacement glyph.
+  const last = text.charCodeAt(cut - 1);
+  if (cut > 0 && last >= 0xd800 && last <= 0xdbff) cut -= 1;
+  return `${text.slice(0, cut)}\n\n_…truncated to fit the card_`;
 }
 
 /**
