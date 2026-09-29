@@ -20,6 +20,19 @@ const FEISHU_RATE_LIMIT_CODE = 11232;
 const TEMPLATE: Record<Importance, string> = { critical: 'red', warning: 'orange', info: 'blue' };
 const PREFIX: Record<Importance, string> = { critical: '🔴', warning: '🟠', info: '🔵' };
 const MAX_CARD_CHARS = 3000;
+/**
+ * A digest is long-form, so it gets more room than a single mail card.
+ *
+ * Feishu accepts a 20 KB request body; even all-CJK text at three bytes a
+ * character leaves this well inside that, and renderDigest already fits its
+ * own smaller budget, so this is headroom rather than the operative limit.
+ */
+const MAX_DIGEST_CARD_CHARS = 6000;
+
+/** Truncate visibly. A body that just stops reads as a complete one. */
+function fit(text: string, limit: number): string {
+  return text.length <= limit ? text : `${text.slice(0, limit - 40)}\n\n_…truncated to fit the card_`;
+}
 
 /**
  * Bare angle brackets are swallowed by card Markdown, but addresses contain them.
@@ -50,7 +63,7 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
       card: {
         config: { wide_screen_mode: true },
         header: { title: { tag: 'plain_text', content: `📮 ${message.subject}` }, template },
-        elements: [{ tag: 'markdown', content: message.body.slice(0, MAX_CARD_CHARS) }],
+        elements: [{ tag: 'markdown', content: fit(message.body, MAX_DIGEST_CARD_CHARS) }],
       },
     };
   }
@@ -73,7 +86,7 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
   if (body) lines.push('', '---', esc(body));
 
   const elements: Array<Record<string, unknown>> = [
-    { tag: 'markdown', content: lines.join('\n').slice(0, MAX_CARD_CHARS) },
+    { tag: 'markdown', content: fit(lines.join('\n'), MAX_CARD_CHARS) },
   ];
 
   const link = buildLink(message.provider, message.account, message.messageId);

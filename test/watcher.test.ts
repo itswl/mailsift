@@ -194,7 +194,7 @@ function twoMailboxes(): WatchConfig {
 }
 
 describe('self-forwarded copies', () => {
-  it('files the copy in the digest without pushing or calling the model', async () => {
+  it('records the copy but neither pushes it nor repeats it in the digest', async () => {
     // Earlier tests leave triage() mocked; this one needs the real rule layer.
     vi.restoreAllMocks();
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
@@ -214,9 +214,12 @@ describe('self-forwarded copies', () => {
     expect(llm).not.toHaveBeenCalled();
     expect(sink.pushed).toHaveLength(0);
     expect(s.pushed).toBe(0);
-    // Nothing is lost: the daily digest still carries it.
-    expect(state.digestPending()).toBe(1);
-    expect(state.queryMail({})[0]).toMatchObject({ importance: 'info', decidedBy: 'rule' });
+    // The original was triaged at its source, so repeating the copy in the
+    // digest would only crowd out mail that has not been seen.
+    expect(state.digestPending()).toBe(0);
+    expect(s.queued).toBe(0);
+    // The record stays, so list_mail still finds it.
+    expect(state.queryMail({})[0]).toMatchObject({ importance: 'info', decidedBy: 'rule', category: 'Forwarded copy' });
   });
 
   it('keeps pushing the copy when suppression is turned off', async () => {

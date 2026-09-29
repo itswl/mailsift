@@ -18,7 +18,7 @@ import {
 import type { Folder } from '../imap/folders.js';
 import { dedupKey, snippet, type MailMessage } from '../imap/message.js';
 import {
-  triage, effectiveRank, pushThreshold, rank, suppressSelfForwards, type TriageResult,
+  triage, effectiveRank, isSelfForward, pushThreshold, rank, suppressSelfForwards, type TriageResult,
 } from './triage.js';
 import * as digest from './digest.js';
 import * as health from './health.js';
@@ -282,7 +282,8 @@ export class Watcher {
       void task.catch((e) => log.error(`Failed to send LLM availability alert: ${e}`));
     };
 
-    for (const [message, result] of await triage(messages, this.triageRules(), onLlmResult)) {
+    const rules = this.triageRules();
+    for (const [message, result] of await triage(messages, rules, onLlmResult)) {
       metrics.addCounter('mailsift.messages.triaged', 1, {
         provider: message.provider,
         importance: result.importance,
@@ -326,6 +327,11 @@ export class Watcher {
       }
 
       this.state.recordOutcome(key, result.importance, false, fields);
+      // A copy forwarded in from another monitored mailbox adds nothing to the
+      // digest: the original was triaged at its source, so it was either
+      // notified already or is listed here itself. Repeating it only crowds out
+      // mail that has not been seen. The row stays, so list_mail still finds it.
+      if (isSelfForward(message, rules)) continue;
       // Always include spam in the digest: it is the category most likely to hide
       // an important message.
       if (message.inSpam || rank(result) >= digestThreshold) {
