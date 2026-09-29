@@ -9,6 +9,7 @@
  * Once an endpoint exhausts its retries, later pushes make a single attempt
  * until one succeeds: a dead endpoint must not multiply the poll duration.
  */
+import { setTimeout as sleep } from 'node:timers/promises';
 import { getLogger } from '../logger.js';
 
 const log = getLogger('delivery');
@@ -37,13 +38,14 @@ export function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
 }
 
-const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+/** Named so the parameter can shadow it without shadowing the import. */
+const sleepFor = (ms: number): Promise<void> => sleep(ms);
 
 export async function deliverWithRetry(
   label: string,
   state: RetryState,
   attempt: () => Promise<DeliveryOutcome>,
-  sleep: (ms: number) => Promise<void> = defaultSleep,
+  sleep: (ms: number) => Promise<void> = sleepFor,
 ): Promise<boolean> {
   const maxAttempts = state.exhausted ? 1 : retryAttempts();
   for (let n = 1; ; n += 1) {

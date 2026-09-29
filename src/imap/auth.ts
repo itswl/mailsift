@@ -9,6 +9,7 @@
  */
 import { chmod, mkdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { dirname } from 'node:path';
 import { getLogger } from '../logger.js';
 import type { AuthKind } from '../config.js';
@@ -191,7 +192,7 @@ export class TokenStore {
         if (Date.now() - started > 30_000) {
           throw new AuthError('Timed out waiting for the token store lock');
         }
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        await sleep(50);
       }
     }
     try {

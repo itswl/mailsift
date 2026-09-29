@@ -8,6 +8,7 @@ import './env.js'; // Must run first so .env is loaded into process.env.
 import { realpathSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 import { ConfigError, loadConfig, needsOAuth } from './config.js';
 import { TokenStore } from './imap/auth.js';
@@ -30,7 +31,6 @@ const log = getLogger('main');
 const STARTUP_FAILURE_BACKOFF_MS = 30_000;
 
 let stopping = false;
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 async function checkConfig(): Promise<number> {
   let config;

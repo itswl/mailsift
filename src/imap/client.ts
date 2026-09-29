@@ -7,6 +7,7 @@
  * 2. IMAP `UID n:*` returns at least one message, even when its UID is below n.
  *    Filter the search result client-side or the last message repeats every poll.
  */
+import { setTimeout as sleep } from 'node:timers/promises';
 import { ImapFlow, type FetchMessageObject, type ListResponse } from 'imapflow';
 import { getAccessToken } from './auth.js';
 import { resolveFolders, type Folder } from './folders.js';
@@ -152,7 +153,7 @@ export async function connect(account: Account, options: ConnectOptions = {}): P
         `[${account.name}] transient IMAP connection failure (${attempt}/${maxAttempts}); ` +
           `retrying in ${delayMs}ms: ${detail}`,
       );
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      await sleep(delayMs);
     }
   }
 
