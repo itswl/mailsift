@@ -223,6 +223,8 @@ It is read-only in the strict sense: there is no route that changes anything, an
 
 Off by default. A page a browser can reach is a wider surface than a JSON-RPC endpoint, so enable it deliberately, keep `MCP_BIND` on loopback, and put TLS in front of it if you reach it from a phone.
 
+The header carries a colour switch cycling through following the system, light and dark. The choice is stored in the browser and applied before the body renders, so it never flashes the other theme, and it moves the status bar colour with it rather than leaving the top of an installed app behind.
+
 It installs to a home screen: the manifest, a maskable icon and a service worker that caches nothing are served without a session, since a browser asks for them before it has one. Installed, it opens without browser chrome, paints the status bar to match the page in either colour scheme, and reaches under a notch with the safe-area insets padded back. The worker deliberately caches nothing, because a page showing yesterday's triage would be worse than no page. Regenerate the icon with `npx tsx scripts/icons.ts` after changing the mark.
 
 Behind a reverse proxy, set `TRUSTED_PROXY=true`. Otherwise every request arrives from the proxy's address, the per-client rate limit collapses into one shared budget, and a single noisy caller can lock out your own browser and any MCP client. With it set, the limit and the audit log key on `CF-Connecting-IP`, `X-Real-IP` or the first `X-Forwarded-For` entry. Leave it off when the port is reached directly, since anyone can send those headers. Sign-in gets a separate, much smaller budget of its own, because it is the only route that answers without credentials.

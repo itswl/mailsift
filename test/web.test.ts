@@ -257,3 +257,47 @@ describe('installable app', () => {
     expect(worker).toContain('fetch');
   });
 });
+
+describe('colour theme', () => {
+  const shell = async (): Promise<string> => String((await routeWeb(request(), url('/'), '', seeded())).body);
+
+  it('offers three states, so following the system stays reachable', async () => {
+    const page = await shell();
+    expect(page).toContain('id="theme"');
+    expect(page).toContain("['auto', 'light', 'dark']");
+  });
+
+  it('lets a stored choice beat the system in either direction', async () => {
+    const page = await shell();
+    // System dark yields to an explicit light choice, and an explicit dark
+    // choice applies under a light system.
+    expect(page).toContain('@media(prefers-color-scheme:dark){:root:not([data-theme=light])');
+    expect(page).toContain(':root[data-theme=dark]{--bg:#15171a');
+  });
+
+  it('applies the choice before the body renders', async () => {
+    // Reading it afterwards would show the other theme for a frame, which is
+    // the flash a manual switch exists to avoid.
+    const page = await shell();
+    const boot = page.indexOf("localStorage.getItem('theme')");
+    expect(boot).toBeGreaterThan(-1);
+    expect(boot).toBeLessThan(page.indexOf('<body>'));
+  });
+
+  it('moves the status bar colour with the choice, not just the page', async () => {
+    // An installed app paints the status bar from this meta; leaving it behind
+    // would keep the top of the screen in the other theme.
+    const page = await shell();
+    expect(page).toContain('<meta name="theme-color" content="#ffffff">');
+    expect(page).toContain("meta.setAttribute('content', isDark ? '#15171a' : '#ffffff')");
+  });
+
+  it('keeps following the system while the choice is auto', async () => {
+    expect(await shell()).toContain("dark.addEventListener('change'");
+  });
+
+  it('survives a browser that refuses storage', async () => {
+    const page = await shell();
+    expect(page).toContain("catch (e) { return 'auto'; }");
+  });
+});
