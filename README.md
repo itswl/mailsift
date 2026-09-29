@@ -223,6 +223,8 @@ It is read-only in the strict sense: there is no route that changes anything, an
 
 Off by default. A page a browser can reach is a wider surface than a JSON-RPC endpoint, so enable it deliberately, keep `MCP_BIND` on loopback, and put TLS in front of it if you reach it from a phone.
 
+Signing in posts the token and exchanges it for an `HttpOnly` cookie that lasts six months and is renewed on each visit, so a browser in regular use is never asked again. The form carries an account field so a password manager will offer to save the token rather than leaving you to type it. An installed app keeps its own cookies on iOS, so expect to sign in once inside it even if the browser is already signed in.
+
 The header carries a colour switch cycling through following the system, light and dark. The choice is stored in the browser and applied before the body renders, so it never flashes the other theme, and it moves the status bar colour with it rather than leaving the top of an installed app behind.
 
 It installs to a home screen: the manifest, a maskable icon and a service worker that caches nothing are served without a session, since a browser asks for them before it has one. Installed, it opens without browser chrome, paints the status bar to match the page in either colour scheme, and reaches under a notch with the safe-area insets padded back. The worker deliberately caches nothing, because a page showing yesterday's triage would be worse than no page. Regenerate the icon with `npx tsx scripts/icons.ts` after changing the mark.

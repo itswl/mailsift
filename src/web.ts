@@ -198,7 +198,8 @@ export function renderLogin(message = ''): string {
   return page('Sign in', `
     <form method="post" action="/auth" class="card login">
       <h1>mailsift</h1>
-      <p class="muted">Enter the access token for this instance.</p>
+      <p class="muted">Enter the access token for this instance. Your browser can remember it.</p>
+      <input type="text" name="user" value="mailsift" autocomplete="username" readonly aria-label="Account">
       <input type="password" name="token" autocomplete="current-password" placeholder="token" autofocus>
       <button type="submit">Open</button>
       ${message ? '<p class="error">' + message + '</p>' : ''}
@@ -329,6 +330,9 @@ border:1px solid var(--line);background:var(--bg);color:var(--fg);text-decoratio
 .login{max-width:320px;margin:15vh auto}
 .login input,.login button{width:100%;margin-top:8px;padding:9px;border-radius:7px;
 border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit}
+/* Present so a password manager has an account to file the token under, but
+   it is not a second thing to fill in. */
+.login input[name=user]{color:var(--muted);cursor:default}
 .error{color:var(--critical);font-size:13px}
 `;
 }
@@ -565,11 +569,19 @@ async function readBody(req: IncomingMessage, limit = 4096): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+/** Six months. Long enough that a browser in regular use is never asked again. */
+const SESSION_MAX_AGE = 180 * 24 * 60 * 60;
+
 function sessionCookie(req: IncomingMessage, token: string): string {
   // Secure only when the request really arrived over TLS: setting it on plain
   // HTTP would make the cookie unusable behind a loopback-only setup.
   const https = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim() === 'https';
-  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`
+  // Lax, not Strict. Strict withholds the cookie on a navigation that starts
+  // outside the site, which is exactly how an installed app launches from a
+  // home screen and how a shared link opens, so it asked for the token again
+  // for no gain: this surface has no route that changes anything, and signing
+  // in still requires the token in the request body rather than a cookie.
+  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}`
     + (https ? '; Secure' : '');
 }
 
@@ -615,7 +627,15 @@ export async function routeWeb(
       : html(401, renderLogin());
   }
 
-  if (url.pathname === '/' && req.method === 'GET') return html(200, renderApp());
+  if (url.pathname === '/' && req.method === 'GET') {
+    const answer = html(200, renderApp());
+    // Roll the session forward on each visit, so regular use never expires.
+    // Only on the page: doing it on the polling calls would rewrite the cookie
+    // every minute for nothing.
+    const session = readCookie(req.headers.cookie, SESSION_COOKIE);
+    if (token && session) answer.cookie = sessionCookie(req, session);
+    return answer;
+  }
   if (url.pathname.startsWith('/api/') && req.method === 'GET') {
     return handleApi(url.pathname, url.searchParams, store);
   }

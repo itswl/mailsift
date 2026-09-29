@@ -72,7 +72,59 @@ describe('authorization', () => {
     const answer = await routeWeb(post, url('/auth'), 'secret', store);
     expect(answer.status).toBe(303);
     expect(answer.cookie).toContain('HttpOnly');
-    expect(answer.cookie).toContain('SameSite=Strict');
+  });
+
+  it('survives a launch that starts outside the site', async () => {
+    // Strict withholds the cookie on exactly that navigation, which is how an
+    // installed app opens from a home screen, so it asked for the token again
+    // every time. Nothing here changes state, and signing in still needs the
+    // token in the body rather than a cookie.
+    const store = seeded();
+    const answer = await routeWeb(request({ method: 'POST', url: '/auth', body: 'token=secret' }), url('/auth'), 'secret', store);
+    expect(answer.cookie).toContain('SameSite=Lax');
+    expect(answer.cookie).not.toContain('SameSite=Strict');
+  });
+
+  it('keeps the session for months, and rolls it forward on each visit', async () => {
+    const store = seeded();
+    const fresh = await routeWeb(request({ method: 'POST', url: '/auth', body: 'token=secret' }), url('/auth'), 'secret', store);
+    expect(fresh.cookie).toContain(`Max-Age=${180 * 24 * 60 * 60}`);
+
+    // Opening the app renews it, so a browser in regular use never expires.
+    const visit = await routeWeb(
+      request({ headers: { cookie: `${SESSION_COOKIE}=secret` } }), url('/'), 'secret', store,
+    );
+    expect(visit.status).toBe(200);
+    expect(visit.cookie).toContain(`${SESSION_COOKIE}=secret`);
+    expect(visit.cookie).toContain('Max-Age=');
+  });
+
+  it('does not rewrite the cookie on the polling calls', async () => {
+    // The app polls every minute; renewing there would resend the header for nothing.
+    const store = seeded();
+    const poll = await routeWeb(
+      request({ url: '/api/mail', headers: { cookie: `${SESSION_COOKIE}=secret` } }),
+      url('/api/mail'), 'secret', store,
+    );
+    expect(poll.status).toBe(200);
+    expect(poll.cookie).toBeUndefined();
+  });
+
+  it('gives a password manager an account to file the token under', async () => {
+    // A lone password field is saved inconsistently, which is what left the
+    // token being typed by hand on every new browser.
+    const login = String((await routeWeb(request(), url('/'), 'secret', seeded())).body);
+    expect(login).toContain('autocomplete="username"');
+    expect(login).toContain('autocomplete="current-password"');
+  });
+
+  it('does not renew a session for a bearer client, which has no cookie', async () => {
+    const store = seeded();
+    const answer = await routeWeb(
+      request({ headers: { authorization: 'Bearer secret' } }), url('/'), 'secret', store,
+    );
+    expect(answer.status).toBe(200);
+    expect(answer.cookie).toBeUndefined();
   });
 
   it('marks the cookie Secure only when the request really arrived over TLS', async () => {
