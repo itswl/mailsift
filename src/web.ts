@@ -26,6 +26,28 @@ export const SESSION_COOKIE = 'mailsift_session';
 const LIVE_FETCH_TIMEOUT_MS = 25_000;
 const LIVE_BODY_CHARS = 20_000;
 
+/**
+ * Sign-in attempts per client per minute.
+ *
+ * /auth is the only route that answers without credentials, so it is the only
+ * one an unauthenticated caller can spend the general request budget on. A
+ * much smaller budget of its own keeps a guessing client from crowding out
+ * real traffic, whatever it achieves against a long token.
+ */
+const AUTH_ATTEMPTS_PER_MINUTE = 10;
+const authWindows = new Map<string, { startedAt: number; count: number }>();
+
+export function allowAuthAttempt(client: string, now = Date.now()): boolean {
+  const current = authWindows.get(client);
+  if (!current || now - current.startedAt >= 60_000) {
+    authWindows.set(client, { startedAt: now, count: 1 });
+    return true;
+  }
+  if (current.count >= AUTH_ATTEMPTS_PER_MINUTE) return false;
+  current.count += 1;
+  return true;
+}
+
 export function webUiEnabled(): boolean {
   return (process.env.WEB_UI_ENABLED ?? 'false').toLowerCase() === 'true';
 }
@@ -422,10 +444,14 @@ export async function routeWeb(
   url: URL,
   token: string,
   store: StateStore,
+  client = 'unknown',
 ): Promise<WebResponse> {
   const html = (status: number, body: string): WebResponse => ({ status, body, contentType: 'text/html; charset=utf-8' });
 
   if (url.pathname === '/auth' && req.method === 'POST') {
+    if (!allowAuthAttempt(client)) {
+      return html(429, renderLogin('Too many attempts. Wait a minute and try again.'));
+    }
     let presented = '';
     try {
       presented = new URLSearchParams(await readBody(req)).get('token')?.trim() ?? '';
