@@ -8,6 +8,7 @@
  * so a wake-up costs no new TLS handshake or LOGIN. The scheduled poll keeps
  * running and reconciles anything a notification missed.
  */
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { ImapFlow } from 'imapflow';
 import type { Account } from '../config.js';
 import { connect, imapErrorText, isTransientConnectError, listFolders } from './client.js';
@@ -54,8 +55,8 @@ export interface ListenerDeps {
 
 const DEFAULT_DEPS: ListenerDeps = {
   connect: (account) => connect(account, { idle: true }),
-  // unref: a backoff timer must not keep the process alive after stop().
-  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms).unref()),
+  // ref:false — a backoff timer must not keep the process alive after stop().
+  sleep: (ms) => sleep(ms, undefined, { ref: false }),
   debounceMs: WAKE_DEBOUNCE_MS,
 };
 
@@ -197,13 +198,13 @@ export class FolderListener {
   private async resolveFolder(client: ImapFlow): Promise<Folder | undefined> {
     const entries = await listFolders(client);
     const monitored = new Set(resolveFolders(entries, this.account.folders).map((f) => f.path));
-    const [folder, ...extra] = resolveFolders(entries, [this.token]);
+    // One token resolves to at most one folder: `all` is refused by the
+    // supervisor, `spam` picks a single folder, and anything else is a name
+    // lookup. The code used to warn about a second match that cannot occur.
+    const [folder] = resolveFolders(entries, [this.token]);
     if (!folder) {
       log.warn(`[${this.label}] no folder matches IMAP_IDLE_FOLDERS entry "${this.token}"`);
       return undefined;
-    }
-    if (extra.length) {
-      log.warn(`[${this.label}] "${this.token}" matches ${extra.length + 1} folders; listening on ${folder.path} only`);
     }
     if (!monitored.has(folder.path)) {
       log.warn(`[${this.label}] ${folder.path} is not in MAIL_ACCOUNT_N_FOLDERS; add it there before enabling IDLE for it`);
