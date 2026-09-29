@@ -205,12 +205,27 @@ export function renderLogin(message = ''): string {
     </form>`);
 }
 
+/**
+ * Applied in the document head, ahead of the body.
+ *
+ * Reading the choice after first paint would show the wrong theme for a frame,
+ * which is exactly the thing a manual switch is meant to stop.
+ */
+function themeBoot(): string {
+  return "(function(){try{var c=localStorage.getItem('theme');"
+    + "if(c==='dark'||c==='light')document.documentElement.dataset.theme=c;"
+    + "var d=c==='dark'||(c!=='light'&&matchMedia('(prefers-color-scheme:dark)').matches);"
+    + "var m=document.querySelector('meta[name=theme-color]');"
+    + "if(m)m.setAttribute('content',d?'" + DARK_BAR + "':'" + LIGHT_BAR + "');}catch(e){}})();";
+}
+
 /** The application shell. All content is built in the browser from the JSON API. */
 export function renderApp(): string {
   return page('mailsift', `
     <header class="bar">
       <strong>mailsift</strong>
       <span id="totals" class="muted"></span>
+      <button id="theme" type="button" aria-label="Colour theme"></button>
     </header>
     <form id="filters" class="bar filters">
       <select name="hours">
@@ -250,16 +265,30 @@ function page(title: string, body: string): string {
     + '<link rel="manifest" href="/manifest.webmanifest">'
     + '<link rel="icon" type="image/png" href="/favicon.ico">'
     + '<link rel="apple-touch-icon" href="/apple-touch-icon.png">'
-    + '<title>' + title + '</title><style>' + styles() + '</style></head><body>'
-    + body + '</body></html>';
+    + '<meta name="theme-color" content="' + LIGHT_BAR + '">'
+    + '<title>' + title + '</title><style>' + styles() + '</style>'
+    // Before the body renders, so a stored choice never flashes the other theme.
+    + '<script>' + themeBoot() + '</script>'
+    + '</head><body>' + body + '</body></html>';
 }
+
+/** The dark palette, written once and used by both the media query and the override. */
+const DARK_PALETTE = '--bg:#15171a;--fg:#e8e8e8;--muted:#9aa0a6;--line:#2a2e33;--card:#1c1f23';
+export const LIGHT_BAR = '#ffffff';
+export const DARK_BAR = '#15171a';
 
 function styles(): string {
   return `
-:root{--bg:#fff;--fg:#111;--muted:#666;--line:#e5e5e5;--card:#fafafa;
+:root{color-scheme:light dark;--bg:#fff;--fg:#111;--muted:#666;--line:#e5e5e5;--card:#fafafa;
 --critical:#d33;--warning:#e08a00;--info:#3573d6}
-@media(prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e8e8e8;--muted:#9aa0a6;
---line:#2a2e33;--card:#1c1f23}}
+/* Follow the system unless a choice was made, and let that choice win either way. */
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){` + DARK_PALETTE + `}}
+:root[data-theme=dark]{` + DARK_PALETTE + `}
+:root[data-theme=light]{color-scheme:light}
+:root[data-theme=dark]{color-scheme:dark}
+#theme{margin-left:auto;font:inherit;font-size:17px;line-height:1;background:none;border:1px solid var(--line);
+color:var(--fg);border-radius:8px;padding:5px 9px;cursor:pointer}
+#theme:hover{background:var(--card)}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
 padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
@@ -420,6 +449,45 @@ async function chrome() {
   $('#digest').hidden = g.pending === 0;
   $('#digest-body').textContent = g.preview;
 }
+
+// Three states rather than two: following the system is the sensible default,
+// and a switch that cannot go back to it forces a choice the reader may not have.
+const THEMES = ['auto', 'light', 'dark'];
+const THEME_FACE = { auto: '\u25D0', light: '\u2600', dark: '\u263E' };
+const THEME_NAME = { auto: 'Follow the system', light: 'Light', dark: 'Dark' };
+const dark = matchMedia('(prefers-color-scheme: dark)');
+
+function readTheme() {
+  try {
+    const stored = localStorage.getItem('theme');
+    return THEMES.includes(stored) ? stored : 'auto';
+  } catch (e) { return 'auto'; }
+}
+
+function applyTheme(choice) {
+  const root = document.documentElement;
+  if (choice === 'auto') delete root.dataset.theme; else root.dataset.theme = choice;
+  const isDark = choice === 'dark' || (choice === 'auto' && dark.matches);
+  // The status bar of an installed app is painted from this, so a manual
+  // choice has to move it too or the top of the screen keeps the other theme.
+  const meta = document.querySelector('meta[name=theme-color]');
+  if (meta) meta.setAttribute('content', isDark ? '${DARK_BAR}' : '${LIGHT_BAR}');
+  const button = document.querySelector('#theme');
+  if (button) {
+    button.textContent = THEME_FACE[choice];
+    button.title = THEME_NAME[choice];
+    button.setAttribute('aria-label', 'Colour theme: ' + THEME_NAME[choice]);
+  }
+}
+
+$('#theme').onclick = () => {
+  const next = THEMES[(THEMES.indexOf(readTheme()) + 1) % THEMES.length];
+  try { localStorage.setItem('theme', next); } catch (e) {}
+  applyTheme(next);
+};
+// Following the system means following it as it changes, including the status bar.
+dark.addEventListener('change', () => { if (readTheme() === 'auto') applyTheme('auto'); });
+applyTheme(readTheme());
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 
