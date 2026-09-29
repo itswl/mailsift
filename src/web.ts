@@ -19,6 +19,7 @@ import { fetchByMessageId } from './imap/client.js';
 import { buildLink } from './links.js';
 import { renderDigest, type DigestItem } from './services/digest.js';
 import { CATEGORIES } from './services/triage.js';
+import { appleTouch180, favicon64, icon192, icon512, maskable512 } from './web-icons.js';
 import type { StateStore } from './services/state.js';
 
 export const SESSION_COOKIE = 'mailsift_session';
@@ -54,10 +55,11 @@ export function webUiEnabled(): boolean {
 
 export interface WebResponse {
   status: number;
-  body: string;
+  body: string | Buffer;
   contentType: string;
   /** Set-Cookie value, when a request establishes a session. */
   cookie?: string;
+  cacheControl?: string;
 }
 
 const json = (status: number, value: unknown): WebResponse => ({
@@ -234,8 +236,20 @@ export function renderApp(): string {
 
 function page(title: string, body: string): string {
   return '<!doctype html><html lang="en"><head><meta charset="utf-8">'
-    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+    // viewport-fit=cover lets the page reach under a notch; the CSS then pads
+    // it back with the safe-area insets, which is what an installed app needs.
+    + '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
     + '<meta name="referrer" content="no-referrer">'
+    // Painted behind the status bar when installed, so it should match the
+    // page rather than announce itself: light and dark are given separately.
+    + '<meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff">'
+    + '<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#15171a">'
+    + '<meta name="apple-mobile-web-app-capable" content="yes">'
+    + '<meta name="apple-mobile-web-app-title" content="mailsift">'
+    + '<meta name="mobile-web-app-capable" content="yes">'
+    + '<link rel="manifest" href="/manifest.webmanifest">'
+    + '<link rel="icon" type="image/png" href="/favicon.ico">'
+    + '<link rel="apple-touch-icon" href="/apple-touch-icon.png">'
     + '<title>' + title + '</title><style>' + styles() + '</style></head><body>'
     + body + '</body></html>';
 }
@@ -247,8 +261,13 @@ function styles(): string {
 @media(prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e8e8e8;--muted:#9aa0a6;
 --line:#2a2e33;--card:#1c1f23}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+-webkit-text-size-adjust:100%;overscroll-behavior-y:contain}
 .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 14px;border-bottom:1px solid var(--line)}
+header.bar{position:sticky;top:0;z-index:2;background:var(--bg)}
+/* A finger needs a bigger target than a mouse does. */
+@media(pointer:coarse){.filters select,.filters input{min-height:38px}.row{padding:14px}}
 .bar strong{font-size:16px}
 .filters select,.filters input{background:var(--bg);color:var(--fg);border:1px solid var(--line);
 border-radius:7px;padding:6px 8px;font:inherit}
@@ -402,15 +421,68 @@ async function chrome() {
   $('#digest-body').textContent = g.preview;
 }
 
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+
 let timer;
 filters.addEventListener('input', () => {
   clearTimeout(timer);
   timer = setTimeout(() => { load(); chrome(); }, 250);
 });
 load(); chrome();
-setInterval(() => { load(); chrome(); }, 60000);
+setInterval(() => { if (!document.hidden) { load(); chrome(); } }, 60000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { load(); chrome(); } });
 `;
 }
+
+/**
+ * The manifest that makes this installable to a home screen.
+ *
+ * `standalone` so it opens without browser chrome, and the theme colour is the
+ * app's own header rather than the brand blue, so the status bar continues the
+ * page instead of sitting on top of it.
+ */
+function manifest(): string {
+  return JSON.stringify({
+    name: 'mailsift',
+    short_name: 'mailsift',
+    description: 'What arrived in your mailboxes, and how it was judged.',
+    start_url: '/',
+    scope: '/',
+    display: 'standalone',
+    orientation: 'portrait',
+    background_color: '#ffffff',
+    theme_color: '#2f6fd0',
+    icons: [
+      { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+      { src: '/icon-maskable.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+    ],
+  });
+}
+
+/**
+ * A service worker that caches nothing.
+ *
+ * It exists so the app is installable. Caching would be actively wrong here:
+ * this is a live view of mailbox state, and a page showing yesterday's triage
+ * is worse than no page at all.
+ */
+const SERVICE_WORKER = [
+  "self.addEventListener('install', () => self.skipWaiting());",
+  "self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));",
+  "self.addEventListener('fetch', () => {});",
+].join('\n');
+
+/** Assets a browser fetches before it has a session, and which hold nothing private. */
+const PUBLIC_ASSETS: Record<string, { body: string | Buffer; type: string; cache: string }> = {
+  '/manifest.webmanifest': { body: manifest(), type: 'application/manifest+json', cache: 'public, max-age=3600' },
+  '/sw.js': { body: SERVICE_WORKER, type: 'text/javascript; charset=utf-8', cache: 'no-cache' },
+  '/icon-192.png': { body: icon192, type: 'image/png', cache: 'public, max-age=604800, immutable' },
+  '/icon-512.png': { body: icon512, type: 'image/png', cache: 'public, max-age=604800, immutable' },
+  '/icon-maskable.png': { body: maskable512, type: 'image/png', cache: 'public, max-age=604800, immutable' },
+  '/apple-touch-icon.png': { body: appleTouch180, type: 'image/png', cache: 'public, max-age=604800, immutable' },
+  '/favicon.ico': { body: favicon64, type: 'image/png', cache: 'public, max-age=604800, immutable' },
+};
 
 /** Read a small request body; anything larger than a token is refused outright. */
 async function readBody(req: IncomingMessage, limit = 4096): Promise<string> {
@@ -447,6 +519,13 @@ export async function routeWeb(
   client = 'unknown',
 ): Promise<WebResponse> {
   const html = (status: number, body: string): WebResponse => ({ status, body, contentType: 'text/html; charset=utf-8' });
+
+  // Icons and the manifest carry nothing private, and a browser asks for them
+  // before it has a session; refusing would leave the install without a mark.
+  const asset = PUBLIC_ASSETS[url.pathname];
+  if (asset && req.method === 'GET') {
+    return { status: 200, body: asset.body, contentType: asset.type, cacheControl: asset.cache };
+  }
 
   if (url.pathname === '/auth' && req.method === 'POST') {
     if (!allowAuthAttempt(client)) {
