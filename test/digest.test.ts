@@ -37,9 +37,9 @@ describe('rendering', () => {
 
   it('groups by category and sorts larger groups first', () => {
     const rows = [
-      toDigestItem(makeMessage({ messageId: '<a@x>' }), makeResult({ category: '账单缴费', summary: '账单 1' })),
-      toDigestItem(makeMessage({ messageId: '<b@x>' }), makeResult({ category: '账单缴费', summary: '账单 2' })),
-      toDigestItem(makeMessage({ messageId: '<c@x>' }), makeResult({ category: '快递物流', summary: '包裹待取' })),
+      toDigestItem(makeMessage({ messageId: '<a@x>', subject: '电费账单' }), makeResult({ category: '账单缴费', summary: '账单 1' })),
+      toDigestItem(makeMessage({ messageId: '<b@x>', subject: '水费账单' }), makeResult({ category: '账单缴费', summary: '账单 2' })),
+      toDigestItem(makeMessage({ messageId: '<c@x>', subject: '包裹通知' }), makeResult({ category: '快递物流', summary: '包裹待取' })),
     ];
     const body = renderDigest(rows);
     expect(body).toContain('**账单缴费 (2)**');
@@ -60,8 +60,8 @@ describe('rendering', () => {
 
   it('marks action-required messages and puts them first within a category', () => {
     const body = renderDigest([
-      toDigestItem(makeMessage({ fromName: 'FYI' }), makeResult({ actionRequired: false, summary: '仅供了解' })),
-      toDigestItem(makeMessage({ fromName: 'Action' }), makeResult({ actionRequired: true, summary: '需要今天处理' })),
+      toDigestItem(makeMessage({ fromName: 'FYI', subject: '周报' }), makeResult({ actionRequired: false, summary: '仅供了解' })),
+      toDigestItem(makeMessage({ fromName: 'Action', subject: '待办' }), makeResult({ actionRequired: true, summary: '需要今天处理' })),
     ]);
     expect(body).toContain('⚠️ **Action**');
     expect(body.indexOf('需要今天处理')).toBeLessThan(body.indexOf('仅供了解'));
@@ -89,6 +89,43 @@ describe('rendering', () => {
     expect(body).toContain('⏰\\[today\\]');
   });
 
+  it('folds repeats of one recurring event into a single counted entry', () => {
+    // A failing pipeline opens a fresh thread per run, so thread collapsing
+    // never joined them and a day of failures arrived as dozens of identical lines.
+    const runs = ['a1b2c3d', 'e4f5a6b', '7c8d9e0'].map((sha, i) =>
+      toDigestItem(
+        makeMessage({ messageId: `<r${i}@x>`, fromAddr: 'notifications@github.com', subject: `[owner/repo] Run failed: ci - main (${sha})`, date: `2026-09-28T0${i}:00:00.000Z` }),
+        makeResult({ importance: 'info', category: 'Work', actionRequired: false, summary: `run ${i} failed` }),
+      ));
+    const body = renderDigest(runs);
+    expect(body).toContain('3 messages');
+    expect(body).toContain('(3 messages)');
+    expect(body).toContain('1 entries');
+    // The newest wording represents the group.
+    expect(body).toContain('run 2 failed');
+  });
+
+  it('keeps different workflows and different senders apart', () => {
+    const rows = [
+      toDigestItem(makeMessage({ messageId: '<x1@x>', fromAddr: 'notifications@github.com', subject: '[owner/repo] Run failed: ci - main (aaaaaaa)' }), makeResult({ category: 'Work', summary: 'ci failed' })),
+      toDigestItem(makeMessage({ messageId: '<x2@x>', fromAddr: 'notifications@github.com', subject: '[owner/repo] Run failed: release - main (bbbbbbb)' }), makeResult({ category: 'Work', summary: 'release failed' })),
+      toDigestItem(makeMessage({ messageId: '<x3@x>', fromAddr: 'ci@elsewhere.com', subject: '[owner/repo] Run failed: ci - main (ccccccc)' }), makeResult({ category: 'Work', summary: 'other sender' })),
+    ];
+    expect(renderDigest(rows)).toContain('3 entries');
+  });
+
+  it('lets the occurrence that needs action speak for the group', () => {
+    // Otherwise a later harmless repeat would bury an earlier actionable one.
+    const rows = [
+      toDigestItem(makeMessage({ messageId: '<n1@x>', subject: '对账单 (100)', date: '2026-09-28T01:00:00.000Z' }), makeResult({ importance: 'critical', actionRequired: true, summary: '需要今天处理' })),
+      toDigestItem(makeMessage({ messageId: '<n2@x>', subject: '对账单 (200)', date: '2026-09-28T09:00:00.000Z' }), makeResult({ importance: 'info', actionRequired: false, summary: '仅供了解' })),
+    ];
+    const body = renderDigest(rows);
+    expect(body).toContain('1 entries');
+    expect(body).toContain('需要今天处理');
+    expect(body).toContain('⚠️');
+  });
+
   it('says how many messages it left out', () => {
     const body = renderDigest(items(0, 60));
     expect(body).toMatch(/_\d+ more messages not shown; use MCP list_digest or list_mail to see them_/);
@@ -109,11 +146,24 @@ describe('rendering', () => {
     expect(body).toContain('more messages not shown');
   });
 
-  it('counts every message it dropped, from the budget and from the line caps', () => {
+  it('counts dropped messages, not dropped entries', () => {
+    // One entry can stand for a dozen repeats, so counting entries would
+    // understate what the reader is not seeing.
     const body = renderDigest(items(0, 60));
     const omitted = Number(/_(\d+) more messages not shown/.exec(body)?.[1]);
     const shown = body.split('\n').filter((l) => l.startsWith('- ')).length;
     expect(omitted + shown).toBe(60);
+
+    const repeats = Array.from({ length: 40 }, (_, i) =>
+      toDigestItem(
+        makeMessage({ messageId: `<q${i}@x>`, fromAddr: 'bot@example.com', subject: `[repo] Run failed: ci - main (${String(i).padStart(7, '0')})` }),
+        makeResult({ category: 'Work', summary: `run ${i}` }),
+      ));
+    const mixed = renderDigest([...items(0, 40), ...repeats]);
+    const hidden = Number(/_(\d+) more messages not shown/.exec(mixed)?.[1] ?? 0);
+    const visible = mixed.split('\n').filter((l) => l.startsWith('- '))
+      .reduce((n, l) => n + Number(/\((\d+) messages\)/.exec(l)?.[1] ?? 1), 0);
+    expect(visible + hidden).toBe(80);
   });
 
   it('marks a card that still had to be cut, rather than stopping mid-sentence', () => {

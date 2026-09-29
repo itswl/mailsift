@@ -14,7 +14,12 @@ const log = getLogger('digest');
 
 export const DIGEST_SENT_KEY = 'digest_last_sent_date';
 const MAX_SPAM_LINES = 15;
-const MAX_INBOX_LINES = 35;
+/**
+ * Backstop on how many entries are worth reading at once. The character budget
+ * below is the real limit; this only guards against a flood of very short
+ * entries turning the card into a wall.
+ */
+const MAX_INBOX_LINES = 50;
 /**
  * Characters the rendered digest may use.
  *
@@ -89,6 +94,61 @@ function collapseThreads(items: DigestItem[]): DigestItem[] {
   return [...grouped.values()];
 }
 
+/**
+ * Key for "this is the same recurring event".
+ *
+ * Automated senders put the volatile part of a notification in a trailing
+ * identifier: a commit, a run number, an order. Strip it and ten CI failures
+ * for one workflow line up behind one key, while a different workflow or a
+ * different sender stays separate. Category is part of the key so unrelated
+ * mail cannot merge just because its subject rhymes.
+ */
+function repeatKey(item: DigestItem): string {
+  const subject = item.subject
+    .replace(/\s*\((?:[0-9a-f]{6,40}|\d{3,})\)\s*$/i, '')
+    .trim()
+    .toLowerCase();
+  return `${item.from.trim().toLowerCase()}|${item.category}|${subject}`;
+}
+
+/**
+ * Fold repeats of one event into a single entry carrying the newest wording.
+ *
+ * collapseThreads only joins messages that reply to each other. Automated
+ * notifications rarely do: every workflow run opens its own thread, so a day
+ * of a failing pipeline arrived as dozens of separate lines that said the same
+ * thing. Runs after thread collapsing, so a real conversation is still one unit
+ * before repeats are considered.
+ */
+function collapseRepeats(items: DigestItem[]): DigestItem[] {
+  /**
+   * Which occurrence speaks for the group.
+   *
+   * The one that most deserves attention, so a later harmless repeat can never
+   * bury an earlier one that needs action. Newest wins when they are equally
+   * urgent, since that describes the current state of a recurring event.
+   */
+  const representative = (a: DigestItem, b: DigestItem): DigestItem => {
+    if (urgency(a) !== urgency(b)) return urgency(a) > urgency(b) ? a : b;
+    return a.date >= b.date ? a : b;
+  };
+
+  const grouped = new Map<string, DigestItem>();
+  for (const item of items) {
+    const key = repeatKey(item);
+    const existing = grouped.get(key);
+    if (!existing) {
+      grouped.set(key, { ...item });
+      continue;
+    }
+    grouped.set(key, {
+      ...representative(existing, item),
+      threadCount: existing.threadCount + item.threadCount,
+    });
+  }
+  return [...grouped.values()];
+}
+
 function urgency(item: DigestItem): number {
   const importance = item.importance === 'critical' ? 2 : item.importance === 'warning' ? 1 : 0;
   return importance + (item.actionRequired ? 1 : 0);
@@ -97,7 +157,7 @@ function urgency(item: DigestItem): number {
 export function renderDigest(items: DigestItem[], maxChars = DIGEST_MAX_CHARS): string {
   if (items.length === 0) return 'No messages require review from the past day.';
 
-  const visibleItems = collapseThreads(items);
+  const visibleItems = collapseRepeats(collapseThreads(items));
 
   const spam = visibleItems.filter((i) => i.inSpam);
   const inbox = visibleItems.filter((i) => !i.inSpam);
@@ -110,12 +170,15 @@ export function renderDigest(items: DigestItem[], maxChars = DIGEST_MAX_CHARS): 
   const ordered = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 
   const lines = [
-    `**${items.length} messages**  ${visibleItems.length} threads · inbox ${inbox.length} · spam ${spam.length}`,
+    `**${items.length} messages**  ${visibleItems.length} entries · inbox ${inbox.length} · spam ${spam.length}`,
     ordered.slice(0, 8).map(([name, n]) => `${markdownText(name)} ${n}`).join('  '),
   ];
 
   let used = lines.reduce((n, l) => n + l.length + 1, 0);
-  let omittedItems = 0;
+  // Counted in messages, not entries: one entry can stand for a dozen repeats,
+  // so counting entries would understate what the reader is not seeing.
+  let omittedMessages = 0;
+  const messagesIn = (group: DigestItem[]): number => group.reduce((n, i) => n + Math.max(1, i.threadCount), 0);
   /** Add a line unless it would eat into the room held for the closing notice. */
   const push = (text: string): boolean => {
     if (used + text.length + 1 > maxChars - CLOSING_RESERVE) return false;
@@ -133,7 +196,7 @@ export function renderDigest(items: DigestItem[], maxChars = DIGEST_MAX_CHARS): 
       if (!push(line(item))) break;
       shownSpam += 1;
     }
-    omittedItems += spam.length - shownSpam;
+    omittedMessages += messagesIn(spam.slice(shownSpam));
   }
 
   if (inbox.length) {
@@ -154,7 +217,7 @@ export function renderDigest(items: DigestItem[], maxChars = DIGEST_MAX_CHARS): 
     for (const [category, group] of groups) {
       if (remaining <= 0 || budgetSpent) {
         droppedCategories += 1;
-        omittedItems += group.length;
+        omittedMessages += messagesIn(group);
         continue;
       }
       const orderedItems = [...group].sort((a, b) =>
@@ -162,10 +225,10 @@ export function renderDigest(items: DigestItem[], maxChars = DIGEST_MAX_CHARS): 
         b.date.localeCompare(a.date),
       );
       const allowed = Math.min(group.length, remaining);
-      if (!push('') || !push(`**${markdownText(category)} (${group.length})**`)) {
+      if (!push('') || !push(`**${markdownText(category)} (${messagesIn(group)})**`)) {
         budgetSpent = true;
         droppedCategories += 1;
-        omittedItems += group.length;
+        omittedMessages += messagesIn(group);
         continue;
       }
       let shown = 0;
@@ -177,7 +240,7 @@ export function renderDigest(items: DigestItem[], maxChars = DIGEST_MAX_CHARS): 
         shown += 1;
       }
       remaining -= shown;
-      omittedItems += group.length - shown;
+      omittedMessages += messagesIn(orderedItems.slice(shown));
     }
     if (droppedCategories) {
       lines.push('', `_${droppedCategories} more categories omitted_`);
@@ -186,8 +249,8 @@ export function renderDigest(items: DigestItem[], maxChars = DIGEST_MAX_CHARS): 
 
   // Always the last word, and always inside the reserved room: a digest that
   // simply stops must never look like a complete one.
-  if (omittedItems > 0) {
-    lines.push('', `_${omittedItems} more messages not shown; use MCP list_digest or list_mail to see them_`);
+  if (omittedMessages > 0) {
+    lines.push('', `_${omittedMessages} more messages not shown; use MCP list_digest or list_mail to see them_`);
   }
 
   return lines.join('\n');
