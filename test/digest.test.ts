@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import './setup.js';
 import { makeMessage, makeResult, RecordingSink } from './helpers.js';
-import { renderDigest, sendDigest, shouldSend, toDigestItem, type DigestItem } from '../src/services/digest.js';
+import {
+  DIGEST_MAX_CHARS, renderDigest, sendDigest, shouldSend, toDigestItem, type DigestItem,
+} from '../src/services/digest.js';
+import { buildCard } from '../src/services/feishu.js';
 import { StateStore } from '../src/services/state.js';
 
 function items(spam: number, inbox: number): DigestItem[] {
@@ -86,8 +89,51 @@ describe('rendering', () => {
     expect(body).toContain('⏰\\[today\\]');
   });
 
-  it('truncates long categories and explains the omission', () => {
-    expect(renderDigest(items(0, 60))).toContain('more in this category');
+  it('says how many messages it left out', () => {
+    const body = renderDigest(items(0, 60));
+    expect(body).toMatch(/_\d+ more messages not shown; use MCP list_digest or list_mail to see them_/);
+  });
+
+  it('stays inside the character budget however much is queued', () => {
+    // The card slices at a fixed width, so a render that overruns loses its own
+    // tail: the notice saying content was dropped is the last thing written and
+    // so the first thing lost, and a truncated digest then reads as a complete one.
+    for (const count of [60, 200, 600]) {
+      expect(renderDigest(items(0, count)).length).toBeLessThanOrEqual(DIGEST_MAX_CHARS);
+    }
+  });
+
+  it('keeps the closing notice even when the budget is far too small', () => {
+    const body = renderDigest(items(0, 60), 400);
+    expect(body.length).toBeLessThanOrEqual(400);
+    expect(body).toContain('more messages not shown');
+  });
+
+  it('counts every message it dropped, from the budget and from the line caps', () => {
+    const body = renderDigest(items(0, 60));
+    const omitted = Number(/_(\d+) more messages not shown/.exec(body)?.[1]);
+    const shown = body.split('\n').filter((l) => l.startsWith('- ')).length;
+    expect(omitted + shown).toBe(60);
+  });
+
+  it('marks a card that still had to be cut, rather than stopping mid-sentence', () => {
+    const card = buildCard(
+      makeMessage({ subject: 'digest', body: 'x'.repeat(9000), extra: { digest: true } }),
+      makeResult({ importance: 'info' }),
+    );
+    const content = String(((card['card'] as { elements: Array<Record<string, unknown>> }).elements[0])!['content']);
+    expect(content).toContain('truncated to fit the card');
+  });
+
+  it('gives a digest more card room than a single mail card', () => {
+    // 3000 characters could not hold a day of mail; Feishu allows a 20 KB body.
+    const card = buildCard(
+      makeMessage({ subject: 'digest', body: 'y'.repeat(5000), extra: { digest: true } }),
+      makeResult({ importance: 'info' }),
+    );
+    const content = String(((card['card'] as { elements: Array<Record<string, unknown>> }).elements[0])!['content']);
+    expect(content.length).toBeGreaterThan(4000);
+    expect(content).not.toContain('truncated');
   });
 });
 

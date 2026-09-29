@@ -15,6 +15,19 @@ const log = getLogger('digest');
 export const DIGEST_SENT_KEY = 'digest_last_sent_date';
 const MAX_SPAM_LINES = 15;
 const MAX_INBOX_LINES = 35;
+/**
+ * Characters the rendered digest may use.
+ *
+ * The line caps above decide how much is worth reading; this one decides how
+ * much the delivery channel can carry. Without it the two disagreed: the line
+ * caps appended "N more" notices at the very end and the card then sliced the
+ * text at a fixed width, so the notices were always the first thing lost and a
+ * truncated digest looked like a complete one. Kept well under the Feishu card
+ * budget so the slice there is a safety net rather than the real limit.
+ */
+export const DIGEST_MAX_CHARS = 4000;
+/** Room held back so the closing notice always fits, however tight the budget. */
+const CLOSING_RESERVE = 160;
 
 export interface DigestItem {
   accountLabel: string;
@@ -81,7 +94,7 @@ function urgency(item: DigestItem): number {
   return importance + (item.actionRequired ? 1 : 0);
 }
 
-export function renderDigest(items: DigestItem[]): string {
+export function renderDigest(items: DigestItem[], maxChars = DIGEST_MAX_CHARS): string {
   if (items.length === 0) return 'No messages require review from the past day.';
 
   const visibleItems = collapseThreads(items);
@@ -101,11 +114,26 @@ export function renderDigest(items: DigestItem[]): string {
     ordered.slice(0, 8).map(([name, n]) => `${markdownText(name)} ${n}`).join('  '),
   ];
 
+  let used = lines.reduce((n, l) => n + l.length + 1, 0);
+  let omittedItems = 0;
+  /** Add a line unless it would eat into the room held for the closing notice. */
+  const push = (text: string): boolean => {
+    if (used + text.length + 1 > maxChars - CLOSING_RESERVE) return false;
+    lines.push(text);
+    used += text.length + 1;
+    return true;
+  };
+
   // Put spam first: it is easiest to miss and the main reason for the digest.
   if (spam.length) {
-    lines.push('', `**⚠️ Spam (${spam.length}; review provider-filtered messages)**`);
-    for (const item of spam.slice(0, MAX_SPAM_LINES)) lines.push(line(item));
-    if (spam.length > MAX_SPAM_LINES) lines.push(`- …${spam.length - MAX_SPAM_LINES} more`);
+    push('');
+    push(`**⚠️ Spam (${spam.length}; review provider-filtered messages)**`);
+    let shownSpam = 0;
+    for (const item of spam.slice(0, MAX_SPAM_LINES)) {
+      if (!push(line(item))) break;
+      shownSpam += 1;
+    }
+    omittedItems += spam.length - shownSpam;
   }
 
   if (inbox.length) {
@@ -122,24 +150,44 @@ export function renderDigest(items: DigestItem[]): string {
 
     let remaining = MAX_INBOX_LINES;
     let droppedCategories = 0;
+    let budgetSpent = false;
     for (const [category, group] of groups) {
-      if (remaining <= 0) {
+      if (remaining <= 0 || budgetSpent) {
         droppedCategories += 1;
+        omittedItems += group.length;
         continue;
       }
-      lines.push('', `**${markdownText(category)} (${group.length})**`);
-      const shown = Math.min(group.length, remaining);
       const orderedItems = [...group].sort((a, b) =>
         urgency(b) - urgency(a) || Number(Boolean(b.deadline)) - Number(Boolean(a.deadline)) ||
         b.date.localeCompare(a.date),
       );
-      for (const item of orderedItems.slice(0, shown)) lines.push(line(item));
+      const allowed = Math.min(group.length, remaining);
+      if (!push('') || !push(`**${markdownText(category)} (${group.length})**`)) {
+        budgetSpent = true;
+        droppedCategories += 1;
+        omittedItems += group.length;
+        continue;
+      }
+      let shown = 0;
+      for (const item of orderedItems.slice(0, allowed)) {
+        if (!push(line(item))) {
+          budgetSpent = true;
+          break;
+        }
+        shown += 1;
+      }
       remaining -= shown;
-      if (group.length > shown) lines.push(`- …${group.length - shown} more in this category`);
+      omittedItems += group.length - shown;
     }
     if (droppedCategories) {
-      lines.push('', `_${droppedCategories} more categories omitted; use MCP list_mail to view all_`);
+      lines.push('', `_${droppedCategories} more categories omitted_`);
     }
+  }
+
+  // Always the last word, and always inside the reserved room: a digest that
+  // simply stops must never look like a complete one.
+  if (omittedItems > 0) {
+    lines.push('', `_${omittedItems} more messages not shown; use MCP list_digest or list_mail to see them_`);
   }
 
   return lines.join('\n');

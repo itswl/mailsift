@@ -47,7 +47,7 @@ DIGEST_HOUR=9
 
 完整配置见 [.env.example](.env.example)。`MAIL_ACCOUNT_N_FOLDERS` 可填 `all`、`INBOX,spam` 或具体文件夹名；`all` 会排除已发送、草稿、回收站和服务商的虚拟视图，`spam` 会自动识别垃圾箱。
 
-`SUPPRESS_SELF_FORWARDS=true`（默认）用于避免邮箱之间互相转发时同一封邮件通知两次。转发副本是一封全新邮件，有自己的 Message-ID，按 Message-ID 去重看不到它，但它的发件人正是被配置监控的某个账号。这类副本会进入每日日报而不实时推送，并且不消耗模型调用。在同一个邮箱内给自己发的邮件不受影响，显式的 `MAIL_ALWAYS_IMPORTANT` 仍然优先。
+`SUPPRESS_SELF_FORWARDS=true`（默认）用于避免邮箱之间互相转发时同一封邮件通知两次。转发副本是一封全新邮件，有自己的 Message-ID，按 Message-ID 去重看不到它，但它的发件人正是被配置监控的某个账号。这类副本会被记录、可通过 `list_mail` 查到，但既不实时推送也不再出现在每日日报里，因为原件已经在源邮箱分诊过。它同样不消耗模型调用。在同一个邮箱内给自己发的邮件不受影响，显式的 `MAIL_ALWAYS_IMPORTANT` 仍然优先。
 
 `SPAM_RANK_BONUS` 按整级提升垃圾箱邮件，而 info 是最低一级，因此在默认的 `PUSH_MIN_IMPORTANCE=warning` 下把它设为 `1` 会推送垃圾箱里的每一封邮件：warning 和 critical 本来就在推送线之上，info 现在也正好压线。除非你把 `PUSH_MIN_IMPORTANCE` 调成 `critical` 又希望垃圾箱里的 warning 仍能穿透，否则保持 `0`。防止邮件被误判进垃圾箱并不需要它，因为分诊会正常评估垃圾箱邮件，真正的账单或验证码在那里也会被评为 warning 或 critical。`--check` 会对导致整箱推送的组合给出提示。
 

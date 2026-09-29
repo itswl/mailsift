@@ -37,7 +37,9 @@ Use `record_feedback` only when the user clearly labels a processed message as `
 
 Triage categories come from a fixed vocabulary: Security, Finance, Delivery, Travel, Health, Legal, Work, Personal, Social, Marketing, System, Other. Rule-decided mail may instead carry Always important, Never important, Feedback rule or Forwarded copy. Search and group on these values rather than inventing filters; records written before the vocabulary existed may still hold free-form labels.
 
-When several mailboxes are monitored and one forwards into another, the copy is recognised by its sender address and filed to the digest with `decidedBy: rule` and category `Forwarded copy`, so it never raises a second notification. Report such a record as a duplicate of mail already triaged in the source mailbox, not as a missed alert.
+When several mailboxes are monitored and one forwards into another, the copy is recognised by its sender address and recorded with `decidedBy: rule` and category `Forwarded copy`. It is neither notified nor listed in the daily digest, because the original was triaged in the source mailbox; `list_mail` with `category: "Forwarded copy"` still finds it. Report such a record as a duplicate of mail already handled at its source, not as a missed alert.
+
+The digest is rendered inside a character budget and always ends by saying how many messages it left out. If a user reports that it looks cut off, check that closing line first: a digest that stops without one is a fault, one that stops with it is working as designed and the rest is available through `list_digest` and `list_mail`.
 
 Verification codes, one-time passwords, and authentication codes are classified locally and should not be sent to the LLM. Other LLM payloads redact common direct identifiers such as email addresses, phone numbers, payment card numbers, and national IDs; card and ID numbers are redacted only when their checksum holds, so order and waybill numbers usually remain. Local notifications and authorized MCP message reads may still contain the original content, so minimize quotation.
 
