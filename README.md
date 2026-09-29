@@ -215,6 +215,14 @@ and pending queues. The Docker healthcheck checks only the poll heartbeat; a
 healthy container does not prove that every account, LLM call, or notification
 sink is healthy. Use MCP `health` and `recovery_status` for those details.
 
+## Read-only web view
+
+`WEB_UI_ENABLED=true` serves a browser view of the triage results at `http://<host>:<MCP_PORT>/`, on the same port and behind the same `MCP_TOKEN` as MCP, because it is the same trust boundary. It lists what arrived with the level, category and the model's reasoning, filters by window, level, category and mailbox, searches subject, sender and summary, previews the queue behind the next digest, and links out to the provider's own client. One message body can be fetched live on request; nothing is cached.
+
+It is read-only in the strict sense: there is no route that changes anything, and the only mailbox call it can make is the same bounded, read-only fetch the MCP resource already uses. It cannot mark read, flag, move, delete or send. For reading and replying to mail, run a real webmail client such as Roundcube against the same accounts; this view is for triage, not for mail handling.
+
+Off by default. A page a browser can reach is a wider surface than a JSON-RPC endpoint, so enable it deliberately, keep `MCP_BIND` on loopback, and put TLS in front of it if you reach it from a phone.
+
 ## Troubleshooting
 
 - **Repeated notifications:** messages are deduplicated by account plus Message-ID. `--recover` is for interrupted, undecided records.

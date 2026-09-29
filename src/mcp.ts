@@ -24,6 +24,7 @@ import {
 } from './services/triage.js';
 import { retryAttempts } from './services/delivery.js';
 import { HEARTBEAT_KEY, IDLE_WAKE_KEY } from './services/watcher.js';
+import { routeWeb, webUiEnabled } from './web.js';
 import { idleEnabled, idleFolderTokens } from './imap/idle.js';
 import {
   ACCOUNT_LAST_ERROR_KEY, ACCOUNT_LAST_FAILURE_KEY, ACCOUNT_LAST_SUCCESS_KEY,
@@ -502,7 +503,22 @@ export async function startMcpHttp(): Promise<import('node:http').Server> {
       try {
         const url = new URL(req.url ?? '/', `http://${host}:${port}`);
         if (url.pathname !== '/mcp') {
-          res.writeHead(404).end();
+          // The read-only browser view shares this port and token, because it
+          // shares the trust boundary. Off unless explicitly enabled.
+          if (!webUiEnabled()) {
+            res.writeHead(404).end();
+            return;
+          }
+          const webStore = new StateStore();
+          try {
+            const answer = await routeWeb(req, url, token, webStore);
+            const headers: Record<string, string> = { 'content-type': answer.contentType };
+            if (answer.cookie) headers['set-cookie'] = answer.cookie;
+            if (answer.status === 303) headers['location'] = '/';
+            res.writeHead(answer.status, headers).end(answer.body);
+          } finally {
+            webStore.close();
+          }
           return;
         }
         const presented = req.headers.authorization?.startsWith('Bearer ')
