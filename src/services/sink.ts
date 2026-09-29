@@ -14,6 +14,15 @@ import { getLogger } from '../logger.js';
 const log = getLogger('sink');
 
 const MAX_SNIPPET = 600;
+/**
+ * A digest carries its whole body, not a preview of one.
+ *
+ * snippet() exists to bound a mail preview at 400 characters. Running a digest
+ * through it delivered a fragment ending mid-word, without the closing line
+ * that states how much was left out, which is the failure the Feishu path was
+ * just fixed for. Sized above DIGEST_MAX_CHARS so the render budget governs.
+ */
+const MAX_DIGEST_BODY = 8000;
 
 /**
  * Build a generic webhook inbound event.
@@ -23,6 +32,7 @@ const MAX_SNIPPET = 600;
  * and contains only a summary plus an MCP reference, never the message body.
  */
 export function buildWebhookPayload(message: MailMessage, result: TriageResult): Record<string, unknown> {
+  const isDigest = Boolean(message.extra?.['digest']);
   return {
     signal: buildMailSignalEvent(message, result),
     mail: {
@@ -35,7 +45,7 @@ export function buildWebhookPayload(message: MailMessage, result: TriageResult):
       from: message.fromAddr,
       from_name: message.fromName,
       date: message.date,
-      snippet: snippet(message).slice(0, MAX_SNIPPET),
+      snippet: isDigest ? message.body.slice(0, MAX_DIGEST_BODY) : snippet(message).slice(0, MAX_SNIPPET),
       has_attachments: message.hasAttachments,
       is_bulk: message.listUnsubscribe,
     },

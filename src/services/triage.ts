@@ -154,15 +154,20 @@ const LlmResult = z.object({
 });
 const LlmResponse = z.object({ results: z.array(LlmResult).default([]) });
 
-const OUTPUT_LANGUAGES: Record<string, string> = {
-  en: 'English',
-  'zh-cn': 'Simplified Chinese',
-  'zh-hans': 'Simplified Chinese',
-  zh: 'Simplified Chinese',
-  'zh-tw': 'Traditional Chinese',
-  'zh-hk': 'Traditional Chinese',
-  'zh-hant': 'Traditional Chinese',
-};
+/**
+ * A Map, not an object literal: `LLM_OUTPUT_LANGUAGE=constructor` resolved on
+ * Object.prototype, so the fallback never fired and every prompt for the life
+ * of the process carried a corrupted language directive.
+ */
+const OUTPUT_LANGUAGES = new Map<string, string>([
+  ['en', 'English'],
+  ['zh-cn', 'Simplified Chinese'],
+  ['zh-hans', 'Simplified Chinese'],
+  ['zh', 'Simplified Chinese'],
+  ['zh-tw', 'Traditional Chinese'],
+  ['zh-hk', 'Traditional Chinese'],
+  ['zh-hant', 'Traditional Chinese'],
+]);
 
 /**
  * The prompt sentence that fixes the language of summaries, reasons, and categories.
@@ -176,7 +181,7 @@ export function outputLanguageDirective(): string {
   if (key === 'auto') {
     return 'Write all output in the language the message itself is written in; use English when that is unclear.';
   }
-  return `Write all output in ${OUTPUT_LANGUAGES[key] ?? (raw || 'English')}.`;
+  return `Write all output in ${OUTPUT_LANGUAGES.get(key) ?? (raw || 'English')}.`;
 }
 
 const systemPrompt = (): string => `You are an email triage assistant. The user's output is often the
