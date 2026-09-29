@@ -112,7 +112,11 @@ function collapseThreads(items: DigestItem[]): DigestItem[] {
  * mail cannot merge just because its subject rhymes.
  */
 function repeatKey(item: DigestItem): string {
-  return `${item.from.trim().toLowerCase()}|${item.category}|${withoutBuildSuffix(item.subject)}`;
+  // The spam flag is part of the key. Folding a quarantined copy into an inbox
+  // entry made it inherit inSpam:false, and the spam section — the one thing
+  // this digest exists to surface — stopped being rendered at all.
+  const where = item.inSpam ? 'spam' : 'inbox';
+  return `${where}|${item.from.trim().toLowerCase()}|${item.category}|${withoutBuildSuffix(item.subject)}`;
 }
 
 /**
@@ -215,7 +219,7 @@ export function renderDigest(items: DigestItem[], maxChars = DIGEST_MAX_CHARS): 
   // Put spam first: it is easiest to miss and the main reason for the digest.
   if (spam.length) {
     push('');
-    push(`**⚠️ Spam (${spam.length}; review provider-filtered messages)**`);
+    push(`**⚠️ Spam (${messagesIn(spam)}; review provider-filtered messages)**`);
     let shownSpam = 0;
     for (const item of spam.slice(0, MAX_SPAM_LINES)) {
       if (!push(line(item))) break;
@@ -251,9 +255,11 @@ export function renderDigest(items: DigestItem[], maxChars = DIGEST_MAX_CHARS): 
       );
       const allowed = Math.min(group.length, remaining);
       const heading = `**${markdownText(category)} (${messagesIn(group)})**`;
-      // Check the blank line and the heading together, so a heading that cannot
-      // fit does not leave an orphan blank behind it.
-      if (!fits(1 + heading.length + 1)) {
+      // Blank line, heading and the first entry are checked together. Checking
+      // only the heading left sections that announced a count and then showed
+      // nothing, and undercounted droppedCategories as well.
+      const firstLine = line(orderedItems[0]!);
+      if (!fits(1 + heading.length + 1 + firstLine.length + 1)) {
         budgetSpent = true;
         droppedCategories += 1;
         omittedMessages += messagesIn(group);

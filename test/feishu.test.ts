@@ -130,6 +130,25 @@ describe('signatures and WebhookWise payloads', () => {
     expect((payload['signal'] as Record<string, unknown>)['payload']).not.toHaveProperty('body');
   });
 
+  it('carries a digest whole, instead of cutting it to a mail preview', () => {
+    // snippet() bounds a mail preview at 400 characters. A digest run through
+    // it arrived as a fragment without the line stating how much was left out,
+    // which is exactly the silent truncation the Feishu path was fixed for.
+    const body = `${'line of digest text\n'.repeat(120)}_12 more messages not shown_`;
+    const payload = buildWebhookPayload(
+      makeMessage({ subject: 'Daily digest', body, extra: { digest: true } }),
+      makeResult({ importance: 'info' }),
+    );
+    const carried = String((payload['mail'] as Record<string, unknown>)['snippet']);
+    expect(carried.length).toBeGreaterThan(2000);
+    expect(carried).toContain('more messages not shown');
+  });
+
+  it('still bounds an ordinary message to a preview', () => {
+    const payload = buildWebhookPayload(makeMessage({ body: 'x'.repeat(5000) }), makeResult());
+    expect(String((payload['mail'] as Record<string, unknown>)['snippet']).length).toBeLessThanOrEqual(600);
+  });
+
   it('keeps the legacy mail / triage shape while adding the source-neutral signal', () => {
     expect(Object.keys(buildWebhookPayload(makeMessage(), makeResult())).sort()).toEqual(['mail', 'signal', 'triage']);
   });

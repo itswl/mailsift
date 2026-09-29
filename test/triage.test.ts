@@ -403,6 +403,16 @@ describe('output language', () => {
     expect(outputLanguageDirective()).toBe(expected);
   });
 
+  it('does not resolve an env value on Object.prototype', () => {
+    // As an object literal, LLM_OUTPUT_LANGUAGE=constructor reached the
+    // prototype chain, so the fallback never fired and every prompt for the
+    // life of the process carried a corrupted directive.
+    for (const key of ['constructor', '__proto__', 'toString', 'valueOf', 'hasOwnProperty']) {
+      process.env.LLM_OUTPUT_LANGUAGE = key;
+      expect(outputLanguageDirective()).toBe(`Write all output in ${key}.`);
+    }
+  });
+
   it('can follow the language of each message', () => {
     process.env.LLM_OUTPUT_LANGUAGE = 'auto';
     expect(outputLanguageDirective()).toContain('the language the message itself is written in');

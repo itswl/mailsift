@@ -295,7 +295,12 @@ export class Watcher {
       this.state.markSeen(key, message.account, message.subject);
       const fields = this.outcomeFields(message, result);
 
-      if (effectiveRank(message, result) >= pushLimit) {
+      // A copy forwarded in from another monitored mailbox is never notified,
+      // whatever the thresholds say. The guard used to sit only on the
+      // below-threshold branch, so a spam bonus or PUSH_MIN_IMPORTANCE=info
+      // let the second notification through after all.
+      const forwardedCopy = Boolean(isSelfForward(message, rules));
+      if (!forwardedCopy && effectiveRank(message, result) >= pushLimit) {
         // Persist a bounded, resendable copy before the external write. The
         // outbox is at-least-once: a crash after provider acceptance and before
         // the delivered mark can still duplicate a notification, so adapters
@@ -331,7 +336,7 @@ export class Watcher {
       // digest: the original was triaged at its source, so it was either
       // notified already or is listed here itself. Repeating it only crowds out
       // mail that has not been seen. The row stays, so list_mail still finds it.
-      if (isSelfForward(message, rules)) continue;
+      if (forwardedCopy) continue;
       // Always include spam in the digest: it is the category most likely to hide
       // an important message.
       if (message.inSpam || rank(result) >= digestThreshold) {
@@ -388,10 +393,13 @@ export class Watcher {
     const stats = newStats();
     const started = performance.now();
     metrics.addCounter('mailsift.polls.started');
+    // Drain first: retrying a queued notification needs no IMAP state, so a
+    // provider that accepts the connection and then stops responding must not
+    // hold up deliveries that are already waiting.
+    await this.exclusive(() => this.flushNotificationOutbox());
     const collected = await this.collectAll(stats);
 
     return this.exclusive(async () => {
-      await this.flushNotificationOutbox();
       await this.commit(collected, stats);
 
       if (digest.shouldSend(this.state)) await digest.sendDigest(this.state, this.sink);

@@ -105,6 +105,43 @@ describe('rendering', () => {
     expect(body).toContain('run 2 failed');
   });
 
+  it('never folds a quarantined copy into an inbox entry', () => {
+    // Merging across the spam boundary made the entry inherit inSpam:false and
+    // the spam section stopped rendering, which is the one thing this digest
+    // exists to surface.
+    const body = renderDigest([
+      toDigestItem(makeMessage({ messageId: '<i@x>', subject: '同一主题', date: '2026-09-28T02:00:00.000Z' }), makeResult({ category: 'Work' })),
+      toDigestItem(makeMessage({ messageId: '<s@x>', subject: '同一主题', inSpam: true, folder: 'Junk', date: '2026-09-28T01:00:00.000Z' }), makeResult({ category: 'Work' })),
+    ]);
+    expect(body).toContain('2 entries');
+    expect(body).toContain('spam 1');
+    expect(body).toContain('Spam (');
+  });
+
+  it('counts the spam heading in messages, like every other count on the card', () => {
+    const repeats = ['f9e809f', 'a3baeb4', 'c0ee030', '644e3ab', '89888f2'].map((sha, i) =>
+      toDigestItem(
+        makeMessage({ messageId: `<z${i}@x>`, inSpam: true, folder: 'Junk', fromAddr: 'bot@example.com', subject: `[r] Run failed: ci - main (${sha})`, date: `2026-09-28T0${i}:00:00.000Z` }),
+        makeResult({ category: 'Work' }),
+      ));
+    const body = renderDigest(repeats);
+    expect(body).toContain('**5 messages**');
+    expect(body).toContain('Spam (5;');
+  });
+
+  it('never prints a category heading with nothing under it', () => {
+    // A heading that fits while its first entry does not announced a count and
+    // then showed no entries, and undercounted the omitted categories too.
+    const many = Array.from({ length: 40 }, (_, i) =>
+      toDigestItem(makeMessage({ messageId: `<c${i}@x>`, subject: `subj ${i}` }),
+        makeResult({ category: `C${i % 8}`, summary: 'x'.repeat(88) })));
+    for (const budget of [780, 820, 900, 1100, 1500]) {
+      const rendered = renderDigest(many, budget).split('\n');
+      const orphan = rendered.findIndex((l, n) => /^\*\*C\d+ \(\d+\)\*\*$/.test(l) && !(rendered[n + 1] ?? '').startsWith('- '));
+      expect(orphan).toBe(-1);
+    }
+  });
+
   it('never merges on a plain number, only on something hash-shaped', () => {
     // Three invoices or two years of one report share everything but a number.
     // Merging them would hide a payment, while failing to merge costs a line,

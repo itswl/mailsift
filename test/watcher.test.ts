@@ -222,6 +222,31 @@ describe('self-forwarded copies', () => {
     expect(state.queryMail({})[0]).toMatchObject({ importance: 'info', decidedBy: 'rule', category: 'Forwarded copy' });
   });
 
+  it('is never pushed, whatever the thresholds allow', async () => {
+    // The guard used to sit only on the below-threshold branch, so a spam bonus
+    // or PUSH_MIN_IMPORTANCE=info let the second notification through anyway.
+    for (const [bonus, threshold, inSpam] of [['1', 'warning', true], ['0', 'info', false]] as const) {
+      vi.restoreAllMocks();
+      process.env.SPAM_RANK_BONUS = bonus;
+      process.env.PUSH_MIN_IMPORTANCE = threshold;
+      process.env.LLM_API_KEY = 'k';
+      vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 200 })));
+      const sink = new RecordingSink();
+      const state = new StateStore(':memory:');
+      const w = new Watcher(twoMailboxes(), state, sink);
+      const s = stats();
+
+      await w.dispatch([makeMessage({
+        messageId: '<fwd@x>', account: 'me@qq.com', fromAddr: 'me@live.com',
+        inSpam, folder: inSpam ? 'Junk' : 'INBOX', subject: '转发: 登录提醒',
+      })], s);
+
+      expect(sink.pushed).toHaveLength(0);
+      expect(s.pushed).toBe(0);
+      expect(state.digestPending()).toBe(0);
+    }
+  });
+
   it('keeps pushing the copy when suppression is turned off', async () => {
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     process.env.SUPPRESS_SELF_FORWARDS = 'false';
@@ -276,6 +301,20 @@ describe('declined deliveries', () => {
 
     await w.pollOnce();
 
+    expect(state.notificationOutboxPending()).toBe(0);
+  });
+
+  it('drains the outbox even when mail collection fails', async () => {
+    // Retrying a queued notification needs no IMAP state, so a provider that
+    // accepts the connection and then hangs must not also stall deliveries
+    // that are already waiting.
+    const { w, state, sink } = watcher();
+    state.enqueueNotification('waiting', makeMessage(), makeResult());
+    vi.spyOn(w, 'collectAll').mockRejectedValue(new Error('imap wedged'));
+
+    await expect(w.pollOnce()).rejects.toThrow('imap wedged');
+
+    expect(sink.pushed).toHaveLength(1);
     expect(state.notificationOutboxPending()).toBe(0);
   });
 
