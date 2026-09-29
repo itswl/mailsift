@@ -105,6 +105,40 @@ describe('rendering', () => {
     expect(body).toContain('run 2 failed');
   });
 
+  it('never merges on a plain number, only on something hash-shaped', () => {
+    // Three invoices or two years of one report share everything but a number.
+    // Merging them would hide a payment, while failing to merge costs a line,
+    // so the suffix has to look like a hash before it is treated as volatile.
+    const numbered = (n: string, i: number) =>
+      toDigestItem(makeMessage({ messageId: `<p${i}@x>`, subject: `账单 (${n})` }), makeResult({ category: 'Finance', summary: `账单 ${n}` }));
+    expect(renderDigest([numbered('1001', 1), numbered('1002', 2), numbered('1003', 3)])).toContain('3 entries');
+    expect(renderDigest([numbered('2024', 4), numbered('2025', 5)])).toContain('2 entries');
+    // Six or more digits still read as a number, not as a commit.
+    expect(renderDigest([numbered('100123', 6), numbered('100124', 7)])).toContain('2 entries');
+
+    const hashed = (sha: string, i: number) =>
+      toDigestItem(makeMessage({ messageId: `<h${i}@x>`, fromAddr: 'notifications@github.com', subject: `[owner/repo] Run failed: ci - main (${sha})` }), makeResult({ category: 'Work', summary: `run ${i}` }));
+    expect(renderDigest([hashed('f9e809f', 1), hashed('a3baeb4', 2), hashed('644e3ab', 3)])).toContain('1 entries');
+  });
+
+  it('gives one category the same count in the summary line and its heading', () => {
+    // Counting entries in one place and messages in the other put two different
+    // numbers for the same category in the same card.
+    const runs = ['f9e809f', 'a3baeb4', 'c0ee030'].map((sha, i) =>
+      toDigestItem(makeMessage({ messageId: `<c${i}@x>`, fromAddr: 'notifications@github.com', subject: `[owner/repo] Run failed: ci - main (${sha})` }), makeResult({ category: 'Work', summary: `run ${i}` })));
+    const body = renderDigest(runs);
+    expect(body.split('\n')[1]).toContain('Work 3');
+    expect(body).toContain('**Work (3)**');
+  });
+
+  it('holds its budget down to the documented floor', () => {
+    // The heading and the closing notice are not optional, so a request below
+    // the floor is treated as the floor rather than silently overrun.
+    for (const budget of [4000, 900, 400, 50, 0]) {
+      expect(renderDigest(items(20, 200), budget).length).toBeLessThanOrEqual(Math.max(budget, 400));
+    }
+  });
+
   it('keeps different workflows and different senders apart', () => {
     const rows = [
       toDigestItem(makeMessage({ messageId: '<x1@x>', fromAddr: 'notifications@github.com', subject: '[owner/repo] Run failed: ci - main (aaaaaaa)' }), makeResult({ category: 'Work', summary: 'ci failed' })),
@@ -117,8 +151,8 @@ describe('rendering', () => {
   it('lets the occurrence that needs action speak for the group', () => {
     // Otherwise a later harmless repeat would bury an earlier actionable one.
     const rows = [
-      toDigestItem(makeMessage({ messageId: '<n1@x>', subject: '对账单 (100)', date: '2026-09-28T01:00:00.000Z' }), makeResult({ importance: 'critical', actionRequired: true, summary: '需要今天处理' })),
-      toDigestItem(makeMessage({ messageId: '<n2@x>', subject: '对账单 (200)', date: '2026-09-28T09:00:00.000Z' }), makeResult({ importance: 'info', actionRequired: false, summary: '仅供了解' })),
+      toDigestItem(makeMessage({ messageId: '<n1@x>', subject: '构建失败 (a1b2c3d)', date: '2026-09-28T01:00:00.000Z' }), makeResult({ importance: 'critical', actionRequired: true, summary: '需要今天处理' })),
+      toDigestItem(makeMessage({ messageId: '<n2@x>', subject: '构建失败 (e4f5a6b)', date: '2026-09-28T09:00:00.000Z' }), makeResult({ importance: 'info', actionRequired: false, summary: '仅供了解' })),
     ];
     const body = renderDigest(rows);
     expect(body).toContain('1 entries');
