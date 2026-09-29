@@ -78,6 +78,10 @@ export class FolderListener {
   private timer: NodeJS.Timeout | undefined;
   private waking = false;
   private wakeAgain = false;
+  /** The wake-up currently running the pipeline on this connection, if any. */
+  private inFlight: Promise<void> | undefined;
+  /** When this session actually began listening, not when the connect started. */
+  private listeningSince: number | undefined;
   private done: Promise<void> = Promise.resolve();
   private releaseStop: () => void = () => undefined;
   /** Settles when stop() is called, so a reconnect backoff does not delay shutdown. */
@@ -108,6 +112,10 @@ export class FolderListener {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
+    // A wake-up runs the deduplicate, triage and deliver pipeline on this very
+    // connection. Logging out underneath it abandons messages that are already
+    // marked seen, so let it finish; bounded, because shutdown cannot hang.
+    if (this.inFlight) await withTimeout(this.inFlight, 30_000);
     const client = this.client;
     this.client = undefined;
     if (client) await this.release(client);
@@ -128,7 +136,6 @@ export class FolderListener {
   private async run(): Promise<void> {
     let failures = 0;
     while (!this.stopping) {
-      const startedAt = Date.now();
       let transient = true;
       try {
         if ((await this.session()) === 'unsupported') return;
@@ -137,8 +144,13 @@ export class FolderListener {
         log.warn(`[${this.label}] IDLE session failed: ${imapErrorText(error)}`);
       }
       if (this.stopping) return;
-      // A session that stayed up for a while was healthy; only quick failures escalate.
-      failures = Date.now() - startedAt >= HEALTHY_SESSION_MS ? 1 : failures + 1;
+      // Measured from when IDLE actually began listening, not from when the
+      // connect started. Connecting to an unreachable host can itself take
+      // longer than the healthy threshold, which pinned failures at 1 and left
+      // the backoff stuck at its 2s floor for every slow failure mode.
+      const listened = this.listeningSince;
+      const healthy = listened !== undefined && Date.now() - listened >= HEALTHY_SESSION_MS;
+      failures = healthy ? 1 : failures + 1;
       const delay = reconnectDelayMs(failures, transient);
       metrics.addCounter('mailsift.idle.reconnects', 1, { provider: this.account.provider });
       log.info(`[${this.label}] reconnecting IDLE in ${Math.round(delay / 1000)}s`);
@@ -148,6 +160,7 @@ export class FolderListener {
 
   /** Resolves when the connection closes; 'unsupported' means polling must cover this folder. */
   private async session(): Promise<'closed' | 'unsupported'> {
+    this.listeningSince = undefined;
     const client = await this.deps.connect(this.account);
     this.client = client;
     try {
@@ -165,6 +178,7 @@ export class FolderListener {
       // Attach after the open so the SELECT response itself does not count as new mail.
       client.on('exists', () => this.scheduleWake());
       log.info(`[${this.label}] IDLE listening`);
+      this.listeningSince = Date.now();
       metrics.addCounter('mailsift.idle.sessions', 1, { provider: this.account.provider });
       await closed;
       return 'closed';
@@ -203,7 +217,11 @@ export class FolderListener {
     if (this.stopping || this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      void this.wake();
+      const run = this.wake().finally(() => {
+        if (this.inFlight === run) this.inFlight = undefined;
+      });
+      this.inFlight = run;
+      void run;
     }, this.deps.debounceMs);
   }
 

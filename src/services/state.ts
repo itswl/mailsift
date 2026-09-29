@@ -394,6 +394,12 @@ export class StateStore {
     for (const row of rows) {
       try {
         const payload = JSON.parse(String(row['payload'])) as { message: MailMessage; result: TriageResult };
+        // Valid JSON of the wrong shape would otherwise reach every caller and
+        // throw there instead of being skipped here.
+        if (!payload?.message?.account || !payload?.result?.importance) {
+          log.error(`Notification outbox record ${String(row['notification_key'])} has an unexpected shape`);
+          continue;
+        }
         out.push({
           notificationKey: String(row['notification_key']),
           message: payload.message,
@@ -646,6 +652,15 @@ export class StateStore {
       | Record<string, unknown>
       | undefined;
     return row ? String(row['value']) : undefined;
+  }
+
+  /** Every meta row under a prefix, for keys that are grouped rather than single. */
+  listMeta(prefix: string): Array<{ key: string; value: string }> {
+    return (
+      this.db
+        .prepare("SELECT key, value FROM meta WHERE key LIKE ? || '%' AND value != '' ORDER BY key")
+        .all(prefix) as Array<Record<string, unknown>>
+    ).map((row) => ({ key: String(row['key']), value: String(row['value']) }));
   }
 
   setMeta(key: string, value: string): void {

@@ -115,8 +115,11 @@ function repeatKey(item: DigestItem): string {
   // The spam flag is part of the key. Folding a quarantined copy into an inbox
   // entry made it inherit inSpam:false, and the spam section — the one thing
   // this digest exists to surface — stopped being rendered at all.
+  // Scoped to one mailbox, like threadKey and dedupKey. Folding across
+  // mailboxes hid that an alert had reached both of them, and under-merging is
+  // the safer direction here as it is everywhere else in this key.
   const where = item.inSpam ? 'spam' : 'inbox';
-  return `${where}|${item.from.trim().toLowerCase()}|${item.category}|${withoutBuildSuffix(item.subject)}`;
+  return `${item.accountLabel}|${where}|${item.from.trim().toLowerCase()}|${item.category}|${withoutBuildSuffix(item.subject)}`;
 }
 
 /**
@@ -276,7 +279,12 @@ export function renderDigest(items: DigestItem[], maxChars = DIGEST_MAX_CHARS): 
         shown += 1;
       }
       remaining -= shown;
-      omittedMessages += messagesIn(orderedItems.slice(shown));
+      const hidden = messagesIn(orderedItems.slice(shown));
+      omittedMessages += hidden;
+      // Say it at the cut as well. A reader scanning one section could not
+      // otherwise tell that section was incomplete; the closing line is the
+      // guarantee, this is the signpost, so a budget refusal here is fine.
+      if (hidden > 0) push(`- …${hidden} more in this category`);
     }
     if (droppedCategories) {
       lines.push('', `_${droppedCategories} more categories omitted_`);

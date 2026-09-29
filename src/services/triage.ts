@@ -258,6 +258,24 @@ export function matchesSenderRule(message: MailMessage, pattern: string): boolea
   return `${address} ${message.fromName}`.toLowerCase().includes(pattern);
 }
 
+/**
+ * Rules whose meaning changed when sender matching was anchored.
+ *
+ * A pattern with an @ in the middle is now compared as a whole address, so a
+ * partial one such as `noreply@notifications.` — written to cover several
+ * subdomains back when matching was a substring test — now matches nothing at
+ * all. It fails silently, and mail suppressed long ago starts being pushed
+ * again after an upgrade, so the operator has to be told.
+ */
+export function unanchoredSenderRules(patterns: readonly string[]): string[] {
+  return patterns.filter((raw) => {
+    const pattern = raw.trim().toLowerCase();
+    const at = pattern.indexOf('@');
+    if (at <= 0 || at >= pattern.length - 1) return false;
+    return !/^[^@\s]+\.[a-z]{2,}$/.test(pattern.slice(at + 1));
+  });
+}
+
 function matches(message: MailMessage, patterns: string[]): string | undefined {
   return patterns.find((p) => matchesSenderRule(message, p));
 }

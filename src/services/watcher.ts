@@ -31,8 +31,16 @@ const log = getLogger('watcher');
 
 export const HEARTBEAT_KEY = 'last_poll_at';
 export const PRUNE_KEY = 'last_prune_date';
-/** Per-account timestamp of the last IDLE wake-up that reached the pipeline. */
+/**
+ * Timestamp of the last IDLE wake-up that reached the pipeline, keyed by
+ * account and folder.
+ *
+ * Listeners are per folder, so a single per-account key let one healthy
+ * listener report freshness on behalf of a sibling that had given up, and the
+ * health tool showed IDLE as working while half of it was gone.
+ */
 export const IDLE_WAKE_KEY = 'idle_last_wake_at:';
+export const idleWakeKey = (account: string, folder: string): string => `${IDLE_WAKE_KEY}${account}|${folder}`;
 
 export interface PollStats {
   accountsOk: number;
@@ -239,10 +247,14 @@ export class Watcher {
         this.state.clearDigest([entry.notificationKey]);
         metrics.addCounter('mailsift.notifications.delivered', 1, { channel: 'outbox_retry' });
       } else if (outcome === 'declined') {
-        // Policy, not a failure: every later retry would decline it too. The
-        // digest already carries it, so drop it instead of reporting a backlog.
+        // Policy, not a failure: every later retry would decline it too. Make
+        // sure the digest really does carry it before dropping the only other
+        // copy: a crash between enqueueNotification and queueDigest leaves a
+        // row whose message is marked seen and queued nowhere. queueDigest
+        // ignores a key that is already present.
+        this.state.queueDigest(entry.notificationKey, digest.toDigestItem(entry.message, entry.result));
         this.state.dropNotification(entry.notificationKey);
-        log.info(`Every output declines ${entry.notificationKey}; leaving it to the digest.`);
+        log.info(`Every output declines ${entry.notificationKey}; left to the digest.`);
       } else {
         this.state.markNotificationFailed(entry.notificationKey, 'sink delivery failed');
         metrics.addCounter('mailsift.notifications.failed', 1, { channel: 'outbox_retry' });
@@ -426,9 +438,12 @@ export class Watcher {
   /**
    * Fetch one folder on an already open connection and run it through the pipeline.
    *
-   * This is the IDLE wake-up path. It is incremental only: a folder without a
-   * cursor is left to the scheduled poll, whose bounded lookback handles first
-   * contact, so a wake-up during the initial backfill cannot double it.
+   * This is the IDLE wake-up path. A folder without a cursor is left to the
+   * scheduled poll, whose bounded lookback handles first contact, so a wake-up
+   * during the initial backfill cannot double it. A cursor whose UIDVALIDITY no
+   * longer matches is not incremental: fetchNew falls back to its bounded date
+   * lookback there, which is correct but heavier than a normal wake-up, and
+   * deduplication keeps it from reprocessing anything.
    */
   async pollFolder(account: Account, folder: Folder, client: ImapFlow): Promise<PollStats> {
     const stats = newStats();
@@ -451,7 +466,7 @@ export class Watcher {
         stats,
         true,
       );
-      this.state.setMeta(IDLE_WAKE_KEY + account.username, new Date().toISOString());
+      this.state.setMeta(idleWakeKey(account.username, folder.path), new Date().toISOString());
       log.info(`[${account.name}/${folder.path}] IDLE wake-up | ${summarizeStats(stats)}`);
       return stats;
     });

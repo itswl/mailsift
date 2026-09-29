@@ -197,6 +197,13 @@ describe('rendering', () => {
     expect(body).toContain('⚠️');
   });
 
+  it('marks the cut inside a section, as well as in the closing line', () => {
+    // A reader scanning one category could not otherwise tell it was truncated.
+    const body = renderDigest(items(0, 60));
+    expect(body).toMatch(/- …\d+ more in this category/);
+    expect(body).toMatch(/_\d+ more messages not shown/);
+  });
+
   it('says how many messages it left out', () => {
     const body = renderDigest(items(0, 60));
     expect(body).toMatch(/_\d+ more messages not shown; use MCP list_digest or list_mail to see them_/);
@@ -220,10 +227,11 @@ describe('rendering', () => {
   it('counts dropped messages, not dropped entries', () => {
     // One entry can stand for a dozen repeats, so counting entries would
     // understate what the reader is not seeing.
+    const entryLines = (text: string): string[] =>
+      text.split('\n').filter((l) => l.startsWith('- ') && !l.startsWith('- …'));
     const body = renderDigest(items(0, 60));
     const omitted = Number(/_(\d+) more messages not shown/.exec(body)?.[1]);
-    const shown = body.split('\n').filter((l) => l.startsWith('- ')).length;
-    expect(omitted + shown).toBe(60);
+    expect(omitted + entryLines(body).length).toBe(60);
 
     const repeats = Array.from({ length: 40 }, (_, i) =>
       toDigestItem(
@@ -232,7 +240,7 @@ describe('rendering', () => {
       ));
     const mixed = renderDigest([...items(0, 40), ...repeats]);
     const hidden = Number(/_(\d+) more messages not shown/.exec(mixed)?.[1] ?? 0);
-    const visible = mixed.split('\n').filter((l) => l.startsWith('- '))
+    const visible = entryLines(mixed)
       .reduce((n, l) => n + Number(/\((\d+) messages\)/.exec(l)?.[1] ?? 1), 0);
     expect(visible + hidden).toBe(80);
   });

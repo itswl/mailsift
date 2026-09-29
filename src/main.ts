@@ -13,7 +13,9 @@ import { ConfigError, loadConfig, needsOAuth } from './config.js';
 import { TokenStore } from './imap/auth.js';
 import { StateStore } from './services/state.js';
 import { buildSink, WebhookWiseSink } from './services/sink.js';
-import { resolveLlmBaseUrl, spamBonusWarning, suppressSelfForwards } from './services/triage.js';
+import {
+  resolveLlmBaseUrl, spamBonusWarning, suppressSelfForwards, unanchoredSenderRules,
+} from './services/triage.js';
 import { sendDigest } from './services/digest.js';
 import { recordStartupFailure } from './services/health.js';
 import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
@@ -57,6 +59,13 @@ async function checkConfig(): Promise<number> {
 
   const { rules } = config;
   console.log(`   Always-important rules: ${rules.alwaysImportant.length}; never-important rules: ${rules.neverImportant.length}`);
+  const stale = unanchoredSenderRules([...rules.alwaysImportant, ...rules.neverImportant]);
+  if (stale.length) {
+    console.log(
+      `   ⚠️  These sender rules no longer match anything: ${stale.join(', ')}. A pattern containing @ is ` +
+        'compared as a complete address. Use @domain.com for a domain, or the full address.',
+    );
+  }
   console.log(
     config.accounts.length > 1 && suppressSelfForwards()
       ? '   Self-forwards: a copy arriving from another monitored mailbox is filed to the digest, not pushed'
