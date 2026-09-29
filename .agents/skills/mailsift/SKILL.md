@@ -45,6 +45,8 @@ Verification codes, one-time passwords, and authentication codes are classified 
 
 The daily digest may collapse messages only when IMAP `In-Reply-To` / Message-ID references prove they are in the same thread. Do not merge unrelated messages based only on similar subjects.
 
+A read-only browser view of the same data may be enabled at the MCP port under `WEB_UI_ENABLED`. It shares this skill's boundary: it reads triage results and can fetch one body on demand, and it has no route that changes a mailbox.
+
 ## MCP connection
 
 The production MCP endpoint is embedded in the main mailsift container at `/mcp`, normally on port `8410`, and requires a bearer token when bound outside loopback. It is rate-limited and audited. Local stdio clients can use the built `dist/src/mcp.js` entry point.

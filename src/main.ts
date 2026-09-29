@@ -21,6 +21,7 @@ import { sendDigest } from './services/digest.js';
 import { recordStartupFailure } from './services/health.js';
 import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
 import { IdleSupervisor, idleEnabled, idleFolderTokens } from './imap/idle.js';
+import { webUiEnabled } from './web.js';
 import { getLogger } from './logger.js';
 import { metrics } from './metrics.js';
 import { startMcpHttp } from './mcp.js';
@@ -129,6 +130,14 @@ async function checkConfig(): Promise<number> {
     }
   } else {
     console.log('   IMAP IDLE: disabled (set IMAP_IDLE_ENABLED=true for real-time wake-ups)');
+  }
+  if ((process.env.MCP_ENABLED ?? 'true').toLowerCase() === 'true') {
+    const where = `${process.env.MCP_PUBLIC_HOST ?? '127.0.0.1'}:${process.env.MCP_PORT ?? 8410}`;
+    console.log(
+      webUiEnabled()
+        ? `   Web view: read-only, on http://${where}/ using the MCP token`
+        : '   Web view: disabled (set WEB_UI_ENABLED=true for a read-only browser view)',
+    );
   }
   console.log(`   Total per-poll backfill limit: ${process.env.MAX_MESSAGES_PER_POLL_TOTAL ?? 500}`);
   console.log(`   Fresh lookbacks are backfilled in chunks of ${process.env.MAX_MESSAGES_PER_LOOKBACK ?? 500}`);
