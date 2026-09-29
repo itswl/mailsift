@@ -533,6 +533,7 @@ export async function startMcpHttp(): Promise<import('node:http').Server> {
             const answer = await routeWeb(req, url, token, webStore, client);
             const headers: Record<string, string> = { 'content-type': answer.contentType };
             if (answer.cookie) headers['set-cookie'] = answer.cookie;
+            if (answer.cacheControl) headers['cache-control'] = answer.cacheControl;
             if (answer.status === 303) headers['location'] = '/';
             res.writeHead(answer.status, headers).end(answer.body);
           } finally {

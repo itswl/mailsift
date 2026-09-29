@@ -212,3 +212,48 @@ describe('rendering', () => {
     expect(page).toContain('textContent');
   });
 });
+
+describe('installable app', () => {
+  it('serves the manifest and icons without a session, since a browser asks before it has one', async () => {
+    const store = seeded();
+    for (const path of ['/manifest.webmanifest', '/icon-192.png', '/icon-512.png',
+      '/icon-maskable.png', '/apple-touch-icon.png', '/favicon.ico', '/sw.js']) {
+      const answer = await routeWeb(request({ url: path }), url(path), 'secret', store);
+      expect(answer.status, path).toBe(200);
+      expect(answer.body.length, path).toBeGreaterThan(0);
+    }
+  });
+
+  it('describes an app that opens without browser chrome, with a maskable icon', async () => {
+    const store = seeded();
+    const answer = await routeWeb(request({ url: '/manifest.webmanifest' }), url('/manifest.webmanifest'), '', store);
+    const m = JSON.parse(String(answer.body)) as { display: string; icons: Array<{ purpose: string; sizes: string }> };
+    expect(answer.contentType).toBe('application/manifest+json');
+    expect(m.display).toBe('standalone');
+    expect(m.icons.some((i) => i.purpose === 'maskable' && i.sizes === '512x512')).toBe(true);
+  });
+
+  it('sends real PNG bytes, not a placeholder', async () => {
+    const store = seeded();
+    const answer = await routeWeb(request({ url: '/icon-512.png' }), url('/icon-512.png'), '', store);
+    const png = answer.body as Buffer;
+    expect(png.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    expect(png.readUInt32BE(16)).toBe(512);
+    expect(answer.cacheControl).toContain('immutable');
+  });
+
+  it('gives the status bar a colour for each scheme and reaches under a notch', async () => {
+    const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
+    expect(page).toContain('prefers-color-scheme: light');
+    expect(page).toContain('prefers-color-scheme: dark');
+    expect(page).toContain('viewport-fit=cover');
+    expect(page).toContain('apple-touch-icon');
+    expect(page).toContain('safe-area-inset-top');
+  });
+
+  it('caches nothing in the worker, because this is a live view', async () => {
+    const worker = String((await routeWeb(request({ url: '/sw.js' }), url('/sw.js'), '', seeded())).body);
+    expect(worker).not.toContain('caches');
+    expect(worker).toContain('fetch');
+  });
+});
