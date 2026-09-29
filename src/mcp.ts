@@ -9,7 +9,7 @@
  */
 import './env.js'; // Must run first so .env is loaded.
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { createServer as createHttpServer } from 'node:http';
+import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -61,6 +61,25 @@ export function allowMcpRequest(client: string, now = Date.now()): boolean {
 
 function clientFingerprint(value: string): string {
   return createHash('sha256').update(value || 'unknown').digest('hex').slice(0, 16);
+}
+
+/**
+ * The address to rate limit and audit against.
+ *
+ * Behind a reverse proxy every request arrives from the proxy, so the socket
+ * address is identical for everyone and a per-client limit collapses into one
+ * shared bucket: a single noisy caller then denies service to every other
+ * client, including this operator's own browser. The forwarded headers carry
+ * the real address, but anyone can send them, so they are believed only when
+ * the deployment states that a proxy is in front.
+ */
+export function clientAddress(req: IncomingMessage): string {
+  if ((process.env.TRUSTED_PROXY ?? 'false').toLowerCase() !== 'true') {
+    return req.socket.remoteAddress ?? 'unknown';
+  }
+  const header = (name: string): string => String(req.headers[name] ?? '').split(',')[0]?.trim() ?? '';
+  return header('cf-connecting-ip') || header('x-real-ip') || header('x-forwarded-for')
+    || req.socket.remoteAddress || 'unknown';
 }
 
 interface MailCursor {
@@ -495,7 +514,7 @@ export async function startMcpHttp(): Promise<import('node:http').Server> {
 
   const httpServer = createHttpServer((req, res) => {
     void (async () => {
-      const client = clientFingerprint(req.socket.remoteAddress ?? 'unknown');
+      const client = clientFingerprint(clientAddress(req));
       if (!allowMcpRequest(client)) {
         res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '60' }).end('{"error":"rate_limited"}');
         return;
@@ -511,7 +530,7 @@ export async function startMcpHttp(): Promise<import('node:http').Server> {
           }
           const webStore = new StateStore();
           try {
-            const answer = await routeWeb(req, url, token, webStore);
+            const answer = await routeWeb(req, url, token, webStore, client);
             const headers: Record<string, string> = { 'content-type': answer.contentType };
             if (answer.cookie) headers['set-cookie'] = answer.cookie;
             if (answer.status === 303) headers['location'] = '/';

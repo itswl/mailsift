@@ -223,6 +223,8 @@ It is read-only in the strict sense: there is no route that changes anything, an
 
 Off by default. A page a browser can reach is a wider surface than a JSON-RPC endpoint, so enable it deliberately, keep `MCP_BIND` on loopback, and put TLS in front of it if you reach it from a phone.
 
+Behind a reverse proxy, set `TRUSTED_PROXY=true`. Otherwise every request arrives from the proxy's address, the per-client rate limit collapses into one shared budget, and a single noisy caller can lock out your own browser and any MCP client. With it set, the limit and the audit log key on `CF-Connecting-IP`, `X-Real-IP` or the first `X-Forwarded-For` entry. Leave it off when the port is reached directly, since anyone can send those headers. Sign-in gets a separate, much smaller budget of its own, because it is the only route that answers without credentials.
+
 ## Troubleshooting
 
 - **Repeated notifications:** messages are deduplicated by account plus Message-ID. `--recover` is for interrupted, undecided records.

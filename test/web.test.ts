@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest';
 import './setup.js';
 import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
-import { handleApi, readCookie, routeWeb, SESSION_COOKIE, tokenMatches, webUiEnabled } from '../src/web.js';
+import {
+  allowAuthAttempt, handleApi, readCookie, routeWeb, SESSION_COOKIE, tokenMatches, webUiEnabled,
+} from '../src/web.js';
+import { clientAddress } from '../src/mcp.js';
 import { StateStore } from '../src/services/state.js';
 
 function request(options: {
@@ -104,6 +107,48 @@ describe('authorization', () => {
   it('reads one cookie out of several', () => {
     expect(readCookie(`a=1; ${SESSION_COOKIE}=tok%20en; b=2`, SESSION_COOKIE)).toBe('tok en');
     expect(readCookie(undefined, SESSION_COOKIE)).toBe('');
+  });
+});
+
+describe('exposure behind a proxy', () => {
+  it('uses the socket address unless a proxy is declared', () => {
+    const req = request({ headers: { 'x-real-ip': '9.9.9.9', 'cf-connecting-ip': '8.8.8.8' } });
+    Object.defineProperty(req, 'socket', { value: { remoteAddress: '172.18.0.5' } });
+    expect(clientAddress(req)).toBe('172.18.0.5');
+  });
+
+  it('reads the real client from the forwarded headers when one is declared', () => {
+    // Behind a proxy every request shares the proxy's address, so a per-client
+    // limit becomes one shared bucket and a single noisy caller locks everyone
+    // else out, this operator's own browser included.
+    process.env.TRUSTED_PROXY = 'true';
+    const make = (headers: Record<string, string>): IncomingMessage => {
+      const req = request({ headers });
+      Object.defineProperty(req, 'socket', { value: { remoteAddress: '172.18.0.5' } });
+      return req;
+    };
+    expect(clientAddress(make({ 'cf-connecting-ip': '8.8.8.8', 'x-real-ip': '9.9.9.9' }))).toBe('8.8.8.8');
+    expect(clientAddress(make({ 'x-real-ip': '9.9.9.9' }))).toBe('9.9.9.9');
+    expect(clientAddress(make({ 'x-forwarded-for': '7.7.7.7, 172.18.0.5' }))).toBe('7.7.7.7');
+    expect(clientAddress(make({}))).toBe('172.18.0.5');
+  });
+
+  it('gives the sign-in route its own small budget', () => {
+    const at = Date.parse('2026-09-29T00:00:00Z');
+    expect(Array.from({ length: 10 }, (_, n) => allowAuthAttempt('guesser', at + n)).every(Boolean)).toBe(true);
+    expect(allowAuthAttempt('guesser', at + 11)).toBe(false);
+    // Another client is unaffected, and the window reopens.
+    expect(allowAuthAttempt('someone-else', at + 11)).toBe(true);
+    expect(allowAuthAttempt('guesser', at + 60_000)).toBe(true);
+  });
+
+  it('refuses a sign-in once the budget is spent, without checking the token', async () => {
+    const store = seeded();
+    const post = (): IncomingMessage => request({ method: 'POST', url: '/auth', body: 'token=secret' });
+    for (let n = 0; n < 10; n += 1) await routeWeb(post(), url('/auth'), 'secret', store, 'flooder');
+    const answer = await routeWeb(post(), url('/auth'), 'secret', store, 'flooder');
+    expect(answer.status).toBe(429);
+    expect(answer.cookie).toBeUndefined();
   });
 });
 
