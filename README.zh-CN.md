@@ -55,6 +55,8 @@ DIGEST_HOUR=9
 
 ## Gmail / Outlook OAuth
 
+逐步配置指南见 [Discussions](../../discussions/46)，其中包含两个最耗时间的坑：Google 同意屏幕停在「测试」会让 refresh token 每 7 天过期，以及 Outlook.com 默认关闭 IMAP。文中还说明了邮箱之间转发的处理方式。
+
 Gmail 和 Outlook 通常需要 OAuth：
 
 ```bash

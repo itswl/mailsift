@@ -68,6 +68,8 @@ DIGEST_HOUR=9
 
 ### Gmail and Outlook OAuth
 
+A step-by-step guide, including the two traps that cost the most time (a Google consent screen left in Testing expires refresh tokens every 7 days, and Outlook.com ships with IMAP switched off), is in [Discussions](../../discussions/46).
+
 Gmail and Outlook require OAuth for most accounts:
 
 ```bash
