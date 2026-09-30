@@ -299,8 +299,8 @@ header.bar{position:sticky;top:0;z-index:2;background:var(--bg)}
 /* A finger needs a bigger target than a mouse does. */
 @media(pointer:coarse){.filters select,.filters input{min-height:38px}.row{padding:14px}}
 .bar strong{font-size:16px}
-.filters select,.filters input{background:var(--bg);color:var(--fg);border:1px solid var(--line);
-border-radius:7px;padding:6px 8px;font:inherit}
+.filters select,.filters input:not([type=checkbox]){background:var(--bg);color:var(--fg);
+border:1px solid var(--line);border-radius:7px;padding:6px 8px;font:inherit}
 .filters input[type=search]{flex:1;min-width:160px}
 .check{display:flex;align-items:center;gap:4px;color:var(--muted);font-size:13px}
 .muted{color:var(--muted);font-size:13px}
@@ -312,14 +312,22 @@ padding:11px 14px;color:inherit;font:inherit;cursor:pointer}
 .row .who{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%}
 .row .when{margin-left:auto;color:var(--muted);font-size:12px;white-space:nowrap}
 .row .sum{color:var(--fg);margin-top:2px}
+/* Summaries quote URLs, message ids and hashes: unbroken runs with nowhere to
+   wrap. Without this they push the row past the viewport and the whole page
+   scrolls sideways. Applied to every container that renders message text, so a
+   long run in a subject or an address cannot do it either. */
+.row,.detail,.card{overflow-wrap:anywhere;min-width:0}
 .row .meta{margin-top:3px;display:flex;gap:6px;flex-wrap:wrap}
 .dot{width:8px;height:8px;border-radius:50%;flex:none;align-self:center}
 .critical{background:var(--critical)}.warning{background:var(--warning)}.info{background:var(--info)}
 .chip{font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:1px 7px}
 .detail{padding:12px 14px;background:var(--card);border-bottom:1px solid var(--line)}
-.detail h3{margin:0 0 6px;font-size:15px}
+.detail h3{margin:0 0 6px;font-size:15px;overflow-wrap:anywhere}
 .detail dl{margin:0 0 8px;display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:13px}
 .detail dt{color:var(--muted)}
+/* A dd carries a 40px inline start margin by default, which pushes the value
+   out of its grid column. */
+.detail dd{margin:0}
 .detail pre{white-space:pre-wrap;word-break:break-word;margin:8px 0 0;font:13px/1.5 ui-monospace,monospace}
 .actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 .actions a,.actions button{font:inherit;font-size:13px;padding:6px 11px;border-radius:7px;
