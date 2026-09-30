@@ -496,7 +496,34 @@ export class StateStore {
       notificationOutboxPending: this.notificationOutboxPending(),
       feedback: this.feedbackSummary(),
       mcpAuditEvents: Number((this.db.prepare('SELECT COUNT(*) AS n FROM mcp_audit').get() as Record<string, unknown>)['n'] ?? 0),
+      mcpAuditByAction: this.mcpAuditByAction(),
     };
+  }
+
+  /**
+   * Audit rows grouped by the tool that ran.
+   *
+   * Without this the table is write-only: it can say how many calls arrived
+   * but not whether a state-changing tool was ever among them, which is the
+   * one question worth asking of it.
+   */
+  mcpAuditByAction(): Array<{ action: string; calls: number; failures: number; lastAt: string; clients: number }> {
+    return (
+      this.db
+        .prepare(
+          `SELECT action, COUNT(*) AS calls,
+                  COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS failures,
+                  MAX(created_at) AS last_at, COUNT(DISTINCT client) AS clients
+           FROM mcp_audit GROUP BY action ORDER BY calls DESC, action ASC`,
+        )
+        .all() as Array<Record<string, unknown>>
+    ).map((row) => ({
+      action: String(row['action']),
+      calls: Number(row['calls']),
+      failures: Number(row['failures']),
+      lastAt: String(row['last_at'] ?? ''),
+      clients: Number(row['clients']),
+    }));
   }
 
   recordMcpAudit(action: string, client: string, success: boolean): void {

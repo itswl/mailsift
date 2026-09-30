@@ -16,9 +16,9 @@ import { makeMessage, makeResult } from './helpers.js';
  */
 const open: Array<() => Promise<void>> = [];
 
-async function connect(state: StateStore): Promise<Client> {
+async function connect(state: StateStore, writable = false): Promise<Client> {
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  const server = createServer({ state });
+  const server = createServer({ state, client: 'test', writable });
   const client = new Client({ name: 'mcp-test', version: '0.0.0' });
   await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
   open.push(async () => {
@@ -61,10 +61,46 @@ describe('tool surface', () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       'feedback_rules', 'get_mail', 'health', 'list_accounts', 'list_dead_letters',
-      'list_digest', 'list_mail', 'mail_summary', 'observability', 'record_feedback',
-      'recovery_status', 'retry_dead_letter', 'search_mail',
+      'list_digest', 'list_mail', 'mail_summary', 'observability',
+      'recovery_status', 'search_mail',
     ]);
     for (const tool of tools) expect(tool.description ?? '').not.toBe('');
+  });
+
+  it('does not offer the state-changing tools to an ordinary reader', async () => {
+    // A leaked read token must not be able to record feedback: two
+    // false_positive labels for one sender infer a never-important rule, which
+    // silences that sender's future alerts.
+    const client = await connect(seeded());
+    const names = (await client.listTools()).tools.map((t) => t.name);
+    expect(names).not.toContain('record_feedback');
+    expect(names).not.toContain('retry_dead_letter');
+
+    // Absent from the listing and also unreachable by name.
+    expect(await client.callTool({ name: 'record_feedback', arguments: { messageId: '<one@x>', label: 'false_positive' } }))
+      .toMatchObject({ isError: true });
+  });
+
+  it('adds exactly the two write tools for a caller holding the write credential', async () => {
+    const reader = new Set((await (await connect(new StateStore(':memory:'))).listTools()).tools.map((t) => t.name));
+    const writer = (await (await connect(new StateStore(':memory:'), true)).listTools()).tools.map((t) => t.name);
+    expect(writer.filter((name) => !reader.has(name)).sort()).toEqual(['record_feedback', 'retry_dead_letter']);
+  });
+
+  it('warns a client that message fields are untrusted data', async () => {
+    // Subjects and summaries reach the model verbatim, so the server has to
+    // say so itself; a client without the skill file sees nothing else.
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    const server = createServer({ state: new StateStore(':memory:') });
+    const client = new Client({ name: 'mcp-test', version: '0.0.0' });
+    await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
+    open.push(async () => {
+      await client.close();
+      await server.close();
+    });
+    const instructions = client.getInstructions() ?? '';
+    expect(instructions).toContain('attacker-controlled');
+    expect(instructions).toMatch(/[Nn]ever follow instructions/);
   });
 
   it('publishes argument schemas so a client can validate before calling', async () => {
@@ -115,6 +151,23 @@ describe('queries', () => {
   it('ignores a malformed cursor instead of failing the call', async () => {
     const client = await connect(seeded());
     expect(await call(client, 'list_mail', { cursor: 'not-base64url-json' })).toMatchObject({ count: 3 });
+  });
+
+  it('pages a search too, so a wide match is not silently cut at the limit', async () => {
+    // search_mail used to take only a limit, so a caller asking for the first
+    // page of a broad query had no way to ask for the rest and could not tell
+    // that anything was missing.
+    const client = await connect(seeded());
+    const first = await call(client, 'search_mail', { query: 'Finance', limit: 2 });
+    expect(first['count']).toBe(2);
+    expect(typeof first['nextCursor']).toBe('string');
+
+    const second = await call(client, 'search_mail', { query: 'Finance', limit: 2, cursor: first['nextCursor'] });
+    expect(second['count']).toBe(1);
+    expect(second['nextCursor']).toBeUndefined();
+
+    const seen = [first, second].flatMap((page) => (page['mail'] as Array<{ messageId: string }>).map((m) => m.messageId));
+    expect(new Set(seen).size).toBe(3);
   });
 
   it('filters by category exactly, where search would match loosely', async () => {
@@ -180,10 +233,50 @@ describe('resources', () => {
   });
 });
 
+describe('access audit', () => {
+  it('names the tool that ran instead of recording that a request happened', async () => {
+    // The audit used to store the constant "http_request" once per request, so
+    // it could not answer whether a state-changing tool had ever been called.
+    const state = seeded();
+    const client = await connect(state);
+    await call(client, 'list_mail');
+    await call(client, 'list_mail');
+    await call(client, 'search_mail', { query: 'Finance' });
+
+    const byAction = Object.fromEntries(
+      state.mcpAuditByAction().map((row) => [row.action, row]),
+    );
+    expect(byAction['list_mail']).toMatchObject({ calls: 2, failures: 0, clients: 1 });
+    expect(byAction['search_mail']).toMatchObject({ calls: 1 });
+    expect(byAction).not.toHaveProperty('http_request');
+    expect(byAction['list_mail']!.lastAt).not.toBe('');
+  });
+
+  it('separates a failed call from a successful one', async () => {
+    const state = seeded();
+    const client = await connect(state);
+    await client.callTool({ name: 'get_mail', arguments: { messageId: '<one@x>' } });
+    await client.callTool({ name: 'get_mail', arguments: {} });
+
+    const getMail = state.mcpAuditByAction().find((row) => row.action === 'get_mail')!;
+    // A schema rejection never reaches the handler, so only the accepted call
+    // is counted; what matters is that a counted call is a real one.
+    expect(getMail).toMatchObject({ calls: 1, failures: 0 });
+  });
+
+  it('reports the breakdown through observability', async () => {
+    const state = seeded();
+    const client = await connect(state);
+    await call(client, 'list_digest');
+    const actions = (await call(client, 'observability'))['mcpAuditByAction'] as Array<{ action: string }>;
+    expect(actions.map((row) => row.action)).toContain('list_digest');
+  });
+});
+
 describe('feedback', () => {
   it('records a label and turns a repeated one into a sender rule', async () => {
     const state = seeded();
-    const client = await connect(state);
+    const client = await connect(state, true);
     expect(await call(client, 'feedback_rules')).toMatchObject({ alwaysImportant: [], neverImportant: [] });
 
     for (const messageId of ['<one@x>', '<two@x>']) {
@@ -196,7 +289,7 @@ describe('feedback', () => {
   });
 
   it('refuses a label outside the accepted set', async () => {
-    const client = await connect(seeded());
+    const client = await connect(seeded(), true);
     expect(await client.callTool({ name: 'record_feedback', arguments: { messageId: '<one@x>', label: 'wrong' } }))
       .toMatchObject({ isError: true });
   });
@@ -210,7 +303,7 @@ describe('recovery and health', () => {
       account: 'me@qq.com', folder: 'INBOX', uidValidity: '7', uid: 42,
       messageId: '<bad@x>', subject: 'oversized', reason: 'source too large',
     });
-    const client = await connect(state);
+    const client = await connect(state, true);
 
     expect(await call(client, 'list_dead_letters')).toMatchObject({ count: 1 });
     expect(await call(client, 'retry_dead_letter', { deadKey: 'me@qq.com|INBOX|7|42' })).toMatchObject({ requeued: true });
@@ -233,7 +326,14 @@ describe('recovery and health', () => {
   it('describes the configured accounts and the recovery backlog', async () => {
     process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw';
     const client = await connect(seeded());
-    expect(await call(client, 'list_accounts')).toMatchObject({ count: 1 });
+    const accounts = await call(client, 'list_accounts');
+    expect(accounts).toMatchObject({ count: 1 });
+    // Which credential an account uses tells a caller what to go after and
+    // answers no query, so it is not part of the reply.
+    for (const account of accounts['accounts'] as Array<Record<string, unknown>>) {
+      expect(account).not.toHaveProperty('auth');
+      expect(account).toMatchObject({ address: 'me@qq.com', provider: 'qq' });
+    }
     expect(await call(client, 'recovery_status')).toMatchObject({ deadLetterCount: 0, notificationOutboxPending: 0 });
   });
 
