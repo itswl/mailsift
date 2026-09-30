@@ -25,7 +25,7 @@ vim .env
 docker compose up -d
 ```
 
-At minimum, configure one mailbox, one output (`FEISHU_WEBHOOK_URL` or `WEBHOOKWISE_URL`), and optionally an LLM API key. For local development with Node >= 22.5:
+At minimum, configure one mailbox, one output (`FEISHU_WEBHOOK_URL` or `WEBHOOK_URL`), and optionally an LLM API key. For local development with Node >= 22.5:
 
 ```bash
 npm install
@@ -45,8 +45,8 @@ MAIL_ACCOUNT_1_FOLDERS=all
 MAIL_ACCOUNT_2=imap|me@example.com|password|imap.example.com
 
 FEISHU_WEBHOOK_URL=
-WEBHOOKWISE_URL=
-WEBHOOKWISE_TOKEN=
+WEBHOOK_URL=
+WEBHOOK_TOKEN=
 
 LLM_PROVIDER=deepseek
 LLM_MODEL=deepseek-flash

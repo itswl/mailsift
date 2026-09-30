@@ -25,11 +25,39 @@ const MAX_SNIPPET = 600;
 const MAX_DIGEST_BODY = 8000;
 
 /**
- * Build a generic webhook inbound event.
+ * Where the webhook posts.
  *
- * Keep fields under mail / triage to avoid generic_json adapter detection and
- * keep mailsift.yaml detection specific. The source-neutral signal is additive
- * and contains only a summary plus an MCP reference, never the message body.
+ * WEBHOOK_URL is the complete endpoint, which is what a webhook usually means.
+ * The older WEBHOOKWISE_* names are still honoured and keep their original
+ * behaviour of appending a fixed receiver path, so an existing deployment does
+ * not silently change shape on upgrade.
+ */
+export function webhookEndpoint(): string {
+  const direct = process.env.WEBHOOK_URL?.trim();
+  if (direct) return direct.replace(/\/$/, '');
+  const legacy = process.env.WEBHOOKWISE_URL?.trim();
+  if (!legacy) return '';
+  const source = process.env.WEBHOOKWISE_SOURCE?.trim() || 'mailsift';
+  return `${legacy.replace(/\/$/, '')}/api/v1/webhook/${source}`;
+}
+
+/** The token header, under either the current or the legacy name. */
+export function webhookToken(): string {
+  return process.env.WEBHOOK_TOKEN?.trim() || process.env.WEBHOOKWISE_TOKEN?.trim() || '';
+}
+
+/** True when the deployment still uses the superseded variable names. */
+export function usesLegacyWebhookNames(): boolean {
+  return !process.env.WEBHOOK_URL?.trim() && Boolean(process.env.WEBHOOKWISE_URL?.trim());
+}
+
+/**
+ * Build the webhook payload.
+ *
+ * Fields stay grouped under mail and triage so a receiver can recognise this
+ * shape specifically rather than treating it as anonymous JSON. The
+ * source-neutral signal is additive and carries only a summary plus an MCP
+ * reference, never the message body.
  */
 export function buildWebhookPayload(message: MailMessage, result: TriageResult): Record<string, unknown> {
   const isDigest = Boolean(message.extra?.['digest']);
@@ -62,21 +90,20 @@ export function buildWebhookPayload(message: MailMessage, result: TriageResult):
   };
 }
 
-export class WebhookWiseSink implements Sink {
+export class WebhookSink implements Sink {
   private readonly retry: RetryState = { exhausted: false };
 
   constructor(
-    private readonly baseUrl = (process.env.WEBHOOKWISE_URL ?? '').replace(/\/$/, ''),
-    private readonly token = process.env.WEBHOOKWISE_TOKEN ?? '',
-    private readonly source = process.env.WEBHOOKWISE_SOURCE ?? 'mailsift',
+    private readonly url = webhookEndpoint(),
+    private readonly token = webhookToken(),
   ) {}
 
   get configured(): boolean {
-    return Boolean(this.baseUrl);
+    return Boolean(this.url);
   }
 
   get endpoint(): string {
-    return `${this.baseUrl}/api/v1/webhook/${this.source}`;
+    return this.url;
   }
 
   async push(message: MailMessage, result: TriageResult): Promise<PushOutcome> {
@@ -140,7 +167,7 @@ export class CompositeSink implements Sink {
 export function buildSink(): Sink {
   const sinks: Sink[] = [];
   if (process.env.FEISHU_WEBHOOK_URL?.trim()) sinks.push(new FeishuSink());
-  if (process.env.WEBHOOKWISE_URL?.trim()) sinks.push(new WebhookWiseSink());
+  if (webhookEndpoint()) sinks.push(new WebhookSink());
   return sinks.length === 1 ? sinks[0]! : new CompositeSink(sinks);
 }
 

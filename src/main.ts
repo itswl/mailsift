@@ -13,7 +13,7 @@ import { parseArgs } from 'node:util';
 import { ConfigError, loadConfig, needsOAuth } from './config.js';
 import { TokenStore } from './imap/auth.js';
 import { StateStore } from './services/state.js';
-import { buildSink, WebhookWiseSink } from './services/sink.js';
+import { buildSink, usesLegacyWebhookNames, webhookEndpoint, webhookToken, WebhookSink } from './services/sink.js';
 import {
   resolveLlmBaseUrl, spamBonusWarning, suppressSelfForwards, unanchoredSenderRules,
 } from './services/triage.js';
@@ -81,17 +81,23 @@ async function checkConfig(): Promise<number> {
     outlets += 1;
     console.log('✅ Output Feishu bot: configured');
   }
-  if (process.env.WEBHOOKWISE_URL?.trim()) {
+  if (webhookEndpoint()) {
     outlets += 1;
     let host = 'configured';
-    try { host = new URL(new WebhookWiseSink().endpoint).host; } catch { /* report configured only */ }
-    console.log(`✅ Output generic webhook: configured (${host})`);
-    if (!process.env.WEBHOOKWISE_TOKEN?.trim()) {
-      console.log('   ⚠️  WEBHOOKWISE_TOKEN is not set; an authenticated endpoint will reject requests.');
+    try { host = new URL(new WebhookSink().endpoint).host; } catch { /* report configured only */ }
+    console.log(`✅ Output webhook: configured (${host})`);
+    if (!webhookToken()) {
+      console.log('   ⚠️  WEBHOOK_TOKEN is not set; an authenticated endpoint will reject requests.');
+    }
+    if (usesLegacyWebhookNames()) {
+      console.log(
+        '   ⚠️  WEBHOOKWISE_URL is superseded by WEBHOOK_URL, which takes the complete endpoint ' +
+          'rather than a base that /api/v1/webhook/<source> is appended to. The old names still work.',
+      );
     }
   }
   if (outlets === 0) {
-    console.log('❌ No output configured: set FEISHU_WEBHOOK_URL or WEBHOOKWISE_URL.');
+    console.log('❌ No output configured: set FEISHU_WEBHOOK_URL or WEBHOOK_URL.');
     problems += 1;
   }
 

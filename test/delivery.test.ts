@@ -5,7 +5,9 @@ import {
   deliverWithRetry, isRetryableStatus, retryAttempts, type DeliveryOutcome,
 } from '../src/services/delivery.js';
 import { FeishuSink } from '../src/services/feishu.js';
-import { WebhookWiseSink } from '../src/services/sink.js';
+import {
+  usesLegacyWebhookNames, webhookEndpoint, webhookToken, WebhookSink,
+} from '../src/services/sink.js';
 
 const ok: DeliveryOutcome = { delivered: true, retryable: false, detail: '' };
 const transient: DeliveryOutcome = { delivered: false, retryable: true, detail: 'ECONNRESET' };
@@ -72,6 +74,48 @@ describe('short retry loop', () => {
   });
 });
 
+describe('webhook endpoint', () => {
+  it('posts to WEBHOOK_URL exactly, because that is what a webhook means', () => {
+    process.env.WEBHOOK_URL = 'https://hooks.example.com/services/abc123';
+    expect(webhookEndpoint()).toBe('https://hooks.example.com/services/abc123');
+    expect(new WebhookSink().endpoint).toBe('https://hooks.example.com/services/abc123');
+  });
+
+  it('ignores a trailing slash', () => {
+    process.env.WEBHOOK_URL = 'https://hooks.example.com/in/';
+    expect(webhookEndpoint()).toBe('https://hooks.example.com/in');
+  });
+
+  it('keeps the superseded name working, path and all', () => {
+    // An existing deployment must not silently start posting somewhere else.
+    process.env.WEBHOOKWISE_URL = 'https://receiver.example.com';
+    expect(webhookEndpoint()).toBe('https://receiver.example.com/api/v1/webhook/mailsift');
+    process.env.WEBHOOKWISE_SOURCE = 'inbox';
+    expect(webhookEndpoint()).toBe('https://receiver.example.com/api/v1/webhook/inbox');
+    expect(usesLegacyWebhookNames()).toBe(true);
+  });
+
+  it('prefers the current name when both are set', () => {
+    process.env.WEBHOOK_URL = 'https://hooks.example.com/in';
+    process.env.WEBHOOKWISE_URL = 'https://receiver.example.com';
+    expect(webhookEndpoint()).toBe('https://hooks.example.com/in');
+    expect(usesLegacyWebhookNames()).toBe(false);
+  });
+
+  it('takes the token under either name', () => {
+    expect(webhookToken()).toBe('');
+    process.env.WEBHOOKWISE_TOKEN = 'old';
+    expect(webhookToken()).toBe('old');
+    process.env.WEBHOOK_TOKEN = 'new';
+    expect(webhookToken()).toBe('new');
+  });
+
+  it('is not configured when neither is set', () => {
+    expect(webhookEndpoint()).toBe('');
+    expect(new WebhookSink().configured).toBe(false);
+  });
+});
+
 describe('sink wiring', () => {
   it('Feishu retries a network error and reports the eventual delivery', async () => {
     vi.useFakeTimers();
@@ -110,7 +154,7 @@ describe('sink wiring', () => {
       .mockResolvedValueOnce(new Response('down', { status: 503 }))
       .mockResolvedValueOnce(new Response('ok', { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
-    const sink = new WebhookWiseSink('https://example.invalid', 'token');
+    const sink = new WebhookSink('https://example.invalid/hook', 'token');
     const pending = sink.push(makeMessage(), makeResult());
     await vi.advanceTimersByTimeAsync(2_000);
     expect(await pending).toBe('delivered');
