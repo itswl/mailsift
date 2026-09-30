@@ -68,7 +68,9 @@ DIGEST_HOUR=9
 
 ### Gmail and Outlook OAuth
 
-A step-by-step guide, including the two traps that cost the most time (a Google consent screen left in Testing expires refresh tokens every 7 days, and Outlook.com ships with IMAP switched off), is in [Discussions](../../discussions/46).
+A step-by-step guide is in [Discussions](../../discussions/46), including the two traps that cost the most time: a Google consent screen left in Testing expires refresh tokens every 7 days, and Outlook.com ships with IMAP switched off.
+
+Gmail can be skipped entirely by forwarding the whole mailbox to an account that uses a password, and monitoring that one instead. Spam needs a filter to come along, since Gmail's plain forwarding leaves it behind; the guide covers it. Outlook has no equivalent, because neither its forwarding setting nor an inbox rule touches Junk, so an Outlook mailbox is worth the OAuth.
 
 Gmail and Outlook require OAuth for most accounts:
 
