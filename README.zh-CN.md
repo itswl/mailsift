@@ -82,9 +82,9 @@ docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual
 
 超过 `MAX_MESSAGE_SOURCE_BYTES`（默认 5 MiB）的邮件不会下载给 MIME 解析器，而会记录为 dead letter，可通过 MCP 的 `list_dead_letters` 查询，不会静默消失。
 
-MCP 恢复工具提供 `recovery_status` 和 `retry_dead_letter`。重试只会回退对应文件夹的本地游标，下一轮正常轮询会重新拉取邮件，不会修改邮箱内容。
+MCP 恢复工具始终提供 `recovery_status`；`retry_dead_letter` 只在配置了下文的写凭证后才注册。重试只会回退对应文件夹的本地游标，下一轮正常轮询会重新拉取邮件，不会修改邮箱内容。
 
-MCP 还提供 `observability` 查看处理、投递、dead-letter 和反馈统计，以及 `record_feedback` 记录 `false_positive`、`missed`、`handled`、`correct`。反馈会保存下来，供后续规则和分类评估使用。
+MCP 还提供 `observability` 查看处理、投递、dead-letter 和反馈统计，以及按工具分组的访问审计。`record_feedback` 记录 `false_positive`、`missed`、`handled`、`correct`，供后续规则和分类评估使用，同样需要写凭证。
 
 同一发件人累计两次 `missed` 反馈会推断为重要发件人，两次 `false_positive` 会推断为低优先级发件人；显式环境规则优先。可通过 MCP `feedback_rules` 查看推断规则。
 
@@ -184,7 +184,17 @@ MCP_TOKEN=<随机长 token>
 
 需要公网访问时，必须显式设置 `MCP_PUBLIC_HOST` 并使用强 token。非回环 `MCP_BIND` 没有 `MCP_TOKEN` 时会拒绝启动；回环监听且 token 为空时是有意的不鉴权模式，因此不能把它暴露到主机之外。端点是 `/mcp`，使用无状态 Streamable HTTP，并默认按客户端每分钟 120 次请求限流，可通过 `MCP_RATE_LIMIT_PER_MINUTE` 调整。
 
-请通过反向代理或隧道使用 HTTPS；MCP 会返回邮箱数据，不能让 bearer token 通过公网明文 HTTP 传输。它提供只读查询和本地恢复工具。`health` 只反映最近一次轮询心跳、账号失败、LLM 失败计数和待处理队列；Docker healthcheck 只检查轮询心跳，healthy 不代表所有账号、LLM 和通知出口都正常，应通过 MCP `health` 和 `recovery_status` 查看详细状态。
+请通过反向代理或隧道使用 HTTPS；MCP 会返回邮箱数据，不能让 bearer token 通过公网明文 HTTP 传输。
+
+### 默认只读，写能力需显式开启
+
+只有 `record_feedback` 和 `retry_dead_letter` 会改变服务状态，未设置 `MCP_WRITE_TOKEN` 时它们根本不会注册。原因在 `record_feedback`：同一发件人累计两条 `false_positive` 会推断出一条"永不重要"规则，因此能写反馈的人就能让你此后收不到该发件人的告警。这会把一次读 token 泄露从信息泄露升级为告警致盲。`retry_dead_letter` 轻得多，代价只是重新抓取和重复通知，但它同样是写操作，所以一起隔离。
+
+把 `MCP_WRITE_TOKEN` 设成与 `MCP_TOKEN` 不同的第二个密钥，二者相同会拒绝启动。用它作为 bearer token 才能拿到完整工具集；`MCP_TOKEN` 则保持为只读凭证，浏览器视图和任何共享客户端都应该只持有它。stdio 模式下调用方本来就能读取 env 文件，所以只要设置了 `MCP_WRITE_TOKEN`，那两个工具在 stdio 下直接可用，无需二次出示。
+
+每次工具调用都会按名称记入审计，鉴权失败同样记录，`observability` 可查看分组结果。审计只保存调用结果和调用方地址的哈希，从不保存出示的凭证值。
+
+`health` 只反映最近一次轮询心跳、账号失败、LLM 失败计数和待处理队列；Docker healthcheck 只检查轮询心跳，healthy 不代表所有账号、LLM 和通知出口都正常，应通过 MCP `health` 和 `recovery_status` 查看详细状态。
 
 Signal Events 中的 MCP 引用只有设置 `MCP_TOKEN` 后才是 Bearer 鉴权引用；实时 IMAP 正文读取是有上限、只读、按需执行的，不会持久化原始正文。
 

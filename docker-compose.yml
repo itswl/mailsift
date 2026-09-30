@@ -18,6 +18,7 @@ services:
       - MCP_BIND=${MCP_BIND:-0.0.0.0}
       - MCP_PORT=${MCP_PORT:-8410}
       - MCP_TOKEN=${MCP_TOKEN:-}
+      - MCP_WRITE_TOKEN=${MCP_WRITE_TOKEN:-}
 
     volumes:
       # Use a named volume because the container runs as uid 10001 and a root-owned

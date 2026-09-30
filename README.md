@@ -95,9 +95,9 @@ Each folder is limited to `MAX_MESSAGES_PER_POLL` (default `200`). All accounts 
 
 Messages larger than `MAX_MESSAGE_SOURCE_BYTES` (default `5 MiB`) are not downloaded into the MIME parser. They are recorded as dead letters and can be inspected through the MCP `list_dead_letters` tool.
 
-The MCP recovery tools expose `recovery_status` and `retry_dead_letter`. Retrying rewinds one folder cursor so the next normal poll can fetch the message again; it does not modify the mailbox.
+The MCP recovery tools expose `recovery_status` always, and `retry_dead_letter` only when the write credential below is configured. Retrying rewinds one folder cursor so the next normal poll can fetch the message again; it does not modify the mailbox.
 
-MCP also provides `observability` for processing, delivery, dead-letter, and feedback totals, plus `record_feedback` with `false_positive`, `missed`, `handled`, and `correct` labels. Feedback is stored for later rule and triage evaluation.
+MCP also provides `observability` for processing, delivery, dead-letter, and feedback totals, plus the access audit grouped by tool. `record_feedback` records `false_positive`, `missed`, `handled`, and `correct` labels for later rule and triage evaluation, and also requires the write credential.
 
 After two feedback records for the same sender, `missed` feedback infers an always-important rule and `false_positive` feedback infers a never-important rule. Explicit environment rules take precedence; inspect inferred rules with MCP `feedback_rules`.
 
@@ -211,9 +211,29 @@ A non-loopback `MCP_BIND` refuses to start without `MCP_TOKEN`; loopback with an
 empty token is unauthenticated by design. The endpoint is `/mcp`, uses stateless
 Streamable HTTP, and applies `MCP_RATE_LIMIT_PER_MINUTE` (default `120`). Use
 HTTPS through a reverse proxy or tunnel because MCP carries mailbox data and
-bearer tokens must not cross the public internet over plain HTTP. It exposes
-read-only query/recovery tools; for local stdio clients, point the command at
-`dist/src/mcp.js`.
+bearer tokens must not cross the public internet over plain HTTP. For local
+stdio clients, point the command at `dist/src/mcp.js`.
+
+### The surface is read-only unless you opt in
+
+`record_feedback` and `retry_dead_letter` are the only tools that change service
+state, and they are not registered at all unless `MCP_WRITE_TOKEN` is set. The
+reason is `record_feedback`: two `false_positive` labels for one sender infer a
+never-important rule, so whoever can record feedback can silence a chosen
+sender's future alerts. That turns a leaked read token from an information
+disclosure into a way to blind you. `retry_dead_letter` is milder and costs a
+re-fetch and a repeat notification, but it writes, so it moves with feedback.
+
+Set `MCP_WRITE_TOKEN` to a second secret that differs from `MCP_TOKEN`; reusing
+one value for both is refused at startup. Present it as the bearer token to get
+the full surface. `MCP_TOKEN` then stays a read-only credential, which is what
+the browser view and any shared client should hold. Over stdio the caller can
+already read the env file, so setting `MCP_WRITE_TOKEN` alone enables the two
+tools there without a second presentation.
+
+Every tool call is audited by name, along with rejected authentication attempts,
+and `observability` reports the breakdown. The value a caller presented is never
+stored, only the outcome and a hash of the caller address.
 
 `health` reports the last poll heartbeat, account failures, LLM failure count,
 and pending queues. The Docker healthcheck checks only the poll heartbeat; a
