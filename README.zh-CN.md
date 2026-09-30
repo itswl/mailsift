@@ -16,7 +16,7 @@ vim .env
 docker compose up -d
 ```
 
-至少配置一个邮箱、一个输出出口（`FEISHU_WEBHOOK_URL` 或 `WEBHOOKWISE_URL`），以及可选的大模型 API Key。Node >= 22.5 的本地运行方式：
+至少配置一个邮箱、一个输出出口（`FEISHU_WEBHOOK_URL` 或 `WEBHOOK_URL`），以及可选的大模型 API Key。Node >= 22.5 的本地运行方式：
 
 ```bash
 npm install
@@ -32,8 +32,8 @@ MAIL_ACCOUNT_1_NAME=QQ主号
 MAIL_ACCOUNT_1_FOLDERS=all
 
 FEISHU_WEBHOOK_URL=
-WEBHOOKWISE_URL=
-WEBHOOKWISE_TOKEN=
+WEBHOOK_URL=
+WEBHOOK_TOKEN=
 
 LLM_PROVIDER=deepseek
 LLM_MODEL=deepseek-flash

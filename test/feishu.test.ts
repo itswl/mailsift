@@ -111,7 +111,7 @@ describe('navigation buttons', () => {
   });
 });
 
-describe('signatures and WebhookWise payloads', () => {
+describe('signatures and webhook payloads', () => {
   it('generates deterministic signatures', () => {
     expect(sign('secret', 1_700_000_000)).toBe(sign('secret', 1_700_000_000));
     expect(sign('secret', 1_700_000_000)).not.toBe(sign('secret', 1_700_000_001));
