@@ -353,3 +353,18 @@ describe('colour theme', () => {
     expect(page).toContain("catch (e) { return 'auto'; }");
   });
 });
+
+describe('layout', () => {
+  it('wraps the unbroken runs that message text is full of', async () => {
+    // A URL or a message id has nowhere to wrap, so without this the row grows
+    // past the viewport and the whole page scrolls sideways on a phone.
+    const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
+    expect(page).toContain('.row,.detail,.card{overflow-wrap:anywhere');
+    expect(page).toContain('.detail h3{margin:0 0 6px;font-size:15px;overflow-wrap:anywhere}');
+  });
+
+  it('keeps a definition value inside its own grid column', async () => {
+    // dd carries a 40px inline start margin by default.
+    expect(String((await routeWeb(request(), url('/'), '', seeded())).body)).toContain('.detail dd{margin:0}');
+  });
+});
