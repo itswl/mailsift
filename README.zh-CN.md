@@ -55,9 +55,10 @@ DIGEST_HOUR=9
 
 ## Gmail / Outlook OAuth
 
-逐步配置指南见 [Discussions](../../discussions/46)，其中包含两个最耗时间的坑：Google 同意屏幕停在「测试」会让 refresh token 每 7 天过期，以及 Outlook.com 默认关闭 IMAP。
+Discussions 里有两篇指南：
 
-Gmail 其实可以整箱转发到一个走密码登录的邮箱，只监控后者，完全不碰 OAuth。但要连垃圾邮件一起转需要用过滤器，因为默认转发不带垃圾邮件，指南里有步骤。Outlook 没有对应的做法——它的转发设置和收件箱规则都不作用于垃圾邮件，所以 Outlook 值得花力气配 OAuth。
+- [Gmail / Outlook 的 OAuth 授权](../../discussions/46)，对照代码实际请求的 scope 和回调地址写的，含两个最耗时间的坑：Google 同意屏幕停在「测试」会让 refresh token 每 7 天过期，以及 Outlook.com 默认关闭 IMAP。
+- [邮箱转发](../../discussions/47)，讲怎样用整箱转发完全绕开 Gmail 的 OAuth。要连垃圾邮件一起转需要用过滤器，因为默认转发不带垃圾邮件。Outlook 没有对应做法，它的转发和收件箱规则都不作用于垃圾邮件，所以 Outlook 值得花力气配 OAuth。这篇同时说明两个被监控的邮箱互相转发时该怎么办。
 
 Gmail 和 Outlook 通常需要 OAuth：
 
