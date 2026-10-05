@@ -3,8 +3,11 @@ import './setup.js';
 import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
 import {
-  allowAuthAttempt, handleApi, readCookie, routeWeb, SESSION_COOKIE, tokenMatches, webUiEnabled,
+  allowAuthAttempt, handleApi, LANGUAGE_COOKIE, languageFromHeader, readCookie, routeWeb, SESSION_COOKIE,
+  tokenMatches, webUiEnabled,
 } from '../src/web.js';
+import { buildLink } from '../src/links.js';
+import { STRINGS, type StringKey } from '../src/web-strings.js';
 import { clientAddress } from '../src/mcp.js';
 import { StateStore } from '../src/services/state.js';
 
@@ -366,5 +369,102 @@ describe('layout', () => {
   it('keeps a definition value inside its own grid column', async () => {
     // dd carries a 40px inline start margin by default.
     expect(String((await routeWeb(request(), url('/'), '', seeded())).body)).toContain('.detail dd{margin:0}');
+  });
+
+  it('keeps both header switches on the first row of a phone', async () => {
+    // Two switches and the count no longer share one line at 390px. The count
+    // wraps inside its own box instead of pushing a switch onto a second row.
+    expect(String((await routeWeb(request(), url('/'), '', seeded())).body)).toContain('#totals{flex:1 1 0;min-width:0}');
+  });
+});
+
+describe('language', () => {
+  const shell = async (headers: Record<string, string> = {}): Promise<string> =>
+    String((await routeWeb(request({ headers }), url('/'), '', seeded())).body);
+
+  it('speaks English unless the browser asks for Chinese', async () => {
+    const english = await shell();
+    expect(english).toContain('<html lang="en">');
+    expect(english).toContain('>any level<');
+    const chinese = await shell({ 'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8' });
+    expect(chinese).toContain('<html lang="zh-CN">');
+    expect(chinese).toContain('>所有级别<');
+    expect(chinese).not.toContain('>any level<');
+  });
+
+  it('ranks the header by weight and serves the first language it has', () => {
+    expect(languageFromHeader(undefined)).toBe('en');
+    expect(languageFromHeader('fr-FR,fr;q=0.9')).toBe('en');
+    expect(languageFromHeader('en;q=0.5, zh;q=0.9')).toBe('zh-CN');
+    // Japanese comes first but is not offered; Chinese is the first one that is.
+    expect(languageFromHeader('ja, zh;q=0.8, en;q=0.7')).toBe('zh-CN');
+    expect(languageFromHeader('zh-TW')).toBe('zh-CN');
+    expect(languageFromHeader('en-GB,en;q=0.9,zh;q=0.8')).toBe('en');
+  });
+
+  it('lets a choice made with the switch beat the browser', async () => {
+    const chosen = await shell({ 'accept-language': 'en', cookie: `${LANGUAGE_COOKIE}=zh-CN` });
+    expect(chosen).toContain('<html lang="zh-CN">');
+    // An unknown value is ignored rather than trusted.
+    const junk = await shell({ 'accept-language': 'zh', cookie: `${LANGUAGE_COOKIE}=xx` });
+    expect(junk).toContain('<html lang="zh-CN">');
+  });
+
+  it('words the sign-in form and its refusals too', async () => {
+    const store = seeded();
+    const headers = { 'accept-language': 'zh-CN' };
+    const login = String((await routeWeb(request({ headers }), url('/'), 'secret', store)).body);
+    expect(login).toContain('<title>登录</title>');
+    expect(login).toContain('>进入<');
+    expect(login).toContain('id="lang"');
+    const refused = await routeWeb(
+      request({ method: 'POST', url: '/auth', body: 'token=wrong', headers }), url('/auth'), 'secret', store,
+    );
+    expect(refused.status).toBe(401);
+    expect(String(refused.body)).toContain('令牌不正确');
+  });
+
+  it('carries every language so the switch rewords the page in place, and tells the server', async () => {
+    const page = await shell();
+    expect(page).toContain('data-i18n="filter.anyLevel"');
+    expect(page).toContain('"zh-CN":{');
+    expect(page).toContain(`document.cookie='${LANGUAGE_COOKIE}='`);
+    // In place rather than by reload, so the filters and the open message keep their place.
+    expect(page).toContain('function applyLanguage');
+    expect(page).not.toContain('location.reload(); }\n};');
+  });
+
+  it('has a Chinese word for every English one, and none left blank', () => {
+    expect(Object.keys(STRINGS['zh-CN']).sort()).toEqual(Object.keys(STRINGS.en).sort());
+    for (const [language, table] of Object.entries(STRINGS)) {
+      for (const [key, value] of Object.entries(table)) expect(value.trim(), `${language} ${key}`).not.toBe('');
+    }
+  });
+
+  it('words the provider link the way links.ts does, in English', () => {
+    // The browser composes the label from the provider so it can be worded in
+    // Chinese; in English the result must be the one the notification card shows.
+    for (const provider of ['gmail', 'gmail_pw', 'outlook', 'qq', 'qq_biz', '163', '126', 'icloud']) {
+      for (const messageId of ['<id@x>', '']) {
+        const link = buildLink(provider, 'me@x', messageId);
+        if (!link) continue;
+        const name = STRINGS.en[`provider.${provider}` as StringKey];
+        const composed = STRINGS.en[link.exact ? 'link.openIn' : 'link.open'].replace('{name}', name);
+        expect(composed, `${provider} ${messageId}`).toBe(link.label);
+      }
+    }
+  });
+
+  it('sends the provider with each row so the browser can word the link', async () => {
+    const answer = await body('/api/mail', seeded()) as { mail: Array<Record<string, unknown>> };
+    expect(answer.mail[0]).toHaveProperty('provider');
+  });
+
+  it('names a live-read failure by a code the browser can word', async () => {
+    // The one failure reachable without a mailbox: the record's account is no longer configured.
+    process.env.MAIL_ACCOUNT_1 = 'qq|someone-else@qq.com|pw';
+    const answer = await body('/api/message?id=%3Cone%40x%3E&live=true', seeded());
+    expect(answer).toMatchObject({ code: 'unconfigured' });
+    expect(STRINGS['zh-CN']['error.unconfigured']).toBeTruthy();
   });
 });
