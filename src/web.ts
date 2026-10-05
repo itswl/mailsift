@@ -15,14 +15,27 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { loadConfig } from './config.js';
+import { escapeHtml } from './html.js';
 import { fetchByMessageId } from './imap/client.js';
 import { buildLink } from './links.js';
 import { renderDigest, type DigestItem } from './services/digest.js';
 import { CATEGORIES } from './services/triage.js';
 import { appleTouch180, favicon64, icon192, icon512, maskable512 } from './web-icons.js';
+import { isLanguage, LANGUAGES, STRINGS, t, type Language, type StringKey } from './web-strings.js';
 import type { StateStore } from './services/state.js';
 
 export const SESSION_COOKIE = 'mailsift_session';
+/**
+ * The language choice. A cookie, unlike the theme's localStorage, because the
+ * server has to see it: the shell and the sign-in form are rendered here, and
+ * a page that arrives in one language and switches after its script runs is
+ * exactly the flash the theme code goes out of its way to avoid. It holds
+ * nothing secret, so the browser may write it, and the server only ever maps
+ * it onto a fixed list.
+ */
+export const LANGUAGE_COOKIE = 'mailsift_lang';
+/** A year. A language is not a choice anyone wants to make twice. */
+const LANGUAGE_MAX_AGE = 365 * 24 * 60 * 60;
 /** A live IMAP read can be slow on providers with poor search; do not hang a tab on it. */
 const LIVE_FETCH_TIMEOUT_MS = 25_000;
 const LIVE_BODY_CHARS = 20_000;
@@ -93,6 +106,48 @@ export function authorized(req: IncomingMessage, token: string): boolean {
   return tokenMatches(token, readCookie(req.headers.cookie, SESSION_COOKIE));
 }
 
+/**
+ * The language the browser asks for, reduced to the ones offered.
+ *
+ * Entries are ranked by their q weight, then by position, and the first one
+ * we can serve wins, so "ja, zh;q=0.8" gets Chinese rather than falling back
+ * to English because Japanese came first. Every Chinese variant maps to
+ * Simplified: it is the one we have, and nearer to what a Traditional reader
+ * wants than English is.
+ */
+export function languageFromHeader(header: string | undefined): Language {
+  const ranked = (header ?? '').split(',')
+    .map((part, index) => {
+      const [tag = '', ...params] = part.trim().toLowerCase().split(';');
+      const q = params.map((p) => p.trim()).find((p) => p.startsWith('q='));
+      const weight = q ? Number(q.slice(2)) : 1;
+      return { tag: tag.trim(), weight: Number.isFinite(weight) ? weight : 0, index };
+    })
+    .filter((entry) => entry.tag && entry.weight > 0)
+    .sort((a, b) => b.weight - a.weight || a.index - b.index);
+  for (const { tag } of ranked) {
+    if (tag === 'zh' || tag.startsWith('zh-')) return 'zh-CN';
+    if (tag === 'en' || tag.startsWith('en-')) return 'en';
+  }
+  return 'en';
+}
+
+/** The language to render in: a choice made with the switch, otherwise what the browser asks for. */
+export function pickLanguage(req: IncomingMessage): Language {
+  const stored = readCookie(req.headers.cookie, LANGUAGE_COOKIE);
+  return isLanguage(stored) ? stored : languageFromHeader(req.headers['accept-language']);
+}
+
+/** Where the switch goes from here: round robin, so it also serves a third language. */
+function nextLanguage(lang: Language): Language {
+  return LANGUAGES[(LANGUAGES.indexOf(lang) + 1) % LANGUAGES.length] ?? LANGUAGES[0];
+}
+
+/** Browser code that records a language choice where the server sees it on the next request. */
+function storeLanguageScript(): string {
+  return `function storeLanguage(l){document.cookie='${LANGUAGE_COOKIE}='+l+'; Path=/; Max-Age=${LANGUAGE_MAX_AGE}; SameSite=Lax'}`;
+}
+
 function intParam(params: URLSearchParams, name: string, fallback: number, max: number): number {
   const raw = Number(params.get(name));
   if (!Number.isFinite(raw) || raw <= 0) return fallback;
@@ -131,10 +186,11 @@ export async function handleApi(
     });
     return json(200, {
       count: mail.length,
-      mail: mail.map((row) => ({
-        ...row,
-        link: buildLink(providerOf(row.account), row.account, row.messageId ?? ''),
-      })),
+      mail: mail.map((row) => {
+        const provider = providerOf(row.account);
+        // The provider travels with the link so the browser can word it in its own language.
+        return { ...row, provider, link: buildLink(provider, row.account, row.messageId ?? '') };
+      }),
     });
   }
 
@@ -156,16 +212,19 @@ export async function handleApi(
     if (params.get('live') !== 'true') return json(200, { ...stored, body: null });
 
     const account = loadConfig().accounts.find((a) => a.username === stored.account);
-    if (!account) return json(409, { error: 'this mailbox is no longer configured' });
+    // Each failure carries a code as well as the message, so the browser can
+    // word it in the reader's language while a JSON client still reads the text.
+    if (!account) return json(409, { error: 'this mailbox is no longer configured', code: 'unconfigured' });
     try {
       const live = await Promise.race([
         fetchByMessageId(account, messageId),
         new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), LIVE_FETCH_TIMEOUT_MS).unref()),
       ]);
-      if (!live) return json(504, { error: 'the mailbox did not return this message in time' });
+      if (!live) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
       return json(200, { ...stored, body: live.body.slice(0, LIVE_BODY_CHARS) });
     } catch (error) {
-      return json(502, { error: `mailbox read failed: ${String(error).slice(0, 200)}` });
+      const detail = String(error).slice(0, 200);
+      return json(502, { error: `mailbox read failed: ${detail}`, code: 'readFailed', detail });
     }
   }
 
@@ -194,16 +253,23 @@ function providerOf(address: string): string {
  * The token is posted rather than put in the URL, so it does not end up in
  * browser history, proxy logs or a Referer header.
  */
-export function renderLogin(message = ''): string {
-  return page('Sign in', `
+export function renderLogin(lang: Language, error?: StringKey): string {
+  const s = (key: StringKey): string => escapeHtml(t(lang, key));
+  // The switch reloads here rather than rewording in place: there is nothing
+  // on this page to lose, and the reload goes to GET / so a refused sign-in is
+  // not posted a second time.
+  return page(lang, s('login.title'), `
     <form method="post" action="/auth" class="card login">
       <h1>mailsift</h1>
-      <p class="muted">Enter the access token for this instance. Your browser can remember it.</p>
-      <input type="text" name="user" value="mailsift" autocomplete="username" readonly aria-label="Account">
-      <input type="password" name="token" autocomplete="current-password" placeholder="token" autofocus>
-      <button type="submit">Open</button>
-      ${message ? '<p class="error">' + message + '</p>' : ''}
-    </form>`);
+      <p class="muted">${s('login.intro')}</p>
+      <input type="text" name="user" value="mailsift" autocomplete="username" readonly aria-label="${s('login.account')}">
+      <input type="password" name="token" autocomplete="current-password" placeholder="${s('login.token')}" autofocus>
+      <button type="submit">${s('login.open')}</button>
+      ${error ? '<p class="error">' + s(error) + '</p>' : ''}
+      <button type="button" id="lang" class="lang" aria-label="${s('lang.label')}">${s('lang.face')}</button>
+    </form>
+    <script>${storeLanguageScript()}
+    document.querySelector('#lang').onclick = () => { storeLanguage('${nextLanguage(lang)}'); location.replace('/'); };</script>`);
 }
 
 /**
@@ -220,38 +286,49 @@ function themeBoot(): string {
     + "if(m)m.setAttribute('content',d?'" + DARK_BAR + "':'" + LIGHT_BAR + "');}catch(e){}})();";
 }
 
-/** The application shell. All content is built in the browser from the JSON API. */
-export function renderApp(): string {
-  return page('mailsift', `
+/**
+ * The application shell. All content is built in the browser from the JSON API.
+ *
+ * The page's own words are rendered in the chosen language and tagged with
+ * their key, so the switch can reword them in place instead of reloading and
+ * losing the filters.
+ */
+export function renderApp(lang: Language): string {
+  const s = (key: StringKey): string => escapeHtml(t(lang, key));
+  const worded = (tag: string, key: StringKey, attrs = ''): string =>
+    `<${tag}${attrs ? ' ' + attrs : ''} data-i18n="${key}">${s(key)}</${tag}>`;
+  const option = (value: string, key: StringKey): string => worded('option', key, `value="${value}"`);
+  return page(lang, 'mailsift', `
     <header class="bar">
       <strong>mailsift</strong>
       <span id="totals" class="muted"></span>
-      <button id="theme" type="button" aria-label="Colour theme"></button>
+      <button id="lang" type="button" class="switch" aria-label="${s('lang.label')}">${s('lang.face')}</button>
+      <button id="theme" type="button" class="switch" aria-label="${s('theme.title')}"></button>
     </header>
     <form id="filters" class="bar filters">
       <select name="hours">
-        <option value="24">24h</option><option value="72">3d</option>
-        <option value="168">7d</option><option value="720">30d</option>
+        ${option('24', 'window.24h')}${option('72', 'window.3d')}
+        ${option('168', 'window.7d')}${option('720', 'window.30d')}
       </select>
       <select name="importance">
-        <option value="">any level</option>
-        <option value="critical">critical</option>
-        <option value="warning">warning</option>
-        <option value="info">info</option>
+        ${option('', 'filter.anyLevel')}
+        ${option('critical', 'level.critical')}
+        ${option('warning', 'level.warning')}
+        ${option('info', 'level.info')}
       </select>
-      <select name="category"><option value="">any category</option></select>
-      <select name="account"><option value="">all mailboxes</option></select>
-      <label class="check"><input type="checkbox" name="spamOnly"> spam</label>
-      <label class="check"><input type="checkbox" name="pushedOnly"> notified</label>
-      <input type="search" name="q" placeholder="search subject, sender, summary">
+      <select name="category">${option('', 'filter.anyCategory')}</select>
+      <select name="account">${option('', 'filter.allMailboxes')}</select>
+      <label class="check"><input type="checkbox" name="spamOnly"> ${worded('span', 'spam')}</label>
+      <label class="check"><input type="checkbox" name="pushedOnly"> ${worded('span', 'notified')}</label>
+      <input type="search" name="q" placeholder="${s('search')}">
     </form>
     <main id="list" aria-live="polite"></main>
-    <section id="digest" class="card"><h2>Waiting for the next digest</h2><pre id="digest-body"></pre></section>
+    <section id="digest" class="card">${worded('h2', 'digest.title')}<pre id="digest-body"></pre></section>
     <script>` + clientScript() + `</script>`);
 }
 
-function page(title: string, body: string): string {
-  return '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+function page(lang: Language, title: string, body: string): string {
+  return '<!doctype html><html lang="' + lang + '"><head><meta charset="utf-8">'
     // viewport-fit=cover lets the page reach under a notch; the CSS then pads
     // it back with the safe-area insets, which is what an installed app needs.
     + '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
@@ -287,9 +364,15 @@ function styles(): string {
 :root[data-theme=dark]{` + DARK_PALETTE + `}
 :root[data-theme=light]{color-scheme:light}
 :root[data-theme=dark]{color-scheme:dark}
-#theme{margin-left:auto;font:inherit;font-size:17px;line-height:1;background:none;border:1px solid var(--line);
+/* The two header switches share one height: a 13px word and a 17px glyph on the same 17px line. */
+.switch{font:inherit;font-size:13px;line-height:17px;background:none;border:1px solid var(--line);
 color:var(--fg);border-radius:8px;padding:5px 9px;cursor:pointer}
-#theme:hover{background:var(--card)}
+.switch:hover{background:var(--card)}
+#theme{font-size:17px}
+/* The count fills the room between the brand and the switches and wraps inside
+   it, so on a phone it takes a second line of text rather than pushing a
+   switch onto a second row. */
+#totals{flex:1 1 0;min-width:0}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
 padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
@@ -341,6 +424,10 @@ border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit}
 /* Present so a password manager has an account to file the token under, but
    it is not a second thing to fill in. */
 .login input[name=user]{color:var(--muted);cursor:default}
+/* On the sign-in form the switch is a quiet word under the button, not a second button. */
+.login .lang{width:auto;display:block;margin:14px auto 0;padding:0;border:0;background:none;
+color:var(--muted);font-size:13px;cursor:pointer}
+.login .lang:hover{color:var(--fg)}
 .error{color:var(--critical);font-size:13px}
 `;
 }
@@ -351,13 +438,29 @@ border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit}
  * Every value that came from a message is written with textContent and never
  * as markup: subjects, sender names and summaries are attacker-controlled, and
  * this is the one place in the service that renders them into a document.
- * Written without template literals so the server template cannot interpolate it.
+ * Written without backticks of its own, so the server's template literal
+ * interpolates only at its own marks.
  */
 function clientScript(): string {
   return `
 const $ = (s) => document.querySelector(s);
 const list = $('#list'), filters = $('#filters');
 let open = null;
+
+// Every language travels with the page, so the switch needs no round trip.
+const LANGUAGES = ${JSON.stringify(LANGUAGES)};
+const STRINGS = ${JSON.stringify(STRINGS)};
+let lang = STRINGS[document.documentElement.lang] ? document.documentElement.lang : 'en';
+const t = (key) => STRINGS[lang][key];
+function fill(key, vars) {
+  let text = t(key);
+  for (const name in vars) text = text.split('{' + name + '}').join(vars[name]);
+  return text;
+}
+// A vocabulary value, worded when the table knows it and shown as stored when
+// not: records written before the vocabulary existed may hold free-form labels.
+const word = (prefix, value) => STRINGS[lang][prefix + value] || value || '';
+${storeLanguageScript()}
 
 function el(tag, cls, text) {
   const n = document.createElement(tag);
@@ -379,36 +482,48 @@ function query() {
   return p;
 }
 
+// The label is composed here from the provider rather than taken from the
+// API, so it can be worded in the reader's language; in English it comes out
+// as the same words links.ts uses.
+function linkLabel(row) {
+  const name = STRINGS[lang]['provider.' + row.provider];
+  return name ? fill(row.link.exact ? 'link.openIn' : 'link.open', { name }) : row.link.label;
+}
+function failure(d) {
+  return STRINGS[lang]['error.' + d.code] ? fill('error.' + d.code, { detail: d.detail || '' }) : (d.error || t('detail.failed'));
+}
+
 function detail(row) {
   const box = el('div', 'detail');
-  box.appendChild(el('h3', null, row.subject || '(no subject)'));
+  box.appendChild(el('h3', null, row.subject || t('noSubject')));
   const dl = el('dl');
-  const add = (k, v) => { if (!v) return; dl.appendChild(el('dt', null, k)); dl.appendChild(el('dd', null, v)); };
-  add('From', (row.senderName ? row.senderName + ' ' : '') + '<' + (row.sender || '') + '>');
-  add('Mailbox', (row.accountLabel || row.account) + ' · ' + (row.folder || ''));
-  add('Judged', row.importance + ' by ' + row.decidedBy + (row.pushed ? ' · notified' : ''));
-  add('Why', row.reason);
-  add('Deadline', row.deadline);
+  const add = (k, v) => { if (!v) return; dl.appendChild(el('dt', null, t(k))); dl.appendChild(el('dd', null, v)); };
+  add('detail.from', (row.senderName ? row.senderName + ' ' : '') + '<' + (row.sender || '') + '>');
+  add('detail.mailbox', (row.accountLabel || row.account) + ' · ' + (row.folder || ''));
+  add('detail.judged', fill('detail.judgedAs', { level: word('level.', row.importance), by: word('by.', row.decidedBy) })
+    + (row.pushed ? ' · ' + t('notified') : ''));
+  add('detail.why', row.reason);
+  add('detail.deadline', row.deadline);
   box.appendChild(dl);
   if (row.summary) box.appendChild(el('pre', null, row.summary));
 
   const actions = el('div', 'actions');
   if (row.link && row.link.url) {
-    const a = el('a', null, row.link.label);
+    const a = el('a', null, linkLabel(row));
     a.href = row.link.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
     actions.appendChild(a);
   }
-  const full = el('button', null, 'Load full message');
+  const full = el('button', null, t('detail.load'));
   full.onclick = async () => {
-    full.disabled = true; full.textContent = 'Reading the mailbox…';
+    full.disabled = true; full.textContent = t('detail.loading');
     try {
       const r = await fetch('/api/message?live=true&id=' + encodeURIComponent(row.messageId || row.dedupKey));
       const d = await r.json();
-      const pre = el('pre', null, r.ok ? (d.body || '(this message has no text body)') : (d.error || 'failed'));
+      const pre = el('pre', null, r.ok ? (d.body || t('detail.noBody')) : failure(d));
       box.appendChild(pre);
       full.remove();
     } catch (e) {
-      full.disabled = false; full.textContent = 'Load full message';
+      full.disabled = false; full.textContent = t('detail.load');
     }
   };
   actions.appendChild(full);
@@ -420,15 +535,16 @@ function rowOf(m) {
   const b = el('button', 'row');
   const top = el('div', 'top');
   top.appendChild(el('span', 'dot ' + (m.importance || 'info')));
-  top.appendChild(el('span', 'who', m.senderName || m.sender || 'unknown'));
+  top.appendChild(el('span', 'who', m.senderName || m.sender || t('unknownSender')));
   top.appendChild(el('span', 'when', when(m.mailDate || m.createdAt)));
   b.appendChild(top);
   b.appendChild(el('div', 'sum', m.summary || m.subject || ''));
   const meta = el('div', 'meta');
-  if (m.category) meta.appendChild(el('span', 'chip', m.category));
-  if (m.inSpam) meta.appendChild(el('span', 'chip', 'spam'));
-  if (m.pushed) meta.appendChild(el('span', 'chip', 'notified'));
+  if (m.category) meta.appendChild(el('span', 'chip', word('category.', m.category)));
+  if (m.inSpam) meta.appendChild(el('span', 'chip', t('spam')));
+  if (m.pushed) meta.appendChild(el('span', 'chip', t('notified')));
   b.appendChild(meta);
+  b.dataset.key = m.dedupKey || '';
   b.onclick = () => {
     if (open && open.parentNode) open.remove();
     if (open && open.dataset.key === (m.dedupKey || '')) { open = null; return; }
@@ -438,35 +554,48 @@ function rowOf(m) {
   return b;
 }
 
+// The last answers are kept so a language switch can reword the page from
+// them instead of asking the server again.
+let lastMail = null, lastSummary = null, lastDigest = null;
+
+function render() {
+  if (!lastMail) return;
+  list.replaceChildren();
+  open = null;
+  if (!lastMail.length) { list.appendChild(el('p', 'card muted', t('empty'))); return; }
+  for (const m of lastMail) list.appendChild(rowOf(m));
+}
+
 async function load() {
   const r = await fetch('/api/mail?' + query().toString());
   if (r.status === 401) { location.reload(); return; }
-  const d = await r.json();
-  list.replaceChildren();
-  open = null;
-  if (!d.mail.length) { list.appendChild(el('p', 'card muted', 'Nothing matches these filters.')); return; }
-  for (const m of d.mail) list.appendChild(rowOf(m));
+  lastMail = (await r.json()).mail;
+  render();
+}
+
+function renderChrome() {
+  const s = lastSummary, g = lastDigest;
+  if (s) $('#totals').textContent = fill('totals', { total: s.total, pushed: s.pushed, spam: s.fromSpamFolder });
+  if (g) { $('#digest').hidden = g.pending === 0; $('#digest-body').textContent = g.preview; }
 }
 
 async function chrome() {
   const p = new URLSearchParams(); p.set('hours', filters.hours.value);
   const s = await (await fetch('/api/summary?' + p.toString())).json();
-  $('#totals').textContent = s.total + ' messages · ' + s.pushed + ' notified · ' + s.fromSpamFolder + ' from spam';
+  lastSummary = s;
   if (!filters.category.dataset.filled) {
-    for (const c of s.categories) filters.category.appendChild(new Option(c, c));
+    for (const c of s.categories) filters.category.appendChild(new Option(word('category.', c), c));
     for (const a of s.accounts) filters.account.appendChild(new Option(a.name, a.address));
     filters.category.dataset.filled = '1';
   }
-  const g = await (await fetch('/api/digest')).json();
-  $('#digest').hidden = g.pending === 0;
-  $('#digest-body').textContent = g.preview;
+  lastDigest = await (await fetch('/api/digest')).json();
+  renderChrome();
 }
 
 // Three states rather than two: following the system is the sensible default,
 // and a switch that cannot go back to it forces a choice the reader may not have.
 const THEMES = ['auto', 'light', 'dark'];
 const THEME_FACE = { auto: '\u25D0', light: '\u2600', dark: '\u263E' };
-const THEME_NAME = { auto: 'Follow the system', light: 'Light', dark: 'Dark' };
 const dark = matchMedia('(prefers-color-scheme: dark)');
 
 function readTheme() {
@@ -486,9 +615,10 @@ function applyTheme(choice) {
   if (meta) meta.setAttribute('content', isDark ? '${DARK_BAR}' : '${LIGHT_BAR}');
   const button = document.querySelector('#theme');
   if (button) {
+    const name = t('theme.' + choice);
     button.textContent = THEME_FACE[choice];
-    button.title = THEME_NAME[choice];
-    button.setAttribute('aria-label', 'Colour theme: ' + THEME_NAME[choice]);
+    button.title = name;
+    button.setAttribute('aria-label', fill('theme.label', { name }));
   }
 }
 
@@ -500,6 +630,30 @@ $('#theme').onclick = () => {
 // Following the system means following it as it changes, including the status bar.
 dark.addEventListener('change', () => { if (readTheme() === 'auto') applyTheme('auto'); });
 applyTheme(readTheme());
+
+// Reword the page in place: the page's own words are tagged with their key,
+// the vocabulary options are relabelled, and the lists are rebuilt from the
+// last answers. The filters keep their values and the open message reopens.
+function applyLanguage(next) {
+  lang = next;
+  document.documentElement.lang = next;
+  for (const n of document.querySelectorAll('[data-i18n]')) n.textContent = t(n.dataset.i18n);
+  filters.q.placeholder = t('search');
+  for (const o of filters.category.options) if (o.value) o.text = word('category.', o.value);
+  const button = $('#lang');
+  button.textContent = t('lang.face');
+  button.setAttribute('aria-label', t('lang.label'));
+  applyTheme(readTheme());
+  const openKey = open && open.dataset.key;
+  render(); renderChrome();
+  if (openKey) for (const row of list.children) if (row.dataset.key === openKey) { row.click(); break; }
+}
+
+$('#lang').onclick = () => {
+  const next = LANGUAGES[(LANGUAGES.indexOf(lang) + 1) % LANGUAGES.length];
+  storeLanguage(next);
+  applyLanguage(next);
+};
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 
@@ -615,28 +769,30 @@ export async function routeWeb(
     return { status: 200, body: asset.body, contentType: asset.type, cacheControl: asset.cache };
   }
 
+  const lang = pickLanguage(req);
+
   if (url.pathname === '/auth' && req.method === 'POST') {
     if (!allowAuthAttempt(client)) {
-      return html(429, renderLogin('Too many attempts. Wait a minute and try again.'));
+      return html(429, renderLogin(lang, 'login.tooMany'));
     }
     let presented = '';
     try {
       presented = new URLSearchParams(await readBody(req)).get('token')?.trim() ?? '';
     } catch {
-      return html(413, renderLogin('That request was too large.'));
+      return html(413, renderLogin(lang, 'login.tooLarge'));
     }
-    if (!tokenMatches(token, presented)) return html(401, renderLogin('That token was not accepted.'));
+    if (!tokenMatches(token, presented)) return html(401, renderLogin(lang, 'login.rejected'));
     return { status: 303, body: '', contentType: 'text/html; charset=utf-8', cookie: sessionCookie(req, presented) };
   }
 
   if (!authorized(req, token)) {
     return url.pathname.startsWith('/api/')
       ? json(401, { error: 'unauthorized' })
-      : html(401, renderLogin());
+      : html(401, renderLogin(lang));
   }
 
   if (url.pathname === '/' && req.method === 'GET') {
-    const answer = html(200, renderApp());
+    const answer = html(200, renderApp(lang));
     // Roll the session forward on each visit, so regular use never expires.
     // Only on the page: doing it on the polling calls would rewrite the cookie
     // every minute for nothing.
