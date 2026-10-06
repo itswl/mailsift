@@ -429,6 +429,11 @@ border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit}
 color:var(--muted);font-size:13px;cursor:pointer}
 .login .lang:hover{color:var(--fg)}
 .error{color:var(--critical);font-size:13px}
+/* iOS Safari zooms editable controls smaller than 16px when they receive focus. */
+@media(pointer:coarse){
+  input:not([type=checkbox]):not([type=radio]):not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]),
+  textarea,.filters select,.form-group select,#search-input,.filter-select{font-size:16px}
+}
 `;
 }
 
