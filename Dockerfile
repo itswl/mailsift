@@ -17,8 +17,9 @@ RUN npm prune --omit=dev && npm cache clean --force
 
 # ---- Runtime ----
 FROM node:22-alpine
+ARG MAILSIFT_VERSION=dev
 # node:sqlite is still experimental and would print a warning on every start.
-ENV NODE_ENV=production TZ=Asia/Shanghai NODE_OPTIONS=--disable-warning=ExperimentalWarning
+ENV NODE_ENV=production TZ=Asia/Shanghai NODE_OPTIONS=--disable-warning=ExperimentalWarning MAILSIFT_VERSION=$MAILSIFT_VERSION
 WORKDIR /app
 
 COPY package*.json ./

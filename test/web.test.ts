@@ -4,7 +4,7 @@ import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
 import {
   allowAuthAttempt, handleApi, LANGUAGE_COOKIE, languageFromHeader, readCookie, routeWeb, SESSION_COOKIE,
-  tokenMatches, webUiEnabled,
+  tokenMatches, webUiEnabled, webVersion,
 } from '../src/web.js';
 import { buildLink } from '../src/links.js';
 import { STRINGS, type StringKey } from '../src/web-strings.js';
@@ -47,6 +47,14 @@ const body = async (path: string, store: StateStore): Promise<Record<string, unk
 };
 
 describe('exposure', () => {
+  it('formats the configured version for the browser', () => {
+    expect(webVersion()).toBe('dev');
+    process.env.MAILSIFT_VERSION = '0.1.56';
+    expect(webVersion()).toBe('v0.1.56');
+    process.env.MAILSIFT_VERSION = 'v0.1.57';
+    expect(webVersion()).toBe('v0.1.57');
+  });
+
   it('is off unless explicitly enabled', () => {
     expect(webUiEnabled()).toBe(false);
     process.env.WEB_UI_ENABLED = 'true';
@@ -255,6 +263,14 @@ describe('read-only data', () => {
 });
 
 describe('rendering', () => {
+  it('shows the running version beside the brand', async () => {
+    process.env.MAILSIFT_VERSION = '0.1.56';
+    const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
+    expect(page).toContain('<strong>mailsift <span class="version">v0.1.56</span></strong>');
+    const login = String((await routeWeb(request(), url('/'), 'secret', seeded())).body);
+    expect(login).toContain('<h1>mailsift <span class="version">v0.1.56</span></h1>');
+  });
+
   it('builds every message value in the browser, never as server-side markup', async () => {
     // Subjects and sender names are attacker-controlled. The shell must carry
     // no message data at all, so there is nothing to escape wrongly.
@@ -369,6 +385,11 @@ describe('layout', () => {
   it('keeps a definition value inside its own grid column', async () => {
     // dd carries a 40px inline start margin by default.
     expect(String((await routeWeb(request(), url('/'), '', seeded())).body)).toContain('.detail dd{margin:0}');
+  });
+
+  it('styles the version as quiet supporting text', async () => {
+    const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
+    expect(page).toContain('.version{color:var(--muted);font-size:11px;font-weight:400;white-space:nowrap}');
   });
 
   it('keeps both header switches on the first row of a phone', async () => {
