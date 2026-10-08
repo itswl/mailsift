@@ -266,13 +266,14 @@ export function renderLogin(lang: Language, error?: StringKey): string {
   // not posted a second time.
   return page(lang, s('login.title'), `
     <form method="post" action="/auth" class="card login">
-      <h1>mailsift <span class="version">${escapeHtml(webVersion())}</span></h1>
+      <h1>mailsift</h1>
       <p class="muted">${s('login.intro')}</p>
       <input type="text" name="user" value="mailsift" autocomplete="username" readonly aria-label="${s('login.account')}">
       <input type="password" name="token" autocomplete="current-password" placeholder="${s('login.token')}" autofocus>
       <button type="submit">${s('login.open')}</button>
       ${error ? '<p class="error">' + s(error) + '</p>' : ''}
       <button type="button" id="lang" class="lang" aria-label="${s('lang.label')}">${s('lang.face')}</button>
+      <p class="version">${escapeHtml(webVersion())}</p>
     </form>
     <script>${storeLanguageScript()}
     document.querySelector('#lang').onclick = () => { storeLanguage('${nextLanguage(lang)}'); location.replace('/'); };</script>`);
@@ -306,7 +307,7 @@ export function renderApp(lang: Language): string {
   const option = (value: string, key: StringKey): string => worded('option', key, `value="${value}"`);
   return page(lang, 'mailsift', `
     <header class="bar">
-      <strong>mailsift <span class="version">${escapeHtml(webVersion())}</span></strong>
+      <strong>mailsift</strong>
       <span id="totals" class="muted"></span>
       <button id="lang" type="button" class="switch" aria-label="${s('lang.label')}">${s('lang.face')}</button>
       <button id="theme" type="button" class="switch" aria-label="${s('theme.title')}"></button>
@@ -330,6 +331,7 @@ export function renderApp(lang: Language): string {
     </form>
     <main id="list" aria-live="polite"></main>
     <section id="digest" class="card">${worded('h2', 'digest.title')}<pre id="digest-body"></pre></section>
+    <footer class="version">${escapeHtml(webVersion())}</footer>
     <script>` + clientScript() + `</script>`);
 }
 
@@ -388,6 +390,7 @@ header.bar{position:sticky;top:0;z-index:2;background:var(--bg)}
 /* A finger needs a bigger target than a mouse does. */
 @media(pointer:coarse){.filters select,.filters input{min-height:38px}.row{padding:14px}}
 .bar strong{font-size:16px}.version{color:var(--muted);font-size:11px;font-weight:400;white-space:nowrap}
+footer.version{text-align:center;padding:12px 14px 20px}.login .version{text-align:center;margin:14px 0 0}
 .filters select,.filters input:not([type=checkbox]){background:var(--bg);color:var(--fg);
 border:1px solid var(--line);border-radius:7px;padding:6px 8px;font:inherit}
 .filters input[type=search]{flex:1;min-width:160px}

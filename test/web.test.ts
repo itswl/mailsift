@@ -263,12 +263,14 @@ describe('read-only data', () => {
 });
 
 describe('rendering', () => {
-  it('shows the running version beside the brand', async () => {
+  it('shows the running version at the bottom of each page', async () => {
     process.env.MAILSIFT_VERSION = '0.1.56';
     const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
-    expect(page).toContain('<strong>mailsift <span class="version">v0.1.56</span></strong>');
+    expect(page).toContain('<strong>mailsift</strong>');
+    expect(page).toContain('<footer class="version">v0.1.56</footer>');
     const login = String((await routeWeb(request(), url('/'), 'secret', seeded())).body);
-    expect(login).toContain('<h1>mailsift <span class="version">v0.1.56</span></h1>');
+    expect(login).toContain('<h1>mailsift</h1>');
+    expect(login).toContain('<p class="version">v0.1.56</p>');
   });
 
   it('builds every message value in the browser, never as server-side markup', async () => {
@@ -387,9 +389,11 @@ describe('layout', () => {
     expect(String((await routeWeb(request(), url('/'), '', seeded())).body)).toContain('.detail dd{margin:0}');
   });
 
-  it('styles the version as quiet supporting text', async () => {
+  it('styles the version as quiet supporting text at the bottom', async () => {
     const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
     expect(page).toContain('.version{color:var(--muted);font-size:11px;font-weight:400;white-space:nowrap}');
+    expect(page).toContain('footer.version{text-align:center;padding:12px 14px 20px}');
+    expect(page).toContain('.login .version{text-align:center;margin:14px 0 0}');
   });
 
   it('keeps both header switches on the first row of a phone', async () => {
