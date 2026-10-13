@@ -49,6 +49,8 @@ const en = {
   'notified': 'notified',
 
   'empty': 'Nothing matches these filters.',
+  'loadMore': 'Load more',
+  'loadingMore': 'Loading more…',
   'unknownSender': 'unknown',
   'noSubject': '(no subject)',
   'digest.title': 'Waiting for the next digest',
@@ -143,6 +145,8 @@ const zhCN: Record<StringKey, string> = {
   'notified': '已推送',
 
   'empty': '没有符合这些筛选条件的邮件。',
+  'loadMore': '加载更多',
+  'loadingMore': '正在加载…',
   'unknownSender': '未知发件人',
   'noSubject': '（无主题）',
   'digest.title': '下一期摘要预览',

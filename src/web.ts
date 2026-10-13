@@ -164,6 +164,26 @@ function boolParam(params: URLSearchParams, name: string): boolean {
   return params.get(name) === 'true';
 }
 
+interface MailCursor {
+  createdAt: string;
+  dedupKey: string;
+}
+
+function encodeMailCursor(row: MailCursor): string {
+  return Buffer.from(JSON.stringify(row), 'utf8').toString('base64url');
+}
+
+function decodeMailCursor(raw: string | null): MailCursor | undefined {
+  if (!raw || raw.length > 1024) return undefined;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Partial<MailCursor>;
+    if (typeof parsed.createdAt !== 'string' || typeof parsed.dedupKey !== 'string') return undefined;
+    return { createdAt: parsed.createdAt, dedupKey: parsed.dedupKey };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Answer one API path.
  *
@@ -180,7 +200,9 @@ export async function handleApi(
     const importance = params.get('importance')?.trim();
     const category = params.get('category')?.trim();
     const account = params.get('account')?.trim();
-    const mail = store.queryMail({
+    const limit = intParam(params, 'limit', 100, 199);
+    const cursor = decodeMailCursor(params.get('cursor'));
+    const rows = store.queryMail({
       sinceHours: intParam(params, 'hours', 24, 24 * 90),
       ...(importance ? { importance } : {}),
       ...(category ? { category } : {}),
@@ -188,8 +210,13 @@ export async function handleApi(
       ...(search ? { search } : {}),
       spamOnly: boolParam(params, 'spamOnly'),
       pushedOnly: boolParam(params, 'pushedOnly'),
-      limit: intParam(params, 'limit', 50, 200),
+      ...(cursor ? { beforeCreatedAt: cursor.createdAt, beforeDedupKey: cursor.dedupKey } : {}),
+      // Read one extra row to know whether the page needs a continuation cursor.
+      limit: limit + 1,
     });
+    const hasMore = rows.length > limit;
+    const mail = hasMore ? rows.slice(0, limit) : rows;
+    const nextCursor = hasMore && mail.at(-1) ? encodeMailCursor(mail.at(-1)!) : undefined;
     return json(200, {
       count: mail.length,
       mail: mail.map((row) => {
@@ -197,6 +224,7 @@ export async function handleApi(
         // The provider travels with the link so the browser can word it in its own language.
         return { ...row, provider, link: buildLink(provider, row.account, row.messageId ?? '') };
       }),
+      ...(nextCursor ? { nextCursor } : {}),
     });
   }
 
@@ -410,6 +438,9 @@ padding:11px 14px;color:inherit;font:inherit;cursor:pointer}
    long run in a subject or an address cannot do it either. */
 .row,.detail,.card{overflow-wrap:anywhere;min-width:0}
 .row .meta{margin-top:3px;display:flex;gap:6px;flex-wrap:wrap}
+.load-more{display:block;margin:14px auto;padding:8px 16px;border:1px solid var(--line);
+border-radius:8px;background:var(--card);color:var(--fg);font:inherit;cursor:pointer}
+.load-more:disabled{opacity:.6;cursor:wait}
 .dot{width:8px;height:8px;border-radius:50%;flex:none;align-self:center}
 .critical{background:var(--critical)}.warning{background:var(--warning)}.info{background:var(--info)}
 .chip{font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:1px 7px}
@@ -460,6 +491,7 @@ function clientScript(): string {
 const $ = (s) => document.querySelector(s);
 const list = $('#list'), filters = $('#filters');
 let open = null;
+const MAIL_PAGE_SIZE = 100;
 
 // Every language travels with the page, so the switch needs no round trip.
 const LANGUAGES = ${JSON.stringify(LANGUAGES)};
@@ -571,6 +603,15 @@ function rowOf(m) {
 // The last answers are kept so a language switch can reword the page from
 // them instead of asking the server again.
 let lastMail = null, lastSummary = null, lastDigest = null;
+let nextCursor = null, loadingMail = false, mailRequestId = 0;
+
+function mergeMail(existing, incoming) {
+  const byKey = new Map();
+  for (const row of existing.concat(incoming)) byKey.set(row.dedupKey || row.messageId, row);
+  return Array.from(byKey.values()).sort((a, b) =>
+    (b.createdAt || '').localeCompare(a.createdAt || '') ||
+    (b.dedupKey || '').localeCompare(a.dedupKey || ''));
+}
 
 function render() {
   if (!lastMail) return;
@@ -578,13 +619,57 @@ function render() {
   open = null;
   if (!lastMail.length) { list.appendChild(el('p', 'card muted', t('empty'))); return; }
   for (const m of lastMail) list.appendChild(rowOf(m));
+  if (nextCursor) {
+    const more = el('button', 'load-more', loadingMail ? t('loadingMore') : t('loadMore'));
+    more.type = 'button';
+    more.disabled = loadingMail;
+    more.onclick = () => load(false);
+    list.appendChild(more);
+  }
 }
 
-async function load() {
-  const r = await fetch('/api/mail?' + query().toString());
-  if (r.status === 401) { location.reload(); return; }
-  lastMail = (await r.json()).mail;
+async function load(reset = true) {
+  if (loadingMail && !reset) return;
+  const cursor = reset ? null : nextCursor;
+  if (!reset && !cursor) return;
+  const requestId = ++mailRequestId;
+  const p = query();
+  p.set('limit', String(MAIL_PAGE_SIZE));
+  if (cursor) p.set('cursor', cursor);
+  loadingMail = true;
   render();
+  try {
+    const r = await fetch('/api/mail?' + p.toString());
+    if (r.status === 401) { location.reload(); return; }
+    const data = await r.json();
+    if (requestId !== mailRequestId) return;
+    const page = Array.isArray(data.mail) ? data.mail : [];
+    lastMail = reset ? page : mergeMail(lastMail || [], page);
+    nextCursor = data.nextCursor || null;
+  } finally {
+    if (requestId === mailRequestId) { loadingMail = false; render(); }
+  }
+}
+
+async function refresh() {
+  if (loadingMail) return;
+  if (!lastMail || lastMail.length <= MAIL_PAGE_SIZE) return load(true);
+  const requestId = ++mailRequestId;
+  const previousCursor = nextCursor;
+  const p = query();
+  p.set('limit', String(MAIL_PAGE_SIZE));
+  loadingMail = true;
+  render();
+  try {
+    const r = await fetch('/api/mail?' + p.toString());
+    if (r.status === 401) { location.reload(); return; }
+    const data = await r.json();
+    if (requestId !== mailRequestId) return;
+    lastMail = mergeMail(lastMail || [], Array.isArray(data.mail) ? data.mail : []);
+    nextCursor = previousCursor;
+  } finally {
+    if (requestId === mailRequestId) { loadingMail = false; render(); }
+  }
 }
 
 function renderChrome() {
@@ -677,8 +762,8 @@ filters.addEventListener('input', () => {
   timer = setTimeout(() => { load(); chrome(); }, 250);
 });
 load(); chrome();
-setInterval(() => { if (!document.hidden) { load(); chrome(); } }, 60000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { load(); chrome(); } });
+setInterval(() => { if (!document.hidden) { refresh(); chrome(); } }, 60000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { refresh(); chrome(); } });
 `;
 }
 
