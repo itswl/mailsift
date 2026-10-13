@@ -170,7 +170,9 @@ interface MailCursor {
 }
 
 function encodeMailCursor(row: MailCursor): string {
-  return Buffer.from(JSON.stringify(row), 'utf8').toString('base64url');
+  // Keep the cursor small and opaque: never put subject, sender or summary
+  // fields into a URL just because the row object happens to contain them.
+  return Buffer.from(JSON.stringify({ createdAt: row.createdAt, dedupKey: row.dedupKey }), 'utf8').toString('base64url');
 }
 
 function decodeMailCursor(raw: string | null): MailCursor | undefined {
@@ -216,7 +218,9 @@ export async function handleApi(
     });
     const hasMore = rows.length > limit;
     const mail = hasMore ? rows.slice(0, limit) : rows;
-    const nextCursor = hasMore && mail.at(-1) ? encodeMailCursor(mail.at(-1)!) : undefined;
+    const nextCursor = hasMore && mail.at(-1)
+      ? encodeMailCursor({ createdAt: mail.at(-1)!.createdAt, dedupKey: mail.at(-1)!.dedupKey })
+      : undefined;
     return json(200, {
       count: mail.length,
       mail: mail.map((row) => {
