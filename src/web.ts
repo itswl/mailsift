@@ -558,11 +558,10 @@ function detail(row) {
   if (row.summary) box.appendChild(el('pre', null, row.summary));
 
   const actions = el('div', 'actions');
-  if (row.link && row.link.url) {
+  if (row.link && row.link.url && row.link.exact) {
     const a = el('a', null, linkLabel(row));
     a.href = row.link.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
     actions.appendChild(a);
-    if (!row.link.exact) actions.appendChild(el('span', 'muted', t('detail.providerHomeHint')));
   }
   const full = el('button', null, t('detail.load'));
   full.type = 'button';

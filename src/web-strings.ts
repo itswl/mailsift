@@ -66,7 +66,6 @@ const en = {
   'detail.retry': 'Retry loading',
   'detail.noBody': '(this message has no text body)',
   'detail.failed': 'failed',
-  'detail.providerHomeHint': 'This opens the mailbox home; the provider cannot locate this exact message. The message body will appear here.',
   'detail.networkFailed': 'The mailbox could not be reached. Try again.',
   // Worded from the code the API sends with a live-read failure.
   'error.unconfigured': 'This mailbox is no longer configured.',
@@ -165,7 +164,6 @@ const zhCN: Record<StringKey, string> = {
   'detail.retry': '重新加载邮件',
   'detail.noBody': '（这封邮件没有文本正文）',
   'detail.failed': '读取失败',
-  'detail.providerHomeHint': '此按钮只能打开邮箱主页，无法直接定位这封邮件；正文会显示在当前页面。',
   'detail.networkFailed': '暂时无法连接邮箱，请重试。',
   'error.unconfigured': '这个邮箱已不在配置中。',
   'error.timeout': '邮箱没有及时返回这封邮件。',
