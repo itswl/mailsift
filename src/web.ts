@@ -562,19 +562,32 @@ function detail(row) {
     const a = el('a', null, linkLabel(row));
     a.href = row.link.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
     actions.appendChild(a);
+    if (!row.link.exact) actions.appendChild(el('span', 'muted', t('detail.providerHomeHint')));
   }
   const full = el('button', null, t('detail.load'));
+  full.type = 'button';
+  const liveBody = el('pre', 'live-body');
+  liveBody.setAttribute('aria-live', 'polite');
   full.onclick = async () => {
     full.disabled = true; full.textContent = t('detail.loading');
+    if (!liveBody.isConnected) box.appendChild(liveBody);
+    liveBody.textContent = t('detail.loading');
     try {
       const r = await fetch('/api/message?live=true&id=' + encodeURIComponent(row.messageId || row.dedupKey));
       const d = await r.json();
-      const pre = el('pre', null, r.ok ? (d.body || t('detail.noBody')) : failure(d));
-      box.appendChild(pre);
-      full.remove();
+      if (r.ok) {
+        liveBody.textContent = d.body || t('detail.noBody');
+        full.remove();
+      } else {
+        liveBody.textContent = failure(d);
+        full.disabled = false; full.textContent = t('detail.retry');
+      }
     } catch (e) {
       full.disabled = false; full.textContent = t('detail.load');
+      liveBody.textContent = t('detail.networkFailed');
     }
+    // Growing the body must not make the reader lose the message card on a phone.
+    box.scrollIntoView({ block: 'nearest' });
   };
   actions.appendChild(full);
   box.appendChild(actions);
