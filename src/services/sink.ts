@@ -4,7 +4,7 @@
  * The webhook authentication uses a token header. Its signature modes sign
  * different payloads, so one header cannot satisfy both replay protection checks.
  */
-import { snippet, type MailMessage } from '../imap/message.js';
+import { isSensitiveVerificationMessage, snippet, type MailMessage } from '../imap/message.js';
 import { FeishuSink, type PushOutcome, type Sink } from './feishu.js';
 import type { TriageResult } from './triage.js';
 import { buildMailSignalEvent } from './signal.js';
@@ -61,6 +61,7 @@ export function usesLegacyWebhookNames(): boolean {
  */
 export function buildWebhookPayload(message: MailMessage, result: TriageResult): Record<string, unknown> {
   const isDigest = Boolean(message.extra?.['digest']);
+  const sensitiveVerification = Boolean(result.sensitiveVerification || isSensitiveVerificationMessage(message));
   return {
     signal: buildMailSignalEvent(message, result),
     mail: {
@@ -69,22 +70,24 @@ export function buildWebhookPayload(message: MailMessage, result: TriageResult):
       folder: message.folder,
       in_spam: message.inSpam,
       message_id: message.messageId,
-      subject: message.subject || '(no subject)',
+      subject: sensitiveVerification ? '验证码邮件' : message.subject || '(no subject)',
       from: message.fromAddr,
       from_name: message.fromName,
       date: message.date,
-      snippet: isDigest ? message.body.slice(0, MAX_DIGEST_BODY) : snippet(message).slice(0, MAX_SNIPPET),
+      snippet: sensitiveVerification
+        ? ''
+        : isDigest ? message.body.slice(0, MAX_DIGEST_BODY) : snippet(message).slice(0, MAX_SNIPPET),
       has_attachments: message.hasAttachments,
       is_bulk: message.listUnsubscribe,
     },
     triage: {
       importance: result.importance,
       score: result.score,
-      summary: result.summary,
-      reason: result.reason,
-      deadline: result.deadline,
-      category: result.category,
-      action_required: result.actionRequired,
+      summary: sensitiveVerification ? '收到验证码邮件。' : result.summary,
+      reason: sensitiveVerification ? '验证码邮件内容已在本地隐藏。' : result.reason,
+      deadline: sensitiveVerification ? '' : result.deadline,
+      category: sensitiveVerification ? 'Security' : result.category,
+      action_required: sensitiveVerification ? true : result.actionRequired,
       decided_by: result.decidedBy,
     },
   };

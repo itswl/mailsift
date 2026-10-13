@@ -4,7 +4,7 @@
  * The digest is the main review surface on a phone, so each line shows a summary
  * instead of a subject. Subjects often omit the useful context.
  */
-import type { MailMessage } from '../imap/message.js';
+import { isSensitiveVerificationMessage, type MailMessage } from '../imap/message.js';
 import { headline, type TriageResult } from './triage.js';
 import type { Sink } from './sink.js';
 import type { StateStore } from './state.js';
@@ -60,18 +60,19 @@ export interface DigestItem {
 }
 
 export function toDigestItem(message: MailMessage, result: TriageResult): DigestItem {
+  const sensitiveVerification = Boolean(result.sensitiveVerification || isSensitiveVerificationMessage(message));
   return {
     accountLabel: message.accountLabel,
     folder: message.folder,
     inSpam: message.inSpam,
-    subject: message.subject || '(no subject)',
+    subject: sensitiveVerification ? '验证码邮件' : message.subject || '(no subject)',
     from: message.fromAddr,
     fromName: message.fromName,
     importance: result.importance,
-    category: result.category,
-    summary: headline(result),
-    deadline: result.deadline,
-    actionRequired: result.actionRequired,
+    category: sensitiveVerification ? 'Security' : result.category,
+    summary: sensitiveVerification ? '收到验证码邮件。' : headline(result),
+    deadline: sensitiveVerification ? '' : result.deadline,
+    actionRequired: sensitiveVerification ? true : result.actionRequired,
     ...(message.threadKey ? { threadKey: message.threadKey } : {}),
     threadCount: 1,
     date: message.date,

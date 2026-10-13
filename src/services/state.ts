@@ -416,9 +416,32 @@ export class StateStore {
   }
 
   markNotificationDelivered(notificationKey: string): void {
-    this.db.prepare(
-      'UPDATE notification_outbox SET delivered_at = ?, last_error = NULL WHERE notification_key = ?',
-    ).run(now(), notificationKey);
+    const row = this.db.prepare(
+      'SELECT payload FROM notification_outbox WHERE notification_key = ?',
+    ).get(notificationKey) as Record<string, unknown> | undefined;
+    let payload = row ? String(row['payload']) : undefined;
+    if (payload) {
+      try {
+        const parsed = JSON.parse(payload) as {
+          result?: { sensitiveVerification?: boolean; verificationCode?: string };
+        };
+        if (parsed.result?.sensitiveVerification && parsed.result.verificationCode) {
+          delete parsed.result.verificationCode;
+          payload = JSON.stringify(parsed);
+        }
+      } catch {
+        // Delivery state must still be recorded if an older or corrupt payload cannot be parsed.
+      }
+    }
+    if (payload !== undefined) {
+      this.db.prepare(
+        'UPDATE notification_outbox SET delivered_at = ?, last_error = NULL, payload = ? WHERE notification_key = ?',
+      ).run(now(), payload, notificationKey);
+    } else {
+      this.db.prepare(
+        'UPDATE notification_outbox SET delivered_at = ?, last_error = NULL WHERE notification_key = ?',
+      ).run(now(), notificationKey);
+    }
   }
 
   /**

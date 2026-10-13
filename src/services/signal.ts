@@ -1,4 +1,4 @@
-import { dedupKey, type MailMessage } from '../imap/message.js';
+import { dedupKey, isSensitiveVerificationMessage, type MailMessage } from '../imap/message.js';
 import { headline, type TriageResult } from './triage.js';
 
 /**
@@ -36,14 +36,15 @@ export interface MailSignalEvent {
 }
 
 export function buildMailSignalEvent(message: MailMessage, result: TriageResult): MailSignalEvent {
+  const sensitiveVerification = Boolean(result.sensitiveVerification || isSensitiveVerificationMessage(message));
   return {
     schema: 'signal.v1',
     source: 'mailsift',
     type: 'email.received',
     source_event_id: message.messageId,
     occurred_at: message.date,
-    title: message.subject || '(no subject)',
-    summary: headline(result),
+    title: sensitiveVerification ? '验证码邮件' : message.subject || '(no subject)',
+    summary: sensitiveVerification ? '收到验证码邮件。' : headline(result),
     priority: result.importance,
     dedup_key: dedupKey(message),
     evidence_ref: {

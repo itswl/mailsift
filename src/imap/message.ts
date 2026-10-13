@@ -26,6 +26,70 @@ export interface MailMessage {
   extra?: Record<string, unknown>;
 }
 
+/** Phrases that identify a verification-code email without sending it to an LLM. */
+export const SENSITIVE_LOCAL_KEYWORDS = [
+  '验证码', '驗證碼', '动态密码', '動態密碼', '一次性密码', '一次性密碼',
+  '身份验证码', '身份驗證碼', '安全码', '安全碼', '登录码', '登入碼',
+  '校验码', '校驗碼', '认证码', '認證碼',
+  'verification code', 'verify code', 'one-time password', 'one time password',
+  'one-time code', 'one time code', 'authentication code', 'auth code',
+  'security code', 'sign-in code', 'sign in code', 'log-in code', 'log in code',
+  'login code', 'passcode', 'confirmation code', 'code to sign in', 'code to log in',
+  'code to verify', 'code for sign-in', 'code for login', 'otp',
+] as const;
+
+export function containsSensitiveVerificationContent(subject: string, body: string): boolean {
+  const haystack = `${subject}\n${body}`.toLowerCase();
+  return SENSITIVE_LOCAL_KEYWORDS.some((keyword) => haystack.includes(keyword.toLowerCase()));
+}
+
+/** Extract a code only when a nearby label identifies it as an authentication code. */
+export function extractVerificationCode(subject: string, body: string): string | undefined {
+  const text = `${subject}\n${body}`;
+  if (!containsSensitiveVerificationContent(subject, body)) return undefined;
+
+  const token = '([A-Z0-9]{4,12})';
+  const patterns = [
+    new RegExp(
+      String.raw`(?:verification|verify|confirmation|authentication|auth|security|login|log[ -]?in|sign[ -]?in|one[ -]?time(?:[ -]?password)?|passcode|otp)(?:\s+(?:code|password|passcode|number))?\s*(?:is\b\s*[:：=]?\s*|[:：=]\s*|(?:为|是)\s*[:：=]?\s*)${token}(?![A-Z0-9])`,
+      'i',
+    ),
+    new RegExp(
+      String.raw`(?:verification|verify|confirmation|authentication|auth|security|login|log[ -]?in|sign[ -]?in|one[ -]?time(?:[ -]?password)?|passcode|otp)(?:\s+(?:code|password|passcode|number))?\s+${token}(?![A-Z0-9])`,
+      'i',
+    ),
+    new RegExp(String.raw`(?:your\s+)?(?:code|passcode|password)\s*(?:is\s+|[:：=]\s*)${token}(?![A-Z0-9])`, 'i'),
+    new RegExp(
+      String.raw`(?:验证码|驗證碼|动态密码|動態密碼|一次性密码|一次性密碼|身份验证码|身份驗證碼|安全码|安全碼|登录码|登入碼|校验码|校驗碼|认证码|認證碼)\s*(?:(?:为|是)\s*[:：=]?\s*|[:：=]\s*)?${token}(?![A-Z0-9])`,
+      'i',
+    ),
+    new RegExp(String.raw`\b(?:use|enter|type|input)\s+${token}\s+(?:to\s+)?(?:verify|authenticate|sign[ -]?in|log[ -]?in)\b`, 'i'),
+    new RegExp(
+      String.raw`\b(?:use|enter|type|input)\s+(?:this|the|following)\s+(?:code|passcode)\s+to\s+(?:verify|authenticate|sign[ -]?in|log[ -]?in)\s*[:：=]?\s*${token}(?![A-Z0-9])`,
+      'i',
+    ),
+    new RegExp(
+      String.raw`\b(?:use|enter|type|input)\s+(?:this|the|following)\s+(?:\d[ -]?digit\s+)?(?:verification\s+)?(?:code|passcode)\s+(?:to\s+(?:verify|authenticate|sign[ -]?in|log[ -]?in)\s*)?[:：=]\s*${token}(?![A-Z0-9])`,
+      'i',
+    ),
+    new RegExp(
+      String.raw`\b(?:sign[ -]?in|log[ -]?in|verify|authenticate)[^.!?\n]{0,50}\b(?:use|enter|type|input)\s+(?:this|the|following)\s+(?:\d[ -]?digit\s+)?(?:verification\s+)?(?:code|passcode)\s*[:：=]\s*${token}(?![A-Z0-9])`,
+      'i',
+    ),
+  ];
+
+  for (const pattern of patterns) {
+    const candidate = pattern.exec(text)?.[1];
+    // Requiring a digit avoids mistaking words such as "expires" for a code.
+    if (candidate && /\d/.test(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+export function isSensitiveVerificationMessage(message: Pick<MailMessage, 'subject' | 'body'>): boolean {
+  return containsSensitiveVerificationContent(message.subject, message.body);
+}
+
 const HTML_TAG = /<[^>]+>/g;
 const STYLE_BLOCK = /<(script|style)[^>]*>[\s\S]*?<\/\1>/gi;
 const WHITESPACE = /\s+/g;
@@ -65,6 +129,7 @@ export function htmlToText(html: string): string {
 }
 
 export function snippet(message: MailMessage): string {
+  if (isSensitiveVerificationMessage(message)) return '验证码邮件（正文已隐藏）';
   return message.body.slice(0, SNIPPET_CHARS);
 }
 

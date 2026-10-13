@@ -301,11 +301,14 @@ export class Watcher {
         importance: result.importance,
         decided_by: result.decidedBy,
       });
+      const safeMessage = result.sensitiveVerification
+        ? { ...message, subject: '验证码邮件', body: '' }
+        : message;
       // Create the seen row before the outcome. An interruption before completion
       // leaves the message eligible for the next poll.
       const key = dedupKey(message);
-      this.state.markSeen(key, message.account, message.subject);
-      const fields = this.outcomeFields(message, result);
+      this.state.markSeen(key, safeMessage.account, safeMessage.subject);
+      const fields = this.outcomeFields(safeMessage, result);
 
       // A copy forwarded in from another monitored mailbox is never notified,
       // whatever the thresholds say. The guard used to sit only on the
@@ -317,9 +320,9 @@ export class Watcher {
         // outbox is at-least-once: a crash after provider acceptance and before
         // the delivered mark can still duplicate a notification, so adapters
         // should use notificationKey for idempotency where supported.
-        const outboxMessage = { ...message, body: snippet(message) };
+        const outboxMessage = { ...safeMessage, body: snippet(safeMessage) };
         this.state.enqueueNotification(key, outboxMessage, result);
-        const outcome = await this.sink.push(message, result);
+        const outcome = await this.sink.push(safeMessage, result);
         if (outcome === 'delivered') {
           this.state.markNotificationDelivered(key);
           metrics.addCounter('mailsift.notifications.delivered', 1, { channel: 'realtime' });
@@ -329,16 +332,16 @@ export class Watcher {
           // No retry can change an output's own policy, so drop the queued copy
           // rather than leaving a notification that can never be delivered.
           this.state.dropNotification(key);
-          log.info(`Every output declined the message; queued for digest: ${message.subject}`);
+          log.info(`Every output declined the message; queued for digest: ${safeMessage.subject}`);
         } else {
           this.state.markNotificationFailed(key, 'sink delivery failed');
           metrics.addCounter('mailsift.notifications.failed', 1, { channel: 'realtime' });
-          log.warn(`Delivery failed; queued for digest: ${message.subject}`);
+          log.warn(`Delivery failed; queued for digest: ${safeMessage.subject}`);
         }
         this.state.recordOutcome(key, result.importance, outcome === 'delivered', fields);
         if (outcome === 'delivered') continue;
         // Undelivered and already marked seen, so the digest is its only route.
-        this.state.queueDigest(key, digest.toDigestItem(message, result));
+        this.state.queueDigest(key, digest.toDigestItem(safeMessage, result));
         stats.queued += 1;
         continue;
       }
@@ -352,7 +355,7 @@ export class Watcher {
       // Always include spam in the digest: it is the category most likely to hide
       // an important message.
       if (message.inSpam || rank(result) >= digestThreshold) {
-        this.state.queueDigest(key, digest.toDigestItem(message, result));
+        this.state.queueDigest(key, digest.toDigestItem(safeMessage, result));
         stats.queued += 1;
       }
     }

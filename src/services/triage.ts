@@ -8,8 +8,15 @@
  */
 import { z } from 'zod';
 import { IMPORTANCE, IMPORTANCE_RANK, type Importance, type Rules } from '../config.js';
-import { snippet, type MailMessage } from '../imap/message.js';
+import {
+  containsSensitiveVerificationContent,
+  extractVerificationCode,
+  snippet,
+  type MailMessage,
+} from '../imap/message.js';
 import { getLogger } from '../logger.js';
+
+export { SENSITIVE_LOCAL_KEYWORDS } from '../imap/message.js';
 
 const log = getLogger('triage');
 
@@ -30,12 +37,6 @@ export const FALLBACK_KEYWORDS = [
   'security alert', 'unusual sign', 'unauthorized', 'action required',
   'final notice', 'terminated', 'delivery failed', 'out for delivery',
   'appointment', 'boarding pass', 'flight change', 'refund', 'chargeback',
-] as const;
-
-/** Content that should be classified locally because sending it to an LLM is unnecessary risk. */
-export const SENSITIVE_LOCAL_KEYWORDS = [
-  '验证码', '驗證碼', '动态密码', '動態密碼', '一次性密码', '一次性密碼',
-  'verification code', 'one-time password', 'one time password', 'auth code', 'otp',
 ] as const;
 
 /**
@@ -75,6 +76,10 @@ export interface TriageResult {
   category: string;
   actionRequired: boolean;
   decidedBy: 'rule' | 'llm' | 'fallback' | 'health' | 'digest';
+  /** A locally detected authentication email; raw content stays out of summaries and snippets. */
+  sensitiveVerification?: boolean;
+  /** Kept only long enough for the Feishu notification and any pending retry. */
+  verificationCode?: string;
 }
 
 export function rank(result: TriageResult): number {
@@ -341,6 +346,10 @@ export function applyRules(message: MailMessage, rules: Rules): TriageResult | u
 
 /** Safe fallback when the LLM is unavailable. */
 export function keywordFallback(message: MailMessage, rules: Rules): TriageResult {
+  if (containsSensitiveContent(message)) {
+    return sensitiveVerificationResult(extractVerificationCode(message.subject, message.body));
+  }
+
   const haystack = `${message.subject}\n${snippet(message)}`.toLowerCase();
   const hits = [...rules.keywords, ...FALLBACK_KEYWORDS].filter(
     (kw) => kw && haystack.includes(kw.toLowerCase()),
@@ -363,9 +372,29 @@ export function keywordFallback(message: MailMessage, rules: Rules): TriageResul
   };
 }
 
+function sensitiveVerificationResult(
+  verificationCode: string | undefined,
+  base?: TriageResult,
+  ensurePush = false,
+): TriageResult {
+  return {
+    importance: ensurePush && base?.importance === 'info' ? 'warning' : base?.importance ?? 'warning',
+    score: ensurePush ? Math.max(base?.score ?? 0, 60) : base?.score ?? 60,
+    summary: verificationCode
+      ? '收到验证码邮件。'
+      : '收到验证码邮件，但未能自动提取验证码。',
+    reason: '验证码邮件在本地处理；LLM skipped，验证码内容不会发送给 LLM。',
+    deadline: '',
+    category: 'Security',
+    actionRequired: ensurePush || (base?.actionRequired ?? true),
+    decidedBy: base?.decidedBy ?? 'fallback',
+    sensitiveVerification: true,
+    ...(verificationCode ? { verificationCode } : {}),
+  };
+}
+
 export function containsSensitiveContent(message: MailMessage): boolean {
-  const haystack = `${message.subject}\n${snippet(message)}`.toLowerCase();
-  return SENSITIVE_LOCAL_KEYWORDS.some((keyword) => haystack.includes(keyword.toLowerCase()));
+  return containsSensitiveVerificationContent(message.subject, message.body);
 }
 
 /** Whether a copy forwarded in from another monitored mailbox should stay out of notifications. */
@@ -464,15 +493,18 @@ function requestBody(messages: MailMessage[], rules: Rules, jsonMode: boolean): 
   const safe = (value: string): string => redact ? redactForLlm(value) : value;
   const payload = {
     user_context: safe(rules.context) || '(no additional user context)',
-    emails: messages.map((m, index) => ({
-      index,
-      subject: safe(m.subject) || '(no subject)',
-      from: safe(`${m.fromName} <${m.fromAddr}>`).trim(),
-      in_spam: m.inSpam,
-      is_bulk: m.listUnsubscribe,
-      to_account: safe(m.account),
-      body: safe(m.body.slice(0, bodyChars)),
-    })),
+    emails: messages.map((m, index) => {
+      const sensitiveVerification = containsSensitiveContent(m);
+      return {
+        index,
+        subject: sensitiveVerification ? '验证码邮件（内容已隐藏）' : safe(m.subject) || '(no subject)',
+        from: safe(`${m.fromName} <${m.fromAddr}>`).trim(),
+        in_spam: m.inSpam,
+        is_bulk: m.listUnsubscribe,
+        to_account: safe(m.account),
+        body: sensitiveVerification ? '验证码邮件（内容已隐藏）' : safe(m.body.slice(0, bodyChars)),
+      };
+    }),
   };
   return {
     model: process.env.LLM_MODEL ?? 'deepseek-flash',
@@ -612,19 +644,25 @@ export async function triage(
   onLlmResult?: LlmResultCallback,
 ): Promise<Array<[MailMessage, TriageResult]>> {
   const decided = new Map<number, TriageResult>();
+  const sensitiveCodes = new Map<number, string | undefined>();
   const pending: Array<[number, MailMessage]> = [];
 
   messages.forEach((message, index) => {
+    const sensitiveVerification = containsSensitiveContent(message);
+    const verificationCode = sensitiveVerification
+      ? extractVerificationCode(message.subject, message.body)
+      : undefined;
     const ruled = applyRules(message, rules);
-    if (ruled) decided.set(index, ruled);
-    else if (skipSensitiveContent() && containsSensitiveContent(message)) {
-      const local = keywordFallback(message, rules);
-      decided.set(index, {
-        ...local,
-        reason: `Sensitive verification content stayed local; LLM skipped. ${local.reason}`,
-      });
+    if (ruled) {
+      decided.set(index, sensitiveVerification
+        ? sensitiveVerificationResult(verificationCode, ruled)
+        : ruled);
+    } else if (sensitiveVerification && skipSensitiveContent()) {
+      decided.set(index, sensitiveVerificationResult(verificationCode));
+    } else {
+      pending.push([index, message]);
+      if (sensitiveVerification) sensitiveCodes.set(index, verificationCode);
     }
-    else pending.push([index, message]);
   });
 
   const batchSize = Number(process.env.LLM_BATCH_SIZE ?? 10);
@@ -633,7 +671,11 @@ export async function triage(
     const outcomes = await classifyBatch(chunk.map(([, m]) => m), rules, onLlmResult);
     chunk.forEach(([index], position) => {
       const outcome = outcomes[position];
-      if (outcome) decided.set(index, outcome);
+      if (outcome) {
+        decided.set(index, sensitiveCodes.has(index)
+          ? sensitiveVerificationResult(sensitiveCodes.get(index), outcome, true)
+          : outcome);
+      }
     });
   }
 

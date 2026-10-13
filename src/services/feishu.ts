@@ -7,7 +7,12 @@
 import { createHmac } from 'node:crypto';
 import { IMPORTANCE_RANK, type Importance } from '../config.js';
 import { buildLink } from '../links.js';
-import { snippet, type MailMessage } from '../imap/message.js';
+import {
+  extractVerificationCode,
+  isSensitiveVerificationMessage,
+  snippet,
+  type MailMessage,
+} from '../imap/message.js';
 import { effectiveRank, headline, type TriageResult } from './triage.js';
 import { deliverWithRetry, isRetryableStatus, type RetryState } from './delivery.js';
 import { getLogger } from '../logger.js';
@@ -60,9 +65,11 @@ function formatDate(raw: string): string {
 
 export function buildCard(message: MailMessage, result: TriageResult): Record<string, unknown> {
   const isDigest = Boolean(message.extra?.['digest']);
+  const isSensitiveVerification = Boolean(result.sensitiveVerification || isSensitiveVerificationMessage(message));
+  const verificationCode = result.verificationCode ?? extractVerificationCode(message.subject, message.body);
   const template = TEMPLATE[result.importance] ?? 'grey';
 
-  if (isDigest) {
+  if (isDigest && !isSensitiveVerification) {
     return {
       msg_type: 'interactive',
       card: {
@@ -74,9 +81,18 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
   }
 
   const spamTag = message.inSpam ? '[Recovered from spam] ' : '';
-  const title = `${PREFIX[result.importance] ?? ''} ${spamTag}${message.subject}`.slice(0, 200);
+  const subject = isSensitiveVerification ? '验证码邮件' : message.subject;
+  const title = `${PREFIX[result.importance] ?? ''} ${spamTag}${subject}`.slice(0, 200);
 
-  const lines = [esc(headline(result))];
+  const lines = [isSensitiveVerification ? '收到验证码邮件。' : esc(headline(result))];
+  if (isSensitiveVerification) {
+    lines.push(
+      '',
+      verificationCode
+        ? `🔐 **验证码** \`${esc(verificationCode)}\``
+        : '未能自动提取验证码，请打开原邮件查看。',
+    );
+  }
   if (result.deadline) lines.push(`\n⏰ **Deadline** ${esc(result.deadline)}`);
   lines.push(
     '',
@@ -87,7 +103,7 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
     `**Category** ${result.category}${result.actionRequired ? ' · Action required' : ''}`,
   );
   if (message.hasAttachments) lines.push('**Attachments** available');
-  const body = snippet(message);
+  const body = isSensitiveVerification ? '' : snippet(message);
   if (body) lines.push('', '---', esc(body));
 
   const elements: Array<Record<string, unknown>> = [
