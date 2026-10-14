@@ -32,7 +32,7 @@ export const SENSITIVE_LOCAL_KEYWORDS = [
   '身份验证码', '身份驗證碼', '安全码', '安全碼', '登录码', '登入碼',
   '校验码', '校驗碼', '认证码', '認證碼',
   'verification code', 'verify code', 'one-time password', 'one time password',
-  'one-time code', 'one time code', 'authentication code', 'auth code',
+  'one-time code', 'one time code', 'authentication code', 'authorization code', 'auth code',
   'security code', 'sign-in code', 'sign in code', 'log-in code', 'log in code',
   'login code', 'passcode', 'confirmation code', 'code to sign in', 'code to log in',
   'code to verify', 'code for sign-in', 'code for login', 'otp',
@@ -51,16 +51,29 @@ export function extractVerificationCode(subject: string, body: string): string |
   const token = '([A-Z0-9]{4,12})';
   const patterns = [
     new RegExp(
-      String.raw`(?:verification|verify|confirmation|authentication|auth|security|login|log[ -]?in|sign[ -]?in|one[ -]?time(?:[ -]?password)?|passcode|otp)(?:\s+(?:code|password|passcode|number))?\s*(?:is\b\s*[:：=]?\s*|[:：=]\s*|(?:为|是)\s*[:：=]?\s*)${token}(?![A-Z0-9])`,
+      String.raw`^\s*${token}\s+is\s+your\b[^\n]{0,100}\b(?:verification|authentication|authorization)\s+code\b`,
       'i',
     ),
     new RegExp(
-      String.raw`(?:verification|verify|confirmation|authentication|auth|security|login|log[ -]?in|sign[ -]?in|one[ -]?time(?:[ -]?password)?|passcode|otp)(?:\s+(?:code|password|passcode|number))?\s+${token}(?![A-Z0-9])`,
+      String.raw`(?:verification|verify|confirmation|authentication|authorization|auth|security|login|log[ -]?in|sign[ -]?in|one[ -]?time(?:[ -]?password)?|passcode|otp)(?:\s+(?:code|password|passcode|number))?\s*(?:is\b\s*[:：=,，]?\s*|[:：=,，]\s*|(?:为|是)\s*[:：=]?\s*)${token}(?![A-Z0-9])`,
+      'i',
+    ),
+    new RegExp(
+      String.raw`(?:verification|verify|confirmation|authentication|authorization|auth|security|login|log[ -]?in|sign[ -]?in|one[ -]?time(?:[ -]?password)?|passcode|otp)(?:\s+(?:code|password|passcode|number))?\s+${token}(?![A-Z0-9])`,
       'i',
     ),
     new RegExp(String.raw`(?:your\s+)?(?:code|passcode|password)\s*(?:is\s+|[:：=]\s*)${token}(?![A-Z0-9])`, 'i'),
     new RegExp(
       String.raw`(?:验证码|驗證碼|动态密码|動態密碼|一次性密码|一次性密碼|身份验证码|身份驗證碼|安全码|安全碼|登录码|登入碼|校验码|校驗碼|认证码|認證碼)\s*(?:(?:为|是)\s*[:：=]?\s*|[:：=]\s*)?${token}(?![A-Z0-9])`,
+      'i',
+    ),
+    new RegExp(String.raw`(?:verification[_ -]?code|verificationCode)\s*[=:：]\s*${token}(?![A-Z0-9])`, 'i'),
+    new RegExp(
+      String.raw`(?:code challenge|one-time code challenge|enter the code below|enter this code)[\s\S]{0,240}?\b([0-9]{4,12})\b`,
+      'i',
+    ),
+    new RegExp(
+      String.raw`(?:验证码|驗證碼|verification code|authorization code)[\s\S]{0,100}?\b([0-9]{4,12})\b`,
       'i',
     ),
     new RegExp(String.raw`\b(?:use|enter|type|input)\s+${token}\s+(?:to\s+)?(?:verify|authenticate|sign[ -]?in|log[ -]?in)\b`, 'i'),
