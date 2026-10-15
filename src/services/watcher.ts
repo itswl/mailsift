@@ -6,7 +6,7 @@
  * wake-ups for a single folder.
  */
 import type { ImapFlow } from 'imapflow';
-import { IMPORTANCE_RANK, type Account, type Importance, type WatchConfig } from '../config.js';
+import { IMPORTANCE_RANK, type Account, type Importance, type Rules, type WatchConfig } from '../config.js';
 import {
   connect,
   fetchNew,
@@ -310,9 +310,9 @@ export class Watcher {
         // Policy, not a failure: every later retry would decline it too. Make
         // sure the digest really does carry it before dropping the only other
         // copy: a crash between enqueueNotification and queueDigest leaves a
-        // row whose message is marked seen and queued nowhere. queueDigest
-        // ignores a key that is already present.
-        this.state.queueDigest(entry.notificationKey, digest.toDigestItem(entry.message, entry.result));
+        // row whose message is marked seen and queued nowhere. upsertDigest
+        // also refreshes any digest copy to match the final notification.
+        this.state.upsertDigest(entry.notificationKey, digest.toDigestItem(entry.message, entry.result));
         this.state.dropNotification(entry.notificationKey);
         log.info(`Every output declines ${entry.notificationKey}; left to the digest.`);
       } else {
@@ -342,6 +342,114 @@ export class Watcher {
     };
   }
 
+  /** Revisit only fallback mail that is still waiting in the daily digest. */
+  private async retriageFallbackDigest(stats: PollStats, rules: Rules): Promise<void> {
+    const rows = this.state.fallbackDigestRows();
+    if (rows.length === 0) return;
+
+    const messages: MailMessage[] = rows.map((row) => {
+      const account = this.config.accounts.find((candidate) => candidate.username === row.account);
+      const body = row.snippet ?? '';
+      return {
+        account: row.account,
+        accountLabel: row.accountLabel ?? row.account,
+        provider: account?.provider ?? '',
+        folder: row.folder ?? '',
+        inSpam: row.inSpam,
+        uid: 0,
+        messageId: row.messageId ?? `<${row.dedupKey}>`,
+        ...(row.threadKey ? { threadKey: row.threadKey } : {}),
+        subject: row.subject ?? '',
+        fromAddr: row.sender ?? '',
+        fromName: row.senderName ?? '',
+        toAddrs: [],
+        date: row.mailDate ?? row.createdAt,
+        body,
+        hasAttachments: Boolean(row.attachmentManifest?.items.length),
+        ...(row.attachmentManifest ? { attachmentManifest: row.attachmentManifest } : {}),
+        // Recipients and List-Unsubscribe were not retained in local state.
+        listUnsubscribe: false,
+      };
+    });
+
+    const llmOutcomes: Array<unknown | null> = [];
+    const results = await triage(messages, rules, (error) => llmOutcomes.push(error));
+    for (const outcome of llmOutcomes) {
+      try {
+        if (outcome) await health.recordLlmFailure(this.state, this.sink, outcome);
+        else await health.recordLlmSuccess(this.state, this.sink);
+      } catch (error) {
+        log.error(`Failed to send LLM availability alert during recovery re-triage: ${error}`);
+      }
+    }
+
+    const pushLimit = pushThreshold();
+    const digestThreshold =
+      IMPORTANCE_RANK[(process.env.DIGEST_MIN_IMPORTANCE ?? 'info') as Importance] ?? 0;
+    for (const [index, [message, result]] of results.entries()) {
+      // A failed retry leaves the original fallback decision and digest entry
+      // untouched so a later recovery can try it again.
+      if (result.decidedBy === 'fallback') continue;
+
+      const key = rows[index]!.dedupKey;
+      const safeMessage = result.sensitiveVerification
+        ? { ...message, subject: '验证码邮件', body: '' }
+        : message;
+      const forwardedCopy = Boolean(isSelfForward(message, rules));
+      const shouldPush = !forwardedCopy && effectiveRank(message, result) >= pushLimit;
+      const fields = this.outcomeFields(safeMessage, result);
+
+      metrics.addCounter('mailsift.messages.triaged', 1, {
+        provider: message.provider,
+        importance: result.importance,
+        decided_by: result.decidedBy,
+      });
+
+      if (forwardedCopy) {
+        this.state.recordOutcome(key, result.importance, false, fields);
+        this.state.clearDigest([key]);
+        continue;
+      }
+
+      if (shouldPush) {
+        const outboxMessage = { ...safeMessage, body: snippet(safeMessage) };
+        this.state.enqueueNotification(key, outboxMessage, result);
+        const outcome = await this.sink.push(safeMessage, result);
+        if (outcome === 'delivered') {
+          this.state.markNotificationDelivered(key);
+          this.state.clearDigest([key]);
+          this.state.recordOutcome(key, result.importance, true, fields);
+          metrics.addCounter('mailsift.notifications.delivered', 1, { channel: 'recovery_retriage' });
+          stats.pushed += 1;
+          if (message.inSpam) stats.spamRescued += 1;
+        } else if (outcome === 'declined') {
+          this.state.dropNotification(key);
+          this.state.recordOutcome(key, result.importance, false, fields);
+          this.state.upsertDigest(key, digest.toDigestItem(safeMessage, result));
+          stats.queued += 1;
+          log.info(`Recovery push was declined; kept the updated digest entry: ${safeMessage.subject}`);
+        } else {
+          this.state.markNotificationFailed(key, 'sink delivery failed');
+          this.state.recordOutcome(key, result.importance, false, fields);
+          this.state.upsertDigest(key, digest.toDigestItem(safeMessage, result));
+          metrics.addCounter('mailsift.notifications.failed', 1, { channel: 'recovery_retriage' });
+          stats.queued += 1;
+          log.warn(`Recovery push failed; kept the updated digest entry: ${safeMessage.subject}`);
+        }
+        continue;
+      }
+
+      this.state.recordOutcome(key, result.importance, false, fields);
+      if (message.inSpam || rank(result) >= digestThreshold) {
+        this.state.upsertDigest(key, digest.toDigestItem(safeMessage, result));
+      } else {
+        this.state.clearDigest([key]);
+      }
+    }
+    const retriaged = results.filter(([, result]) => result.decidedBy !== 'fallback').length;
+    log.info(`Re-triaged ${retriaged}/${rows.length} fallback digest messages after LLM recovery.`);
+  }
+
   async dispatch(messages: MailMessage[], stats: PollStats): Promise<void> {
     if (messages.length === 0) return;
 
@@ -349,12 +457,9 @@ export class Watcher {
     const digestThreshold =
       IMPORTANCE_RANK[(process.env.DIGEST_MIN_IMPORTANCE ?? 'info') as Importance] ?? 0;
 
-    const onLlmResult = (error: unknown | null): void => {
-      const task = error
-        ? health.recordLlmFailure(this.state, this.sink, error)
-        : health.recordLlmSuccess(this.state, this.sink);
-      void task.catch((e) => log.error(`Failed to send LLM availability alert: ${e}`));
-    };
+    const wasUnavailable = Boolean(this.state.getMeta(health.LLM_FAIL_COUNT_KEY));
+    const llmOutcomes: Array<unknown | null> = [];
+    const onLlmResult = (error: unknown | null): void => { llmOutcomes.push(error); };
 
     const rules = this.triageRules();
     const threadContexts = this.triageThreadContexts(messages);
@@ -421,6 +526,21 @@ export class Watcher {
         this.state.queueDigest(key, digest.toDigestItem(safeMessage, result));
         stats.queued += 1;
       }
+    }
+
+    // Triage calls run sequentially, so replay their availability events in
+    // order after all of this batch's outcomes have been committed. A final
+    // successful call is the recovery boundary for the fallback digest sweep.
+    for (const outcome of llmOutcomes) {
+      try {
+        if (outcome) await health.recordLlmFailure(this.state, this.sink, outcome);
+        else await health.recordLlmSuccess(this.state, this.sink);
+      } catch (error) {
+        log.error(`Failed to send LLM availability alert: ${error}`);
+      }
+    }
+    if (wasUnavailable && llmOutcomes.length > 0 && llmOutcomes.at(-1) === null) {
+      await this.retriageFallbackDigest(stats, rules);
     }
   }
 

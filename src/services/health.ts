@@ -245,8 +245,8 @@ export async function recordLlmSuccess(state: StateStore, sink: Sink): Promise<b
   const sent = await deliver(sink,
     healthMessage(
       '✅ LLM recovered',
-      '**Triage is back to normal.**\n\nMessages queued during fallback are not re-triaged; ' +
-        'review that period\'s digest for anything important.',
+      '**Triage is back to normal.**\n\nFallback messages still waiting in the digest are being re-triaged. ' +
+        'Messages already delivered are left alone.',
       'llm-ok',
       String(Date.now()),
     ),

@@ -377,6 +377,24 @@ export class StateStore {
   }
 
   /**
+   * Fallback messages still waiting in the digest and without an active push
+   * retry. The digest join is the delivery boundary: messages already sent or
+   * removed from the queue are never reconsidered.
+   */
+  fallbackDigestRows(): MailRow[] {
+    const rows = this.db.prepare(
+      `SELECT s.* FROM seen s
+       JOIN digest_queue d ON d.dedup_key = s.dedup_key
+       LEFT JOIN notification_outbox n
+         ON n.notification_key = s.dedup_key AND n.delivered_at IS NULL
+       WHERE s.decided_by = 'fallback' AND s.snippet IS NOT NULL
+         AND n.notification_key IS NULL
+       ORDER BY d.created_at`,
+    ).all() as Array<Record<string, unknown>>;
+    return rows.map(toRow);
+  }
+
+  /**
    * Every folder cursor, newest write first.
    *
    * Answers how far each folder has been processed, which is the first thing
@@ -919,6 +937,14 @@ export class StateStore {
     this.db
       .prepare('INSERT OR IGNORE INTO digest_queue (dedup_key, payload, created_at) VALUES (?, ?, ?)')
       .run(dedupKey, JSON.stringify(payload), now());
+  }
+
+  /** Replace an existing digest payload while preserving its place in the queue. */
+  upsertDigest(dedupKey: string, payload: unknown): void {
+    this.db.prepare(
+      `INSERT INTO digest_queue (dedup_key, payload, created_at) VALUES (?, ?, ?)
+       ON CONFLICT(dedup_key) DO UPDATE SET payload = excluded.payload`,
+    ).run(dedupKey, JSON.stringify(payload), now());
   }
 
   digestPending(): number {
