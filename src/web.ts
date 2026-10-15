@@ -3,9 +3,9 @@
  *
  * A browser surface over what the poller already stored: what arrived, how it
  * was judged and why. It does not open, alter or send mail. Every mailbox
- * operation in this service uses a read-only lock, and this view does not add
- * an exception; the one IMAP call it can make fetches a single body on demand
- * and persists nothing, exactly as the MCP resource already does.
+ * operation in this service uses a read-only lock. On demand it can fetch a
+ * single message body, selected MIME metadata, or one attachment, and persists
+ * nothing.
  *
  * It shares the MCP server's port and token, because it shares that trust
  * boundary: whoever can read triage results over JSON-RPC can read them here.
@@ -18,7 +18,7 @@ import { loadConfig } from './config.js';
 import { escapeHtml } from './html.js';
 import {
   AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
-  fetchAttachmentManifestByMessageId, fetchByMessageId,
+  fetchAttachmentManifestByMessageId, fetchByMessageId, inspectMailSafety,
 } from './imap/client.js';
 import { buildLink } from './links.js';
 import { renderDigest, type DigestItem } from './services/digest.js';
@@ -42,6 +42,7 @@ const LANGUAGE_MAX_AGE = 365 * 24 * 60 * 60;
 /** A live IMAP read can be slow on providers with poor search; do not hang a tab on it. */
 const LIVE_FETCH_TIMEOUT_MS = 25_000;
 const LIVE_ATTACHMENT_TIMEOUT_MS = 60_000;
+const LIVE_SAFETY_TIMEOUT_MS = 25_000;
 const LIVE_BODY_CHARS = 20_000;
 
 /**
@@ -367,6 +368,49 @@ async function handleAttachmentsApi(
   }
 }
 
+async function handleMailSafetyApi(
+  params: URLSearchParams,
+  store: StateStore,
+  client: string,
+): Promise<WebResponse> {
+  const id = params.get('id')?.trim();
+  if (!id) {
+    store.recordMcpAudit('web:inspect-mail-safety', client, false);
+    return json(400, { error: 'id is required' });
+  }
+  const stored = store.getMail(id);
+  if (!stored?.messageId) {
+    store.recordMcpAudit('web:inspect-mail-safety', client, false);
+    return json(404, { error: 'mail record not found', code: 'safetyNotFound' });
+  }
+  const account = loadConfig().accounts.find((candidate) => candidate.username === stored.account);
+  if (!account) {
+    store.recordMcpAudit('web:inspect-mail-safety', client, false);
+    return json(409, { error: 'mailbox is no longer configured', code: 'unconfigured' });
+  }
+
+  try {
+    const timeout = Symbol('mail safety lookup timeout');
+    const report = await Promise.race([
+      inspectMailSafety(account, stored.messageId),
+      new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_SAFETY_TIMEOUT_MS).unref()),
+    ]);
+    if (report === timeout) {
+      store.recordMcpAudit('web:inspect-mail-safety', client, false);
+      return json(504, { error: 'the mailbox did not return safety metadata in time', code: 'safetyTimeout' });
+    }
+    store.recordMcpAudit('web:inspect-mail-safety', client, Boolean(report));
+    if (!report) {
+      return json(404, { error: 'message not found in configured read-only folders', code: 'safetyNotFound' });
+    }
+    return json(200, report);
+  } catch (error) {
+    store.recordMcpAudit('web:inspect-mail-safety', client, false);
+    const detail = String(error).slice(0, 200);
+    return json(502, { error: 'mail safety inspection failed: ' + detail, code: 'safetyFailed', detail });
+  }
+}
+
 async function handleAttachmentApi(
   params: URLSearchParams,
   store: StateStore,
@@ -628,6 +672,14 @@ border:1px solid var(--line);background:var(--bg);color:var(--fg);text-decoratio
 .attachment-item a{overflow-wrap:anywhere}
 .attachment-meta{color:var(--muted);font-size:12px}
 .attachment-status{margin:6px 0 0;color:var(--muted);font-size:12px}
+.safety{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.safety h4{margin:0 0 6px;font-size:13px}
+.safety-findings{margin:6px 0;padding-left:20px;display:grid;gap:5px;font-size:13px}
+.safety-finding.warning,.safety-warning{color:var(--critical)}
+.safety-finding.caution{color:var(--warning)}
+.safety-finding.info{color:var(--muted)}
+.safety-meta,.safety-status{margin:4px 0 0;color:var(--muted);font-size:12px}
+.safety-warning{font-size:12px}
 .thread-history{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
 .thread-history h4{margin:0 0 8px;font-size:13px}
 .thread-message{display:grid;gap:2px;padding:8px 0;border-top:1px solid var(--line);font-size:13px}
@@ -720,6 +772,23 @@ function failure(d) {
     ? fill('error.' + d.code, { detail: d.detail || '', maxBytes: d.maxBytes ? sizeLabel(d.maxBytes) : '' })
     : (d.error || t('detail.failed'));
 }
+const SAFETY_FINDING_KEYS = {
+  spam_folder: 'safety.spamFolder',
+  bulk_headers: 'safety.bulkHeaders',
+  reply_to_domain_mismatch: 'safety.replyMismatch',
+  attachment_executable_or_installer: 'safety.executable',
+  attachment_script_or_shortcut: 'safety.script',
+  attachment_macro_enabled_document: 'safety.macro',
+  attachment_active_content: 'safety.activeContent',
+  attachment_archive_not_scanned: 'safety.archive',
+};
+const ATTACHMENT_WARNING_KEYS = {
+  executable_or_installer: 'safety.executable',
+  script_or_shortcut: 'safety.script',
+  macro_enabled_document: 'safety.macro',
+  active_content: 'safety.activeContent',
+  archive_not_scanned: 'safety.archive',
+};
 function sizeLabel(size) {
   if (typeof size !== 'number' || !Number.isFinite(size) || size < 0) return '';
   if (size < 1024) return size + ' B';
@@ -781,6 +850,12 @@ function renderAttachmentManifest(container, manifest, row) {
     const details = [item.contentType, sizeLabel(item.sizeBytes), item.inline ? t('detail.inline') : '']
       .filter(Boolean).join(' · ');
     if (details) entry.appendChild(el('span', 'attachment-meta', details));
+    if (Array.isArray(item.safetyWarnings)) {
+      for (const warning of item.safetyWarnings) {
+        const key = ATTACHMENT_WARNING_KEYS[warning];
+        if (key) entry.appendChild(el('span', 'safety-warning', t(key)));
+      }
+    }
     entry.appendChild(status);
     list.appendChild(entry);
   }
@@ -825,6 +900,78 @@ function attachmentSection(box, row) {
     content.appendChild(load);
     content.appendChild(status);
   }
+  section.appendChild(content);
+  box.appendChild(section);
+}
+
+function renderSafetyReport(container, report) {
+  container.replaceChildren();
+  const findings = Array.isArray(report.findings) ? report.findings : [];
+  if (!findings.length) {
+    container.appendChild(el('p', 'safety-status', t('safety.noClues')));
+  } else {
+    const list = el('ul', 'safety-findings');
+    for (const finding of findings) {
+      const severity = ['warning', 'caution', 'info'].includes(finding.severity) ? finding.severity : 'info';
+      const entry = el('li', 'safety-finding ' + severity);
+      const key = SAFETY_FINDING_KEYS[finding.code];
+      const headers = report.spamSignals && Array.isArray(report.spamSignals.bulkHeaders)
+        ? report.spamSignals.bulkHeaders.join(', ')
+        : '';
+      const label = finding.code === 'bulk_headers' && key
+        ? fill(key, { headers })
+        : (key ? t(key) : (finding.detail || ''));
+      entry.appendChild(el('span', null, label));
+      if (finding.attachment) {
+        entry.appendChild(el('div', 'safety-meta', fill('safety.attachment', { name: finding.attachment })));
+      }
+      if (finding.code === 'reply_to_domain_mismatch' && report.senderSignals) {
+        entry.appendChild(el('div', 'safety-meta', fill('safety.senderDomains', {
+          from: report.senderSignals.fromAddress || '',
+          replyTo: (report.senderSignals.replyToAddresses || []).join(', '),
+        })));
+      }
+      list.appendChild(entry);
+    }
+    container.appendChild(list);
+  }
+  if (report.attachmentsTruncated) {
+    container.appendChild(el('p', 'safety-status', t('safety.attachmentsTruncated')));
+  }
+  container.appendChild(el('p', 'safety-status', t('safety.limits')));
+}
+
+function safetySection(box, row) {
+  if (!row.messageId) return;
+  const section = el('section', 'safety');
+  section.appendChild(el('h4', null, t('safety.title')));
+  const content = el('div');
+  const load = el('button', null, t('safety.check'));
+  load.type = 'button';
+  const status = el('p', 'safety-status');
+  load.onclick = async () => {
+    load.disabled = true;
+    load.textContent = t('safety.checking');
+    status.textContent = '';
+    try {
+      const response = await fetch('/api/safety?id=' + encodeURIComponent(row.dedupKey || row.messageId));
+      const result = await response.json();
+      if (!response.ok) {
+        status.textContent = failure(result);
+        load.disabled = false;
+        load.textContent = t('safety.check');
+        return;
+      }
+      renderSafetyReport(content, result);
+      load.remove();
+    } catch {
+      status.textContent = t('detail.networkFailed');
+      load.disabled = false;
+      load.textContent = t('safety.check');
+    }
+  };
+  content.appendChild(load);
+  content.appendChild(status);
   section.appendChild(content);
   box.appendChild(section);
 }
@@ -876,6 +1023,7 @@ function detail(row) {
   };
   actions.appendChild(full);
   box.appendChild(actions);
+  safetySection(box, row);
   attachmentSection(box, row);
   return box;
 }
@@ -1261,6 +1409,11 @@ export async function routeWeb(
   }
   if (url.pathname === '/api/attachments' && req.method === 'GET') {
     const answer = await handleAttachmentsApi(url.searchParams, store, client);
+    answer.cacheControl = 'no-store';
+    return answer;
+  }
+  if (url.pathname === '/api/safety' && req.method === 'GET') {
+    const answer = await handleMailSafetyApi(url.searchParams, store, client);
     answer.cacheControl = 'no-store';
     return answer;
   }

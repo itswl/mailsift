@@ -53,10 +53,14 @@ The production MCP endpoint is embedded in the main mailsift container at `/mcp`
 
 Available tools include:
 
-- Queries: `list_mail` (filter by importance, category, account, spam or pushed), `search_mail`, `get_mail`, `list_digest`, `mail_summary`, `list_accounts`, `health`.
+- Queries: `list_mail` (filter by importance, category, account, spam or pushed), `search_mail`, `get_mail`, `list_digest`, `mail_summary`, `list_accounts`, `list_folders`, `inspect_mail_safety`, `health`.
 - Recovery: `recovery_status`, `list_dead_letters`, and `retry_dead_letter` where configured.
 - Operations and learning: `observability`, `feedback_rules`, and `record_feedback` where configured.
 
 `health` also reports the thresholds that decide delivery under `delivery`: push and digest minimum importance, the spam bonus and any warning about it, whether self-forwards are suppressed, and the retry count. Read those before concluding that a missing notification is a fault; the message may simply have been below the threshold. `recovery_status` reports folder UID progress under `cursors` and the queued notifications under `notificationOutbox`, which is where a delivery backlog is diagnosed.
+
+`list_folders` accepts the account address from `list_accounts` and reads folder paths, flags, special-use markers, and selectability with IMAP LIST. It does not open folders or change messages.
+
+`inspect_mail_safety` accepts a configured account address and Message-ID. It reports metadata-only clues from the configured folder, mailing-list headers, From/Reply-To domain mismatch, and attachment filename/MIME types. These are not a spam or malware verdict: SPF/DKIM/DMARC are not verified, sender fields may be forged, and message bodies, links, and file contents are not inspected. The tool is read-only.
 
 If an MCP call fails or returns incomplete data, say so and do not infer the missing mailbox state.

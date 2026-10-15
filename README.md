@@ -248,6 +248,24 @@ without downloading the entire message source. Filenames are treated as
 untrusted data and files are delivered as downloads. mailsift returns image and
 PDF files as-is; it does not recognize images or extract PDF text.
 
+### Spam and safety clues
+
+The inspect_mail_safety tool checks a message's configured folder, mailing-list or bulk-mail headers, a From/Reply-To
+domain mismatch, and attachment filename/MIME types. The web detail view offers the same metadata check, and attachment
+lists show file-type cautions. Mailbox reads use a read-only lock and fetch only the envelope, selected headers, and MIME
+structure.
+
+These are clues, not a spam or malware verdict. Mailing-list headers do not prove spam; sender fields can be forged.
+mailsift does not verify SPF, DKIM or DMARC and does not inspect links, message bodies, or attachment contents. It does
+not move, delete, flag, or otherwise change messages as part of this check.
+
+### Discovering folders
+
+`list_folders` takes the exact account address returned by `list_accounts` and
+lists its decoded IMAP folder paths, hierarchy delimiter, flags, special-use
+marker, and selectability. It uses IMAP LIST without opening folders or
+changing mail.
+
 Every tool call is audited by name, along with rejected authentication attempts,
 and `observability` reports the breakdown. The value a caller presented is never
 stored, only the outcome and a hash of the caller address.

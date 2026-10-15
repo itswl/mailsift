@@ -176,6 +176,12 @@ docker compose run --rm mailsift node dist/src/main.js --recover
 
 `list_attachments` 可按邮箱账号和 Message-ID 列出附件元数据，并为每个文件返回一个 MCP Resource URI；读取该 URI 会按需获取对应文件。网页详情也支持列出并下载附件。附件二进制不会持久化；新分诊记录只保留有数量上限的文件名、MIME 类型、部件 ID 和邮件服务器报告的大小。每个文件默认最多读取 10 MiB，可用 `MCP_ATTACHMENT_MAX_BYTES` 调整，最高 100 MiB。该上限与整封邮件的 `MCP_LIVE_SOURCE_BYTES` 分开计算，下载时只读取选中的 MIME 部件。图片和 PDF 会按原文件下载，暂不做图片识别或 PDF 文本提取。
 
+`inspect_mail_safety` 按需读取邮件信封、指定邮件头和 MIME 结构，提示它是否位于配置的垃圾邮件文件夹、是否带有群发邮件头、`From` 与 `Reply-To` 域名是否不同，以及附件文件名或 MIME 类型是否需要谨慎。网页邮件详情也可触发同样的检查，附件清单会直接显示文件类型提示。检查使用只读锁，不读取正文或附件内容。
+
+这些只是元数据线索，不是垃圾邮件或恶意软件判定。邮件列表头不代表垃圾邮件，发件人字段也可能伪造；不会验证 SPF/DKIM/DMARC，不会检查链接、正文或文件内容，也不会移动、删除或标记邮件。
+
+`list_folders` 接收 `list_accounts` 返回的邮箱地址，通过只读 IMAP LIST 列出解码后的文件夹路径、层级分隔符、标记、特殊用途和是否可选中。它不会打开文件夹，也不会修改邮件。
+
 内置 MCP 默认在主进程中开启。Docker 中，`MCP_BIND` 是容器内监听地址，`MCP_PUBLIC_HOST` 是宿主机发布地址；Compose 会让宿主机端口和容器端口都使用 `MCP_PORT`。默认只在宿主机回环地址提供服务：
 
 ```dotenv

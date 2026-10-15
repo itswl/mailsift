@@ -10,7 +10,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { ImapFlow, type FetchMessageObject, type ListResponse } from 'imapflow';
 import { getAccessToken } from './auth.js';
-import { resolveFolders, type Folder } from './folders.js';
+import { resolveFolders, toFolder, type Folder } from './folders.js';
 import {
   extractAttachmentManifest, extractBody, fallbackMessageId, findTextBodyPart, htmlToText, normalizeDate,
   type AttachmentInfo, type AttachmentManifest, type MailMessage,
@@ -167,6 +167,46 @@ export async function listFolders(client: ImapFlow): Promise<ListResponse[]> {
   return client.list();
 }
 
+export interface MailboxFolderInfo {
+  /** Decoded IMAP path; this is the value accepted by mailbox commands. */
+  path: string;
+  name: string;
+  delimiter: string;
+  flags: string[];
+  specialUse: string | null;
+  specialUseSource: ListResponse['specialUseSource'] | null;
+  selectable: boolean;
+  subscribed: boolean;
+}
+
+/**
+ * Discover folder metadata through IMAP LIST. This does not open a folder or
+ * change message flags or contents.
+ */
+export async function discoverMailboxFolders(account: Account): Promise<MailboxFolderInfo[]> {
+  const client = await connect(account);
+  try {
+    const entries = await listFolders(client);
+    return entries
+      .map((entry) => {
+        const folder = toFolder(entry);
+        return {
+          path: folder.path,
+          name: entry.name,
+          delimiter: entry.delimiter,
+          flags: [...folder.flags].sort(),
+          specialUse: entry.specialUse ?? null,
+          specialUseSource: entry.specialUseSource ?? null,
+          selectable: folder.selectable,
+          subscribed: entry.subscribed,
+        };
+      })
+      .sort((left, right) => left.path.localeCompare(right.path));
+  } finally {
+    await client.logout().catch(() => undefined);
+  }
+}
+
 export async function targetFolders(client: ImapFlow, account: Account): Promise<Folder[]> {
   return resolveFolders(await listFolders(client), account.folders);
 }
@@ -175,6 +215,37 @@ function firstAddress(input: unknown): { name: string; address: string } {
   const list = (input ?? []) as Array<{ name?: string; address?: string }>;
   const head = list[0];
   return { name: head?.name?.trim() ?? '', address: (head?.address ?? '').toLowerCase() };
+}
+
+function parseHeaderValues(raw: Buffer | undefined): Map<string, string[]> {
+  const unfolded = (raw?.toString('utf8') ?? '').replace(/\r?\n[ \t]+/g, ' ');
+  const values = new Map<string, string[]>();
+  for (const line of unfolded.split(/\r?\n/)) {
+    const separator = line.indexOf(':');
+    if (separator <= 0) continue;
+    const name = line.slice(0, separator).trim().toLowerCase();
+    const value = line.slice(separator + 1).trim();
+    const existing = values.get(name);
+    if (existing) existing.push(value);
+    else values.set(name, [value]);
+  }
+  return values;
+}
+
+function addressDomain(address: string): string | undefined {
+  const separator = address.lastIndexOf('@');
+  if (separator <= 0 || separator === address.length - 1) return undefined;
+  return address.slice(separator + 1).trim().replace(/\.$/, '').toLowerCase() || undefined;
+}
+
+function attachmentWarningDetail(code: NonNullable<AttachmentInfo['safetyWarnings']>[number]): string {
+  switch (code) {
+    case 'executable_or_installer': return 'Executable or installer file type; only its metadata was checked.';
+    case 'script_or_shortcut': return 'Script or shortcut file type; only its metadata was checked.';
+    case 'macro_enabled_document': return 'Macro-enabled document type; only its metadata was checked.';
+    case 'active_content': return 'HTML or SVG active-content type; only its metadata was checked.';
+    case 'archive_not_scanned': return 'Archive or disk-image contents were not inspected.';
+  }
 }
 
 function threadReference(headers: string): string | undefined {
@@ -207,6 +278,33 @@ export class AttachmentNotFoundError extends Error {
 export interface AttachmentManifestLookup {
   folder: string;
   manifest: AttachmentManifest;
+}
+
+export interface MailSafetyFinding {
+  code: string;
+  severity: 'info' | 'caution' | 'warning';
+  detail: string;
+  attachment?: string;
+}
+
+export interface MailSafetyReport {
+  account: string;
+  messageId: string;
+  folder: string;
+  spamSignals: {
+    inSpamFolder: boolean;
+    bulkHeaders: string[];
+    precedence: string | null;
+  };
+  senderSignals: {
+    fromAddress: string;
+    replyToAddresses: string[];
+    replyToDomainMismatch: boolean;
+  };
+  attachments: AttachmentInfo[];
+  attachmentsTruncated: boolean;
+  findings: MailSafetyFinding[];
+  limitations: string;
 }
 
 export interface DownloadedAttachment {
@@ -521,6 +619,126 @@ export async function fetchAttachmentManifestByMessageId(
         )) {
           if (raw.envelope?.messageId?.trim() !== messageId) continue;
           return { folder: folder.path, manifest: extractAttachmentManifest(raw.bodyStructure) };
+        }
+      } finally {
+        lock.release();
+      }
+    }
+    return undefined;
+  } finally {
+    await client.logout().catch(() => undefined);
+  }
+}
+
+/**
+ * Inspect only delivery headers and MIME structure for spam and safety clues.
+ * The read-only mailbox lock and metadata-only FETCH do not read the body,
+ * download files, or change message state.
+ */
+export async function inspectMailSafety(
+  account: Account,
+  messageId: string,
+): Promise<MailSafetyReport | undefined> {
+  const client = await connect(account);
+  try {
+    const folders = await targetFolders(client, account);
+    for (const folder of folders) {
+      const lock = await client.getMailboxLock(folder.path, { readOnly: true });
+      try {
+        const uids = await searchMessageUids(client, messageId);
+        if (!uids.length) continue;
+        for await (const raw of client.fetch(
+          uids,
+          {
+            uid: true,
+            envelope: true,
+            bodyStructure: true,
+            headers: ['list-id', 'list-unsubscribe', 'precedence'],
+          },
+          { uid: true },
+        )) {
+          if (raw.envelope?.messageId?.trim() !== messageId) continue;
+
+          const values = parseHeaderValues(raw.headers);
+          const listId = (values.get('list-id')?.length ?? 0) > 0;
+          const listUnsubscribe = (values.get('list-unsubscribe')?.length ?? 0) > 0;
+          const precedenceValues = (values.get('precedence') ?? [])
+            .map((value) => value.split(/[;,]/, 1)[0]?.trim().toLowerCase() ?? '')
+            .filter(Boolean);
+          const precedence = precedenceValues[0]?.slice(0, 40) ?? null;
+          const bulkPrecedence = precedenceValues.find((value) => ['bulk', 'junk', 'list'].includes(value));
+          const bulkHeaders = [
+            ...(listId ? ['list-id'] : []),
+            ...(listUnsubscribe ? ['list-unsubscribe'] : []),
+            ...(bulkPrecedence ? ['precedence'] : []),
+          ];
+
+          const fromAddress = firstAddress(raw.envelope?.from).address;
+          const replyToAddresses = (raw.envelope?.replyTo ?? [])
+            .map((address) => (address.address ?? '').trim().toLowerCase())
+            .filter(Boolean);
+          const fromDomain = addressDomain(fromAddress);
+          const replyToDomainMismatch = Boolean(fromDomain && replyToAddresses.some((address) => {
+            const replyDomain = addressDomain(address);
+            return replyDomain !== undefined && replyDomain !== fromDomain;
+          }));
+          const attachmentManifest = extractAttachmentManifest(raw.bodyStructure);
+          const attachments = attachmentManifest.items;
+          const findings: MailSafetyFinding[] = [];
+
+          if (folder.isSpam) {
+            findings.push({
+              code: 'spam_folder',
+              severity: 'warning',
+              detail: 'This message is in a configured folder recognized as spam or junk.',
+            });
+          }
+          if (bulkHeaders.length) {
+            findings.push({
+              code: 'bulk_headers',
+              severity: 'info',
+              detail: `Mailing-list or bulk-mail markers found: ${bulkHeaders.join(', ')}. These markers do not prove spam.`,
+            });
+          }
+          if (replyToDomainMismatch) {
+            findings.push({
+              code: 'reply_to_domain_mismatch',
+              severity: 'warning',
+              detail: 'Reply-To uses a different domain from From; verify the recipient independently before replying.',
+            });
+          }
+          for (const attachment of attachments) {
+            for (const code of attachment.safetyWarnings ?? []) {
+              findings.push({
+                code: `attachment_${code}`,
+                severity: code === 'archive_not_scanned' ? 'caution' : 'warning',
+                detail: attachmentWarningDetail(code),
+                attachment: attachment.filename ?? `part ${attachment.partId}`,
+              });
+            }
+          }
+
+          return {
+            account: account.username,
+            messageId,
+            folder: folder.path,
+            spamSignals: {
+              inSpamFolder: folder.isSpam,
+              bulkHeaders,
+              precedence,
+            },
+            senderSignals: {
+              fromAddress,
+              replyToAddresses,
+              replyToDomainMismatch,
+            },
+            attachments,
+            attachmentsTruncated: attachmentManifest.truncated,
+            findings,
+            limitations:
+              'Metadata-only heuristics. Bulk headers are not a spam verdict; From and Reply-To may be spoofed. ' +
+              'Sender authentication is not verified, and no URLs, message body, or attachment contents are inspected.',
+          };
         }
       } finally {
         lock.release();

@@ -16,7 +16,18 @@ export interface AttachmentInfo {
   transferEncoding?: string;
   inline: boolean;
   contentId?: string;
+  /** Metadata-only caution codes; these do not indicate that a file is malware. */
+  safetyWarnings?: AttachmentSafetyWarningCode[];
 }
+
+export const ATTACHMENT_SAFETY_WARNING_CODES = [
+  'executable_or_installer',
+  'script_or_shortcut',
+  'macro_enabled_document',
+  'active_content',
+  'archive_not_scanned',
+] as const;
+export type AttachmentSafetyWarningCode = (typeof ATTACHMENT_SAFETY_WARNING_CODES)[number];
 
 export interface AttachmentManifest {
   items: AttachmentInfo[];
@@ -54,6 +65,59 @@ export interface MailMessage {
 
 const MIME_TYPE = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i;
 const BODY_TEXT_TYPES = new Set(['text/plain', 'text/html', 'text/x-amp-html']);
+const EXECUTABLE_EXTENSIONS = new Set([
+  'app', 'apk', 'com', 'cpl', 'deb', 'dmg', 'dll', 'exe', 'jar', 'msi', 'msp', 'pkg', 'rpm', 'scr', 'sys',
+]);
+const EXECUTABLE_MIME_TYPES = new Set([
+  'application/vnd.microsoft.portable-executable', 'application/x-dosexec', 'application/x-elf',
+  'application/x-executable', 'application/x-mach-binary', 'application/x-msdownload',
+  'application/x-msdos-program',
+]);
+const SCRIPT_EXTENSIONS = new Set([
+  'bash', 'bat', 'cmd', 'command', 'hta', 'js', 'jse', 'lnk', 'ps1', 'psm1', 'sh', 'url', 'vbe', 'vbs',
+  'wsf', 'wsh', 'zsh',
+]);
+const MACRO_EXTENSIONS = new Set(['docm', 'dotm', 'ppsm', 'pptm', 'potm', 'xlam', 'xlsm', 'xltm']);
+const MACRO_MIME_TYPES = new Set([
+  'application/vnd.ms-excel.addin.macroenabled.12',
+  'application/vnd.ms-excel.sheet.macroenabled.12',
+  'application/vnd.ms-powerpoint.presentation.macroenabled.12',
+  'application/vnd.ms-powerpoint.slideshow.macroenabled.12',
+  'application/vnd.ms-word.document.macroenabled.12',
+]);
+const ACTIVE_CONTENT_EXTENSIONS = new Set(['htm', 'html', 'mht', 'mhtml', 'svg', 'xhtml']);
+const ACTIVE_CONTENT_MIME_TYPES = new Set(['application/xhtml+xml', 'image/svg+xml', 'text/html']);
+const ARCHIVE_EXTENSIONS = new Set(['7z', 'bz2', 'gz', 'iso', 'img', 'rar', 'tar', 'tgz', 'xz', 'zip']);
+const ARCHIVE_MIME_TYPES = new Set([
+  'application/gzip', 'application/vnd.rar', 'application/x-7z-compressed', 'application/x-bzip2',
+  'application/x-iso9660-image', 'application/x-rar-compressed', 'application/x-tar', 'application/zip',
+]);
+
+/** Identify file types that merit care without opening or scanning file contents. */
+export function attachmentSafetyWarnings(
+  attachment: { filename?: string | undefined; contentType: string },
+): AttachmentSafetyWarningCode[] {
+  const filename = attachment.filename?.trim().split(/[\\/]/).at(-1)?.toLowerCase() ?? '';
+  const extension = filename.includes('.') ? filename.slice(filename.lastIndexOf('.') + 1) : '';
+  const contentType = attachment.contentType.trim().toLowerCase().split(';', 1)[0] ?? '';
+  const warnings: AttachmentSafetyWarningCode[] = [];
+
+  if (EXECUTABLE_EXTENSIONS.has(extension) || EXECUTABLE_MIME_TYPES.has(contentType)) {
+    warnings.push('executable_or_installer');
+  }
+  if (SCRIPT_EXTENSIONS.has(extension)) warnings.push('script_or_shortcut');
+  if (MACRO_EXTENSIONS.has(extension) || MACRO_MIME_TYPES.has(contentType)) {
+    warnings.push('macro_enabled_document');
+  }
+  if (ACTIVE_CONTENT_EXTENSIONS.has(extension) || ACTIVE_CONTENT_MIME_TYPES.has(contentType)) {
+    warnings.push('active_content');
+  }
+  if (ARCHIVE_EXTENSIONS.has(extension) || ARCHIVE_MIME_TYPES.has(contentType)) {
+    warnings.push('archive_not_scanned');
+  }
+
+  return warnings;
+}
 
 /**
  * Build a bounded, lightweight manifest from IMAP BODYSTRUCTURE.
@@ -84,6 +148,7 @@ export function extractAttachmentManifest(
     const transferEncoding = node.encoding?.trim().toLowerCase().slice(0, 40) || undefined;
     const rawContentId = node.id?.trim().replace(/^<|>$/g, '').slice(0, 500);
     const contentId = rawContentId || undefined;
+    const safetyWarnings = attachmentSafetyWarnings({ filename, contentType });
     items.push({
       partId,
       ...(filename ? { filename } : {}),
@@ -92,6 +157,7 @@ export function extractAttachmentManifest(
       ...(transferEncoding ? { transferEncoding } : {}),
       inline,
       ...(contentId ? { contentId } : {}),
+      ...(safetyWarnings.length ? { safetyWarnings } : {}),
     });
   };
 

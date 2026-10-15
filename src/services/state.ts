@@ -21,7 +21,8 @@ const nodeRequire = createRequire(import.meta.url);
 const { DatabaseSync } = nodeRequire('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSync = import('node:sqlite').DatabaseSync;
 import { getLogger } from '../logger.js';
-import type { AttachmentManifest, MailMessage } from '../imap/message.js';
+import { attachmentSafetyWarnings } from '../imap/message.js';
+import type { AttachmentInfo, AttachmentManifest, MailMessage } from '../imap/message.js';
 import type { TriageResult } from './triage.js';
 
 const log = getLogger('state');
@@ -199,8 +200,21 @@ function parseAttachmentManifest(value: unknown): AttachmentManifest | null {
         && /^\d+(?:\.\d+)*$/.test(attachment['partId'])
         && typeof attachment['contentType'] === 'string'
         && typeof attachment['inline'] === 'boolean';
-    }).slice(0, 100);
-    return { items: items as AttachmentManifest['items'], truncated: parsed.truncated === true };
+    }).slice(0, 100).map((item) => {
+      const attachment = { ...(item as unknown as Record<string, unknown>) };
+      // Recompute warnings from the stored filename and MIME metadata so older
+      // rows gain the hints too and a persisted field cannot assert its own risk.
+      delete attachment['safetyWarnings'];
+      const safetyWarnings = attachmentSafetyWarnings({
+        filename: typeof attachment['filename'] === 'string' ? attachment['filename'] : undefined,
+        contentType: String(attachment['contentType']),
+      });
+      return {
+        ...attachment,
+        ...(safetyWarnings.length ? { safetyWarnings } : {}),
+      } as unknown as AttachmentInfo;
+    });
+    return { items, truncated: parsed.truncated === true };
   } catch {
     return null;
   }
