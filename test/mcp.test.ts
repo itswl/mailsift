@@ -60,7 +60,7 @@ describe('tool surface', () => {
     const client = await connect(new StateStore(':memory:'));
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
-      'feedback_rules', 'get_mail', 'health', 'list_accounts', 'list_dead_letters',
+      'feedback_rules', 'get_mail', 'health', 'list_accounts', 'list_attachments', 'list_dead_letters',
       'list_digest', 'list_mail', 'mail_summary', 'observability',
       'recovery_status', 'search_mail',
     ]);
