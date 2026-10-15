@@ -15,6 +15,12 @@ import {
   extractAttachmentManifest, extractBody, fallbackMessageId, findTextBodyPart, htmlToText, normalizeDate,
   type AttachmentInfo, type AttachmentManifest, type MailMessage,
 } from './message.js';
+import {
+  inspectLinkRisks,
+  scanAttachment,
+  type AttachmentScanReport,
+  type LinkRiskReport,
+} from '../security.js';
 import { needsOAuth, type Account } from '../config.js';
 import { getLogger } from '../logger.js';
 
@@ -261,6 +267,20 @@ function attachmentMaxBytes(): number {
   return Number.isFinite(value) && value > 0 ? Math.max(1, Math.min(Math.floor(value), hardMax)) : fallback;
 }
 
+function attachmentScanMaxBytes(): number {
+  const fallback = 1024 * 1024;
+  const hardMax = 4 * 1024 * 1024;
+  const value = Number(process.env.MCP_ATTACHMENT_SCAN_BYTES ?? fallback);
+  return Number.isFinite(value) && value > 0 ? Math.max(1, Math.min(Math.floor(value), hardMax)) : fallback;
+}
+
+function safetyBodyMaxBytes(): number {
+  const fallback = 256 * 1024;
+  const hardMax = 1024 * 1024;
+  const value = Number(process.env.MCP_SAFETY_BODY_BYTES ?? fallback);
+  return Number.isFinite(value) && value > 0 ? Math.max(1, Math.min(Math.floor(value), hardMax)) : fallback;
+}
+
 export class AttachmentTooLargeError extends Error {
   constructor(readonly maxBytes: number) {
     super(`attachment exceeds MCP_ATTACHMENT_MAX_BYTES=${maxBytes}`);
@@ -285,6 +305,8 @@ export interface MailSafetyFinding {
   severity: 'info' | 'caution' | 'warning';
   detail: string;
   attachment?: string;
+  /** Host only for link findings; paths and query parameters are omitted. */
+  linkHost?: string;
 }
 
 export interface MailSafetyReport {
@@ -303,6 +325,7 @@ export interface MailSafetyReport {
   };
   attachments: AttachmentInfo[];
   attachmentsTruncated: boolean;
+  links: LinkRiskReport;
   findings: MailSafetyFinding[];
   limitations: string;
 }
@@ -310,6 +333,11 @@ export interface MailSafetyReport {
 export interface DownloadedAttachment {
   metadata: AttachmentInfo;
   content: Buffer;
+}
+
+interface DownloadedPrefix {
+  content: Buffer;
+  truncated: boolean;
 }
 
 export const MAIL_ACTIONS = ['mark_read', 'mark_unread', 'star', 'unstar', 'move'] as const;
@@ -630,10 +658,79 @@ export async function fetchAttachmentManifestByMessageId(
   }
 }
 
+/** Read at most maxBytes from a decoded MIME part, retaining no suffix. */
+async function downloadDecodedPrefix(
+  client: ImapFlow,
+  uid: number,
+  partId: string,
+  maxBytes: number,
+): Promise<DownloadedPrefix> {
+  const download = await client.download(uid, partId, { uid: true, maxBytes: maxBytes + 1 });
+  if (!download.content) return { content: Buffer.alloc(0), truncated: false };
+  const chunks: Buffer[] = [];
+  let size = 0;
+  let truncated = false;
+  for await (const chunk of download.content) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const remaining = maxBytes - size;
+    if (buffer.length > remaining) {
+      if (remaining > 0) chunks.push(buffer.subarray(0, remaining));
+      size = maxBytes;
+      truncated = true;
+      download.content.destroy();
+      break;
+    }
+    chunks.push(buffer);
+    size += buffer.length;
+  }
+  return { content: Buffer.concat(chunks, size), truncated };
+}
+
 /**
- * Inspect only delivery headers and MIME structure for spam and safety clues.
- * The read-only mailbox lock and metadata-only FETCH do not read the body,
- * download files, or change message state.
+ * Scan one attachment using only a bounded decoded prefix. The bytes are held
+ * for this call and discarded before the report is returned.
+ */
+export async function scanAttachmentByMessageId(
+  account: Account,
+  messageId: string,
+  partId: string,
+): Promise<AttachmentScanReport | undefined> {
+  if (!/^\d+(?:\.\d+)*$/.test(partId)) throw new AttachmentNotFoundError(partId);
+  const maxBytes = attachmentScanMaxBytes();
+  const client = await connect(account);
+  try {
+    const folders = await targetFolders(client, account);
+    for (const folder of folders) {
+      const lock = await client.getMailboxLock(folder.path, { readOnly: true });
+      try {
+        const uids = await searchMessageUids(client, messageId);
+        if (!uids.length) continue;
+        for (const uid of uids) {
+          const raw = await client.fetchOne(
+            uid,
+            { uid: true, envelope: true, bodyStructure: true },
+            { uid: true },
+          );
+          if (!raw || raw.envelope?.messageId?.trim() !== messageId) continue;
+          const metadata = extractAttachmentManifest(raw.bodyStructure).items.find((part) => part.partId === partId);
+          if (!metadata) throw new AttachmentNotFoundError(partId);
+          const prefix = await downloadDecodedPrefix(client, uid, partId, maxBytes);
+          return scanAttachment(metadata, prefix.content, prefix.truncated);
+        }
+      } finally {
+        lock.release();
+      }
+    }
+    return undefined;
+  } finally {
+    await client.logout().catch(() => undefined);
+  }
+}
+
+/**
+ * Inspect delivery headers, a bounded text-body prefix, and MIME structure for
+ * spam and safety clues. Link parsing is local only: no URL is opened or
+ * resolved, and attachment bytes are not downloaded by this function.
  */
 export async function inspectMailSafety(
   account: Account,
@@ -647,16 +744,20 @@ export async function inspectMailSafety(
       try {
         const uids = await searchMessageUids(client, messageId);
         if (!uids.length) continue;
-        for await (const raw of client.fetch(
-          uids,
-          {
-            uid: true,
-            envelope: true,
-            bodyStructure: true,
-            headers: ['list-id', 'list-unsubscribe', 'precedence'],
-          },
-          { uid: true },
-        )) {
+        // Use one FETCH at a time because a matching record may need a
+        // bounded body-part DOWNLOAD while the read-only lock is held.
+        for (const uid of uids) {
+          const raw = await client.fetchOne(
+            uid,
+            {
+              uid: true,
+              envelope: true,
+              bodyStructure: true,
+              headers: ['list-id', 'list-unsubscribe', 'precedence'],
+            },
+            { uid: true },
+          );
+          if (!raw) continue;
           if (raw.envelope?.messageId?.trim() !== messageId) continue;
 
           const values = parseHeaderValues(raw.headers);
@@ -718,6 +819,44 @@ export async function inspectMailSafety(
             }
           }
 
+          let links: LinkRiskReport = {
+            checked: false,
+            bodyPart: null,
+            scannedBytes: 0,
+            truncated: false,
+            linksFound: 0,
+            findings: [],
+            findingsTruncated: false,
+            limitations:
+              'No readable text body part was found, so no links were parsed. No URL was opened or resolved.',
+          };
+          const textPart = findTextBodyPart(raw.bodyStructure);
+          if (textPart) {
+            try {
+              const prefix = await downloadDecodedPrefix(client, raw.uid, textPart.partId, safetyBodyMaxBytes());
+              links = inspectLinkRisks(prefix.content.toString('utf8'), {
+                bodyPart: textPart.partId,
+                scannedBytes: prefix.content.length,
+                truncated: prefix.truncated,
+              });
+              for (const finding of links.findings) {
+                findings.push({
+                  code: finding.code,
+                  severity: finding.severity,
+                  detail: finding.detail,
+                  ...(finding.host ? { linkHost: finding.host } : {}),
+                });
+              }
+            } catch (error) {
+              links = {
+                ...links,
+                limitations: 'The bounded text body could not be read, so links were not parsed. No URL was opened or resolved.',
+                findings: [],
+              };
+              log.warn(`Unable to inspect bounded links for ${messageId}: ${String(error).slice(0, 200)}`);
+            }
+          }
+
           return {
             account: account.username,
             messageId,
@@ -734,10 +873,12 @@ export async function inspectMailSafety(
             },
             attachments,
             attachmentsTruncated: attachmentManifest.truncated,
+            links,
             findings,
             limitations:
-              'Metadata-only heuristics. Bulk headers are not a spam verdict; From and Reply-To may be spoofed. ' +
-              'Sender authentication is not verified, and no URLs, message body, or attachment contents are inspected.',
+              'Heuristics only. Bulk headers are not a spam verdict; From and Reply-To may be spoofed. ' +
+              'Sender authentication is not verified. Links are parsed from a bounded body prefix but never opened; ' +
+              'attachment contents are not inspected here.',
           };
         }
       } finally {

@@ -53,7 +53,7 @@ The production MCP endpoint is embedded in the main mailsift container at `/mcp`
 
 Available tools include:
 
-- Queries: `list_mail` (filter by importance, category, account, spam or pushed), `search_mail`, `get_mail`, `list_digest`, `mail_summary`, `list_accounts`, `list_folders`, `inspect_mail_safety`, `health`.
+- Queries: `list_mail` (filter by importance, category, account, spam or pushed), `search_mail`, `get_mail`, `list_digest`, `mail_summary`, `list_accounts`, `list_folders`, `inspect_mail_safety`, `scan_attachment`, `list_audit`, `health`.
 - Recovery: `recovery_status`, `list_dead_letters`, and `retry_dead_letter` where configured.
 - Operations and learning: `observability`, `feedback_rules`, and `record_feedback` where configured.
 
@@ -61,6 +61,6 @@ Available tools include:
 
 `list_folders` accepts the account address from `list_accounts` and reads folder paths, flags, special-use markers, and selectability with IMAP LIST. It does not open folders or change messages.
 
-`inspect_mail_safety` accepts a configured account address and Message-ID. It reports metadata-only clues from the configured folder, mailing-list headers, From/Reply-To domain mismatch, and attachment filename/MIME types. These are not a spam or malware verdict: SPF/DKIM/DMARC are not verified, sender fields may be forged, and message bodies, links, and file contents are not inspected. The tool is read-only.
+`inspect_mail_safety` accepts a configured account address and Message-ID. It reports clues from the configured folder, mailing-list headers, From/Reply-To domain mismatch, attachment filename/MIME types, and suspicious URLs parsed from a bounded text-body prefix. It never opens a URL or attachment. `scan_attachment` reads a bounded prefix locally for filename/MIME and common-signature hints, without unpacking or executing it. These are not spam or malware verdicts: SPF/DKIM/DMARC are not verified and sender fields may be forged. Both tools are read-only.
 
 If an MCP call fails or returns incomplete data, say so and do not infer the missing mailbox state.

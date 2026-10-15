@@ -240,7 +240,9 @@ export class Watcher {
   }
 
   private async flushNotificationOutbox(): Promise<void> {
-    for (const entry of this.state.pendingNotifications()) {
+    // Failed deliveries carry a durable next_attempt_at timestamp. Only due
+    // entries are sent here; recovery_status still exposes delayed entries.
+    for (const entry of this.state.pendingNotifications(50, true)) {
       const outcome = await this.sink.push(entry.message, entry.result);
       if (outcome === 'delivered') {
         this.state.markNotificationDelivered(entry.notificationKey);

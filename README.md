@@ -98,7 +98,7 @@ Messages up to `MAX_MESSAGE_SOURCE_BYTES` (default `5 MiB`) use the normal MIME 
 
 The MCP recovery tools expose `recovery_status` always, and `retry_dead_letter` only when the write credential below is configured. Retrying rewinds one folder cursor so the next normal poll can fetch the message again; it does not modify the mailbox.
 
-MCP also provides `observability` for processing, delivery, dead-letter, feedback, and mailbox-action totals, plus the access audit grouped by tool. `record_feedback` records `false_positive`, `missed`, `handled`, and `correct` labels for later rule and triage evaluation, and also requires the write credential. `list_threads` groups messages by their References/In-Reply-To root, while `search_mail` also checks the stored body preview and attachment metadata.
+MCP also provides `observability` for processing, delivery, dead-letter, feedback, and mailbox-action totals, plus the access audit grouped by tool. `list_audit` shows recent tool/resource events and audited mailbox actions with bounded targets, without credentials or message bodies. `record_feedback` records `false_positive`, `missed`, `handled`, and `correct` labels for later rule and triage evaluation, and also requires the write credential. `list_threads` groups messages by their References/In-Reply-To root, while `search_mail` also checks the stored body preview and attachment metadata.
 
 After two feedback records for the same sender, `missed` feedback infers an always-important rule and `false_positive` feedback infers a never-important rule. Explicit environment rules take precedence; inspect inferred rules with MCP `feedback_rules`.
 
@@ -248,16 +248,26 @@ without downloading the entire message source. Filenames are treated as
 untrusted data and files are delivered as downloads. mailsift returns image and
 PDF files as-is; it does not recognize images or extract PDF text.
 
+`scan_attachment` and the **Scan attachment** button read only a bounded decoded
+prefix, controlled by `MCP_ATTACHMENT_SCAN_BYTES` (default 1 MiB, hard cap 4 MiB).
+The local check looks for suspicious filename/MIME combinations and common
+executable, script, active-content, and container signatures. It does not unpack,
+execute, upload, persist, or claim to replace antivirus software.
+
+Link parsing reads at most `MCP_SAFETY_BODY_BYTES` (default 256 KiB, hard cap
+1 MiB) from a selected text body part. It reports scheme, IP-host, punycode,
+userinfo, and common shortener clues while omitting URL paths and query values.
+
 ### Spam and safety clues
 
-The inspect_mail_safety tool checks a message's configured folder, mailing-list or bulk-mail headers, a From/Reply-To
-domain mismatch, and attachment filename/MIME types. The web detail view offers the same metadata check, and attachment
-lists show file-type cautions. Mailbox reads use a read-only lock and fetch only the envelope, selected headers, and MIME
-structure.
+The `inspect_mail_safety` tool checks a message's configured folder, mailing-list or bulk-mail headers, a From/Reply-To
+domain mismatch, attachment filename/MIME types, and links parsed from a bounded text body prefix. The web detail view
+offers the same check, and attachment lists show file-type cautions and a bounded scan button. Mailbox reads use a
+read-only lock; only the selected text body prefix is read for link parsing, and no link is opened.
 
 These are clues, not a spam or malware verdict. Mailing-list headers do not prove spam; sender fields can be forged.
-mailsift does not verify SPF, DKIM or DMARC and does not inspect links, message bodies, or attachment contents. It does
-not move, delete, flag, or otherwise change messages as part of this check.
+mailsift does not verify SPF, DKIM or DMARC, resolve or reputation-check links, unpack attachments, or provide an
+antivirus verdict. It does not move, delete, flag, or otherwise change messages as part of these checks.
 
 ### Discovering folders
 
@@ -266,9 +276,10 @@ lists its decoded IMAP folder paths, hierarchy delimiter, flags, special-use
 marker, and selectability. It uses IMAP LIST without opening folders or
 changing mail.
 
-Every tool call is audited by name, along with rejected authentication attempts,
-and `observability` reports the breakdown. The value a caller presented is never
-stored, only the outcome and a hash of the caller address.
+Every tool and live resource call is audited by name, outcome, caller fingerprint,
+and (where useful) a bounded account/message/part target; rejected authentication
+attempts are included. `list_audit` returns recent rows and mailbox-action audit.
+Credentials, message bodies, and URL query strings are never stored in the audit.
 
 `health` reports the last poll heartbeat, account failures, LLM failure count,
 and pending queues. The Docker healthcheck checks only the poll heartbeat; a
@@ -297,7 +308,7 @@ Behind a reverse proxy, set `TRUSTED_PROXY=true`. Otherwise every request arrive
 
 - **Repeated notifications:** messages are deduplicated by account plus Message-ID. `--recover` is for interrupted, undecided records.
 - **Nothing was notified:** call MCP `health` first. Its `delivery` block reports the push and digest thresholds, the spam bonus, and whether self-forwards are suppressed, which usually explains the decision without further digging. `recovery_status` then shows folder UID progress and any notification still queued for retry.
-- **Delivery failures:** a push that fails with a network error, a timeout, or HTTP 408/429/5xx is retried up to `SINK_RETRY_ATTEMPTS` times (default `3`, seconds apart) and then waits in the durable outbox for the next poll. An endpoint that stays down gets one attempt per push until a delivery succeeds, so a dead endpoint does not stretch the poll.
+- **Delivery failures:** a push that fails with a network error, a timeout, or HTTP 408/429/5xx is retried up to `SINK_RETRY_ATTEMPTS` times (default `3`, seconds apart) and then waits in the durable outbox. Outbox retries use persisted exponential backoff (`OUTBOX_RETRY_BASE_SECONDS`, default `60`; `OUTBOX_RETRY_MAX_SECONDS`, default `3600`), so a failed endpoint is not hammered on every poll. `recovery_status` shows the next attempt time.
 - **Outbox backlog:** only real failures wait there. An output that declines a message under its own threshold, such as `FEISHU_MIN_IMPORTANCE`, settles it immediately and the digest carries it, so a pending count in MCP `health` always means something is genuinely undelivered.
 - **QQ scans many messages:** some QQ IMAP endpoints ignore `SINCE`; the local UID cursor still preserves correctness.
 - **Messages marked read:** mailsift uses read-only mailbox locks and `BODY.PEEK[]`.

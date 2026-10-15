@@ -51,20 +51,20 @@ CREATE TABLE IF NOT EXISTS dead_letter (
 );
 CREATE TABLE IF NOT EXISTS notification_outbox (
   notification_key TEXT PRIMARY KEY, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-  last_error TEXT, created_at TEXT NOT NULL, delivered_at TEXT
+  last_error TEXT, next_attempt_at TEXT, created_at TEXT NOT NULL, delivered_at TEXT
 );
 CREATE TABLE IF NOT EXISTS feedback (
   id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL, dedup_key TEXT,
   label TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS mcp_audit (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, client TEXT,
+  id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, client TEXT, target TEXT,
   success INTEGER NOT NULL, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS mail_actions (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL, message_id TEXT NOT NULL,
   action TEXT NOT NULL, source_folder TEXT, destination_folder TEXT,
-  success INTEGER NOT NULL, error TEXT, created_at TEXT NOT NULL
+  success INTEGER NOT NULL, error TEXT, client TEXT, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_seen_created ON seen (created_at);
@@ -144,6 +144,15 @@ export interface MailActionAudit {
   destinationFolder?: string;
   success: boolean;
   error?: string;
+  client?: string;
+  createdAt: string;
+}
+
+export interface McpAuditEvent {
+  action: string;
+  client: string | null;
+  target: string | null;
+  success: boolean;
   createdAt: string;
 }
 
@@ -173,6 +182,7 @@ export interface NotificationOutboxRow {
   result: TriageResult;
   attempts: number;
   lastError: string | null;
+  nextAttemptAt: string | null;
   createdAt: string;
 }
 
@@ -180,6 +190,25 @@ export type FeedbackLabel = 'false_positive' | 'missed' | 'handled' | 'correct';
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function retrySeconds(name: string, fallback: number, maximum: number): number {
+  const value = Number(process.env[name] ?? fallback);
+  return Number.isFinite(value) && value >= 1 ? Math.min(Math.floor(value), maximum) : fallback;
+}
+
+function auditTargetValue(value: string | undefined): string | null {
+  if (!value) return null;
+  // Targets are identifiers for investigation, not a place to retain URL
+  // query strings that may contain tracking values or bearer-like tokens.
+  return value.replace(/[\r\n\t]+/g, ' ').replace(/[?].*$/s, '').slice(0, 1000) || null;
+}
+
+export function notificationRetryDelayMs(attempt: number): number {
+  const baseSeconds = retrySeconds('OUTBOX_RETRY_BASE_SECONDS', 60, 86_400);
+  const maxSeconds = retrySeconds('OUTBOX_RETRY_MAX_SECONDS', 3_600, 7 * 86_400);
+  const safeAttempt = Math.max(1, Math.floor(attempt));
+  return Math.min(maxSeconds, baseSeconds * 2 ** Math.min(safeAttempt - 1, 30)) * 1000;
 }
 
 const ROW_COLUMNS = [
@@ -271,6 +300,31 @@ export class StateStore {
         if (!String(error).toLowerCase().includes('duplicate column name')) throw error;
       }
     }
+    const outboxColumns = this.db.prepare('PRAGMA table_info(notification_outbox)').all() as Array<Record<string, unknown>>;
+    if (!outboxColumns.some((column) => column['name'] === 'next_attempt_at')) {
+      try {
+        this.db.exec('ALTER TABLE notification_outbox ADD COLUMN next_attempt_at TEXT');
+      } catch (error) {
+        if (!String(error).toLowerCase().includes('duplicate column name')) throw error;
+      }
+    }
+    const auditColumns = this.db.prepare('PRAGMA table_info(mcp_audit)').all() as Array<Record<string, unknown>>;
+    if (!auditColumns.some((column) => column['name'] === 'target')) {
+      try {
+        this.db.exec('ALTER TABLE mcp_audit ADD COLUMN target TEXT');
+      } catch (error) {
+        if (!String(error).toLowerCase().includes('duplicate column name')) throw error;
+      }
+    }
+    const actionColumns = this.db.prepare('PRAGMA table_info(mail_actions)').all() as Array<Record<string, unknown>>;
+    if (!actionColumns.some((column) => column['name'] === 'client')) {
+      try {
+        this.db.exec('ALTER TABLE mail_actions ADD COLUMN client TEXT');
+      } catch (error) {
+        if (!String(error).toLowerCase().includes('duplicate column name')) throw error;
+      }
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_outbox_retry ON notification_outbox (delivered_at, next_attempt_at, created_at)');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_seen_thread ON seen (thread_key, created_at)');
   }
 
@@ -402,7 +456,9 @@ export class StateStore {
     const outbox = Number(this.db.prepare(
       'DELETE FROM notification_outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?',
     ).run(cutoff).changes);
-    return seen + dead + outbox;
+    const mcpAudit = Number(this.db.prepare('DELETE FROM mcp_audit WHERE created_at < ?').run(cutoff).changes);
+    const mailActions = Number(this.db.prepare('DELETE FROM mail_actions WHERE created_at < ?').run(cutoff).changes);
+    return seen + dead + outbox + mcpAudit + mailActions;
   }
 
   recordDeadLetter(input: {
@@ -459,15 +515,23 @@ export class StateStore {
   enqueueNotification(notificationKey: string, message: MailMessage, result: TriageResult): void {
     this.db.prepare(
       `INSERT OR IGNORE INTO notification_outbox
-       (notification_key, payload, created_at) VALUES (?, ?, ?)`,
-    ).run(notificationKey, JSON.stringify({ message, result }), now());
+       (notification_key, payload, next_attempt_at, created_at) VALUES (?, ?, ?, ?)`,
+    ).run(notificationKey, JSON.stringify({ message, result }), now(), now());
   }
 
-  pendingNotifications(limit = 50): NotificationOutboxRow[] {
-    const rows = this.db.prepare(
-      `SELECT notification_key, payload, attempts, last_error, created_at
-       FROM notification_outbox WHERE delivered_at IS NULL ORDER BY created_at LIMIT ?`,
-    ).all(Math.max(1, Math.min(limit, 200))) as Array<Record<string, unknown>>;
+  pendingNotifications(limit = 50, readyOnly = false): NotificationOutboxRow[] {
+    const boundedLimit = Math.max(1, Math.min(limit, 200));
+    const rows = readyOnly
+      ? this.db.prepare(
+        `SELECT notification_key, payload, attempts, last_error, next_attempt_at, created_at
+         FROM notification_outbox
+         WHERE delivered_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+         ORDER BY created_at LIMIT ?`,
+      ).all(now(), boundedLimit)
+      : this.db.prepare(
+        `SELECT notification_key, payload, attempts, last_error, next_attempt_at, created_at
+         FROM notification_outbox WHERE delivered_at IS NULL ORDER BY created_at LIMIT ?`,
+      ).all(boundedLimit);
     const out: NotificationOutboxRow[] = [];
     for (const row of rows) {
       try {
@@ -484,6 +548,7 @@ export class StateStore {
           result: payload.result,
           attempts: Number(row['attempts']),
           lastError: (row['last_error'] as string) ?? null,
+          nextAttemptAt: (row['next_attempt_at'] as string) ?? null,
           createdAt: String(row['created_at']),
         });
       } catch {
@@ -513,11 +578,11 @@ export class StateStore {
     }
     if (payload !== undefined) {
       this.db.prepare(
-        'UPDATE notification_outbox SET delivered_at = ?, last_error = NULL, payload = ? WHERE notification_key = ?',
+        'UPDATE notification_outbox SET delivered_at = ?, last_error = NULL, next_attempt_at = NULL, payload = ? WHERE notification_key = ?',
       ).run(now(), payload, notificationKey);
     } else {
       this.db.prepare(
-        'UPDATE notification_outbox SET delivered_at = ?, last_error = NULL WHERE notification_key = ?',
+        'UPDATE notification_outbox SET delivered_at = ?, last_error = NULL, next_attempt_at = NULL WHERE notification_key = ?',
       ).run(now(), notificationKey);
     }
   }
@@ -533,16 +598,29 @@ export class StateStore {
   }
 
   markNotificationFailed(notificationKey: string, error: unknown): void {
+    const row = this.db.prepare(
+      'SELECT attempts FROM notification_outbox WHERE notification_key = ?',
+    ).get(notificationKey) as Record<string, unknown> | undefined;
+    if (!row) return;
+    const attempts = Number(row['attempts'] ?? 0) + 1;
+    const nextAttemptAt = new Date(Date.now() + notificationRetryDelayMs(attempts)).toISOString();
     this.db.prepare(
-      `UPDATE notification_outbox SET attempts = attempts + 1, last_error = ?
+      `UPDATE notification_outbox SET attempts = ?, last_error = ?, next_attempt_at = ?
        WHERE notification_key = ?`,
-    ).run(String(error).slice(0, 500), notificationKey);
+    ).run(attempts, String(error).slice(0, 500), nextAttemptAt, notificationKey);
   }
 
   notificationOutboxPending(): number {
     const row = this.db.prepare(
       'SELECT COUNT(*) AS n FROM notification_outbox WHERE delivered_at IS NULL',
     ).get() as Record<string, unknown>;
+    return Number(row['n'] ?? 0);
+  }
+
+  notificationOutboxDelayed(): number {
+    const row = this.db.prepare(
+      'SELECT COUNT(*) AS n FROM notification_outbox WHERE delivered_at IS NULL AND next_attempt_at > ?',
+    ).get(now()) as Record<string, unknown>;
     return Number(row['n'] ?? 0);
   }
 
@@ -595,6 +673,7 @@ export class StateStore {
       undecidedTotal: Number(totals['undecided']),
       deadLetterTotal: this.listDeadLetters(200).length,
       notificationOutboxPending: this.notificationOutboxPending(),
+      notificationOutboxDelayed: this.notificationOutboxDelayed(),
       feedback: this.feedbackSummary(),
       mailActionTotal: Number((this.db.prepare('SELECT COUNT(*) AS n FROM mail_actions').get() as Record<string, unknown>)['n'] ?? 0),
       mailActionFailures: Number((this.db.prepare('SELECT COUNT(*) AS n FROM mail_actions WHERE success = 0').get() as Record<string, unknown>)['n'] ?? 0),
@@ -629,10 +708,26 @@ export class StateStore {
     }));
   }
 
-  recordMcpAudit(action: string, client: string, success: boolean): void {
+  recordMcpAudit(action: string, client: string, success: boolean, target?: string): void {
     this.db.prepare(
-      'INSERT INTO mcp_audit (action, client, success, created_at) VALUES (?, ?, ?, ?)',
-    ).run(action.slice(0, 100), client.slice(0, 100), success ? 1 : 0, now());
+      'INSERT INTO mcp_audit (action, client, target, success, created_at) VALUES (?, ?, ?, ?, ?)',
+    ).run(
+      action.slice(0, 100), client.slice(0, 100), auditTargetValue(target), success ? 1 : 0, now(),
+    );
+  }
+
+  listMcpAudit(limit = 50): McpAuditEvent[] {
+    const rows = this.db.prepare(
+      `SELECT action, client, target, success, created_at
+       FROM mcp_audit ORDER BY created_at DESC, id DESC LIMIT ?`,
+    ).all(Math.max(1, Math.min(limit, 200))) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      action: String(row['action']),
+      client: (row['client'] as string) ?? null,
+      target: (row['target'] as string) ?? null,
+      success: Boolean(row['success']),
+      createdAt: String(row['created_at']),
+    }));
   }
 
   // ---- Queries (MCP and troubleshooting) ----
@@ -741,22 +836,23 @@ export class StateStore {
     destinationFolder?: string;
     success: boolean;
     error?: string;
+    client?: string;
   }): void {
     this.db.prepare(
       `INSERT INTO mail_actions
-       (account, message_id, action, source_folder, destination_folder, success, error, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       (account, message_id, action, source_folder, destination_folder, success, error, client, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       input.account.slice(0, 320), input.messageId.slice(0, 1000), input.action.slice(0, 80),
       input.sourceFolder?.slice(0, 500) ?? null, input.destinationFolder?.slice(0, 500) ?? null,
-      input.success ? 1 : 0, input.error?.slice(0, 500) ?? null, now(),
+      input.success ? 1 : 0, input.error?.slice(0, 500) ?? null, input.client?.slice(0, 100) ?? null, now(),
     );
   }
 
   listMailActions(limit = 50): MailActionAudit[] {
     const rows = this.db.prepare(
       `SELECT account, message_id, action, source_folder, destination_folder,
-              success, error, created_at
+              success, error, client, created_at
        FROM mail_actions ORDER BY created_at DESC, id DESC LIMIT ?`,
     ).all(Math.max(1, Math.min(limit, 200))) as Array<Record<string, unknown>>;
     return rows.map((row) => ({
@@ -767,6 +863,7 @@ export class StateStore {
       ...(row['destination_folder'] ? { destinationFolder: String(row['destination_folder']) } : {}),
       success: Boolean(row['success']),
       ...(row['error'] ? { error: String(row['error']) } : {}),
+      ...(row['client'] ? { client: String(row['client']) } : {}),
       createdAt: String(row['created_at']),
     }));
   }

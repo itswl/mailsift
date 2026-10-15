@@ -84,7 +84,7 @@ docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual
 
 MCP 恢复工具始终提供 `recovery_status`；`retry_dead_letter` 只在配置了下文的写凭证后才注册。重试只会回退对应文件夹的本地游标，下一轮正常轮询会重新拉取邮件，不会修改邮箱内容。
 
-MCP 还提供 `observability` 查看处理、投递、dead-letter、反馈和邮箱操作统计，以及按工具分组的访问审计。`record_feedback` 记录 `false_positive`、`missed`、`handled`、`correct`，供后续规则和分类评估使用，同样需要写凭证。`list_threads` 按 References/In-Reply-To 根键聚合会话，`search_mail` 还会检索已保存的正文片段和附件元数据。
+MCP 还提供 `observability` 查看处理、投递、dead-letter、反馈和邮箱操作统计，以及按工具分组的访问审计。`list_audit` 可查看近期工具/资源调用和邮箱操作审计，目标只保留有限的账号、Message-ID、部件标识，不保存凭证或正文。`record_feedback` 记录 `false_positive`、`missed`、`handled`、`correct`，供后续规则和分类评估使用，同样需要写凭证。`list_threads` 按 References/In-Reply-To 根键聚合会话，`search_mail` 还会检索已保存的正文片段和附件元数据。
 
 同一发件人累计两次 `missed` 反馈会推断为重要发件人，两次 `false_positive` 会推断为低优先级发件人；显式环境规则优先。可通过 MCP `feedback_rules` 查看推断规则。
 
@@ -176,9 +176,13 @@ docker compose run --rm mailsift node dist/src/main.js --recover
 
 `list_attachments` 可按邮箱账号和 Message-ID 列出附件元数据，并为每个文件返回一个 MCP Resource URI；读取该 URI 会按需获取对应文件。网页详情也支持列出并下载附件。附件二进制不会持久化；新分诊记录只保留有数量上限的文件名、MIME 类型、部件 ID 和邮件服务器报告的大小。每个文件默认最多读取 10 MiB，可用 `MCP_ATTACHMENT_MAX_BYTES` 调整，最高 100 MiB。该上限与整封邮件的 `MCP_LIVE_SOURCE_BYTES` 分开计算，下载时只读取选中的 MIME 部件。图片和 PDF 会按原文件下载，暂不做图片识别或 PDF 文本提取。
 
-`inspect_mail_safety` 按需读取邮件信封、指定邮件头和 MIME 结构，提示它是否位于配置的垃圾邮件文件夹、是否带有群发邮件头、`From` 与 `Reply-To` 域名是否不同，以及附件文件名或 MIME 类型是否需要谨慎。网页邮件详情也可触发同样的检查，附件清单会直接显示文件类型提示。检查使用只读锁，不读取正文或附件内容。
+`scan_attachment` 以及网页中的“扫描附件”按钮只读取有限的解码前缀，大小由 `MCP_ATTACHMENT_SCAN_BYTES` 控制（默认 1 MiB，最高 4 MiB）。本地启发式检查文件名/MIME 是否可疑，并识别常见可执行文件、脚本、主动内容和容器签名；不会解包、执行、上传或持久化文件，也不宣称替代杀毒软件。
 
-这些只是元数据线索，不是垃圾邮件或恶意软件判定。邮件列表头不代表垃圾邮件，发件人字段也可能伪造；不会验证 SPF/DKIM/DMARC，不会检查链接、正文或文件内容，也不会移动、删除或标记邮件。
+链接解析最多读取 `MCP_SAFETY_BODY_BYTES`（默认 256 KiB，最高 1 MiB）的文本正文前缀，提示协议、IP 主机、punycode、用户信息段和常见短链线索；不会返回 URL 路径和查询参数。
+
+`inspect_mail_safety` 按需读取邮件信封、指定邮件头和 MIME 结构，提示它是否位于配置的垃圾邮件文件夹、是否带有群发邮件头、`From` 与 `Reply-To` 域名是否不同、附件文件名或 MIME 类型是否需要谨慎，以及有限正文前缀中的链接风险。网页邮件详情也可触发同样的检查，附件清单会直接显示文件类型提示。检查使用只读锁，只解析有限正文，不访问链接，也不读取附件内容。
+
+这些只是启发式线索，不是垃圾邮件或恶意软件判定。邮件列表头不代表垃圾邮件，发件人字段也可能伪造；不会验证 SPF/DKIM/DMARC，不会访问链接、解包附件或提供杀毒结论，也不会移动、删除或标记邮件。
 
 `list_folders` 接收 `list_accounts` 返回的邮箱地址，通过只读 IMAP LIST 列出解码后的文件夹路径、层级分隔符、标记、特殊用途和是否可选中。它不会打开文件夹，也不会修改邮件。
 
@@ -202,9 +206,9 @@ MCP_TOKEN=<随机长 token>
 
 把 `MCP_WRITE_TOKEN` 设成与 `MCP_TOKEN` 不同的第二个密钥，二者相同会拒绝启动。用它作为 bearer token 才能拿到完整工具集；`MCP_TOKEN` 则保持为只读凭证，浏览器视图和任何共享客户端都应该只持有它。stdio 模式下调用方本来就能读取 env 文件，所以只要设置了 `MCP_WRITE_TOKEN`，写工具在 stdio 下直接可用，无需二次出示。
 
-每次工具调用都会按名称记入审计，鉴权失败同样记录，`observability` 可查看分组结果。审计只保存调用结果和调用方地址的哈希，从不保存出示的凭证值。
+每次工具和实时资源调用都会按名称、结果、调用方指纹和有限目标记入审计，鉴权失败同样记录；`list_audit` 可查看明细。审计不保存凭证、正文或 URL 查询参数。
 
-`health` 只反映最近一次轮询心跳、账号失败、LLM 失败计数和待处理队列；Docker healthcheck 只检查轮询心跳，healthy 不代表所有账号、LLM 和通知出口都正常，应通过 MCP `health` 和 `recovery_status` 查看详细状态。
+`health` 只反映最近一次轮询心跳、账号失败、LLM 失败计数和待处理队列；通知 outbox 失败后按持久化指数退避重试，默认间隔 60 秒、120 秒、240 秒并上限 1 小时，可用 `OUTBOX_RETRY_BASE_SECONDS` 与 `OUTBOX_RETRY_MAX_SECONDS` 调整。Docker healthcheck 只检查轮询心跳，healthy 不代表所有账号、LLM 和通知出口都正常，应通过 MCP `health` 和 `recovery_status` 查看详细状态。
 
 Signal Events 中的 MCP 引用只有设置 `MCP_TOKEN` 后才是 Bearer 鉴权引用；实时 IMAP 正文读取是有上限、只读、按需执行的，不会持久化原始正文。
 
