@@ -21,7 +21,7 @@ const nodeRequire = createRequire(import.meta.url);
 const { DatabaseSync } = nodeRequire('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSync = import('node:sqlite').DatabaseSync;
 import { getLogger } from '../logger.js';
-import type { MailMessage } from '../imap/message.js';
+import type { AttachmentManifest, MailMessage } from '../imap/message.js';
 import type { TriageResult } from './triage.js';
 
 const log = getLogger('state');
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS seen (
   folder TEXT, in_spam INTEGER NOT NULL DEFAULT 0,
   importance TEXT, category TEXT, summary TEXT, reason TEXT, deadline TEXT,
   decided_by TEXT, pushed INTEGER NOT NULL DEFAULT 0,
-  mail_date TEXT, snippet TEXT, created_at TEXT NOT NULL
+  mail_date TEXT, snippet TEXT, attachments_json TEXT, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS digest_queue (
   dedup_key TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
@@ -79,6 +79,7 @@ export interface MailRecord {
   decidedBy?: string;
   mailDate?: string;
   snippet?: string;
+  attachmentManifest?: AttachmentManifest;
 }
 
 export interface MailRow {
@@ -101,6 +102,7 @@ export interface MailRow {
   mailDate: string | null;
   createdAt: string;
   snippet?: string | null;
+  attachmentManifest?: AttachmentManifest | null;
 }
 
 export interface QueryOptions {
@@ -154,8 +156,27 @@ function now(): string {
 const ROW_COLUMNS = [
   'dedup_key', 'message_id', 'account', 'account_label', 'subject', 'sender', 'sender_name',
   'folder', 'in_spam', 'importance', 'category', 'summary', 'reason', 'deadline',
-  'decided_by', 'pushed', 'mail_date', 'created_at',
+  'decided_by', 'pushed', 'mail_date', 'attachments_json', 'created_at',
 ] as const;
+
+function parseAttachmentManifest(value: unknown): AttachmentManifest | null {
+  if (typeof value !== 'string' || !value) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<AttachmentManifest>;
+    if (!parsed || !Array.isArray(parsed.items)) return null;
+    const items = parsed.items.filter((item) => {
+      if (!item || typeof item !== 'object') return false;
+      const attachment = item as unknown as Record<string, unknown>;
+      return typeof attachment['partId'] === 'string'
+        && /^\d+(?:\.\d+)*$/.test(attachment['partId'])
+        && typeof attachment['contentType'] === 'string'
+        && typeof attachment['inline'] === 'boolean';
+    }).slice(0, 100);
+    return { items: items as AttachmentManifest['items'], truncated: parsed.truncated === true };
+  } catch {
+    return null;
+  }
+}
 
 function toRow(raw: Record<string, unknown>): MailRow {
   return {
@@ -178,6 +199,7 @@ function toRow(raw: Record<string, unknown>): MailRow {
     mailDate: (raw['mail_date'] as string) ?? null,
     createdAt: String(raw['created_at'] ?? ''),
     ...(raw['snippet'] !== undefined ? { snippet: raw['snippet'] as string } : {}),
+    attachmentManifest: parseAttachmentManifest(raw['attachments_json']),
   };
 }
 
@@ -195,6 +217,16 @@ export class StateStore {
     this.db.exec('PRAGMA busy_timeout = 5000');
     this.db.exec('PRAGMA journal_mode = WAL');
     this.db.exec(SCHEMA);
+    // Additive migration for databases created before attachment metadata was
+    // exposed. Multiple service processes may open the same DB concurrently.
+    const seenColumns = this.db.prepare('PRAGMA table_info(seen)').all() as Array<Record<string, unknown>>;
+    if (!seenColumns.some((column) => column['name'] === 'attachments_json')) {
+      try {
+        this.db.exec('ALTER TABLE seen ADD COLUMN attachments_json TEXT');
+      } catch (error) {
+        if (!String(error).toLowerCase().includes('duplicate column name')) throw error;
+      }
+    }
   }
 
   close(): void {
@@ -291,7 +323,7 @@ export class StateStore {
       .prepare(
         `UPDATE seen SET importance = ?, pushed = ?, message_id = ?, account_label = ?,
            sender = ?, sender_name = ?, folder = ?, in_spam = ?, category = ?,
-           summary = ?, reason = ?, deadline = ?, decided_by = ?, mail_date = ?, snippet = ?
+           summary = ?, reason = ?, deadline = ?, decided_by = ?, mail_date = ?, snippet = ?, attachments_json = ?
          WHERE dedup_key = ?`,
       )
       .run(
@@ -301,6 +333,7 @@ export class StateStore {
         fields.folder ?? null, fields.inSpam ? 1 : 0, fields.category ?? null,
         fields.summary ?? null, fields.reason ?? null, fields.deadline ?? null,
         fields.decidedBy ?? null, fields.mailDate ?? null, fields.snippet ?? null,
+        fields.attachmentManifest ? JSON.stringify(fields.attachmentManifest) : null,
         dedupKey,
       );
   }

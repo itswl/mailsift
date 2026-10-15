@@ -11,7 +11,10 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { ImapFlow, type FetchMessageObject, type ListResponse } from 'imapflow';
 import { getAccessToken } from './auth.js';
 import { resolveFolders, type Folder } from './folders.js';
-import { extractBody, fallbackMessageId, normalizeDate, type MailMessage } from './message.js';
+import {
+  extractAttachmentManifest, extractBody, fallbackMessageId, findTextBodyPart, htmlToText, normalizeDate,
+  type AttachmentInfo, type AttachmentManifest, type MailMessage,
+} from './message.js';
 import { needsOAuth, type Account } from '../config.js';
 import { getLogger } from '../logger.js';
 
@@ -174,16 +177,107 @@ function firstAddress(input: unknown): { name: string; address: string } {
   return { name: head?.name?.trim() ?? '', address: (head?.address ?? '').toLowerCase() };
 }
 
+function attachmentMaxBytes(): number {
+  const fallback = 10 * 1024 * 1024;
+  const hardMax = 100 * 1024 * 1024;
+  const value = Number(process.env.MCP_ATTACHMENT_MAX_BYTES ?? fallback);
+  return Number.isFinite(value) && value > 0 ? Math.max(1, Math.min(Math.floor(value), hardMax)) : fallback;
+}
+
+export class AttachmentTooLargeError extends Error {
+  constructor(readonly maxBytes: number) {
+    super(`attachment exceeds MCP_ATTACHMENT_MAX_BYTES=${maxBytes}`);
+    this.name = 'AttachmentTooLargeError';
+  }
+}
+
+export class AttachmentNotFoundError extends Error {
+  constructor(partId: string) {
+    super(`attachment part not found: ${partId}`);
+    this.name = 'AttachmentNotFoundError';
+  }
+}
+
+export interface AttachmentManifestLookup {
+  folder: string;
+  manifest: AttachmentManifest;
+}
+
+export interface DownloadedAttachment {
+  metadata: AttachmentInfo;
+  content: Buffer;
+}
+
+async function extractLargeMessageBody(
+  client: ImapFlow,
+  uid: number,
+  structure: FetchMessageObject['bodyStructure'],
+  maxBytes: number,
+): Promise<{ body: string; hasAttachments: boolean }> {
+  const part = findTextBodyPart(structure);
+  if (!part) return { body: '', hasAttachments: false };
+
+  const download = await client.download(uid, part.partId, { uid: true, maxBytes: maxBytes + 1 });
+  if (!download.content) return { body: '', hasAttachments: false };
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of download.content) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > maxBytes) {
+      download.content.destroy();
+      throw new Error(`text body part ${part.partId} exceeds MAX_MESSAGE_SOURCE_BYTES=${maxBytes}`);
+    }
+    chunks.push(buffer);
+  }
+
+  const decoded = Buffer.concat(chunks, size).toString('utf8');
+  const text = part.contentType === 'text/plain' ? decoded : htmlToText(decoded);
+  return { body: text.replace(/\s+/g, ' ').trim(), hasAttachments: false };
+}
+
+/** Find candidate UIDs in the currently selected folder and confirm exact IDs at fetch time. */
+async function searchMessageUids(client: ImapFlow, messageId: string): Promise<number[]> {
+  const headerFound = await client.search({ header: { 'message-id': messageId } }, { uid: true });
+  const found = Array.isArray(headerFound) && headerFound.length
+    ? headerFound
+    : await client.search({ text: messageId }, { uid: true });
+  let foundUids = Array.isArray(found) ? found : [];
+  if (foundUids.length === 0) {
+    const lookbackDays = intEnv('MCP_LIVE_LOOKBACK_DAYS', 90);
+    const maxCandidates = intEnv('MCP_LIVE_SEARCH_MAX_MESSAGES', 500);
+    const broad = await client.search(
+      { since: new Date(Date.now() - lookbackDays * 86_400_000) },
+      { uid: true },
+    );
+    if (Array.isArray(broad) && broad.length > maxCandidates) {
+      throw new Error(`live IMAP search exceeds MCP_LIVE_SEARCH_MAX_MESSAGES (${maxCandidates})`);
+    }
+    const matching: number[] = [];
+    for await (const raw of client.fetch(
+      Array.isArray(broad) ? broad : [],
+      { uid: true, envelope: true },
+      { uid: true },
+    )) {
+      if (raw.envelope?.messageId?.trim() === messageId) matching.push(raw.uid);
+    }
+    foundUids = matching;
+  }
+  return foundUids;
+}
+
 
 async function toMailMessage(
   raw: FetchMessageObject,
   account: Account,
   folder: Folder,
+  parsedBody?: { body: string; hasAttachments: boolean },
 ): Promise<MailMessage> {
   const envelope = raw.envelope;
   const from = firstAddress(envelope?.from);
   const headers = raw.headers?.toString('utf8') ?? '';
-  const { body, hasAttachments } = await extractBody(raw.source);
+  const { body, hasAttachments } = parsedBody ?? await extractBody(raw.source);
+  const attachmentManifest = extractAttachmentManifest(raw.bodyStructure);
 
   const messageId =
     envelope?.messageId?.trim() ||
@@ -213,7 +307,8 @@ async function toMailMessage(
     ...(envelope?.inReplyTo?.trim()
       ? { threadKey: `${account.username}|${envelope.inReplyTo.trim().toLowerCase()}` }
       : { threadKey: `${account.username}|${messageId.toLowerCase()}` }),
-    hasAttachments,
+    hasAttachments: hasAttachments || attachmentManifest.items.length > 0 || attachmentManifest.truncated,
+    attachmentManifest,
     listUnsubscribe: /^list-unsubscribe:/im.test(headers),
   };
 }
@@ -267,34 +362,52 @@ export async function fetchNew(
     const messages: MailMessage[] = [];
     const failures: FetchFailure[] = [];
     const maxSourceBytes = intEnv('MAX_MESSAGE_SOURCE_BYTES', 5 * 1024 * 1024);
+    const fetched: FetchMessageObject[] = [];
     for await (const raw of client.fetch(
       uids,
       {
         uid: true,
         size: true,
         envelope: true,
-        source: { maxLength: maxSourceBytes + 1 },
+        bodyStructure: true,
         headers: ['list-unsubscribe'],
       },
       { uid: true },
     )) {
+      fetched.push(raw);
+    }
+
+    // Avoid downloading large attachments as part of the message source. Small
+    // messages keep the existing mailparser path; large messages fetch only
+    // the selected text/plain or HTML body part below.
+    const sourceUids = fetched
+      .filter((raw) => raw.size === undefined || raw.size <= maxSourceBytes)
+      .map((raw) => raw.uid);
+    const sources = new Map<number, Buffer>();
+    if (sourceUids.length) {
+      for await (const raw of client.fetch(
+        sourceUids,
+        { uid: true, source: { maxLength: maxSourceBytes + 1 } },
+        { uid: true },
+      )) {
+        if (raw.source) sources.set(raw.uid, raw.source);
+      }
+    }
+
+    for (const raw of fetched) {
       const envelope = raw.envelope;
       const subject = envelope?.subject?.trim() ?? '';
       const messageId = envelope?.messageId?.trim() ?? '';
-      if (raw.size !== undefined && raw.size > maxSourceBytes) {
-        failures.push({
-          folder: folder.path,
-          uidValidity,
-          uid: raw.uid,
-          subject,
-          messageId,
-          reason: `message size ${raw.size} exceeds MAX_MESSAGE_SOURCE_BYTES=${maxSourceBytes}`,
-        });
-        log.error(`[${account.name}/${folder.path}] skipped oversized uid=${raw.uid} (${raw.size} bytes)`);
-        continue;
-      }
       try {
-        messages.push(await toMailMessage(raw, account, folder));
+        const source = sources.get(raw.uid);
+        const sourceWasFetched = sources.has(raw.uid);
+        const needsTextPart = (raw.size !== undefined && raw.size > maxSourceBytes)
+          || (source !== undefined && source.length > maxSourceBytes)
+          || !sourceWasFetched;
+        const parsedBody = needsTextPart
+          ? await extractLargeMessageBody(client, raw.uid, raw.bodyStructure, maxSourceBytes)
+          : await extractBody(source);
+        messages.push(await toMailMessage(raw, account, folder, parsedBody));
       } catch (error) {
         // One malformed message must not stop the entire folder.
         log.warn(`Failed to parse uid=${raw.uid}; skipping: ${error}`);
@@ -325,31 +438,7 @@ export async function fetchByMessageId(account: Account, messageId: string): Pro
     for (const folder of folders) {
       const lock = await client.getMailboxLock(folder.path, { readOnly: true });
       try {
-        const headerFound = await client.search({ header: { 'message-id': messageId } }, { uid: true });
-        let found = Array.isArray(headerFound) && headerFound.length
-          ? headerFound
-          : await client.search({ text: messageId }, { uid: true });
-        let foundUids = Array.isArray(found) ? found : [];
-        if (foundUids.length === 0) {
-          const lookbackDays = intEnv('MCP_LIVE_LOOKBACK_DAYS', 90);
-          const maxCandidates = intEnv('MCP_LIVE_SEARCH_MAX_MESSAGES', 500);
-          const broad = await client.search(
-            { since: new Date(Date.now() - lookbackDays * 86_400_000) },
-            { uid: true },
-          );
-          if (Array.isArray(broad) && broad.length > maxCandidates) {
-            throw new Error(`live IMAP search exceeds MCP_LIVE_SEARCH_MAX_MESSAGES (${maxCandidates})`);
-          }
-          const matching: number[] = [];
-          for await (const raw of client.fetch(
-            Array.isArray(broad) ? broad : [],
-            { uid: true, envelope: true },
-            { uid: true },
-          )) {
-            if (raw.envelope?.messageId?.trim() === messageId) matching.push(raw.uid);
-          }
-          foundUids = matching;
-        }
+        const foundUids = await searchMessageUids(client, messageId);
         if (!foundUids.length) continue;
         for await (const raw of client.fetch(
           foundUids,
@@ -357,6 +446,7 @@ export async function fetchByMessageId(account: Account, messageId: string): Pro
             uid: true,
             size: true,
             envelope: true,
+            bodyStructure: true,
             source: { maxLength: maxSourceBytes + 1 },
             headers: ['list-unsubscribe'],
           },
@@ -367,6 +457,94 @@ export async function fetchByMessageId(account: Account, messageId: string): Pro
           }
           const message = await toMailMessage(raw, account, folder);
           if (message.messageId === messageId) return message;
+        }
+      } finally {
+        lock.release();
+      }
+    }
+    return undefined;
+  } finally {
+    await client.logout().catch(() => undefined);
+  }
+}
+
+/**
+ * Read lightweight attachment metadata from the configured mailbox without
+ * fetching the full message source or changing mailbox state.
+ */
+export async function fetchAttachmentManifestByMessageId(
+  account: Account,
+  messageId: string,
+): Promise<AttachmentManifestLookup | undefined> {
+  const client = await connect(account);
+  try {
+    const folders = await targetFolders(client, account);
+    for (const folder of folders) {
+      const lock = await client.getMailboxLock(folder.path, { readOnly: true });
+      try {
+        const uids = await searchMessageUids(client, messageId);
+        if (!uids.length) continue;
+        for await (const raw of client.fetch(
+          uids,
+          { uid: true, envelope: true, bodyStructure: true },
+          { uid: true },
+        )) {
+          if (raw.envelope?.messageId?.trim() !== messageId) continue;
+          return { folder: folder.path, manifest: extractAttachmentManifest(raw.bodyStructure) };
+        }
+      } finally {
+        lock.release();
+      }
+    }
+    return undefined;
+  } finally {
+    await client.logout().catch(() => undefined);
+  }
+}
+
+/**
+ * Fetch one attachment body part on demand. The MIME part is checked against
+ * BODYSTRUCTURE before downloading, so callers cannot use this path to fetch
+ * arbitrary message sections. Nothing is persisted.
+ */
+export async function fetchAttachmentByMessageId(
+  account: Account,
+  messageId: string,
+  partId: string,
+): Promise<DownloadedAttachment | undefined> {
+  if (!/^\d+(?:\.\d+)*$/.test(partId)) throw new AttachmentNotFoundError(partId);
+  const maxBytes = attachmentMaxBytes();
+  const client = await connect(account);
+  try {
+    const folders = await targetFolders(client, account);
+    for (const folder of folders) {
+      const lock = await client.getMailboxLock(folder.path, { readOnly: true });
+      try {
+        const uids = await searchMessageUids(client, messageId);
+        if (!uids.length) continue;
+        for (const uid of uids) {
+          const raw = await client.fetchOne(
+            uid,
+            { uid: true, envelope: true, bodyStructure: true },
+            { uid: true },
+          );
+          if (!raw || raw.envelope?.messageId?.trim() !== messageId) continue;
+          const metadata = extractAttachmentManifest(raw.bodyStructure).items.find((part) => part.partId === partId);
+          if (!metadata) throw new AttachmentNotFoundError(partId);
+          const download = await client.download(uid, partId, { uid: true, maxBytes: maxBytes + 1 });
+          if (!download.content) throw new AttachmentNotFoundError(partId);
+          const chunks: Buffer[] = [];
+          let size = 0;
+          for await (const chunk of download.content) {
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            size += buffer.length;
+            if (size > maxBytes) {
+              download.content.destroy();
+              throw new AttachmentTooLargeError(maxBytes);
+            }
+            chunks.push(buffer);
+          }
+          return { metadata, content: Buffer.concat(chunks, size) };
         }
       } finally {
         lock.release();

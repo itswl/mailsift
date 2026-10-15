@@ -93,7 +93,7 @@ The first scan uses `INITIAL_LOOKBACK_DAYS` (default `3`). If a fresh folder or 
 
 Each folder is limited to `MAX_MESSAGES_PER_POLL` (default `200`). All accounts and folders share `MAX_MESSAGES_PER_POLL_TOTAL` (default `500`). When the ordinary total cap is reached, unprocessed folders keep their cursors and continue on the next poll. Selected UIDs are processed oldest-first so a cap does not skip older mail.
 
-Messages larger than `MAX_MESSAGE_SOURCE_BYTES` (default `5 MiB`) are not downloaded into the MIME parser. They are recorded as dead letters and can be inspected through the MCP `list_dead_letters` tool.
+Messages up to `MAX_MESSAGE_SOURCE_BYTES` (default `5 MiB`) use the normal MIME parser. For larger messages, mailsift reads only the selected `text/plain` body part, falling back to HTML, so a large attachment is not pulled into triage. If that text body alone exceeds the limit, the message is recorded as a dead letter and can be inspected through `list_dead_letters`; `list_attachments` can still look up its files by account and Message-ID.
 
 The MCP recovery tools expose `recovery_status` always, and `retry_dead_letter` only when the write credential below is configured. Retrying rewinds one folder cursor so the next normal poll can fetch the message again; it does not modify the mailbox.
 
@@ -231,6 +231,22 @@ the browser view and any shared client should hold. Over stdio the caller can
 already read the env file, so setting `MCP_WRITE_TOKEN` alone enables the two
 tools there without a second presentation.
 
+### Reading attachments
+
+`list_attachments` takes a configured account and Message-ID, and returns MIME
+metadata plus a `mailsift://imap/.../attachment/{partId}` resource URI for each
+file. Read the resource to fetch that one file from IMAP. The web view also lists
+and downloads attachments from a message's detail panel. Reads use a read-only
+mailbox lock; attachment bytes are never stored. New triage records keep only a
+bounded manifest of names, MIME types, part IDs, and reported sizes.
+
+`MCP_ATTACHMENT_MAX_BYTES` limits the decoded size of each on-demand file and
+defaults to 10 MiB (configuration is capped at 100 MiB). This limit is separate
+from `MCP_LIVE_SOURCE_BYTES`, so attachment reads fetch the selected MIME part
+without downloading the entire message source. Filenames are treated as
+untrusted data and files are delivered as downloads. mailsift returns image and
+PDF files as-is; it does not recognize images or extract PDF text.
+
 Every tool call is audited by name, along with rejected authentication attempts,
 and `observability` reports the breakdown. The value a caller presented is never
 stored, only the outcome and a hash of the caller address.
@@ -242,9 +258,9 @@ sink is healthy. Use MCP `health` and `recovery_status` for those details.
 
 ## Read-only web view
 
-`WEB_UI_ENABLED=true` serves a browser view of the triage results at `http://<host>:<MCP_PORT>/`, on the same port and behind the same `MCP_TOKEN` as MCP, because it is the same trust boundary. It lists what arrived with the level, category and the model's reasoning, filters by window, level, category and mailbox, searches subject, sender and summary, previews the queue behind the next digest, and links out to the provider's own client. One message body can be fetched live on request; nothing is cached.
+`WEB_UI_ENABLED=true` serves a browser view of the triage results at `http://<host>:<MCP_PORT>/`, on the same port and behind the same `MCP_TOKEN` as MCP, because it is the same trust boundary. It lists what arrived with the level, category and the model's reasoning, filters by window, level, category and mailbox, searches subject, sender and summary, previews the queue behind the next digest, and links out to the provider's own client. A message body and individual attachments can be fetched live on request; attachment files are downloaded and never cached or persisted by mailsift.
 
-It is read-only in the strict sense: there is no route that changes anything, and the only mailbox call it can make is the same bounded, read-only fetch the MCP resource already uses. It cannot mark read, flag, move, delete or send. For reading and replying to mail, run a real webmail client such as Roundcube against the same accounts; this view is for triage, not for mail handling.
+It is read-only in the strict sense: mailbox calls fetch a message body or a selected MIME part under a read-only lock. It cannot mark read, flag, move, delete or send. For reading and replying to mail, run a real webmail client such as Roundcube against the same accounts; this view is for triage, not for mail handling.
 
 Off by default. A page a browser can reach is a wider surface than a JSON-RPC endpoint, so enable it deliberately, keep `MCP_BIND` on loopback, and put TLS in front of it if you reach it from a phone.
 

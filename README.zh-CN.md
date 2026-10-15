@@ -80,7 +80,7 @@ docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual
 
 单个文件夹每轮最多处理 `MAX_MESSAGES_PER_POLL`（默认 200）封。所有账号和文件夹合计受 `MAX_MESSAGES_PER_POLL_TOTAL`（默认 500）限制。普通全局上限触发时，尚未处理的文件夹保留游标，下一轮继续。UID 按从老到新处理，避免截断时跳过旧邮件。
 
-超过 `MAX_MESSAGE_SOURCE_BYTES`（默认 5 MiB）的邮件不会下载给 MIME 解析器，而会记录为 dead letter，可通过 MCP 的 `list_dead_letters` 查询，不会静默消失。
+不超过 `MAX_MESSAGE_SOURCE_BYTES`（默认 5 MiB）的邮件按原来的 MIME 解析路径处理。更大的邮件只读取 `text/plain` 正文部件，没有时再读取 HTML，因此大附件不会被带入分诊。如果正文部件本身也超过上限，邮件会记为 dead letter，可通过 `list_dead_letters` 查询；知道邮箱账号和 Message-ID 后，仍可用 `list_attachments` 单独查找并读取附件。
 
 MCP 恢复工具始终提供 `recovery_status`；`retry_dead_letter` 只在配置了下文的写凭证后才注册。重试只会回退对应文件夹的本地游标，下一轮正常轮询会重新拉取邮件，不会修改邮箱内容。
 
@@ -154,9 +154,9 @@ docker compose run --rm mailsift node dist/src/main.js --recover
 
 ## 只读 Web 视图
 
-设置 `WEB_UI_ENABLED=true` 后，浏览器访问 `http://<host>:<MCP_PORT>/` 可以看到分诊结果，与 MCP 同端口、同 `MCP_TOKEN`，因为两者的信任边界相同。页面按时间窗口、重要性、分类、邮箱筛选，可搜索主题、发件人和摘要，展示模型给出的判断理由，预览下一份日报的待发内容，并提供跳转到服务商客户端的链接。单封邮件可以按需实时取回正文，不做缓存。
+设置 `WEB_UI_ENABLED=true` 后，浏览器访问 `http://<host>:<MCP_PORT>/` 可以看到分诊结果，与 MCP 同端口、同 `MCP_TOKEN`，因为两者的信任边界相同。页面按时间窗口、重要性、分类、邮箱筛选，可搜索主题、发件人和摘要，展示模型给出的判断理由，预览下一份日报的待发内容，并提供跳转到服务商客户端的链接。邮件正文和单个附件都可按需从邮箱实时读取；附件只下载到调用方，不会被 mailsift 缓存或持久化。
 
-它是严格只读的：没有任何会产生修改的路由，唯一的邮箱调用就是 MCP 资源已有的那个有界只读读取。它不能标已读、加旗标、移动、删除或发信。**要读信和回信，请另外跑一个成熟的 webmail（比如 Roundcube）指向同一批账号**，这个视图负责分诊，不负责收发邮件。
+它是严格只读的：邮箱调用只会在只读锁下读取邮件正文或指定 MIME 部件。它不能标已读、加旗标、移动、删除或发信。**要读信和回信，请另外跑一个成熟的 webmail（比如 Roundcube）指向同一批账号**，这个视图负责分诊，不负责收发邮件。
 
 默认关闭。浏览器可达的页面比 JSON-RPC 端点暴露面更大，请显式开启，保持 `MCP_BIND` 在回环地址，从手机访问时在前面放一层 TLS。
 
@@ -173,6 +173,8 @@ docker compose run --rm mailsift node dist/src/main.js --recover
 ## MCP
 
 排查"为什么没收到通知"时先调 `health`：它的 `delivery` 段会给出推送与日报阈值、垃圾箱加成及其风险提示、自转发是否被抑制、重试次数，通常不必再往下查就能解释这次判定。`recovery_status` 进一步给出各文件夹的 UID 进度和仍在排队重试的通知条目，是定位投递积压的地方。`list_mail` 支持按分类精确过滤，`list_digest` 可预览待发日报。
+
+`list_attachments` 可按邮箱账号和 Message-ID 列出附件元数据，并为每个文件返回一个 MCP Resource URI；读取该 URI 会按需获取对应文件。网页详情也支持列出并下载附件。附件二进制不会持久化；新分诊记录只保留有数量上限的文件名、MIME 类型、部件 ID 和邮件服务器报告的大小。每个文件默认最多读取 10 MiB，可用 `MCP_ATTACHMENT_MAX_BYTES` 调整，最高 100 MiB。该上限与整封邮件的 `MCP_LIVE_SOURCE_BYTES` 分开计算，下载时只读取选中的 MIME 部件。图片和 PDF 会按原文件下载，暂不做图片识别或 PDF 文本提取。
 
 内置 MCP 默认在主进程中开启。Docker 中，`MCP_BIND` 是容器内监听地址，`MCP_PUBLIC_HOST` 是宿主机发布地址；Compose 会让宿主机端口和容器端口都使用 `MCP_PORT`。默认只在宿主机回环地址提供服务：
 

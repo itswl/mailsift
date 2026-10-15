@@ -277,6 +277,7 @@ export class Watcher {
       decidedBy: result.decidedBy,
       mailDate: message.date,
       snippet: snippet(message),
+      ...(message.attachmentManifest ? { attachmentManifest: message.attachmentManifest } : {}),
     };
   }
 

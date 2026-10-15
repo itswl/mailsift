@@ -1,8 +1,32 @@
 /** Convert an IMAP envelope into a structured MailMessage without throwing. */
 import { createHash } from 'node:crypto';
+import type { MessageStructureObject } from 'imapflow';
 import { simpleParser } from 'mailparser';
 
 export const SNIPPET_CHARS = 400;
+export const MAX_ATTACHMENT_MANIFEST_ITEMS = 100;
+
+export interface AttachmentInfo {
+  /** IMAP BODYSTRUCTURE part number used for an on-demand read. */
+  partId: string;
+  filename?: string;
+  contentType: string;
+  /** Reported MIME part size in bytes; the downloaded size can differ slightly. */
+  sizeBytes?: number;
+  transferEncoding?: string;
+  inline: boolean;
+  contentId?: string;
+}
+
+export interface AttachmentManifest {
+  items: AttachmentInfo[];
+  truncated: boolean;
+}
+
+export interface TextBodyPart {
+  partId: string;
+  contentType: 'text/plain' | 'text/html' | 'text/x-amp-html';
+}
 
 export interface MailMessage {
   account: string;
@@ -21,9 +45,131 @@ export interface MailMessage {
   date: string;
   body: string;
   hasAttachments: boolean;
+  /** Lightweight MIME metadata only. File contents are fetched separately. */
+  attachmentManifest?: AttachmentManifest;
   listUnsubscribe: boolean;
   /** Synthetic messages (digest and health alerts) use this to select rendering. */
   extra?: Record<string, unknown>;
+}
+
+const MIME_TYPE = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i;
+const BODY_TEXT_TYPES = new Set(['text/plain', 'text/html', 'text/x-amp-html']);
+
+/**
+ * Build a bounded, lightweight manifest from IMAP BODYSTRUCTURE.
+ *
+ * It includes ordinary attachments and inline MIME parts such as CID images,
+ * while leaving the plain and HTML message bodies out of the download list.
+ */
+export function extractAttachmentManifest(
+  structure: MessageStructureObject | undefined,
+): AttachmentManifest {
+  const items: AttachmentInfo[] = [];
+  let truncated = false;
+
+  const add = (node: MessageStructureObject, partId: string, inline: boolean): void => {
+    if (!/^\d+(?:\.\d+)*$/.test(partId)) return;
+    if (items.length >= MAX_ATTACHMENT_MANIFEST_ITEMS) {
+      truncated = true;
+      return;
+    }
+    const parameters = node.dispositionParameters ?? {};
+    const name = parameters['filename'] ?? node.parameters?.['name'];
+    const filename = typeof name === 'string' && name.trim() ? name.trim().slice(0, 512) : undefined;
+    const rawType = node.type.trim().toLowerCase();
+    const contentType = MIME_TYPE.test(rawType) ? rawType : 'application/octet-stream';
+    const sizeBytes = typeof node.size === 'number' && Number.isFinite(node.size) && node.size >= 0
+      ? node.size
+      : undefined;
+    const transferEncoding = node.encoding?.trim().toLowerCase().slice(0, 40) || undefined;
+    const rawContentId = node.id?.trim().replace(/^<|>$/g, '').slice(0, 500);
+    const contentId = rawContentId || undefined;
+    items.push({
+      partId,
+      ...(filename ? { filename } : {}),
+      contentType,
+      ...(sizeBytes !== undefined ? { sizeBytes } : {}),
+      ...(transferEncoding ? { transferEncoding } : {}),
+      inline,
+      ...(contentId ? { contentId } : {}),
+    });
+  };
+
+  const visit = (node: MessageStructureObject, fallbackPartId?: string): void => {
+    if (truncated) return;
+    const children = node.childNodes ?? [];
+    const partId = node.part ?? fallbackPartId ?? (children.length ? undefined : '1');
+    const type = node.type.trim().toLowerCase();
+    const disposition = node.disposition?.trim().toLowerCase();
+    const filename = node.dispositionParameters?.['filename'] ?? node.parameters?.['name'];
+    const contentId = node.id?.trim();
+    const inline = disposition === 'inline' || (disposition !== 'attachment' && Boolean(contentId));
+    const isNamed = typeof filename === 'string' && filename.trim().length > 0;
+    const isExplicitAttachment = disposition === 'attachment';
+
+    // A named or explicitly attached multipart/message part is one downloadable
+    // item. Do not expose its internal MIME children as separate files.
+    if (partId && (isNamed || isExplicitAttachment || type === 'message/rfc822')) {
+      add(node, partId, inline);
+      return;
+    }
+
+    if (children.length) {
+      for (let index = 0; index < children.length && !truncated; index += 1) {
+        const child = children[index]!;
+        const childPartId = child.part ?? (partId ? `${partId}.${index + 1}` : String(index + 1));
+        visit(child, childPartId);
+      }
+      return;
+    }
+
+    const isBodyText = BODY_TEXT_TYPES.has(type) && !isExplicitAttachment;
+    if (partId && !type.startsWith('multipart/') && !isBodyText) {
+      add(node, partId, inline);
+    }
+  };
+
+  if (structure) visit(structure);
+  return { items, truncated };
+}
+
+/** Find a message's readable text body without descending into attached files. */
+export function findTextBodyPart(structure: MessageStructureObject | undefined): TextBodyPart | undefined {
+  if (!structure) return undefined;
+  const candidates: TextBodyPart[] = [];
+
+  const visit = (node: MessageStructureObject, fallbackPartId?: string): void => {
+    const children = node.childNodes ?? [];
+    const partId = node.part ?? fallbackPartId ?? (children.length ? undefined : '1');
+    const type = node.type.trim().toLowerCase();
+    const disposition = node.disposition?.trim().toLowerCase();
+    const filename = node.dispositionParameters?.['filename'] ?? node.parameters?.['name'];
+
+    // Text files can be attachments too; do not use their contents as the
+    // message body. A forwarded message is another MIME tree, not this body's
+    // text, so leave it alone as well.
+    if (disposition === 'attachment'
+      || (typeof filename === 'string' && filename.trim().length > 0)
+      || type === 'message/rfc822') return;
+
+    if (children.length) {
+      children.forEach((child, index) => {
+        const childPartId = child.part ?? (partId ? `${partId}.${index + 1}` : String(index + 1));
+        visit(child, childPartId);
+      });
+      return;
+    }
+
+    if (!partId || !/^[0-9]+(?:\.[0-9]+)*$/.test(partId)) return;
+    if (type === 'text/plain' || type === 'text/html' || type === 'text/x-amp-html') {
+      candidates.push({ partId, contentType: type });
+    }
+  };
+
+  visit(structure);
+  return candidates.find((part) => part.contentType === 'text/plain')
+    ?? candidates.find((part) => part.contentType === 'text/html')
+    ?? candidates.find((part) => part.contentType === 'text/x-amp-html');
 }
 
 /** Phrases that identify a verification-code email without sending it to an LLM. */

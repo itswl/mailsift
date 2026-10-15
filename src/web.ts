@@ -16,7 +16,10 @@ import { timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { loadConfig } from './config.js';
 import { escapeHtml } from './html.js';
-import { fetchByMessageId } from './imap/client.js';
+import {
+  AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
+  fetchAttachmentManifestByMessageId, fetchByMessageId,
+} from './imap/client.js';
 import { buildLink } from './links.js';
 import { renderDigest, type DigestItem } from './services/digest.js';
 import { CATEGORIES } from './services/triage.js';
@@ -38,6 +41,7 @@ export const LANGUAGE_COOKIE = 'mailsift_lang';
 const LANGUAGE_MAX_AGE = 365 * 24 * 60 * 60;
 /** A live IMAP read can be slow on providers with poor search; do not hang a tab on it. */
 const LIVE_FETCH_TIMEOUT_MS = 25_000;
+const LIVE_ATTACHMENT_TIMEOUT_MS = 60_000;
 const LIVE_BODY_CHARS = 20_000;
 
 /**
@@ -79,6 +83,7 @@ export interface WebResponse {
   /** Set-Cookie value, when a request establishes a session. */
   cookie?: string;
   cacheControl?: string;
+  headers?: Record<string, string>;
 }
 
 const json = (status: number, value: unknown): WebResponse => ({
@@ -267,6 +272,131 @@ export async function handleApi(
   }
 
   return json(404, { error: 'unknown endpoint' });
+}
+
+function attachmentContentDisposition(filename: string | undefined): string {
+  const safe = (filename || 'attachment')
+    .replace(/[\\/\u0000-\u001f\u007f"]/g, '_')
+    .trim()
+    .slice(0, 200) || 'attachment';
+  const ascii = safe.replace(/[^\x20-\x7e]/g, '_');
+  const encoded = encodeURIComponent(safe).replace(/['()*]/g, (char) =>
+    `%${char.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
+function attachmentContentType(value: string): string {
+  const normalized = value.toLowerCase();
+  return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(normalized)
+    ? normalized
+    : 'application/octet-stream';
+}
+
+async function handleAttachmentsApi(
+  params: URLSearchParams,
+  store: StateStore,
+  client: string,
+): Promise<WebResponse> {
+  const id = params.get('id')?.trim();
+  if (!id) {
+    store.recordMcpAudit('web:list-attachments', client, false);
+    return json(400, { error: 'id is required' });
+  }
+  const stored = store.getMail(id);
+  if (!stored?.messageId) {
+    store.recordMcpAudit('web:list-attachments', client, false);
+    return json(404, { error: 'mail record not found' });
+  }
+  const account = loadConfig().accounts.find((candidate) => candidate.username === stored.account);
+  if (!account) {
+    store.recordMcpAudit('web:list-attachments', client, false);
+    return json(409, { error: 'mailbox is no longer configured', code: 'unconfigured' });
+  }
+
+  try {
+    const timeout = Symbol('attachment lookup timeout');
+    const found = await Promise.race([
+      fetchAttachmentManifestByMessageId(account, stored.messageId),
+      new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_ATTACHMENT_TIMEOUT_MS).unref()),
+    ]);
+    if (found === timeout) {
+      store.recordMcpAudit('web:list-attachments', client, false);
+      return json(504, { error: 'the mailbox did not return attachment metadata in time', code: 'attachmentTimeout' });
+    }
+    store.recordMcpAudit('web:list-attachments', client, Boolean(found));
+    if (!found) return json(404, { error: 'message not found in configured read-only folders' });
+    return json(200, {
+      folder: found.folder,
+      attachments: found.manifest.items,
+      truncated: found.manifest.truncated,
+    });
+  } catch (error) {
+    store.recordMcpAudit('web:list-attachments', client, false);
+    const detail = String(error).slice(0, 200);
+    return json(502, { error: `mailbox attachment lookup failed: ${detail}`, code: 'attachmentFailed', detail });
+  }
+}
+
+async function handleAttachmentApi(
+  params: URLSearchParams,
+  store: StateStore,
+  client: string,
+): Promise<WebResponse> {
+  const id = params.get('id')?.trim();
+  const partId = params.get('part')?.trim();
+  if (!id || !partId) {
+    store.recordMcpAudit('web:get-attachment', client, false);
+    return json(400, { error: 'id and part are required' });
+  }
+  const stored = store.getMail(id);
+  if (!stored?.messageId) {
+    store.recordMcpAudit('web:get-attachment', client, false);
+    return json(404, { error: 'mail record not found' });
+  }
+  const account = loadConfig().accounts.find((candidate) => candidate.username === stored.account);
+  if (!account) {
+    store.recordMcpAudit('web:get-attachment', client, false);
+    return json(409, { error: 'mailbox is no longer configured', code: 'unconfigured' });
+  }
+
+  try {
+    const timeout = Symbol('attachment download timeout');
+    const found = await Promise.race([
+      fetchAttachmentByMessageId(account, stored.messageId, partId),
+      new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_ATTACHMENT_TIMEOUT_MS).unref()),
+    ]);
+    if (found === timeout) {
+      store.recordMcpAudit('web:get-attachment', client, false);
+      return json(504, { error: 'the mailbox did not return this attachment in time', code: 'attachmentTimeout' });
+    }
+    store.recordMcpAudit('web:get-attachment', client, Boolean(found));
+    if (!found) return json(404, { error: 'message not found in configured read-only folders' });
+    return {
+      status: 200,
+      body: found.content,
+      contentType: attachmentContentType(found.metadata.contentType),
+      cacheControl: 'no-store',
+      headers: {
+        'content-disposition': attachmentContentDisposition(found.metadata.filename),
+        'x-content-type-options': 'nosniff',
+      },
+    };
+  } catch (error) {
+    store.recordMcpAudit('web:get-attachment', client, false);
+    if (error instanceof AttachmentNotFoundError) {
+      return json(404, { error: 'attachment not found', code: 'attachmentNotFound' });
+    }
+    if (error instanceof AttachmentTooLargeError) {
+      return json(413, {
+        error: 'attachment exceeds the configured per-file limit',
+        code: 'attachmentTooLarge',
+        maxBytes: error.maxBytes,
+      });
+    }
+    const detail = String(error).slice(0, 200);
+    return json(502, { error: `attachment read failed: ${detail}`, code: 'attachmentFailed', detail });
+  }
 }
 
 function accountLabels(): Array<{ address: string; name: string }> {
@@ -459,6 +589,13 @@ border-radius:8px;background:var(--card);color:var(--fg);font:inherit;cursor:poi
 .actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 .actions a,.actions button{font:inherit;font-size:13px;padding:6px 11px;border-radius:7px;
 border:1px solid var(--line);background:var(--bg);color:var(--fg);text-decoration:none;cursor:pointer}
+.attachments{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.attachments h4{margin:0 0 6px;font-size:13px}
+.attachment-list{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.attachment-item{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:13px}
+.attachment-item a{overflow-wrap:anywhere}
+.attachment-meta{color:var(--muted);font-size:12px}
+.attachment-status{margin:6px 0 0;color:var(--muted);font-size:12px}
 .card{margin:14px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--card)}
 .card h2{margin:0 0 8px;font-size:14px}
 .card pre{white-space:pre-wrap;word-break:break-word;margin:0;font:12px/1.5 ui-monospace,monospace;color:var(--muted)}
@@ -540,7 +677,117 @@ function linkLabel(row) {
   return name ? fill(row.link.exact ? 'link.openIn' : 'link.open', { name }) : row.link.label;
 }
 function failure(d) {
-  return STRINGS[lang]['error.' + d.code] ? fill('error.' + d.code, { detail: d.detail || '' }) : (d.error || t('detail.failed'));
+  return STRINGS[lang]['error.' + d.code]
+    ? fill('error.' + d.code, { detail: d.detail || '', maxBytes: d.maxBytes ? sizeLabel(d.maxBytes) : '' })
+    : (d.error || t('detail.failed'));
+}
+function sizeLabel(size) {
+  if (typeof size !== 'number' || !Number.isFinite(size) || size < 0) return '';
+  if (size < 1024) return size + ' B';
+  const units = ['KB', 'MB', 'GB'];
+  let value = size / 1024, index = 0;
+  while (value >= 1024 && index < units.length - 1) { value /= 1024; index++; }
+  return value.toFixed(value >= 10 ? 0 : 1) + ' ' + units[index];
+}
+function downloadFilename(value) {
+  const source = typeof value === 'string' ? value : 'attachment';
+  const safe = Array.from(source, (char) => {
+    const code = char.charCodeAt(0);
+    return char === '/' || code === 92 || code < 32 || code === 127 ? '_' : char;
+  }).join('').trim().slice(0, 200);
+  return safe || 'attachment';
+}
+function renderAttachmentManifest(container, manifest, row) {
+  container.replaceChildren();
+  const items = Array.isArray(manifest.items) ? manifest.items
+    : (Array.isArray(manifest.attachments) ? manifest.attachments : []);
+  if (!items.length && !manifest.truncated) {
+    container.appendChild(el('p', 'attachment-status', t('detail.noAttachments')));
+    return;
+  }
+  const list = el('ul', 'attachment-list');
+  for (const item of items) {
+    const entry = el('li', 'attachment-item');
+    const filename = item.filename || fill('detail.unnamedAttachment', { partId: item.partId || '' });
+    const link = el('a', null, filename);
+    const href = '/api/attachment?id=' + encodeURIComponent(row.dedupKey || row.messageId)
+      + '&part=' + encodeURIComponent(item.partId || '');
+    link.href = href;
+    link.download = downloadFilename(item.filename);
+    const status = el('span', 'attachment-status');
+    link.onclick = async (event) => {
+      event.preventDefault();
+      status.textContent = t('detail.downloadingAttachment');
+      try {
+        const response = await fetch(href);
+        if (!response.ok) {
+          const result = await response.json().catch(() => ({}));
+          status.textContent = failure(result);
+          return;
+        }
+        const objectUrl = URL.createObjectURL(await response.blob());
+        const save = document.createElement('a');
+        save.href = objectUrl;
+        save.download = downloadFilename(item.filename);
+        document.body.appendChild(save);
+        save.click();
+        save.remove();
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+        status.textContent = '';
+      } catch {
+        status.textContent = t('detail.networkFailed');
+      }
+    };
+    entry.appendChild(link);
+    const details = [item.contentType, sizeLabel(item.sizeBytes), item.inline ? t('detail.inline') : '']
+      .filter(Boolean).join(' · ');
+    if (details) entry.appendChild(el('span', 'attachment-meta', details));
+    entry.appendChild(status);
+    list.appendChild(entry);
+  }
+  container.appendChild(list);
+  if (manifest.truncated) {
+    container.appendChild(el('p', 'attachment-status', t('detail.attachmentsTruncated')));
+  }
+}
+function attachmentSection(box, row) {
+  const manifest = row.attachmentManifest;
+  if (manifest && Array.isArray(manifest.items) && !manifest.items.length && !manifest.truncated) return;
+  const section = el('section', 'attachments');
+  section.appendChild(el('h4', null, t('detail.attachments')));
+  const content = el('div');
+  if (manifest) {
+    renderAttachmentManifest(content, manifest, row);
+  } else {
+    const load = el('button', null, t('detail.checkAttachments'));
+    load.type = 'button';
+    const status = el('p', 'attachment-status');
+    load.onclick = async () => {
+      load.disabled = true;
+      load.textContent = t('detail.loadingAttachments');
+      status.textContent = '';
+      try {
+        const response = await fetch('/api/attachments?id=' + encodeURIComponent(row.dedupKey || row.messageId));
+        const result = await response.json();
+        if (!response.ok) {
+          status.textContent = failure(result);
+          load.disabled = false;
+          load.textContent = t('detail.checkAttachments');
+          return;
+        }
+        renderAttachmentManifest(content, result, row);
+        load.remove();
+      } catch {
+        status.textContent = t('detail.networkFailed');
+        load.disabled = false;
+        load.textContent = t('detail.checkAttachments');
+      }
+    };
+    content.appendChild(load);
+    content.appendChild(status);
+  }
+  section.appendChild(content);
+  box.appendChild(section);
 }
 
 function detail(row) {
@@ -590,6 +837,7 @@ function detail(row) {
   };
   actions.appendChild(full);
   box.appendChild(actions);
+  attachmentSection(box, row);
   return box;
 }
 
@@ -913,6 +1161,16 @@ export async function routeWeb(
     // every minute for nothing.
     const session = readCookie(req.headers.cookie, SESSION_COOKIE);
     if (token && session) answer.cookie = sessionCookie(req, session);
+    return answer;
+  }
+  if (url.pathname === '/api/attachments' && req.method === 'GET') {
+    const answer = await handleAttachmentsApi(url.searchParams, store, client);
+    answer.cacheControl = 'no-store';
+    return answer;
+  }
+  if (url.pathname === '/api/attachment' && req.method === 'GET') {
+    const answer = await handleAttachmentApi(url.searchParams, store, client);
+    answer.cacheControl = 'no-store';
     return answer;
   }
   if (url.pathname.startsWith('/api/') && req.method === 'GET') {
