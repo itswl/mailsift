@@ -2,7 +2,7 @@
 
 mailsift 用于统一监控多个 IMAP 邮箱，包括垃圾箱。它结合本地规则和大模型判断邮件重要性，将需要处理的邮件推送到飞书或通用 Webhook，其余邮件汇总为每日简报。
 
-> 这是辅助工具，不是邮件客户端。mailsift 只读，不会发送、回复、整理邮件，也不会将邮件标记为已读。分类结果可能有误，请继续以邮件客户端为准。
+> 这是辅助工具，不是邮件客户端。mailsift 默认只读；单独配置写凭证后，可以执行少量有审计的标记、加星和移动操作，但不会发送、回复、删除邮件或静默修改邮箱。分类结果可能有误，请继续以邮件客户端为准。
 
 英文主文档见 [README.md](README.md)。
 
@@ -84,7 +84,7 @@ docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual
 
 MCP 恢复工具始终提供 `recovery_status`；`retry_dead_letter` 只在配置了下文的写凭证后才注册。重试只会回退对应文件夹的本地游标，下一轮正常轮询会重新拉取邮件，不会修改邮箱内容。
 
-MCP 还提供 `observability` 查看处理、投递、dead-letter 和反馈统计，以及按工具分组的访问审计。`record_feedback` 记录 `false_positive`、`missed`、`handled`、`correct`，供后续规则和分类评估使用，同样需要写凭证。
+MCP 还提供 `observability` 查看处理、投递、dead-letter、反馈和邮箱操作统计，以及按工具分组的访问审计。`record_feedback` 记录 `false_positive`、`missed`、`handled`、`correct`，供后续规则和分类评估使用，同样需要写凭证。`list_threads` 按 References/In-Reply-To 根键聚合会话，`search_mail` 还会检索已保存的正文片段和附件元数据。
 
 同一发件人累计两次 `missed` 反馈会推断为重要发件人，两次 `false_positive` 会推断为低优先级发件人；显式环境规则优先。可通过 MCP `feedback_rules` 查看推断规则。
 
@@ -154,11 +154,11 @@ docker compose run --rm mailsift node dist/src/main.js --recover
 
 ## 只读 Web 视图
 
-设置 `WEB_UI_ENABLED=true` 后，浏览器访问 `http://<host>:<MCP_PORT>/` 可以看到分诊结果，与 MCP 同端口、同 `MCP_TOKEN`，因为两者的信任边界相同。页面按时间窗口、重要性、分类、邮箱筛选，可搜索主题、发件人和摘要，展示模型给出的判断理由，预览下一份日报的待发内容，并提供跳转到服务商客户端的链接。邮件正文和单个附件都可按需从邮箱实时读取；附件只下载到调用方，不会被 mailsift 缓存或持久化。
+设置 `WEB_UI_ENABLED=true` 后，浏览器访问 `http://<host>:<MCP_PORT>/` 可以看到分诊结果，与 MCP 同端口、同 `MCP_TOKEN`，因为两者的信任边界相同。页面可以切换邮件或会话视图，按时间窗口、重要性、分类、邮箱筛选，可搜索主题、发件人、摘要和附件元数据，展示模型给出的判断理由，预览下一份日报的待发内容，并提供跳转到服务商客户端的链接。邮件正文和单个附件都可按需从邮箱实时读取；附件只下载到调用方，不会被 mailsift 缓存或持久化。
 
 它是严格只读的：邮箱调用只会在只读锁下读取邮件正文或指定 MIME 部件。它不能标已读、加旗标、移动、删除或发信。**要读信和回信，请另外跑一个成熟的 webmail（比如 Roundcube）指向同一批账号**，这个视图负责分诊，不负责收发邮件。
 
-默认关闭。浏览器可达的页面比 JSON-RPC 端点暴露面更大，请显式开启，保持 `MCP_BIND` 在回环地址，从手机访问时在前面放一层 TLS。
+浏览器视图仍然严格只读；需要标记、加星或移动邮件时，使用带独立写凭证的 MCP 客户端。发送、回复和删除仍交给正式邮件客户端。默认关闭。浏览器可达的页面比 JSON-RPC 端点暴露面更大，请显式开启，保持 `MCP_BIND` 在回环地址，从手机访问时在前面放一层 TLS。
 
 登录时 token 以 POST 提交并换成一个 `HttpOnly` cookie，有效期半年，每次打开页面都会续期，因此常用的浏览器不会再被问第二次。登录表单带一个账号字段，密码管理器会主动提示保存 token，不用手工输入。注意 iOS 上安装到主屏的应用有**独立的 cookie 存储**，即使 Safari 里已登录，应用内仍需登录一次。
 
@@ -192,9 +192,9 @@ MCP_TOKEN=<随机长 token>
 
 ### 默认只读，写能力需显式开启
 
-只有 `record_feedback` 和 `retry_dead_letter` 会改变服务状态，未设置 `MCP_WRITE_TOKEN` 时它们根本不会注册。原因在 `record_feedback`：同一发件人累计两条 `false_positive` 会推断出一条"永不重要"规则，因此能写反馈的人就能让你此后收不到该发件人的告警。这会把一次读 token 泄露从信息泄露升级为告警致盲。`retry_dead_letter` 轻得多，代价只是重新抓取和重复通知，但它同样是写操作，所以一起隔离。
+`manage_mail`、`record_feedback` 和 `retry_dead_letter` 会改变状态，未设置 `MCP_WRITE_TOKEN` 时根本不会注册。`manage_mail` 支持 `mark_read`、`mark_unread`、`star`、`unstar` 和 `move`，拒绝移动到回收站/删除文件夹，也不会发送邮件。每次操作都会在可写 IMAP 锁内重新按 Message-ID 定位，并写入审计记录；独立写凭证可以避免读凭证泄露后修改邮箱或改变后续分诊规则。
 
-把 `MCP_WRITE_TOKEN` 设成与 `MCP_TOKEN` 不同的第二个密钥，二者相同会拒绝启动。用它作为 bearer token 才能拿到完整工具集；`MCP_TOKEN` 则保持为只读凭证，浏览器视图和任何共享客户端都应该只持有它。stdio 模式下调用方本来就能读取 env 文件，所以只要设置了 `MCP_WRITE_TOKEN`，那两个工具在 stdio 下直接可用，无需二次出示。
+把 `MCP_WRITE_TOKEN` 设成与 `MCP_TOKEN` 不同的第二个密钥，二者相同会拒绝启动。用它作为 bearer token 才能拿到完整工具集；`MCP_TOKEN` 则保持为只读凭证，浏览器视图和任何共享客户端都应该只持有它。stdio 模式下调用方本来就能读取 env 文件，所以只要设置了 `MCP_WRITE_TOKEN`，写工具在 stdio 下直接可用，无需二次出示。
 
 每次工具调用都会按名称记入审计，鉴权失败同样记录，`observability` 可查看分组结果。审计只保存调用结果和调用方地址的哈希，从不保存出示的凭证值。
 

@@ -237,6 +237,35 @@ export async function handleApi(
     });
   }
 
+  if (path === '/api/threads') {
+    const search = params.get('q')?.trim();
+    const importance = params.get('importance')?.trim();
+    const category = params.get('category')?.trim();
+    const account = params.get('account')?.trim();
+    const limit = intParam(params, 'limit', 50, 100);
+    const threads = store.queryThreads({
+      sinceHours: intParam(params, 'hours', 24, 24 * 90),
+      ...(importance ? { importance } : {}),
+      ...(category ? { category } : {}),
+      ...(account ? { account } : {}),
+      ...(search ? { search } : {}),
+      limit,
+    });
+    const addLink = (row: (typeof threads)[number]['latest']) => {
+      const provider = providerOf(row.account);
+      return { ...row, provider, link: buildLink(provider, row.account, row.messageId ?? '') };
+    };
+    return json(200, {
+      count: threads.length,
+      windowHours: intParam(params, 'hours', 24, 24 * 90),
+      threads: threads.map((thread) => ({
+        ...thread,
+        latest: addLink(thread.latest),
+        messages: thread.messages.map(addLink),
+      })),
+    });
+  }
+
   if (path === '/api/summary') {
     const hours = intParam(params, 'hours', 24, 24 * 90);
     return json(200, { ...store.summarize(hours), categories: CATEGORIES, accounts: accountLabels() });
@@ -475,6 +504,9 @@ export function renderApp(lang: Language): string {
       <button id="theme" type="button" class="switch" aria-label="${s('theme.title')}"></button>
     </header>
     <form id="filters" class="bar filters">
+      <select name="view">
+        ${option('mail', 'view.mail')}${option('threads', 'view.threads')}
+      </select>
       <select name="hours">
         ${option('24', 'window.24h')}${option('72', 'window.3d')}
         ${option('168', 'window.7d')}${option('720', 'window.30d')}
@@ -596,6 +628,10 @@ border:1px solid var(--line);background:var(--bg);color:var(--fg);text-decoratio
 .attachment-item a{overflow-wrap:anywhere}
 .attachment-meta{color:var(--muted);font-size:12px}
 .attachment-status{margin:6px 0 0;color:var(--muted);font-size:12px}
+.thread-history{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.thread-history h4{margin:0 0 8px;font-size:13px}
+.thread-message{display:grid;gap:2px;padding:8px 0;border-top:1px solid var(--line);font-size:13px}
+.thread-message pre{margin:2px 0 0;font-size:12px}
 .card{margin:14px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--card)}
 .card h2{margin:0 0 8px;font-size:14px}
 .card pre{white-space:pre-wrap;word-break:break-word;margin:0;font:12px/1.5 ui-monospace,monospace;color:var(--muted)}
@@ -667,6 +703,9 @@ function query() {
   const p = new URLSearchParams();
   for (const [k, v] of new FormData(filters)) if (v) p.set(k, v === 'on' ? 'true' : v);
   return p;
+}
+function dataPath() {
+  return filters.view.value === 'threads' ? '/api/threads' : '/api/mail';
 }
 
 // The label is composed here from the provider rather than taken from the
@@ -864,9 +903,50 @@ function rowOf(m) {
   return b;
 }
 
+function rowOfThread(thread) {
+  const m = thread.latest || {};
+  const b = el('button', 'row');
+  const top = el('div', 'top');
+  top.appendChild(el('span', 'dot ' + (m.importance || 'info')));
+  top.appendChild(el('span', 'who', m.senderName || m.sender || t('unknownSender')));
+  top.appendChild(el('span', 'when', when(m.mailDate || m.createdAt)));
+  b.appendChild(top);
+  b.appendChild(el('div', 'sum', m.subject || m.summary || t('noSubject')));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('span', 'chip', fill('thread.count', { count: thread.messageCount || 1 })));
+  if (m.category) meta.appendChild(el('span', 'chip', word('category.', m.category)));
+  if (m.inSpam) meta.appendChild(el('span', 'chip', t('spam')));
+  b.appendChild(meta);
+  b.dataset.key = thread.threadKey || m.dedupKey || m.messageId || '';
+  b.onclick = () => {
+    if (open && open.parentNode) open.remove();
+    if (open && open.dataset.key === b.dataset.key) { open = null; return; }
+    const d = threadDetail(thread); d.dataset.key = b.dataset.key;
+    b.after(d); open = d;
+  };
+  return b;
+}
+
+function threadDetail(thread) {
+  const box = detail(thread.latest);
+  if ((thread.messages || []).length <= 1) return box;
+  const history = el('section', 'thread-history');
+  history.appendChild(el('h4', null, fill('thread.count', { count: thread.messageCount })));
+  for (const message of thread.messages.slice(1)) {
+    const item = el('article', 'thread-message');
+    item.appendChild(el('strong', null, message.subject || t('noSubject')));
+    item.appendChild(el('span', 'attachment-meta', (message.senderName || message.sender || t('unknownSender'))
+      + ' · ' + when(message.mailDate || message.createdAt)));
+    if (message.summary) item.appendChild(el('pre', null, message.summary));
+    history.appendChild(item);
+  }
+  box.appendChild(history);
+  return box;
+}
+
 // The last answers are kept so a language switch can reword the page from
 // them instead of asking the server again.
-let lastMail = null, lastSummary = null, lastDigest = null;
+let lastMail = null, lastThreads = null, lastSummary = null, lastDigest = null;
 let nextCursor = null, loadingMail = false, mailRequestId = 0;
 
 function mergeMail(existing, incoming) {
@@ -878,6 +958,14 @@ function mergeMail(existing, incoming) {
 }
 
 function render() {
+  if (filters.view.value === 'threads') {
+    if (!lastThreads) return;
+    list.replaceChildren();
+    open = null;
+    if (!lastThreads.length) { list.appendChild(el('p', 'card muted', t('empty'))); return; }
+    for (const thread of lastThreads) list.appendChild(rowOfThread(thread));
+    return;
+  }
   if (!lastMail) return;
   list.replaceChildren();
   open = null;
@@ -903,13 +991,20 @@ async function load(reset = true) {
   loadingMail = true;
   render();
   try {
-    const r = await fetch('/api/mail?' + p.toString());
+    const r = await fetch(dataPath() + '?' + p.toString());
     if (r.status === 401) { location.reload(); return; }
     const data = await r.json();
     if (requestId !== mailRequestId) return;
-    const page = Array.isArray(data.mail) ? data.mail : [];
-    lastMail = reset ? page : mergeMail(lastMail || [], page);
-    nextCursor = data.nextCursor || null;
+    if (filters.view.value === 'threads') {
+      lastThreads = Array.isArray(data.threads) ? data.threads : [];
+      lastMail = null;
+      nextCursor = null;
+    } else {
+      const page = Array.isArray(data.mail) ? data.mail : [];
+      lastMail = reset ? page : mergeMail(lastMail || [], page);
+      lastThreads = null;
+      nextCursor = data.nextCursor || null;
+    }
   } finally {
     if (requestId === mailRequestId) { loadingMail = false; render(); }
   }
@@ -917,6 +1012,7 @@ async function load(reset = true) {
 
 async function refresh() {
   if (loadingMail) return;
+  if (filters.view.value === 'threads') return load(true);
   if (!lastMail || lastMail.length <= MAIL_PAGE_SIZE) return load(true);
   const requestId = ++mailRequestId;
   const previousCursor = nextCursor;
@@ -925,7 +1021,7 @@ async function refresh() {
   loadingMail = true;
   render();
   try {
-    const r = await fetch('/api/mail?' + p.toString());
+    const r = await fetch(dataPath() + '?' + p.toString());
     if (r.status === 401) { location.reload(); return; }
     const data = await r.json();
     if (requestId !== mailRequestId) return;

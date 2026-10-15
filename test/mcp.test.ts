@@ -61,6 +61,7 @@ describe('tool surface', () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       'feedback_rules', 'get_mail', 'health', 'list_accounts', 'list_attachments', 'list_dead_letters',
+      'list_threads',
       'list_digest', 'list_mail', 'mail_summary', 'observability',
       'recovery_status', 'search_mail',
     ]);
@@ -75,6 +76,7 @@ describe('tool surface', () => {
     const names = (await client.listTools()).tools.map((t) => t.name);
     expect(names).not.toContain('record_feedback');
     expect(names).not.toContain('retry_dead_letter');
+    expect(names).not.toContain('manage_mail');
 
     // Absent from the listing and also unreachable by name.
     expect(await client.callTool({ name: 'record_feedback', arguments: { messageId: '<one@x>', label: 'false_positive' } }))
@@ -84,7 +86,7 @@ describe('tool surface', () => {
   it('adds exactly the two write tools for a caller holding the write credential', async () => {
     const reader = new Set((await (await connect(new StateStore(':memory:'))).listTools()).tools.map((t) => t.name));
     const writer = (await (await connect(new StateStore(':memory:'), true)).listTools()).tools.map((t) => t.name);
-    expect(writer.filter((name) => !reader.has(name)).sort()).toEqual(['record_feedback', 'retry_dead_letter']);
+    expect(writer.filter((name) => !reader.has(name)).sort()).toEqual(['manage_mail', 'record_feedback', 'retry_dead_letter']);
   });
 
   it('warns a client that message fields are untrusted data', async () => {

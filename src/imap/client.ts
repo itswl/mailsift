@@ -177,6 +177,12 @@ function firstAddress(input: unknown): { name: string; address: string } {
   return { name: head?.name?.trim() ?? '', address: (head?.address ?? '').toLowerCase() };
 }
 
+function threadReference(headers: string): string | undefined {
+  const match = /^references:\s*([^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*)/im.exec(headers);
+  const ids = match?.[1]?.match(/<[^>\s]+>/g) ?? [];
+  return ids[0]?.trim().toLowerCase();
+}
+
 function attachmentMaxBytes(): number {
   const fallback = 10 * 1024 * 1024;
   const hardMax = 100 * 1024 * 1024;
@@ -206,6 +212,30 @@ export interface AttachmentManifestLookup {
 export interface DownloadedAttachment {
   metadata: AttachmentInfo;
   content: Buffer;
+}
+
+export const MAIL_ACTIONS = ['mark_read', 'mark_unread', 'star', 'unstar', 'move'] as const;
+export type MailAction = (typeof MAIL_ACTIONS)[number];
+
+export interface MailActionResult {
+  action: MailAction;
+  account: string;
+  messageId: string;
+  sourceFolder: string;
+  destinationFolder?: string;
+}
+
+export class MailActionError extends Error {
+  constructor(readonly code: 'invalid_action' | 'invalid_destination' | 'not_found' | 'failed', message: string) {
+    super(message);
+    this.name = 'MailActionError';
+  }
+}
+
+function isUnsafeMoveDestination(path: string): boolean {
+  const normalized = path.trim().toLowerCase();
+  const leaf = normalized.split('/').at(-1) ?? normalized;
+  return new Set(['trash', 'deleted', 'deleted items', 'deleted messages', '回收站', '已删除', '已刪除']).has(leaf);
 }
 
 async function extractLargeMessageBody(
@@ -288,6 +318,8 @@ async function toMailMessage(
       uid: raw.uid,
     });
 
+  const rootReference = threadReference(headers) || envelope?.inReplyTo?.trim().toLowerCase() || messageId.toLowerCase();
+
   return {
     account: account.username,
     accountLabel: account.name,
@@ -304,9 +336,7 @@ async function toMailMessage(
       .filter(Boolean),
     date: normalizeDate(envelope?.date),
     body,
-    ...(envelope?.inReplyTo?.trim()
-      ? { threadKey: `${account.username}|${envelope.inReplyTo.trim().toLowerCase()}` }
-      : { threadKey: `${account.username}|${messageId.toLowerCase()}` }),
+    threadKey: `${account.username}|${rootReference}`,
     hasAttachments: hasAttachments || attachmentManifest.items.length > 0 || attachmentManifest.truncated,
     attachmentManifest,
     listUnsubscribe: /^list-unsubscribe:/im.test(headers),
@@ -370,7 +400,7 @@ export async function fetchNew(
         size: true,
         envelope: true,
         bodyStructure: true,
-        headers: ['list-unsubscribe'],
+        headers: ['list-unsubscribe', 'references'],
       },
       { uid: true },
     )) {
@@ -448,7 +478,7 @@ export async function fetchByMessageId(account: Account, messageId: string): Pro
             envelope: true,
             bodyStructure: true,
             source: { maxLength: maxSourceBytes + 1 },
-            headers: ['list-unsubscribe'],
+            headers: ['list-unsubscribe', 'references'],
           },
           { uid: true },
         )) {
@@ -545,6 +575,92 @@ export async function fetchAttachmentByMessageId(
             chunks.push(buffer);
           }
           return { metadata, content: Buffer.concat(chunks, size) };
+        }
+      } finally {
+        lock.release();
+      }
+    }
+    return undefined;
+  } finally {
+    await client.logout().catch(() => undefined);
+  }
+}
+
+/**
+ * Apply one narrowly-scoped mailbox action after the caller has presented the
+ * separate write credential. Message IDs are resolved again inside the
+ * selected mailbox, so a stale local row cannot turn into an arbitrary UID.
+ */
+export async function applyMessageAction(
+  account: Account,
+  messageId: string,
+  action: MailAction,
+  destination?: string,
+): Promise<MailActionResult | undefined> {
+  if (!MAIL_ACTIONS.includes(action)) {
+    throw new MailActionError('invalid_action', `unsupported mail action: ${action}`);
+  }
+  const target = destination?.trim();
+  if (action === 'move' && !target) {
+    throw new MailActionError('invalid_destination', 'move requires a destination folder');
+  }
+  if (action === 'move' && target && isUnsafeMoveDestination(target)) {
+    throw new MailActionError('invalid_destination', 'moving to a delete/trash folder is disabled');
+  }
+
+  const client = await connect(account);
+  try {
+    let destinationPath: string | undefined;
+    if (action === 'move') {
+      const listed = await listFolders(client);
+      const found = listed.find((entry) => entry.path === target);
+      const flags = new Set([...((found?.flags ?? []) as Iterable<string>)].map((flag) => String(flag).toLowerCase()));
+      if (!found || flags.has('\\noselect')) {
+        throw new MailActionError('invalid_destination', `destination folder not found or not selectable: ${target}`);
+      }
+      destinationPath = found.path;
+    }
+
+    const folders = await targetFolders(client, account);
+    for (const folder of folders) {
+      const lock = await client.getMailboxLock(folder.path, { readOnly: false });
+      try {
+        const uids = await searchMessageUids(client, messageId);
+        if (!uids.length) continue;
+        for (const uid of uids) {
+          const raw = await client.fetchOne(uid, { uid: true, envelope: true }, { uid: true });
+          if (!raw || raw.envelope?.messageId?.trim() !== messageId) continue;
+          if (action === 'mark_read') {
+            if (!await client.messageFlagsAdd([uid], ['\\Seen'], { uid: true })) {
+              throw new MailActionError('failed', 'IMAP server rejected the mark-read operation');
+            }
+          } else if (action === 'mark_unread') {
+            if (!await client.messageFlagsRemove([uid], ['\\Seen'], { uid: true })) {
+              throw new MailActionError('failed', 'IMAP server rejected the mark-unread operation');
+            }
+          } else if (action === 'star') {
+            if (!await client.messageFlagsAdd([uid], ['\\Flagged'], { uid: true })) {
+              throw new MailActionError('failed', 'IMAP server rejected the star operation');
+            }
+          } else if (action === 'unstar') {
+            if (!await client.messageFlagsRemove([uid], ['\\Flagged'], { uid: true })) {
+              throw new MailActionError('failed', 'IMAP server rejected the unstar operation');
+            }
+          } else if (destinationPath) {
+            if (destinationPath === folder.path) {
+              throw new MailActionError('invalid_destination', 'message is already in the destination folder');
+            }
+            if (!await client.messageMove([uid], destinationPath, { uid: true })) {
+              throw new MailActionError('failed', 'IMAP server rejected the move operation');
+            }
+          }
+          return {
+            action,
+            account: account.username,
+            messageId,
+            sourceFolder: folder.path,
+            ...(destinationPath ? { destinationFolder: destinationPath } : {}),
+          };
         }
       } finally {
         lock.release();

@@ -44,7 +44,10 @@ const en = {
   'filter.anyLevel': 'any level',
   'filter.anyCategory': 'any category',
   'filter.allMailboxes': 'all mailboxes',
-  'search': 'search subject, sender, summary',
+  'view.mail': 'messages',
+  'view.threads': 'threads',
+  'thread.count': '{count} messages in this thread',
+  'search': 'search subject, sender, summary, attachments',
   'spam': 'spam',
   'notified': 'notified',
 
@@ -154,7 +157,10 @@ const zhCN: Record<StringKey, string> = {
   'filter.anyLevel': '所有级别',
   'filter.anyCategory': '所有分类',
   'filter.allMailboxes': '所有邮箱',
-  'search': '搜索主题、发件人、摘要',
+  'view.mail': '邮件',
+  'view.threads': '会话',
+  'thread.count': '这个会话有 {count} 封邮件',
+  'search': '搜索主题、发件人、摘要、附件',
   'spam': '垃圾箱',
   'notified': '已推送',
 

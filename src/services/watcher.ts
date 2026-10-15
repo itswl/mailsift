@@ -265,6 +265,7 @@ export class Watcher {
   private outcomeFields(message: MailMessage, result: TriageResult) {
     return {
       messageId: message.messageId,
+      ...(message.threadKey ? { threadKey: message.threadKey } : {}),
       accountLabel: message.accountLabel,
       sender: message.fromAddr,
       senderName: message.fromName,

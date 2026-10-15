@@ -2,7 +2,7 @@
 
 Unified IMAP monitoring for important email. mailsift scans every configured mailbox—including spam folders—uses an LLM plus local rules to classify messages, and sends important results to Feishu or a generic webhook.
 
-> mailsift is an assistant, not a mail client. It is read-only: it does not send, reply to, organize, or mark messages as read. Classification can be wrong, so keep using your mail client as the source of truth.
+> mailsift is an assistant, not a mail client. It is read-only by default. A separate write token can enable a small audited set of mailbox actions (mark, star, and move); it never sends, replies to, deletes, or silently changes mail. Classification can be wrong, so keep using your mail client as the source of truth.
 
 中文文档：[README.zh-CN.md](README.zh-CN.md)。
 
@@ -14,6 +14,7 @@ Unified IMAP monitoring for important email. mailsift scans every configured mai
 - Real-time push notifications and a daily digest.
 - Crash-safe cursor handling and recovery for interrupted processing.
 - Optional MCP server for querying local triage results.
+- Conversation grouping, bounded search across triage text and attachment metadata, and an optional audited mailbox action surface.
 
 ## Quick start
 
@@ -97,7 +98,7 @@ Messages up to `MAX_MESSAGE_SOURCE_BYTES` (default `5 MiB`) use the normal MIME 
 
 The MCP recovery tools expose `recovery_status` always, and `retry_dead_letter` only when the write credential below is configured. Retrying rewinds one folder cursor so the next normal poll can fetch the message again; it does not modify the mailbox.
 
-MCP also provides `observability` for processing, delivery, dead-letter, and feedback totals, plus the access audit grouped by tool. `record_feedback` records `false_positive`, `missed`, `handled`, and `correct` labels for later rule and triage evaluation, and also requires the write credential.
+MCP also provides `observability` for processing, delivery, dead-letter, feedback, and mailbox-action totals, plus the access audit grouped by tool. `record_feedback` records `false_positive`, `missed`, `handled`, and `correct` labels for later rule and triage evaluation, and also requires the write credential. `list_threads` groups messages by their References/In-Reply-To root, while `search_mail` also checks the stored body preview and attachment metadata.
 
 After two feedback records for the same sender, `missed` feedback infers an always-important rule and `false_positive` feedback infers a never-important rule. Explicit environment rules take precedence; inspect inferred rules with MCP `feedback_rules`.
 
@@ -216,19 +217,19 @@ stdio clients, point the command at `dist/src/mcp.js`.
 
 ### The surface is read-only unless you opt in
 
-`record_feedback` and `retry_dead_letter` are the only tools that change service
-state, and they are not registered at all unless `MCP_WRITE_TOKEN` is set. The
-reason is `record_feedback`: two `false_positive` labels for one sender infer a
-never-important rule, so whoever can record feedback can silence a chosen
-sender's future alerts. That turns a leaked read token from an information
-disclosure into a way to blind you. `retry_dead_letter` is milder and costs a
-re-fetch and a repeat notification, but it writes, so it moves with feedback.
+`manage_mail`, `record_feedback`, and `retry_dead_letter` are write tools, and
+they are not registered at all unless `MCP_WRITE_TOKEN` is set. `manage_mail`
+supports `mark_read`, `mark_unread`, `star`, `unstar`, and `move`; it refuses
+delete/trash destinations and never sends mail. Every operation resolves the
+Message-ID again inside a writable IMAP lock and records an audit row. The
+separate token keeps a leaked read credential from changing either mailbox
+contents or future triage policy.
 
 Set `MCP_WRITE_TOKEN` to a second secret that differs from `MCP_TOKEN`; reusing
 one value for both is refused at startup. Present it as the bearer token to get
 the full surface. `MCP_TOKEN` then stays a read-only credential, which is what
 the browser view and any shared client should hold. Over stdio the caller can
-already read the env file, so setting `MCP_WRITE_TOKEN` alone enables the two
+already read the env file, so setting `MCP_WRITE_TOKEN` alone enables the write
 tools there without a second presentation.
 
 ### Reading attachments
@@ -258,9 +259,9 @@ sink is healthy. Use MCP `health` and `recovery_status` for those details.
 
 ## Read-only web view
 
-`WEB_UI_ENABLED=true` serves a browser view of the triage results at `http://<host>:<MCP_PORT>/`, on the same port and behind the same `MCP_TOKEN` as MCP, because it is the same trust boundary. It lists what arrived with the level, category and the model's reasoning, filters by window, level, category and mailbox, searches subject, sender and summary, previews the queue behind the next digest, and links out to the provider's own client. A message body and individual attachments can be fetched live on request; attachment files are downloaded and never cached or persisted by mailsift.
+`WEB_UI_ENABLED=true` serves a browser view of the triage results at `http://<host>:<MCP_PORT>/`, on the same port and behind the same `MCP_TOKEN` as MCP, because it is the same trust boundary. It lists messages or conversation-like threads, filters by window, level, category and mailbox, searches subject, sender, summary and attachment metadata, previews the queue behind the next digest, and links out to the provider's own client. A message body and individual attachments can be fetched live on request; attachment files are downloaded and never cached or persisted by mailsift.
 
-It is read-only in the strict sense: mailbox calls fetch a message body or a selected MIME part under a read-only lock. It cannot mark read, flag, move, delete or send. For reading and replying to mail, run a real webmail client such as Roundcube against the same accounts; this view is for triage, not for mail handling.
+The browser view remains read-only in the strict sense: mailbox calls fetch a message body or a selected MIME part under a read-only lock. Use MCP with the separate write token for the small audited action set; sending, replying, deleting, and other mailbox management still belong in a real webmail client such as Roundcube.
 
 Off by default. A page a browser can reach is a wider surface than a JSON-RPC endpoint, so enable it deliberately, keep `MCP_BIND` on loopback, and put TLS in front of it if you reach it from a phone.
 

@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS cursors (
 );
 CREATE TABLE IF NOT EXISTS seen (
   dedup_key TEXT PRIMARY KEY, account TEXT NOT NULL, account_label TEXT,
-  message_id TEXT, subject TEXT, sender TEXT, sender_name TEXT,
+  message_id TEXT, thread_key TEXT, subject TEXT, sender TEXT, sender_name TEXT,
   folder TEXT, in_spam INTEGER NOT NULL DEFAULT 0,
   importance TEXT, category TEXT, summary TEXT, reason TEXT, deadline TEXT,
   decided_by TEXT, pushed INTEGER NOT NULL DEFAULT 0,
@@ -60,13 +60,20 @@ CREATE TABLE IF NOT EXISTS mcp_audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, client TEXT,
   success INTEGER NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS mail_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL, message_id TEXT NOT NULL,
+  action TEXT NOT NULL, source_folder TEXT, destination_folder TEXT,
+  success INTEGER NOT NULL, error TEXT, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_seen_created ON seen (created_at);
 CREATE INDEX IF NOT EXISTS idx_seen_importance ON seen (importance);
+CREATE INDEX IF NOT EXISTS idx_mail_actions_created ON mail_actions (created_at);
 `;
 
 export interface MailRecord {
   messageId?: string;
+  threadKey?: string;
   accountLabel?: string;
   sender?: string;
   senderName?: string;
@@ -85,6 +92,7 @@ export interface MailRecord {
 export interface MailRow {
   dedupKey: string;
   messageId: string | null;
+  threadKey: string | null;
   account: string;
   accountLabel: string | null;
   subject: string | null;
@@ -116,6 +124,26 @@ export interface QueryOptions {
   limit?: number;
   beforeCreatedAt?: string;
   beforeDedupKey?: string;
+}
+
+export interface MailThread {
+  threadKey: string;
+  account: string;
+  accountLabel: string | null;
+  messageCount: number;
+  latest: MailRow;
+  messages: MailRow[];
+}
+
+export interface MailActionAudit {
+  account: string;
+  messageId: string;
+  action: string;
+  sourceFolder?: string;
+  destinationFolder?: string;
+  success: boolean;
+  error?: string;
+  createdAt: string;
 }
 
 export interface DeadLetterRow {
@@ -154,7 +182,7 @@ function now(): string {
 }
 
 const ROW_COLUMNS = [
-  'dedup_key', 'message_id', 'account', 'account_label', 'subject', 'sender', 'sender_name',
+  'dedup_key', 'message_id', 'thread_key', 'account', 'account_label', 'subject', 'sender', 'sender_name',
   'folder', 'in_spam', 'importance', 'category', 'summary', 'reason', 'deadline',
   'decided_by', 'pushed', 'mail_date', 'attachments_json', 'created_at',
 ] as const;
@@ -182,6 +210,7 @@ function toRow(raw: Record<string, unknown>): MailRow {
   return {
     dedupKey: String(raw['dedup_key'] ?? ''),
     messageId: (raw['message_id'] as string) ?? null,
+    threadKey: (raw['thread_key'] as string) ?? null,
     account: String(raw['account'] ?? ''),
     accountLabel: (raw['account_label'] as string) ?? null,
     subject: (raw['subject'] as string) ?? null,
@@ -220,13 +249,15 @@ export class StateStore {
     // Additive migration for databases created before attachment metadata was
     // exposed. Multiple service processes may open the same DB concurrently.
     const seenColumns = this.db.prepare('PRAGMA table_info(seen)').all() as Array<Record<string, unknown>>;
-    if (!seenColumns.some((column) => column['name'] === 'attachments_json')) {
+    for (const [name, definition] of [['attachments_json', 'TEXT'], ['thread_key', 'TEXT']] as const) {
+      if (seenColumns.some((column) => column['name'] === name)) continue;
       try {
-        this.db.exec('ALTER TABLE seen ADD COLUMN attachments_json TEXT');
+        this.db.exec(`ALTER TABLE seen ADD COLUMN ${name} ${definition}`);
       } catch (error) {
         if (!String(error).toLowerCase().includes('duplicate column name')) throw error;
       }
     }
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_seen_thread ON seen (thread_key, created_at)');
   }
 
   close(): void {
@@ -321,14 +352,14 @@ export class StateStore {
   recordOutcome(dedupKey: string, importance: string, pushed: boolean, fields: MailRecord = {}): void {
     this.db
       .prepare(
-        `UPDATE seen SET importance = ?, pushed = ?, message_id = ?, account_label = ?,
+        `UPDATE seen SET importance = ?, pushed = ?, message_id = ?, thread_key = ?, account_label = ?,
            sender = ?, sender_name = ?, folder = ?, in_spam = ?, category = ?,
            summary = ?, reason = ?, deadline = ?, decided_by = ?, mail_date = ?, snippet = ?, attachments_json = ?
          WHERE dedup_key = ?`,
       )
       .run(
         importance, pushed ? 1 : 0,
-        fields.messageId ?? null, fields.accountLabel ?? null,
+        fields.messageId ?? null, fields.threadKey ?? null, fields.accountLabel ?? null,
         fields.sender ?? null, fields.senderName ?? null,
         fields.folder ?? null, fields.inSpam ? 1 : 0, fields.category ?? null,
         fields.summary ?? null, fields.reason ?? null, fields.deadline ?? null,
@@ -551,6 +582,8 @@ export class StateStore {
       deadLetterTotal: this.listDeadLetters(200).length,
       notificationOutboxPending: this.notificationOutboxPending(),
       feedback: this.feedbackSummary(),
+      mailActionTotal: Number((this.db.prepare('SELECT COUNT(*) AS n FROM mail_actions').get() as Record<string, unknown>)['n'] ?? 0),
+      mailActionFailures: Number((this.db.prepare('SELECT COUNT(*) AS n FROM mail_actions WHERE success = 0').get() as Record<string, unknown>)['n'] ?? 0),
       mcpAuditEvents: Number((this.db.prepare('SELECT COUNT(*) AS n FROM mcp_audit').get() as Record<string, unknown>)['n'] ?? 0),
       mcpAuditByAction: this.mcpAuditByAction(),
     };
@@ -616,9 +649,10 @@ export class StateStore {
     }
     if (options.search) {
       clauses.push(
-        '(subject LIKE ? OR sender LIKE ? OR sender_name LIKE ? OR reason LIKE ? OR category LIKE ? OR summary LIKE ?)',
+        '(subject LIKE ? OR message_id LIKE ? OR thread_key LIKE ? OR sender LIKE ? OR sender_name LIKE ? '
+          + 'OR reason LIKE ? OR category LIKE ? OR summary LIKE ? OR snippet LIKE ? OR attachments_json LIKE ?)',
       );
-      params.push(...Array<string>(6).fill(`%${options.search}%`));
+      params.push(...Array<string>(10).fill(`%${options.search}%`));
     }
     if (options.beforeCreatedAt) {
       if (options.beforeDedupKey) {
@@ -648,6 +682,79 @@ export class StateStore {
       )
       .get(messageId, messageId) as Record<string, unknown> | undefined;
     return row ? toRow(row) : undefined;
+  }
+
+  /** Group the bounded local mail view into conversation-like threads. */
+  queryThreads(options: QueryOptions = {}): MailThread[] {
+    const requested = Math.max(1, Math.min(options.limit ?? 30, 200));
+    // A thread can contain many messages. Read a bounded multiplier so a busy
+    // thread does not consume the whole page while keeping this query cheap.
+    const scanLimit = Math.min(1000, Math.max(requested * 20, requested));
+    const rows = this.queryMail({ ...options, limit: scanLimit });
+    const groups = new Map<string, MailRow[]>();
+    for (const row of rows) {
+      const key = row.threadKey || `${row.account}|${row.messageId || row.dedupKey}`;
+      const existing = groups.get(key);
+      if (existing) existing.push(row);
+      else groups.set(key, [row]);
+    }
+
+    return [...groups.entries()]
+      .map(([threadKey, messages]) => {
+        messages.sort((a, b) =>
+          b.createdAt.localeCompare(a.createdAt) || b.dedupKey.localeCompare(a.dedupKey));
+        const latest = messages[0]!;
+        return {
+          threadKey,
+          account: latest.account,
+          accountLabel: latest.accountLabel,
+          messageCount: messages.length,
+          latest,
+          messages,
+        } satisfies MailThread;
+      })
+      .sort((a, b) =>
+        b.latest.createdAt.localeCompare(a.latest.createdAt)
+        || b.latest.dedupKey.localeCompare(a.latest.dedupKey))
+      .slice(0, requested);
+  }
+
+  recordMailAction(input: {
+    account: string;
+    messageId: string;
+    action: string;
+    sourceFolder?: string;
+    destinationFolder?: string;
+    success: boolean;
+    error?: string;
+  }): void {
+    this.db.prepare(
+      `INSERT INTO mail_actions
+       (account, message_id, action, source_folder, destination_folder, success, error, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      input.account.slice(0, 320), input.messageId.slice(0, 1000), input.action.slice(0, 80),
+      input.sourceFolder?.slice(0, 500) ?? null, input.destinationFolder?.slice(0, 500) ?? null,
+      input.success ? 1 : 0, input.error?.slice(0, 500) ?? null, now(),
+    );
+  }
+
+  listMailActions(limit = 50): MailActionAudit[] {
+    const rows = this.db.prepare(
+      `SELECT account, message_id, action, source_folder, destination_folder,
+              success, error, created_at
+       FROM mail_actions ORDER BY created_at DESC, id DESC LIMIT ?`,
+    ).all(Math.max(1, Math.min(limit, 200))) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      account: String(row['account']),
+      messageId: String(row['message_id']),
+      action: String(row['action']),
+      ...(row['source_folder'] ? { sourceFolder: String(row['source_folder']) } : {}),
+      ...(row['destination_folder'] ? { destinationFolder: String(row['destination_folder']) } : {}),
+      success: Boolean(row['success']),
+      ...(row['error'] ? { error: String(row['error']) } : {}),
+      createdAt: String(row['created_at']),
+    }));
   }
 
   summarize(sinceHours = 24): Record<string, unknown> {
