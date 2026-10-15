@@ -61,8 +61,7 @@ describe('tool surface', () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       'feedback_rules', 'get_mail', 'health', 'list_accounts', 'list_attachments', 'list_dead_letters',
-      'list_threads',
-      'list_digest', 'list_mail', 'mail_summary', 'observability',
+      'list_digest', 'list_mail', 'list_threads', 'mail_summary', 'observability',
       'recovery_status', 'search_mail',
     ]);
     for (const tool of tools) expect(tool.description ?? '').not.toBe('');
