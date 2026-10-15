@@ -16,9 +16,12 @@ import {
   type MessageBudget,
 } from '../imap/client.js';
 import type { Folder } from '../imap/folders.js';
-import { dedupKey, snippet, type MailMessage } from '../imap/message.js';
 import {
-  triage, effectiveRank, isSelfForward, pushThreshold, rank, suppressSelfForwards, type TriageResult,
+  containsSensitiveVerificationContent, dedupKey, snippet, type MailMessage,
+} from '../imap/message.js';
+import {
+  triage, effectiveRank, isSelfForward, pushThreshold, rank, suppressSelfForwards,
+  type ThreadContextEntry, type TriageResult,
 } from './triage.js';
 import * as digest from './digest.js';
 import * as health from './health.js';
@@ -28,6 +31,11 @@ import { getLogger } from '../logger.js';
 import { metrics } from '../metrics.js';
 
 const log = getLogger('watcher');
+
+function threadContextLimit(): number {
+  const configured = Number(process.env.LLM_THREAD_CONTEXT_MESSAGES ?? 3);
+  return Number.isFinite(configured) ? Math.max(0, Math.min(Math.floor(configured), 5)) : 3;
+}
 
 export const HEARTBEAT_KEY = 'last_poll_at';
 export const PRUNE_KEY = 'last_prune_date';
@@ -239,6 +247,56 @@ export class Watcher {
     };
   }
 
+  /** Build transient LLM context from locally stored summaries and snippets. */
+  private triageThreadContexts(messages: MailMessage[]): ReadonlyMap<MailMessage, ThreadContextEntry[]> {
+    const limit = threadContextLimit();
+    const contexts = new Map<MailMessage, ThreadContextEntry[]>();
+    if (limit === 0) return contexts;
+
+    const historyByThread = new Map<string, ThreadContextEntry[]>();
+    const previousInBatch = new Map<string, ThreadContextEntry[]>();
+    const ordered = messages.map((message, index) => ({ message, index, time: Date.parse(message.date) }))
+      .sort((a, b) => {
+        const timeA = Number.isFinite(a.time) ? a.time : 0;
+        const timeB = Number.isFinite(b.time) ? b.time : 0;
+        return timeA - timeB || a.index - b.index;
+      });
+
+    for (const { message } of ordered) {
+      if (!message.threadKey) continue;
+      const key = JSON.stringify([message.account, message.threadKey]);
+      let history = historyByThread.get(key);
+      if (!history) {
+        history = this.state.getThreadContext(message.account, message.threadKey, limit)
+          .reverse()
+          .map((row) => ({
+            subject: row.subject ?? '',
+            from: row.senderName ? `${row.senderName} <${row.sender ?? ''}>` : row.sender ?? '',
+            date: row.mailDate ?? row.createdAt,
+            summary: row.summary ?? '',
+            snippet: row.snippet ?? '',
+          }))
+          .filter((entry) => entry.summary || entry.snippet);
+        historyByThread.set(key, history);
+      }
+
+      const earlier = previousInBatch.get(key) ?? [];
+      const entries = [...history, ...earlier].slice(-limit);
+      if (entries.length) contexts.set(message, entries);
+
+      const sensitive = containsSensitiveVerificationContent(message.subject, message.body);
+      const current: ThreadContextEntry = {
+        subject: sensitive ? '验证码邮件（内容已隐藏）' : message.subject,
+        from: `${message.fromName} <${message.fromAddr}>`,
+        date: message.date,
+        summary: '',
+        snippet: sensitive ? '' : snippet(message),
+      };
+      previousInBatch.set(key, [...earlier, current].slice(-limit));
+    }
+    return contexts;
+  }
+
   private async flushNotificationOutbox(): Promise<void> {
     // Failed deliveries carry a durable next_attempt_at timestamp. Only due
     // entries are sent here; recovery_status still exposes delayed entries.
@@ -299,7 +357,8 @@ export class Watcher {
     };
 
     const rules = this.triageRules();
-    for (const [message, result] of await triage(messages, rules, onLlmResult)) {
+    const threadContexts = this.triageThreadContexts(messages);
+    for (const [message, result] of await triage(messages, rules, onLlmResult, threadContexts)) {
       metrics.addCounter('mailsift.messages.triaged', 1, {
         provider: message.provider,
         importance: result.importance,

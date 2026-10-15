@@ -793,6 +793,20 @@ export class StateStore {
     return row ? toRow(row) : undefined;
   }
 
+  /** Recent, already-processed messages from one mailbox thread. */
+  getThreadContext(account: string, threadKey: string, limit = 3): MailRow[] {
+    const safeLimit = Math.max(0, Math.min(Math.floor(limit), 5));
+    if (safeLimit === 0) return [];
+    return (
+      this.db.prepare(
+        `SELECT ${ROW_COLUMNS.join(', ')}, snippet FROM seen
+         WHERE account = ? AND thread_key = ? AND importance IS NOT NULL
+         ORDER BY COALESCE(mail_date, created_at) DESC, created_at DESC
+         LIMIT ?`,
+      ).all(account, threadKey, safeLimit) as Array<Record<string, unknown>>
+    ).map(toRow);
+  }
+
   /** Group the bounded local mail view into conversation-like threads. */
   queryThreads(options: QueryOptions = {}): MailThread[] {
     const requested = Math.max(1, Math.min(options.limit ?? 30, 200));

@@ -102,6 +102,8 @@ MCP 还提供 `observability` 查看处理、投递、dead-letter、反馈和邮
 
 `LLM_REDACT_PII=true`（默认）会在发送给 LLM 前脱敏邮件地址、电话号码、银行卡号和身份证号；银行卡号和身份证号只在校验位成立时才脱敏，因此运单号、订单号、发票号通常会保留在摘要里。本地状态及通知保留原始值。只有在确认网关可信且确实需要更多上下文时，才考虑关闭它。
 
+`LLM_THREAD_CONTEXT_MESSAGES`（默认 `3`，范围 `0`–`5`）会把同一邮箱会话中较早的邮件加入新邮件的 LLM 输入。使用本地已保存的主题、发件人、摘要和限长片段，也会带上同一轮扫描中更早邮件的限长片段；不会重新读取旧邮件，也不会额外持久化正文。只有本来就需要 LLM 分类的邮件才会带上上下文，且同样应用 PII 脱敏。设为 `0` 可关闭。
+
 LLM 接口必须兼容 OpenAI 的 `/chat/completions`：请求使用 `model`、`messages`，并在启用时带上 `response_format: {"type":"json_object"}`；响应需要在 `choices[0].message.content` 中返回 JSON，并为每封输入邮件提供对应的 `index`。如果服务商不支持 `response_format`，可设置 `LLM_JSON_MODE=false`；服务商明确拒绝时 mailsift 也会自动重试一次。
 
 `LLM_OUTPUT_LANGUAGE` 决定摘要和原因的语言：`en`（默认）、`zh-CN`、`zh-TW`、`auto`（跟随每封邮件的语言）或任意语言名称。

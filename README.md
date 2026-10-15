@@ -116,6 +116,8 @@ Metrics are instrumented with OpenTelemetry and disabled by default. Set `OTEL_E
 
 `LLM_REDACT_PII=true` (the default) redacts email addresses, phone numbers, payment card numbers, and resident ID numbers from fields sent to the LLM. Card and ID numbers are only redacted when their checksum holds, so waybill, order, and invoice numbers stay readable in summaries. Local state and notifications keep the original values. Set it to `false` only when the configured endpoint is trusted and the additional context is necessary.
 
+`LLM_THREAD_CONTEXT_MESSAGES` (default `3`, range `0`-`5`) adds recent earlier messages from the same mailbox thread to a new message's LLM input. It uses stored subjects, senders, summaries, and bounded snippets, plus bounded snippets from earlier messages fetched in the same poll. It does not fetch older messages or persist additional body text. Context is sent only when the message already needs LLM classification, and the normal PII redaction applies. Set it to `0` to disable.
+
 The LLM integration is OpenAI-compatible: mailsift posts to `${LLM_BASE_URL}/chat/completions` with `model`, `messages`, and (when enabled) `response_format: {"type":"json_object"}`. The response must provide JSON in `choices[0].message.content` with one result per input index. Set `LLM_JSON_MODE=false` for providers that reject `response_format`; mailsift also retries once without it when the rejection is explicit.
 
 `LLM_OUTPUT_LANGUAGE` sets the language of summaries and reasons: `en` (default), `zh-CN`, `zh-TW`, `auto` to follow each message, or any language name.
