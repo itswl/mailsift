@@ -595,7 +595,7 @@ export function renderApp(lang: Language): string {
   return page(lang, 'mailsift', `
     <header class="app-header">
       <div class="header-inner">
-        <div class="brand"><span class="brand-mark" aria-hidden="true">m</span><strong>mailsift</strong></div>
+        <div class="brand"><img class="brand-mark" src="/icon-192.png" alt="" aria-hidden="true"><strong>mailsift</strong></div>
         <div class="header-actions">
           <button id="install" type="button" class="switch install" data-i18n="pwa.install" hidden>${s('pwa.install')}</button>
           <button id="lang" type="button" class="switch" aria-label="${s('lang.label')}">${s('lang.face')}</button>
@@ -700,7 +700,7 @@ body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset
 border-bottom:1px solid var(--line)}
 .header-inner{display:flex;align-items:center;justify-content:space-between;gap:16px;width:min(1120px,100%);min-height:58px;margin:0 auto}
 .brand,.header-actions{display:flex;align-items:center;gap:10px}.brand strong{font-size:16px;letter-spacing:-.02em}
-.brand-mark{display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:var(--accent);color:white;font-weight:750;font-size:18px;line-height:1}
+.brand-mark{display:block;width:29px;height:29px;border-radius:9px;object-fit:cover}
 .switch{min-height:36px;padding:6px 10px;border:1px solid var(--line);border-radius:9px;background:var(--card);color:var(--fg);font:inherit;font-size:13px;line-height:1.2;cursor:pointer;box-shadow:var(--shadow)}
 .switch:hover{border-color:var(--accent)}#theme{min-width:38px;font-size:17px}.install{color:var(--accent);font-weight:600}
 .app-main{width:min(1120px,100%);margin:0 auto;padding:22px 20px 30px}
