@@ -404,7 +404,7 @@ describe('layout', () => {
     expect(page).toContain('class="header-actions"');
     expect(page).toContain('@media(max-width:370px)');
     expect(page).toContain('.brand strong{display:none}');
-    expect(page).toContain('html{touch-action:manipulation}');
+    expect(page).toContain('html{touch-action:manipulation;background:var(--bg)}');
     expect(page).not.toContain('transform:translateY(-1px)');
   });
 });
