@@ -574,7 +574,9 @@ function themeBoot(): string {
     + "if(c==='dark'||c==='light')document.documentElement.dataset.theme=c;"
     + "var d=c==='dark'||(c!=='light'&&matchMedia('(prefers-color-scheme:dark)').matches);"
     + "var m=document.querySelector('meta[name=theme-color]');"
-    + "if(m)m.setAttribute('content',d?'" + DARK_BAR + "':'" + LIGHT_BAR + "');}catch(e){}})();";
+    + "if(m)m.setAttribute('content',d?'" + DARK_BAR + "':'" + LIGHT_BAR + "');"
+    + "var a=document.querySelector('meta[name=apple-mobile-web-app-status-bar-style]');"
+    + "if(a)a.setAttribute('content',d?'black-translucent':'default');}catch(e){}})();";
 }
 
 /**
@@ -590,35 +592,60 @@ export function renderApp(lang: Language): string {
     `<${tag}${attrs ? ' ' + attrs : ''} data-i18n="${key}">${s(key)}</${tag}>`;
   const option = (value: string, key: StringKey): string => worded('option', key, `value="${value}"`);
   return page(lang, 'mailsift', `
-    <header class="bar">
-      <strong>mailsift</strong>
-      <span id="totals" class="muted"></span>
-      <button id="lang" type="button" class="switch" aria-label="${s('lang.label')}">${s('lang.face')}</button>
-      <button id="theme" type="button" class="switch" aria-label="${s('theme.title')}"></button>
+    <header class="app-header">
+      <div class="header-inner">
+        <div class="brand"><span class="brand-mark" aria-hidden="true">m</span><strong>mailsift</strong></div>
+        <div class="header-actions">
+          <button id="install" type="button" class="switch install" data-i18n="pwa.install" hidden>${s('pwa.install')}</button>
+          <button id="lang" type="button" class="switch" aria-label="${s('lang.label')}">${s('lang.face')}</button>
+          <button id="theme" type="button" class="switch" aria-label="${s('theme.title')}"></button>
+        </div>
+      </div>
     </header>
-    <form id="filters" class="bar filters">
-      <select name="view">
-        ${option('mail', 'view.mail')}${option('threads', 'view.threads')}
-      </select>
-      <select name="hours">
-        ${option('24', 'window.24h')}${option('72', 'window.3d')}
-        ${option('168', 'window.7d')}${option('720', 'window.30d')}
-      </select>
-      <select name="importance">
-        ${option('', 'filter.anyLevel')}
-        ${option('critical', 'level.critical')}
-        ${option('warning', 'level.warning')}
-        ${option('info', 'level.info')}
-      </select>
-      <select name="category">${option('', 'filter.anyCategory')}</select>
-      <select name="account">${option('', 'filter.allMailboxes')}</select>
-      <label class="check"><input type="checkbox" name="spamOnly"> ${worded('span', 'spam')}</label>
-      <label class="check"><input type="checkbox" name="pushedOnly"> ${worded('span', 'notified')}</label>
-      <input type="search" name="q" placeholder="${s('search')}">
-    </form>
-    <main id="list" aria-live="polite"></main>
+    <main class="app-main">
+      <div id="network-status" class="network-status" role="status" aria-live="polite" hidden></div>
+      <section class="overview" aria-label="${s('overview.title')}">
+        <div class="overview-total"><span class="eyebrow" data-i18n="overview.total">${s('overview.total')}</span><strong id="overview-count">—</strong></div>
+        <div class="overview-stat"><span data-i18n="overview.notified">${s('overview.notified')}</span><strong id="overview-pushed">—</strong></div>
+        <div class="overview-stat"><span data-i18n="overview.spam">${s('overview.spam')}</span><strong id="overview-spam">—</strong></div>
+      </section>
+      <form id="filters" class="filters">
+        <div class="filter-primary">
+          <input type="search" name="q" placeholder="${s('search')}">
+          <select name="view">
+            ${option('mail', 'view.mail')}${option('threads', 'view.threads')}
+          </select>
+          <select name="hours">
+            ${option('24', 'window.24h')}${option('72', 'window.3d')}
+            ${option('168', 'window.7d')}${option('720', 'window.30d')}
+          </select>
+        </div>
+        <details id="advanced-filters" class="advanced-filters">
+          <summary id="filter-summary">${s('filter.more')}</summary>
+          <div class="advanced-grid">
+            <select name="importance">
+              ${option('', 'filter.anyLevel')}
+              ${option('critical', 'level.critical')}
+              ${option('warning', 'level.warning')}
+              ${option('info', 'level.info')}
+            </select>
+            <select name="category">${option('', 'filter.anyCategory')}</select>
+            <select name="account">${option('', 'filter.allMailboxes')}</select>
+            <label class="check"><input type="checkbox" name="spamOnly"> ${worded('span', 'spam')}</label>
+            <label class="check"><input type="checkbox" name="pushedOnly"> ${worded('span', 'notified')}</label>
+          </div>
+        </details>
+      </form>
+      <section id="list" aria-live="polite"></section>
+    </main>
     <section id="digest" class="card">${worded('h2', 'digest.title')}<pre id="digest-body"></pre></section>
     <footer class="version">${escapeHtml(webVersion())}</footer>
+    <dialog id="install-help" class="install-help">
+      <button id="install-close" type="button" class="dialog-close" aria-label="${s('pwa.close')}">×</button>
+      <h2 data-i18n="pwa.iosTitle">${s('pwa.iosTitle')}</h2>
+      <p data-i18n="pwa.iosHelp">${s('pwa.iosHelp')}</p>
+      <button id="install-done" type="button" class="primary-action" data-i18n="pwa.done">${s('pwa.done')}</button>
+    </dialog>
     <script>` + clientScript() + `</script>`);
 }
 
@@ -628,16 +655,15 @@ function page(lang: Language, title: string, body: string): string {
     // it back with the safe-area insets, which is what an installed app needs.
     + '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
     + '<meta name="referrer" content="no-referrer">'
-    // Painted behind the status bar when installed, so it should match the
-    // page rather than announce itself: light and dark are given separately.
-    + '<meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff">'
-    + '<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#15171a">'
     + '<meta name="apple-mobile-web-app-capable" content="yes">'
+    + '<meta name="apple-mobile-web-app-status-bar-style" content="default">'
     + '<meta name="apple-mobile-web-app-title" content="mailsift">'
     + '<meta name="mobile-web-app-capable" content="yes">'
     + '<link rel="manifest" href="/manifest.webmanifest">'
     + '<link rel="icon" type="image/png" href="/favicon.ico">'
     + '<link rel="apple-touch-icon" href="/apple-touch-icon.png">'
+    // One theme-color tag lets the saved theme choice drive the installed
+    // app status bar immediately, including after a manual light/dark switch.
     + '<meta name="theme-color" content="' + LIGHT_BAR + '">'
     + '<title>' + title + '</title><style>' + styles() + '</style>'
     // Before the body renders, so a stored choice never flashes the other theme.
@@ -646,47 +672,54 @@ function page(lang: Language, title: string, body: string): string {
 }
 
 /** The dark palette, written once and used by both the media query and the override. */
-const DARK_PALETTE = '--bg:#15171a;--fg:#e8e8e8;--muted:#9aa0a6;--line:#2a2e33;--card:#1c1f23';
-export const LIGHT_BAR = '#ffffff';
-export const DARK_BAR = '#15171a';
+const DARK_PALETTE = '--bg:#15171b;--fg:#e7e9ed;--muted:#9299a4;--line:#30343c;--card:#1d2026;--accent:#8798ff;--critical:#ff737c;--warning:#edb751;--info:#8798ff;--action-ink:#15171b;--shadow:0 1px 3px rgba(0,0,0,.18)';
+export const LIGHT_BAR = '#f4f5f7';
+export const DARK_BAR = '#15171b';
 
 function styles(): string {
   return `
-:root{color-scheme:light dark;--bg:#fff;--fg:#111;--muted:#666;--line:#e5e5e5;--card:#fafafa;
---critical:#d33;--warning:#e08a00;--info:#3573d6}
+:root{color-scheme:light dark;--bg:#f4f5f7;--fg:#20242a;--muted:#707783;--line:#e2e5e9;--card:#fff;
+--critical:#c9434d;--warning:#b57912;--info:#536ee8;--accent:#536ee8;--action-ink:#fff;--shadow:0 1px 2px rgba(19,29,48,.035)}
 /* Follow the system unless a choice was made, and let that choice win either way. */
 @media(prefers-color-scheme:dark){:root:not([data-theme=light]){` + DARK_PALETTE + `}}
 :root[data-theme=dark]{` + DARK_PALETTE + `}
 :root[data-theme=light]{color-scheme:light}
 :root[data-theme=dark]{color-scheme:dark}
-/* The two header switches share one height: a 13px word and a 17px glyph on the same 17px line. */
-.switch{font:inherit;font-size:13px;line-height:17px;background:none;border:1px solid var(--line);
-color:var(--fg);border-radius:8px;padding:5px 9px;cursor:pointer}
-.switch:hover{background:var(--card)}
-#theme{font-size:17px}
-/* The count fills the room between the brand and the switches and wraps inside
-   it, so on a phone it takes a second line of text rather than pushing a
-   switch onto a second row. */
-#totals{flex:1 1 0;min-width:0}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
-padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
--webkit-text-size-adjust:100%;overscroll-behavior-y:contain}
-.bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 14px;border-bottom:1px solid var(--line)}
-header.bar{position:sticky;top:0;z-index:2;background:var(--bg)}
-/* A finger needs a bigger target than a mouse does. */
-@media(pointer:coarse){.filters select,.filters input{min-height:38px}.row{padding:14px}}
-.bar strong{font-size:16px}.version{color:var(--muted);font-size:11px;font-weight:400;white-space:nowrap}
-footer.version{text-align:center;padding:12px 14px 20px}.login .version{text-align:center;margin:14px 0 0}
-.filters select,.filters input:not([type=checkbox]){background:var(--bg);color:var(--fg);
-border:1px solid var(--line);border-radius:7px;padding:6px 8px;font:inherit}
-.filters input[type=search]{flex:1;min-width:160px}
-.check{display:flex;align-items:center;gap:4px;color:var(--muted);font-size:13px}
-.muted{color:var(--muted);font-size:13px}
-main{padding:0 0 24px}
-.row{display:block;width:100%;text-align:left;background:none;border:0;border-bottom:1px solid var(--line);
-padding:11px 14px;color:inherit;font:inherit;cursor:pointer}
-.row:hover{background:var(--card)}
+padding:0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);-webkit-text-size-adjust:100%;overscroll-behavior-y:contain}
+[hidden]{display:none!important}
+.app-header{position:sticky;top:0;z-index:5;padding:env(safe-area-inset-top) 18px 0;background:var(--bg);background:color-mix(in srgb,var(--bg) 90%,transparent);
+border-bottom:1px solid color-mix(in srgb,var(--line) 82%,transparent);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}
+.header-inner{display:flex;align-items:center;justify-content:space-between;gap:16px;width:min(1120px,100%);min-height:58px;margin:0 auto}
+.brand,.header-actions{display:flex;align-items:center;gap:10px}.brand strong{font-size:16px;letter-spacing:-.02em}
+.brand-mark{display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:var(--accent);color:white;font-weight:750;font-size:18px;line-height:1}
+.switch{min-height:36px;padding:6px 10px;border:1px solid var(--line);border-radius:9px;background:var(--card);color:var(--fg);font:inherit;font-size:13px;line-height:1.2;cursor:pointer;box-shadow:var(--shadow)}
+.switch:hover{border-color:var(--accent)}#theme{min-width:38px;font-size:17px}.install{color:var(--accent);font-weight:600}
+.app-main{width:min(1120px,100%);margin:0 auto;padding:22px 20px 30px}
+.version{color:var(--muted);font-size:11px;font-weight:400;white-space:nowrap}
+footer.version{text-align:center;padding:8px 14px 20px}.login .version{text-align:center;margin:14px 0 0}
+.overview{display:grid;grid-template-columns:minmax(220px,1.5fr) repeat(2,minmax(130px,1fr));align-items:stretch;margin:0 0 14px;border:1px solid var(--line);border-radius:13px;background:var(--card);box-shadow:var(--shadow);overflow:hidden}
+.overview-total,.overview-stat{display:flex;flex-direction:column;justify-content:center;gap:3px;min-height:83px;padding:15px 20px}
+.overview-total{background:linear-gradient(115deg,color-mix(in srgb,var(--accent) 8%,var(--card)),var(--card) 75%)}
+.overview-stat{border-left:1px solid var(--line)}.overview-total .eyebrow,.overview-stat span{color:var(--muted);font-size:12px}
+.overview-total strong{font-size:26px;line-height:1.1;letter-spacing:-.035em;font-variant-numeric:tabular-nums}
+.overview-stat strong{font-size:19px;line-height:1.2;font-variant-numeric:tabular-nums}
+.network-status{margin:0 0 12px;padding:10px 13px;border:1px solid color-mix(in srgb,var(--warning) 30%,var(--line));border-radius:10px;background:color-mix(in srgb,var(--warning) 8%,var(--card));color:var(--fg);font-size:13px}
+.filters{display:grid;gap:9px;margin:0 0 14px;padding:11px;border:1px solid var(--line);border-radius:12px;background:var(--card);box-shadow:var(--shadow)}
+.filter-primary{display:grid;grid-template-columns:minmax(180px,1fr) minmax(120px,.3fr) minmax(95px,.23fr);gap:8px}
+.filters select,.filters input:not([type=checkbox]){width:100%;min-width:0;min-height:40px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:14px}
+.filters input[type=search]{padding-left:36px;background-image:radial-gradient(circle at 14px 14px,transparent 5px,var(--muted) 5.7px,var(--muted) 6.5px,transparent 7px),linear-gradient(45deg,transparent 47%,var(--muted) 49%,var(--muted) 55%,transparent 57%);background-size:20px 20px,7px 7px;background-position:6px 3px,21px 21px;background-repeat:no-repeat}
+.filters select:focus,.filters input:focus{outline:2px solid color-mix(in srgb,var(--accent) 35%,transparent);outline-offset:1px;border-color:var(--accent)}
+.advanced-filters summary{display:flex;align-items:center;gap:8px;width:max-content;max-width:100%;min-height:34px;padding:4px 3px;color:var(--muted);font-size:13px;font-weight:550;cursor:pointer;list-style:none}
+.advanced-filters summary::-webkit-details-marker{display:none}.advanced-filters summary::before{content:'＋';color:var(--accent);font-size:15px}
+.advanced-filters[open] summary::before{content:'−'}.advanced-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;padding-top:4px}
+.check{display:flex;align-items:center;gap:7px;min-height:40px;padding:0 10px;color:var(--muted);font-size:13px}
+.check input{width:17px;height:17px;accent-color:var(--accent)}
+#list{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,360px),1fr));gap:9px;align-items:start}
+.row{display:block;width:100%;min-width:0;min-height:103px;text-align:left;background:var(--card);border:1px solid var(--line);border-radius:11px;
+padding:13px 14px;color:inherit;font:inherit;cursor:pointer;box-shadow:var(--shadow);transition:border-color .15s,transform .15s,box-shadow .15s}
+.row:hover{border-color:color-mix(in srgb,var(--accent) 45%,var(--line));box-shadow:0 4px 14px rgba(19,29,48,.07);transform:translateY(-1px)}
 .row .top{display:flex;gap:8px;align-items:baseline}
 .row .who{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%}
 .row .when{margin-left:auto;color:var(--muted);font-size:12px;white-space:nowrap}
@@ -696,8 +729,9 @@ padding:11px 14px;color:inherit;font:inherit;cursor:pointer}
    scrolls sideways. Applied to every container that renders message text, so a
    long run in a subject or an address cannot do it either. */
 .row,.detail,.card{overflow-wrap:anywhere;min-width:0}
+.detail{grid-column:1/-1}
 .row .meta{margin-top:3px;display:flex;gap:6px;flex-wrap:wrap}
-.load-more{display:block;margin:14px auto;padding:8px 16px;border:1px solid var(--line);
+.load-more{display:block;grid-column:1/-1;margin:14px auto;padding:8px 16px;border:1px solid var(--line);
 border-radius:8px;background:var(--card);color:var(--fg);font:inherit;cursor:pointer}
 .load-more:disabled{opacity:.6;cursor:wait}
 .dot{width:8px;height:8px;border-radius:50%;flex:none;align-self:center}
@@ -737,8 +771,15 @@ border:1px solid var(--line);background:var(--bg);color:var(--fg);text-decoratio
 .thread-message{display:grid;gap:2px;padding:8px 0;border-top:1px solid var(--line);font-size:13px}
 .thread-message pre{margin:2px 0 0;font-size:12px}
 .card{margin:14px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+#digest{max-width:1080px;margin:0 auto 14px;box-shadow:var(--shadow)}
+.load-error{grid-column:1/-1;display:grid;gap:10px;margin:0}
 .card h2{margin:0 0 8px;font-size:14px}
 .card pre{white-space:pre-wrap;word-break:break-word;margin:0;font:12px/1.5 ui-monospace,monospace;color:var(--muted)}
+.primary-action{min-height:40px;padding:8px 14px;border:0;border-radius:9px;background:var(--accent);color:var(--action-ink);font:inherit;font-weight:600;cursor:pointer}
+.install-help{position:fixed;width:min(360px,calc(100vw - 32px));padding:24px;border:1px solid var(--line);border-radius:16px;background:var(--card);color:var(--fg);box-shadow:0 18px 60px rgba(0,0,0,.24)}
+.install-help::backdrop{background:rgba(12,16,24,.48);-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px)}
+.install-help h2{margin:0 28px 8px 0;font-size:18px;line-height:1.3}.install-help p{margin:0 0 18px;color:var(--muted);font-size:14px}
+.dialog-close{position:absolute;right:12px;top:10px;width:34px;height:34px;border:0;border-radius:8px;background:transparent;color:var(--muted);font-size:24px;cursor:pointer}
 .login{max-width:320px;margin:15vh auto}
 .login input,.login button{width:100%;margin-top:8px;padding:9px;border-radius:7px;
 border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit}
@@ -752,8 +793,26 @@ color:var(--muted);font-size:13px;cursor:pointer}
 .error{color:var(--critical);font-size:13px}
 /* iOS Safari zooms editable controls smaller than 16px when they receive focus. */
 @media(pointer:coarse){
+  .switch{min-height:42px}#theme{min-width:42px}
   input:not([type=checkbox]):not([type=radio]):not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]),
   textarea,.filters select,.form-group select,#search-input,.filter-select{font-size:16px}
+}
+@media(max-width:640px){
+  .app-header{padding-left:14px;padding-right:14px}.header-inner{min-height:54px}.brand,.header-actions{gap:7px}
+  .app-main{padding:14px 12px 24px}
+  .overview{grid-template-columns:1.25fr 1fr 1fr;margin-bottom:10px;border-radius:11px}
+  .overview-total,.overview-stat{min-height:72px;padding:11px 12px}.overview-total strong{font-size:23px}.overview-stat strong{font-size:17px}
+  .overview-total .eyebrow,.overview-stat span{font-size:11px}
+  .filters{gap:7px;padding:9px;margin-bottom:10px}.filter-primary{grid-template-columns:1fr 1fr;gap:7px}
+  .filter-primary input[type=search]{grid-column:1/-1}.filter-primary select{min-height:42px}
+  .advanced-grid{grid-template-columns:1fr 1fr}.advanced-grid select:first-child{grid-column:1/-1}
+  #list{grid-template-columns:1fr;gap:7px}.row{min-height:94px;padding:13px}
+  #digest{margin:0 12px 12px}
+}
+@media(max-width:370px){
+  .brand strong{display:none}
+  .install{padding:6px 7px;font-size:12px}.switch{padding-left:8px;padding-right:8px}
+  .overview-total,.overview-stat{padding:10px 9px}.overview-total strong{font-size:21px}.overview-stat strong{font-size:16px}
 }
 `;
 }
@@ -788,6 +847,24 @@ function fill(key, vars) {
 // not: records written before the vocabulary existed may hold free-form labels.
 const word = (prefix, value) => STRINGS[lang][prefix + value] || value || '';
 ${storeLanguageScript()}
+
+let connectionProblem = !navigator.onLine;
+function setNetworkIssue(active) {
+  connectionProblem = active;
+  const banner = $('#network-status');
+  banner.hidden = !active;
+  if (active) banner.textContent = t(navigator.onLine ? 'network.unavailable' : 'network.offline');
+}
+if (connectionProblem) setNetworkIssue(true);
+
+function updateFilterSummary() {
+  const active = ['importance', 'category', 'account', 'spamOnly', 'pushedOnly']
+    .filter((name) => {
+      const field = filters.elements.namedItem(name);
+      return field && (field.type === 'checkbox' ? field.checked : Boolean(field.value));
+    }).length;
+  $('#filter-summary').textContent = active ? fill('filter.moreActive', { count: active }) : t('filter.more');
+}
 
 function el(tag, cls, text) {
   const n = document.createElement(tag);
@@ -1220,7 +1297,7 @@ function threadDetail(thread) {
 
 // The last answers are kept so a language switch can reword the page from
 // them instead of asking the server again.
-let lastMail = null, lastThreads = null, lastSummary = null, lastDigest = null;
+let lastMail = null, lastThreads = null, lastSummary = null, lastDigest = null, loadFailed = false;
 let nextCursor = null, loadingMail = false, mailRequestId = 0;
 
 function mergeMail(existing, incoming) {
@@ -1233,14 +1310,30 @@ function mergeMail(existing, incoming) {
 
 function render() {
   if (filters.view.value === 'threads') {
-    if (!lastThreads) return;
+    if (!lastThreads) {
+      if (loadFailed) {
+        list.replaceChildren();
+        const error = el('div', 'card load-error', t('network.unavailable'));
+        const retry = el('button', 'primary-action', t('network.retry'));
+        retry.type = 'button'; retry.onclick = () => load(true); error.appendChild(retry); list.appendChild(error);
+      }
+      return;
+    }
     list.replaceChildren();
     open = null;
     if (!lastThreads.length) { list.appendChild(el('p', 'card muted', t('empty'))); return; }
     for (const thread of lastThreads) list.appendChild(rowOfThread(thread));
     return;
   }
-  if (!lastMail) return;
+  if (!lastMail) {
+    if (loadFailed) {
+      list.replaceChildren();
+      const error = el('div', 'card load-error', t('network.unavailable'));
+      const retry = el('button', 'primary-action', t('network.retry'));
+      retry.type = 'button'; retry.onclick = () => load(true); error.appendChild(retry); list.appendChild(error);
+    }
+    return;
+  }
   list.replaceChildren();
   open = null;
   if (!lastMail.length) { list.appendChild(el('p', 'card muted', t('empty'))); return; }
@@ -1279,6 +1372,13 @@ async function load(reset = true) {
       lastThreads = null;
       nextCursor = data.nextCursor || null;
     }
+    loadFailed = false;
+    setNetworkIssue(false);
+  } catch (e) {
+    if (requestId === mailRequestId) {
+      loadFailed = true;
+      setNetworkIssue(true);
+    }
   } finally {
     if (requestId === mailRequestId) { loadingMail = false; render(); }
   }
@@ -1301,6 +1401,9 @@ async function refresh() {
     if (requestId !== mailRequestId) return;
     lastMail = mergeMail(lastMail || [], Array.isArray(data.mail) ? data.mail : []);
     nextCursor = previousCursor;
+    setNetworkIssue(false);
+  } catch (e) {
+    if (requestId === mailRequestId) setNetworkIssue(true);
   } finally {
     if (requestId === mailRequestId) { loadingMail = false; render(); }
   }
@@ -1308,21 +1411,30 @@ async function refresh() {
 
 function renderChrome() {
   const s = lastSummary, g = lastDigest;
-  if (s) $('#totals').textContent = fill('totals', { total: s.total, pushed: s.pushed, spam: s.fromSpamFolder });
+  if (s) {
+    $('#overview-count').textContent = s.total;
+    $('#overview-pushed').textContent = s.pushed;
+    $('#overview-spam').textContent = s.fromSpamFolder;
+  }
   if (g) { $('#digest').hidden = g.pending === 0; $('#digest-body').textContent = g.preview; }
 }
 
 async function chrome() {
-  const p = new URLSearchParams(); p.set('hours', filters.hours.value);
-  const s = await (await fetch('/api/summary?' + p.toString())).json();
-  lastSummary = s;
-  if (!filters.category.dataset.filled) {
-    for (const c of s.categories) filters.category.appendChild(new Option(word('category.', c), c));
-    for (const a of s.accounts) filters.account.appendChild(new Option(a.name, a.address));
-    filters.category.dataset.filled = '1';
+  try {
+    const p = new URLSearchParams(); p.set('hours', filters.hours.value);
+    const s = await (await fetch('/api/summary?' + p.toString())).json();
+    lastSummary = s;
+    if (!filters.category.dataset.filled) {
+      for (const c of s.categories) filters.category.appendChild(new Option(word('category.', c), c));
+      for (const a of s.accounts) filters.account.appendChild(new Option(a.name, a.address));
+      filters.category.dataset.filled = '1';
+      updateFilterSummary();
+    }
+    lastDigest = await (await fetch('/api/digest')).json();
+    renderChrome();
+  } catch (e) {
+    setNetworkIssue(true);
   }
-  lastDigest = await (await fetch('/api/digest')).json();
-  renderChrome();
 }
 
 // Three states rather than two: following the system is the sensible default,
@@ -1346,6 +1458,8 @@ function applyTheme(choice) {
   // choice has to move it too or the top of the screen keeps the other theme.
   const meta = document.querySelector('meta[name=theme-color]');
   if (meta) meta.setAttribute('content', isDark ? '${DARK_BAR}' : '${LIGHT_BAR}');
+  const appleStatus = document.querySelector('meta[name=apple-mobile-web-app-status-bar-style]');
+  if (appleStatus) appleStatus.setAttribute('content', isDark ? 'black-translucent' : 'default');
   const button = document.querySelector('#theme');
   if (button) {
     const name = t('theme.' + choice);
@@ -1376,6 +1490,10 @@ function applyLanguage(next) {
   const button = $('#lang');
   button.textContent = t('lang.face');
   button.setAttribute('aria-label', t('lang.label'));
+  $('.overview').setAttribute('aria-label', t('overview.title'));
+  $('#install-close').setAttribute('aria-label', t('pwa.close'));
+  updateFilterSummary();
+  if (connectionProblem) setNetworkIssue(true);
   applyTheme(readTheme());
   const openKey = open && open.dataset.key;
   render(); renderChrome();
@@ -1388,13 +1506,48 @@ $('#lang').onclick = () => {
   applyLanguage(next);
 };
 
+const installButton = $('#install'), installHelp = $('#install-help');
+let pendingInstall = null;
+const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const appleMobile = /iPhone|iPad|iPod/.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+if (!standalone && appleMobile) installButton.hidden = false;
+window.addEventListener('beforeinstallprompt', (event) => {
+  event.preventDefault();
+  pendingInstall = event;
+  installButton.hidden = false;
+});
+installButton.addEventListener('click', async () => {
+  if (pendingInstall) {
+    const promptEvent = pendingInstall;
+    pendingInstall = null;
+    try {
+      await promptEvent.prompt();
+      await promptEvent.userChoice;
+    } catch (e) {}
+    installButton.hidden = true;
+  } else if (appleMobile && !standalone) {
+    installHelp.showModal();
+  }
+});
+function closeInstallHelp() { if (installHelp.open) installHelp.close(); }
+$('#install-close').addEventListener('click', closeInstallHelp);
+$('#install-done').addEventListener('click', closeInstallHelp);
+installHelp.addEventListener('click', (event) => { if (event.target === installHelp) closeInstallHelp(); });
+window.addEventListener('appinstalled', () => { pendingInstall = null; installButton.hidden = true; });
+
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 
 let timer;
 filters.addEventListener('input', () => {
+  updateFilterSummary();
+  lastMail = null; lastThreads = null; loadFailed = false; render();
   clearTimeout(timer);
   timer = setTimeout(() => { load(); chrome(); }, 250);
 });
+window.addEventListener('offline', () => setNetworkIssue(true));
+window.addEventListener('online', () => { setNetworkIssue(false); load(); chrome(); });
+updateFilterSummary();
 load(); chrome();
 setInterval(() => { if (!document.hidden) { refresh(); chrome(); } }, 60000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { refresh(); chrome(); } });
@@ -1416,9 +1569,8 @@ function manifest(): string {
     start_url: '/',
     scope: '/',
     display: 'standalone',
-    orientation: 'portrait',
-    background_color: '#ffffff',
-    theme_color: '#2f6fd0',
+    background_color: LIGHT_BAR,
+    theme_color: LIGHT_BAR,
     icons: [
       { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
       { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
