@@ -596,7 +596,7 @@ export function renderApp(lang: Language): string {
   return page(lang, 'mailsift', `
     <header class="app-header">
       <div class="header-inner">
-        <div class="brand"><img class="brand-mark" src="/icon-192.png" alt="" aria-hidden="true"><strong>mailsift</strong></div>
+        <div class="brand"><img class="brand-mark" src="/icon-192.png?v=2" alt="" aria-hidden="true"><strong>mailsift</strong></div>
         <div class="header-actions">
           <button id="install" type="button" class="switch install" data-i18n="pwa.install" hidden>${s('pwa.install')}</button>
           <button id="lang" type="button" class="switch" aria-label="${s('lang.label')}">${s('lang.face')}</button>
@@ -664,8 +664,8 @@ function page(lang: Language, title: string, body: string): string {
     + '<meta name="apple-mobile-web-app-title" content="mailsift">'
     + '<meta name="mobile-web-app-capable" content="yes">'
     + '<link rel="manifest" href="/manifest.webmanifest">'
-    + '<link rel="icon" type="image/png" href="/favicon.ico">'
-    + '<link rel="apple-touch-icon" href="/apple-touch-icon.png">'
+    + '<link rel="icon" type="image/png" href="/favicon.ico?v=2">'
+    + '<link rel="apple-touch-icon" href="/apple-touch-icon.png?v=2">'
     // One theme-color tag lets the saved theme choice drive the installed
     // app status bar immediately, including after a manual light/dark switch.
     + '<meta name="theme-color" content="' + LIGHT_BAR + '">'
@@ -1577,9 +1577,9 @@ function manifest(): string {
     background_color: LIGHT_BAR,
     theme_color: LIGHT_BAR,
     icons: [
-      { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
-      { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
-      { src: '/icon-maskable.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+      { src: '/icon-192.png?v=2', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: '/icon-512.png?v=2', sizes: '512x512', type: 'image/png', purpose: 'any' },
+      { src: '/icon-maskable.png?v=2', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
     ],
   });
 }

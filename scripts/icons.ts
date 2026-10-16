@@ -13,9 +13,11 @@
 import { deflateSync } from 'node:zlib';
 import { writeFileSync } from 'node:fs';
 
-const BG = [0x2f, 0x6f, 0xd0] as const;
-const GLYPH = [0xff, 0xff, 0xff] as const;
-const ACCENT = [0xf5, 0xa5, 0x24] as const;
+const TILE_TOP = [0x1f, 0x23, 0x2b] as const;
+const TILE_BOTTOM = [0x0d, 0x0f, 0x12] as const;
+const GLOW = [0x7b, 0x98, 0xf7] as const;
+const ORB_TOP = [0xa3, 0xb8, 0xfc] as const;
+const ORB_BOTTOM = [0x58, 0x78, 0xef] as const;
 const SAMPLES = 4;
 
 type Rgb = readonly [number, number, number];
@@ -41,9 +43,9 @@ function roundedRect(x: number, y: number, x0: number, y0: number, x1: number, y
 /**
  * The mark, on a unit canvas.
  *
- * An envelope with a badge over one corner: mail, and the one piece of it that
- * was judged worth interrupting for. Returns the colour at a point, or null
- * where the icon is transparent.
+ * A blue-violet orb on a graphite tile, with a mail envelope cut through it.
+ * It borrows QuotaPulse's glow, gradient and negative-space treatment while
+ * keeping a distinct mark for Mailsift. Returns null for transparent corners.
  */
 function sample(x: number, y: number, scale: number, round: boolean): Rgb | null {
   // Background fills the tile. Rounded only for the favicon; the launcher and
@@ -54,22 +56,34 @@ function sample(x: number, y: number, scale: number, round: boolean): Rgb | null
   const gx = (x - 0.5) / scale + 0.5;
   const gy = (y - 0.5) / scale + 0.5;
 
-  const stroke = 0.055;
-  const dot = Math.hypot(gx - 0.755, gy - 0.275);
-  if (dot <= 0.105) return ACCENT;
-  // A gap in the background colour, so the badge reads as sitting above.
-  if (dot <= 0.142) return BG;
+  const tile = mix(TILE_TOP, TILE_BOTTOM, y);
+  const glowStrength = Math.max(0, 1 - Math.hypot(x - 0.5, y - 0.5) / 0.46) * 0.3;
+  const litTile = mix(tile, GLOW, glowStrength);
 
-  const body = Math.abs(roundedRect(gx, gy, 0.20, 0.31, 0.80, 0.71, 0.05));
-  if (body <= stroke / 2) return GLYPH;
+  const orbRadius = 0.367;
+  const orb = Math.hypot(gx - 0.5, gy - 0.5) <= orbRadius;
+  if (!orb) return litTile;
 
-  const flap = Math.min(
-    distanceToSegment(gx, gy, 0.20, 0.355, 0.50, 0.545),
-    distanceToSegment(gx, gy, 0.50, 0.545, 0.80, 0.355),
+  const coin = mix(ORB_TOP, ORB_BOTTOM, gy);
+  const stroke = 0.043;
+  const envelope = Math.min(
+    distanceToSegment(gx, gy, 0.27, 0.36, 0.73, 0.36),
+    distanceToSegment(gx, gy, 0.27, 0.36, 0.27, 0.66),
+    distanceToSegment(gx, gy, 0.73, 0.36, 0.73, 0.66),
+    distanceToSegment(gx, gy, 0.27, 0.66, 0.73, 0.66),
+    distanceToSegment(gx, gy, 0.285, 0.385, 0.5, 0.535),
+    distanceToSegment(gx, gy, 0.5, 0.535, 0.715, 0.385),
   );
-  if (flap <= stroke / 2) return GLYPH;
+  return envelope <= stroke / 2 ? tile : coin;
+}
 
-  return BG;
+function mix(a: Rgb, b: Rgb, amount: number): Rgb {
+  const t = Math.max(0, Math.min(1, amount));
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * t),
+    Math.round(a[1] + (b[1] - a[1]) * t),
+    Math.round(a[2] + (b[2] - a[2]) * t),
+  ];
 }
 
 function render(size: number, scale: number, round: boolean): Buffer {
