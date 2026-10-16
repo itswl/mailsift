@@ -235,6 +235,19 @@ describe('LLM layer', () => {
     expect(seen).toEqual([null]);
   });
 
+  it('omits temperature from chat completion requests', async () => {
+    const spy = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ results: [{ index: 0, importance: 'info', score: 1, reason: 'x' }] }) } }],
+      }), { status: 200 }),
+    );
+    vi.stubGlobal('fetch', spy);
+    process.env.LLM_API_KEY = 'k';
+    await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
+    const init = spy.mock.calls[0]?.[1];
+    expect(JSON.parse(String(init?.body))).not.toHaveProperty('temperature');
+  });
+
   it('does not send rule matches to the model', async () => {
     const spy = vi.fn(async () => new Response('{}', { status: 200 }));
     vi.stubGlobal('fetch', spy);

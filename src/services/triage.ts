@@ -536,7 +536,6 @@ function requestBody(
   };
   return {
     model: process.env.LLM_MODEL ?? 'deepseek-flash',
-    temperature: 0,
     ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
     messages: [
       { role: 'system', content: systemPrompt() },
