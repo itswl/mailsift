@@ -572,9 +572,12 @@ export function renderLogin(lang: Language, error?: StringKey): string {
 function themeBoot(): string {
   return "(function(){try{var c=localStorage.getItem('theme');"
     + "if(c==='dark'||c==='light')document.documentElement.dataset.theme=c;"
+    + "var d=c==='dark'||(c!=='light'&&matchMedia('(prefers-color-scheme:dark)').matches);"
     + "var m=document.querySelector('meta[name=theme-color]');"
     + "var b=getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();"
-    + "if(m&&b)m.setAttribute('content',b);}catch(e){}})();";
+    + "if(m&&b)m.setAttribute('content',b);"
+    + "var a=document.querySelector('meta[name=apple-mobile-web-app-status-bar-style]');"
+    + "if(a)a.setAttribute('content',d?'black-translucent':'default');}catch(e){}})();";
 }
 
 /**
@@ -651,7 +654,9 @@ function page(lang: Language, title: string, body: string): string {
   return '<!doctype html><html lang="' + lang + '"><head><meta charset="utf-8">'
     // viewport-fit=cover lets the page reach under a notch; the CSS then pads
     // it back with the safe-area insets, which is what an installed app needs.
-    + '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
+    // Prevent iOS from zooming email text on double-tap or pinch. The interface
+    // is responsive and all controls remain legible at the default scale.
+    + '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">'
     + '<meta name="referrer" content="no-referrer">'
     + '<meta name="apple-mobile-web-app-capable" content="yes">'
     + '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">'
@@ -683,13 +688,16 @@ function styles(): string {
 :root[data-theme=light]{color-scheme:light}
 :root[data-theme=dark]{color-scheme:dark}
 *{box-sizing:border-box}
-html{touch-action:manipulation}
+html{touch-action:manipulation;background:var(--bg)}
 button,input,select,textarea,a,summary{-webkit-tap-highlight-color:transparent}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
 padding:0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);-webkit-text-size-adjust:100%;overscroll-behavior-y:contain}
+/* Paint the area behind the iOS status bar from the live theme, not the
+   theme-color snapshot iOS took when this home-screen app was opened. */
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top);background:var(--bg);z-index:4;pointer-events:none}
 [hidden]{display:none!important}
-.app-header{position:sticky;top:0;z-index:5;padding:env(safe-area-inset-top) 18px 0;background:var(--bg);background:color-mix(in srgb,var(--bg) 90%,transparent);
-border-bottom:1px solid color-mix(in srgb,var(--line) 82%,transparent);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}
+.app-header{position:sticky;top:0;z-index:5;padding:env(safe-area-inset-top) 18px 0;background:var(--bg);
+border-bottom:1px solid var(--line)}
 .header-inner{display:flex;align-items:center;justify-content:space-between;gap:16px;width:min(1120px,100%);min-height:58px;margin:0 auto}
 .brand,.header-actions{display:flex;align-items:center;gap:10px}.brand strong{font-size:16px;letter-spacing:-.02em}
 .brand-mark{display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:var(--accent);color:white;font-weight:750;font-size:18px;line-height:1}
@@ -1452,11 +1460,14 @@ function readTheme() {
 function applyTheme(choice) {
   const root = document.documentElement;
   if (choice === 'auto') delete root.dataset.theme; else root.dataset.theme = choice;
-  // The status bar of an installed app is painted from this, so a manual
-  // choice has to move it too or the browser chrome keeps the other theme.
+  // iOS samples theme-color when a home-screen app opens, but the safe-area
+  // backing above is live CSS. Keep both native status-bar text style and
+  // browser chrome metadata in sync with the active palette.
   const meta = document.querySelector('meta[name=theme-color]');
   const bg = getComputedStyle(root).getPropertyValue('--bg').trim();
   if (meta && bg) meta.setAttribute('content', bg);
+  const appleStatus = document.querySelector('meta[name=apple-mobile-web-app-status-bar-style]');
+  if (appleStatus) appleStatus.setAttribute('content', choice === 'dark' || (choice === 'auto' && dark.matches) ? 'black-translucent' : 'default');
   const button = document.querySelector('#theme');
   if (button) {
     const name = t('theme.' + choice);
