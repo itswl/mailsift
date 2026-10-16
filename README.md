@@ -298,7 +298,7 @@ Off by default. A page a browser can reach is a wider surface than a JSON-RPC en
 
 Signing in posts the token and exchanges it for an `HttpOnly` cookie that lasts six months and is renewed on each visit, so a browser in regular use is never asked again. The form carries an account field so a password manager will offer to save the token rather than leaving you to type it. An installed app keeps its own cookies on iOS, so expect to sign in once inside it even if the browser is already signed in.
 
-The header carries a colour switch cycling through following the system, light and dark. The choice is stored in the browser and applied before the body renders, so it never flashes the other theme, and it moves the status bar colour with it rather than leaving the top of an installed app behind.
+The header carries a two-state light/dark switch. The choice is stored in the browser and applied before the body renders, so it never flashes the other theme, and it moves the status bar colour with it rather than leaving the top of an installed app behind.
 
 Next to it is a language switch between English and Simplified Chinese. The page follows the browser's language until the switch is used; that choice is kept in a cookie, so the server renders the page, and the sign-in form before it, in that language from the first paint. Only the page's own words change. Subjects, summaries and reasons are shown as stored, in the language `LLM_OUTPUT_LANGUAGE` told the model to write, and the digest preview is the text that will actually be sent.
 

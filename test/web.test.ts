@@ -335,18 +335,18 @@ describe('installable app', () => {
 describe('colour theme', () => {
   const shell = async (): Promise<string> => String((await routeWeb(request(), url('/'), '', seeded())).body);
 
-  it('offers three states, so following the system stays reachable', async () => {
+  it('offers a direct light and dark switch', async () => {
     const page = await shell();
     expect(page).toContain('id="theme"');
-    expect(page).toContain("['auto', 'light', 'dark']");
+    expect(page).toContain("const THEMES = ['light', 'dark']");
+    expect(page).not.toContain('theme.auto');
   });
 
-  it('lets a stored choice beat the system in either direction', async () => {
+  it('uses the selected palette without following the system', async () => {
     const page = await shell();
-    // System dark yields to an explicit light choice, and an explicit dark
-    // choice applies under a light system.
-    expect(page).toContain('@media(prefers-color-scheme:dark){:root:not([data-theme=light])');
-    expect(page).toContain(':root[data-theme=dark]{--bg:#15171b');
+    expect(page).toContain(':root[data-theme=dark]{--bg:#0e1013');
+    expect(page).toContain('--accent:#3358d4');
+    expect(page).not.toContain('prefers-color-scheme');
   });
 
   it('applies the choice before the body renders', async () => {
@@ -366,13 +366,13 @@ describe('colour theme', () => {
     expect(page).toContain("if (meta && bg) meta.setAttribute('content', bg)");
   });
 
-  it('keeps following the system while the choice is auto', async () => {
-    expect(await shell()).toContain("dark.addEventListener('change'");
+  it('defaults to light when there is no saved theme', async () => {
+    expect(await shell()).toContain("if(c!=='dark'&&c!=='light')c='light'");
   });
 
   it('survives a browser that refuses storage', async () => {
     const page = await shell();
-    expect(page).toContain("catch (e) { return 'auto'; }");
+    expect(page).toContain("catch (e) { return 'light'; }");
   });
 });
 

@@ -571,8 +571,9 @@ export function renderLogin(lang: Language, error?: StringKey): string {
  */
 function themeBoot(): string {
   return "(function(){try{var c=localStorage.getItem('theme');"
-    + "if(c==='dark'||c==='light')document.documentElement.dataset.theme=c;"
-    + "var d=c==='dark'||(c!=='light'&&matchMedia('(prefers-color-scheme:dark)').matches);"
+    + "if(c!=='dark'&&c!=='light')c='light';"
+    + "document.documentElement.dataset.theme=c;"
+    + "var d=c==='dark';"
     + "var m=document.querySelector('meta[name=theme-color]');"
     + "var b=getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();"
     + "if(m&&b)m.setAttribute('content',b);"
@@ -674,23 +675,22 @@ function page(lang: Language, title: string, body: string): string {
     + '</head><body>' + body + '</body></html>';
 }
 
-/** The dark palette, written once and used by both the media query and the override. */
-const DARK_PALETTE = '--bg:#15171b;--fg:#e7e9ed;--muted:#9299a4;--line:#30343c;--card:#1d2026;--accent:#8798ff;--critical:#ff737c;--warning:#edb751;--info:#8798ff;--action-ink:#15171b;--shadow:0 1px 3px rgba(0,0,0,.18)';
+/** Dark tokens adapted from QuotaPulse's neutral surfaces and indigo accent. */
+const DARK_PALETTE = '--bg:#0e1013;--fg:#e9ebef;--muted:#7d8795;--line:#252a33;--card:#15181d;--surface-muted:#1b1f26;--input:#111418;--accent:#7b98f7;--critical:#ef6b6b;--warning:#e8a33d;--info:#7b98f7;--action-ink:#0e1013;--shadow:0 1px 2px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.03);--glow:rgba(123,152,247,.10)';
 export const LIGHT_BAR = '#f4f5f7';
 
 function styles(): string {
   return `
-:root{color-scheme:light dark;--bg:#f4f5f7;--fg:#20242a;--muted:#707783;--line:#e2e5e9;--card:#fff;
---critical:#c9434d;--warning:#b57912;--info:#536ee8;--accent:#536ee8;--action-ink:#fff;--shadow:0 1px 2px rgba(19,29,48,.035)}
-/* Follow the system unless a choice was made, and let that choice win either way. */
-@media(prefers-color-scheme:dark){:root:not([data-theme=light]){` + DARK_PALETTE + `}}
+:root{color-scheme:light;--bg:#f4f5f7;--fg:#15171b;--muted:#686d76;--line:#e5e7eb;--card:#fff;
+--surface-muted:#f7f8fa;--input:#eef0f3;--critical:#d64545;--warning:#b86b04;--info:#3358d4;--accent:#3358d4;--action-ink:#fff;
+--shadow:0 1px 2px rgba(20,24,33,.05),0 0 0 1px rgba(20,24,33,.02);--glow:rgba(51,88,212,.09)}
 :root[data-theme=dark]{` + DARK_PALETTE + `}
 :root[data-theme=light]{color-scheme:light}
 :root[data-theme=dark]{color-scheme:dark}
 *{box-sizing:border-box}
 html{touch-action:manipulation;background:var(--bg)}
 button,input,select,textarea,a,summary{-webkit-tap-highlight-color:transparent}
-body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+body{margin:0;background:radial-gradient(900px 420px at 50% -140px,var(--glow),transparent 70%),var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
 padding:0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);-webkit-text-size-adjust:100%;overscroll-behavior-y:contain}
 /* Paint the area behind the iOS status bar from the live theme, not the
    theme-color snapshot iOS took when this home-screen app was opened. */
@@ -701,21 +701,21 @@ border-bottom:1px solid var(--line)}
 .header-inner{display:flex;align-items:center;justify-content:space-between;gap:16px;width:min(1120px,100%);min-height:58px;margin:0 auto}
 .brand,.header-actions{display:flex;align-items:center;gap:10px}.brand strong{font-size:16px;letter-spacing:-.02em}
 .brand-mark{display:block;width:29px;height:29px;border-radius:9px;object-fit:cover}
-.switch{min-height:36px;padding:6px 10px;border:1px solid var(--line);border-radius:9px;background:var(--card);color:var(--fg);font:inherit;font-size:13px;line-height:1.2;cursor:pointer;box-shadow:var(--shadow)}
+.switch{min-height:36px;padding:6px 10px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);font:inherit;font-size:13px;line-height:1.2;cursor:pointer;box-shadow:var(--shadow)}
 .switch:hover{border-color:var(--accent)}#theme{min-width:38px;font-size:17px}.install{color:var(--accent);font-weight:600}
 .app-main{width:min(1120px,100%);margin:0 auto;padding:22px 20px 30px}
 .version{color:var(--muted);font-size:11px;font-weight:400;white-space:nowrap}
 footer.version{text-align:center;padding:8px 14px 20px}.login .version{text-align:center;margin:14px 0 0}
-.overview{display:grid;grid-template-columns:minmax(220px,1.5fr) repeat(2,minmax(130px,1fr));align-items:stretch;margin:0 0 14px;border:1px solid var(--line);border-radius:13px;background:var(--card);box-shadow:var(--shadow);overflow:hidden}
+.overview{display:grid;grid-template-columns:minmax(220px,1.5fr) repeat(2,minmax(130px,1fr));align-items:stretch;margin:0 0 14px;border:1px solid var(--line);border-radius:14px;background:var(--card);box-shadow:var(--shadow);overflow:hidden}
 .overview-total,.overview-stat{display:flex;flex-direction:column;justify-content:center;gap:3px;min-height:83px;padding:15px 20px}
 .overview-total{background:linear-gradient(115deg,color-mix(in srgb,var(--accent) 8%,var(--card)),var(--card) 75%)}
 .overview-stat{border-left:1px solid var(--line)}.overview-total .eyebrow,.overview-stat span{color:var(--muted);font-size:12px}
 .overview-total strong{font-size:26px;line-height:1.1;letter-spacing:-.035em;font-variant-numeric:tabular-nums}
 .overview-stat strong{font-size:19px;line-height:1.2;font-variant-numeric:tabular-nums}
 .network-status{margin:0 0 12px;padding:10px 13px;border:1px solid color-mix(in srgb,var(--warning) 30%,var(--line));border-radius:10px;background:color-mix(in srgb,var(--warning) 8%,var(--card));color:var(--fg);font-size:13px}
-.filters{display:grid;gap:9px;margin:0 0 14px;padding:11px;border:1px solid var(--line);border-radius:12px;background:var(--card);box-shadow:var(--shadow)}
+.filters{display:grid;gap:9px;margin:0 0 14px;padding:12px;border:1px solid var(--line);border-radius:14px;background:var(--card);box-shadow:var(--shadow)}
 .filter-primary{display:grid;grid-template-columns:minmax(180px,1fr) minmax(120px,.3fr) minmax(95px,.23fr);gap:8px}
-.filters select,.filters input:not([type=checkbox]){width:100%;min-width:0;min-height:40px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:14px}
+.filters select,.filters input:not([type=checkbox]){width:100%;min-width:0;min-height:40px;background:var(--input);color:var(--fg);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font:inherit;font-size:14px}
 .filters input[type=search]{padding-left:36px;background-image:radial-gradient(circle at 14px 14px,transparent 5px,var(--muted) 5.7px,var(--muted) 6.5px,transparent 7px),linear-gradient(45deg,transparent 47%,var(--muted) 49%,var(--muted) 55%,transparent 57%);background-size:20px 20px,7px 7px;background-position:6px 3px,21px 21px;background-repeat:no-repeat}
 .filters select:focus,.filters input:focus{outline:2px solid color-mix(in srgb,var(--accent) 35%,transparent);outline-offset:1px;border-color:var(--accent)}
 .advanced-filters summary{display:flex;align-items:center;gap:8px;width:max-content;max-width:100%;min-height:34px;padding:4px 3px;color:var(--muted);font-size:13px;font-weight:550;cursor:pointer;list-style:none}
@@ -724,7 +724,7 @@ footer.version{text-align:center;padding:8px 14px 20px}.login .version{text-alig
 .check{display:flex;align-items:center;gap:7px;min-height:40px;padding:0 10px;color:var(--muted);font-size:13px}
 .check input{width:17px;height:17px;accent-color:var(--accent)}
 #list{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,360px),1fr));gap:9px;align-items:start}
-.row{display:block;width:100%;min-width:0;min-height:103px;text-align:left;background:var(--card);border:1px solid var(--line);border-radius:11px;
+.row{display:block;width:100%;min-width:0;min-height:103px;text-align:left;background:var(--card);border:1px solid var(--line);border-radius:14px;
 padding:13px 14px;color:inherit;font:inherit;cursor:pointer;box-shadow:var(--shadow);transition:border-color .15s,box-shadow .15s}
 .row:hover{border-color:color-mix(in srgb,var(--accent) 45%,var(--line));box-shadow:0 4px 14px rgba(19,29,48,.07)}
 .row .top{display:flex;gap:8px;align-items:baseline}
@@ -744,7 +744,7 @@ border-radius:8px;background:var(--card);color:var(--fg);font:inherit;cursor:poi
 .dot{width:8px;height:8px;border-radius:50%;flex:none;align-self:center}
 .critical{background:var(--critical)}.warning{background:var(--warning)}.info{background:var(--info)}
 .chip{font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:1px 7px}
-.detail{padding:12px 14px;background:var(--card);border-bottom:1px solid var(--line)}
+.detail{padding:14px;background:var(--card);border-bottom:1px solid var(--line)}
 .detail h3{margin:0 0 6px;font-size:15px;overflow-wrap:anywhere}
 .detail dl{margin:0 0 8px;display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:13px}
 .detail dt{color:var(--muted)}
@@ -753,8 +753,8 @@ border-radius:8px;background:var(--card);color:var(--fg);font:inherit;cursor:poi
 .detail dd{margin:0}
 .detail pre{white-space:pre-wrap;word-break:break-word;margin:8px 0 0;font:13px/1.5 ui-monospace,monospace}
 .actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
-.actions a,.actions button{font:inherit;font-size:13px;padding:6px 11px;border-radius:7px;
-border:1px solid var(--line);background:var(--bg);color:var(--fg);text-decoration:none;cursor:pointer}
+.actions a,.actions button{font:inherit;font-size:13px;padding:6px 11px;border-radius:8px;
+border:1px solid var(--line);background:var(--input);color:var(--fg);text-decoration:none;cursor:pointer}
 .attachments{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
 .attachments h4{margin:0 0 6px;font-size:13px}
 .attachment-list{list-style:none;margin:0;padding:0;display:grid;gap:6px}
@@ -788,8 +788,8 @@ border:1px solid var(--line);background:var(--bg);color:var(--fg);text-decoratio
 .install-help h2{margin:0 28px 8px 0;font-size:18px;line-height:1.3}.install-help p{margin:0 0 18px;color:var(--muted);font-size:14px}
 .dialog-close{position:absolute;right:12px;top:10px;width:34px;height:34px;border:0;border-radius:8px;background:transparent;color:var(--muted);font-size:24px;cursor:pointer}
 .login{max-width:320px;margin:15vh auto}
-.login input,.login button{width:100%;margin-top:8px;padding:9px;border-radius:7px;
-border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit}
+.login input,.login button{width:100%;margin-top:8px;padding:9px;border-radius:9px;
+border:1px solid var(--line);background:var(--input);color:var(--fg);font:inherit}
 /* Present so a password manager has an account to file the token under, but
    it is not a second thing to fill in. */
 .login input[name=user]{color:var(--muted);cursor:default}
@@ -1444,22 +1444,20 @@ async function chrome() {
   }
 }
 
-// Three states rather than two: following the system is the sensible default,
-// and a switch that cannot go back to it forces a choice the reader may not have.
-const THEMES = ['auto', 'light', 'dark'];
-const THEME_FACE = { auto: '\u25D0', light: '\u2600', dark: '\u263E' };
-const dark = matchMedia('(prefers-color-scheme: dark)');
+// A direct two-state switch: the glyph and label name the theme it will apply.
+const THEMES = ['light', 'dark'];
+const THEME_FACE = { light: '\u263E', dark: '\u2600' };
 
 function readTheme() {
   try {
     const stored = localStorage.getItem('theme');
-    return THEMES.includes(stored) ? stored : 'auto';
-  } catch (e) { return 'auto'; }
+    return THEMES.includes(stored) ? stored : 'light';
+  } catch (e) { return 'light'; }
 }
 
 function applyTheme(choice) {
   const root = document.documentElement;
-  if (choice === 'auto') delete root.dataset.theme; else root.dataset.theme = choice;
+  root.dataset.theme = choice;
   // iOS samples theme-color when a home-screen app opens, but the safe-area
   // backing above is live CSS. Keep both native status-bar text style and
   // browser chrome metadata in sync with the active palette.
@@ -1467,10 +1465,11 @@ function applyTheme(choice) {
   const bg = getComputedStyle(root).getPropertyValue('--bg').trim();
   if (meta && bg) meta.setAttribute('content', bg);
   const appleStatus = document.querySelector('meta[name=apple-mobile-web-app-status-bar-style]');
-  if (appleStatus) appleStatus.setAttribute('content', choice === 'dark' || (choice === 'auto' && dark.matches) ? 'black-translucent' : 'default');
+  if (appleStatus) appleStatus.setAttribute('content', choice === 'dark' ? 'black-translucent' : 'default');
   const button = document.querySelector('#theme');
   if (button) {
-    const name = t('theme.' + choice);
+    const target = choice === 'dark' ? 'light' : 'dark';
+    const name = t('theme.' + target);
     button.textContent = THEME_FACE[choice];
     button.title = name;
     button.setAttribute('aria-label', fill('theme.label', { name }));
@@ -1478,12 +1477,10 @@ function applyTheme(choice) {
 }
 
 $('#theme').onclick = () => {
-  const next = THEMES[(THEMES.indexOf(readTheme()) + 1) % THEMES.length];
+  const next = readTheme() === 'dark' ? 'light' : 'dark';
   try { localStorage.setItem('theme', next); } catch (e) {}
   applyTheme(next);
 };
-// Following the system means following it as it changes, including the status bar.
-dark.addEventListener('change', () => { if (readTheme() === 'auto') applyTheme('auto'); });
 applyTheme(readTheme());
 
 // Reword the page in place: the page's own words are tagged with their key,
