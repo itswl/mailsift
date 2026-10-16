@@ -317,8 +317,9 @@ describe('installable app', () => {
 
   it('gives the status bar a colour for each scheme and reaches under a notch', async () => {
     const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
-    expect(page).toContain("meta[name=theme-color]");
-    expect(page).toContain("a.setAttribute('content',d?'black-translucent':'default')");
+    expect(page).toContain('<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">');
+    expect(page).toContain("getComputedStyle(document.documentElement).getPropertyValue('--bg')");
+    expect(page).toContain("getComputedStyle(root).getPropertyValue('--bg')");
     expect(page).toContain('viewport-fit=cover');
     expect(page).toContain('apple-touch-icon');
     expect(page).toContain('safe-area-inset-top');
@@ -362,7 +363,7 @@ describe('colour theme', () => {
     // would keep the top of the screen in the other theme.
     const page = await shell();
     expect(page).toContain('<meta name="theme-color" content="#f4f5f7">');
-    expect(page).toContain("meta.setAttribute('content', isDark ? '#15171b' : '#f4f5f7')");
+    expect(page).toContain("if (meta && bg) meta.setAttribute('content', bg)");
   });
 
   it('keeps following the system while the choice is auto', async () => {
@@ -403,6 +404,8 @@ describe('layout', () => {
     expect(page).toContain('class="header-actions"');
     expect(page).toContain('@media(max-width:370px)');
     expect(page).toContain('.brand strong{display:none}');
+    expect(page).toContain('html{touch-action:manipulation}');
+    expect(page).not.toContain('transform:translateY(-1px)');
   });
 });
 

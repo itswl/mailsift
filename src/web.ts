@@ -572,11 +572,9 @@ export function renderLogin(lang: Language, error?: StringKey): string {
 function themeBoot(): string {
   return "(function(){try{var c=localStorage.getItem('theme');"
     + "if(c==='dark'||c==='light')document.documentElement.dataset.theme=c;"
-    + "var d=c==='dark'||(c!=='light'&&matchMedia('(prefers-color-scheme:dark)').matches);"
     + "var m=document.querySelector('meta[name=theme-color]');"
-    + "if(m)m.setAttribute('content',d?'" + DARK_BAR + "':'" + LIGHT_BAR + "');"
-    + "var a=document.querySelector('meta[name=apple-mobile-web-app-status-bar-style]');"
-    + "if(a)a.setAttribute('content',d?'black-translucent':'default');}catch(e){}})();";
+    + "var b=getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();"
+    + "if(m&&b)m.setAttribute('content',b);}catch(e){}})();";
 }
 
 /**
@@ -656,7 +654,7 @@ function page(lang: Language, title: string, body: string): string {
     + '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
     + '<meta name="referrer" content="no-referrer">'
     + '<meta name="apple-mobile-web-app-capable" content="yes">'
-    + '<meta name="apple-mobile-web-app-status-bar-style" content="default">'
+    + '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">'
     + '<meta name="apple-mobile-web-app-title" content="mailsift">'
     + '<meta name="mobile-web-app-capable" content="yes">'
     + '<link rel="manifest" href="/manifest.webmanifest">'
@@ -674,7 +672,6 @@ function page(lang: Language, title: string, body: string): string {
 /** The dark palette, written once and used by both the media query and the override. */
 const DARK_PALETTE = '--bg:#15171b;--fg:#e7e9ed;--muted:#9299a4;--line:#30343c;--card:#1d2026;--accent:#8798ff;--critical:#ff737c;--warning:#edb751;--info:#8798ff;--action-ink:#15171b;--shadow:0 1px 3px rgba(0,0,0,.18)';
 export const LIGHT_BAR = '#f4f5f7';
-export const DARK_BAR = '#15171b';
 
 function styles(): string {
   return `
@@ -686,6 +683,8 @@ function styles(): string {
 :root[data-theme=light]{color-scheme:light}
 :root[data-theme=dark]{color-scheme:dark}
 *{box-sizing:border-box}
+html{touch-action:manipulation}
+button,input,select,textarea,a,summary{-webkit-tap-highlight-color:transparent}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
 padding:0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);-webkit-text-size-adjust:100%;overscroll-behavior-y:contain}
 [hidden]{display:none!important}
@@ -718,8 +717,8 @@ footer.version{text-align:center;padding:8px 14px 20px}.login .version{text-alig
 .check input{width:17px;height:17px;accent-color:var(--accent)}
 #list{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,360px),1fr));gap:9px;align-items:start}
 .row{display:block;width:100%;min-width:0;min-height:103px;text-align:left;background:var(--card);border:1px solid var(--line);border-radius:11px;
-padding:13px 14px;color:inherit;font:inherit;cursor:pointer;box-shadow:var(--shadow);transition:border-color .15s,transform .15s,box-shadow .15s}
-.row:hover{border-color:color-mix(in srgb,var(--accent) 45%,var(--line));box-shadow:0 4px 14px rgba(19,29,48,.07);transform:translateY(-1px)}
+padding:13px 14px;color:inherit;font:inherit;cursor:pointer;box-shadow:var(--shadow);transition:border-color .15s,box-shadow .15s}
+.row:hover{border-color:color-mix(in srgb,var(--accent) 45%,var(--line));box-shadow:0 4px 14px rgba(19,29,48,.07)}
 .row .top{display:flex;gap:8px;align-items:baseline}
 .row .who{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%}
 .row .when{margin-left:auto;color:var(--muted);font-size:12px;white-space:nowrap}
@@ -1453,13 +1452,11 @@ function readTheme() {
 function applyTheme(choice) {
   const root = document.documentElement;
   if (choice === 'auto') delete root.dataset.theme; else root.dataset.theme = choice;
-  const isDark = choice === 'dark' || (choice === 'auto' && dark.matches);
   // The status bar of an installed app is painted from this, so a manual
-  // choice has to move it too or the top of the screen keeps the other theme.
+  // choice has to move it too or the browser chrome keeps the other theme.
   const meta = document.querySelector('meta[name=theme-color]');
-  if (meta) meta.setAttribute('content', isDark ? '${DARK_BAR}' : '${LIGHT_BAR}');
-  const appleStatus = document.querySelector('meta[name=apple-mobile-web-app-status-bar-style]');
-  if (appleStatus) appleStatus.setAttribute('content', isDark ? 'black-translucent' : 'default');
+  const bg = getComputedStyle(root).getPropertyValue('--bg').trim();
+  if (meta && bg) meta.setAttribute('content', bg);
   const button = document.querySelector('#theme');
   if (button) {
     const name = t('theme.' + choice);
