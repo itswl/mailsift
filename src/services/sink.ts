@@ -61,7 +61,10 @@ export function usesLegacyWebhookNames(): boolean {
  */
 export function buildWebhookPayload(message: MailMessage, result: TriageResult): Record<string, unknown> {
   const isDigest = Boolean(message.extra?.['digest']);
-  const sensitiveVerification = Boolean(result.sensitiveVerification || isSensitiveVerificationMessage(message));
+  const sensitiveVerification = Boolean(
+    result.sensitiveVerification ||
+      (result.decidedBy !== 'health' && isSensitiveVerificationMessage(message)),
+  );
   return {
     signal: buildMailSignalEvent(message, result),
     mail: {
