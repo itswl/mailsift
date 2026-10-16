@@ -596,11 +596,11 @@ export function renderApp(lang: Language): string {
   return page(lang, 'mailsift', `
     <header class="app-header">
       <div class="header-inner">
-        <div class="brand"><img class="brand-mark" src="/icon-192.png?v=2" alt="" aria-hidden="true"><strong>mailsift</strong></div>
+        <div class="brand"><img class="brand-mark" src="/icon-192.png?v=3" alt="" aria-hidden="true"><strong>mailsift</strong></div>
         <div class="header-actions">
           <button id="install" type="button" class="switch install" data-i18n="pwa.install" hidden>${s('pwa.install')}</button>
           <button id="lang" type="button" class="switch" aria-label="${s('lang.label')}">${s('lang.face')}</button>
-          <button id="theme" type="button" class="switch" aria-label="${s('theme.title')}"></button>
+          <button id="theme" type="button" class="switch" aria-label="${s('theme.title')}"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 0 0 16z" fill="currentColor" stroke="none"/></svg></button>
         </div>
       </div>
     </header>
@@ -664,8 +664,8 @@ function page(lang: Language, title: string, body: string): string {
     + '<meta name="apple-mobile-web-app-title" content="mailsift">'
     + '<meta name="mobile-web-app-capable" content="yes">'
     + '<link rel="manifest" href="/manifest.webmanifest">'
-    + '<link rel="icon" type="image/png" href="/favicon.ico?v=2">'
-    + '<link rel="apple-touch-icon" href="/apple-touch-icon.png?v=2">'
+    + '<link rel="icon" type="image/png" href="/favicon.ico?v=3">'
+    + '<link rel="apple-touch-icon" href="/apple-touch-icon.png?v=3">'
     // One theme-color tag lets the saved theme choice drive the installed
     // app status bar immediately, including after a manual light/dark switch.
     + '<meta name="theme-color" content="' + LIGHT_BAR + '">'
@@ -702,7 +702,7 @@ border-bottom:1px solid var(--line)}
 .brand,.header-actions{display:flex;align-items:center;gap:10px}.brand strong{font-size:16px;letter-spacing:-.02em}
 .brand-mark{display:block;width:29px;height:29px;border-radius:9px;object-fit:cover}
 .switch{min-height:36px;padding:6px 10px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);font:inherit;font-size:13px;line-height:1.2;cursor:pointer;box-shadow:var(--shadow)}
-.switch:hover{border-color:var(--accent)}#theme{min-width:38px;font-size:17px}.install{color:var(--accent);font-weight:600}
+.switch:hover{border-color:var(--accent)}#theme{width:38px;min-width:38px;height:38px;padding:0;display:grid;place-items:center;color:var(--muted);border-color:transparent;background:transparent;box-shadow:none;transition:background .2s,color .2s,border-color .2s}#theme:hover{border-color:var(--line);background:var(--surface-muted);color:var(--fg)}.theme-icon{display:block;width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round;transition:transform .45s cubic-bezier(.2,.7,.2,1)}:root[data-theme=dark] .theme-icon{transform:rotate(180deg)}.install{color:var(--accent);font-weight:600}
 .app-main{width:min(1120px,100%);margin:0 auto;padding:22px 20px 30px}
 .version{color:var(--muted);font-size:11px;font-weight:400;white-space:nowrap}
 footer.version{text-align:center;padding:8px 14px 20px}.login .version{text-align:center;margin:14px 0 0}
@@ -800,7 +800,7 @@ color:var(--muted);font-size:13px;cursor:pointer}
 .error{color:var(--critical);font-size:13px}
 /* iOS Safari zooms editable controls smaller than 16px when they receive focus. */
 @media(pointer:coarse){
-  .switch{min-height:42px}#theme{min-width:42px}
+  .switch{min-height:42px}#theme{width:42px;min-width:42px;height:42px}
   input:not([type=checkbox]):not([type=radio]):not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]),
   textarea,.filters select,.form-group select,#search-input,.filter-select{font-size:16px}
 }
@@ -1444,10 +1444,8 @@ async function chrome() {
   }
 }
 
-// A direct two-state switch: the glyph and label name the theme it will apply.
+// A two-state switch with QuotaPulse's half-filled disc and a label naming the destination theme.
 const THEMES = ['light', 'dark'];
-const THEME_FACE = { light: '\u263E', dark: '\u2600' };
-
 function readTheme() {
   try {
     const stored = localStorage.getItem('theme');
@@ -1470,7 +1468,6 @@ function applyTheme(choice) {
   if (button) {
     const target = choice === 'dark' ? 'light' : 'dark';
     const name = t('theme.' + target);
-    button.textContent = THEME_FACE[choice];
     button.title = name;
     button.setAttribute('aria-label', fill('theme.label', { name }));
   }
@@ -1577,9 +1574,9 @@ function manifest(): string {
     background_color: LIGHT_BAR,
     theme_color: LIGHT_BAR,
     icons: [
-      { src: '/icon-192.png?v=2', sizes: '192x192', type: 'image/png', purpose: 'any' },
-      { src: '/icon-512.png?v=2', sizes: '512x512', type: 'image/png', purpose: 'any' },
-      { src: '/icon-maskable.png?v=2', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+      { src: '/icon-192.png?v=3', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: '/icon-512.png?v=3', sizes: '512x512', type: 'image/png', purpose: 'any' },
+      { src: '/icon-maskable.png?v=3', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
     ],
   });
 }
