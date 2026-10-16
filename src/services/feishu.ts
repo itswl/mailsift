@@ -65,8 +65,13 @@ function formatDate(raw: string): string {
 
 export function buildCard(message: MailMessage, result: TriageResult): Record<string, unknown> {
   const isDigest = Boolean(message.extra?.['digest']);
-  const isSensitiveVerification = Boolean(result.sensitiveVerification || isSensitiveVerificationMessage(message));
-  const verificationCode = result.verificationCode ?? extractVerificationCode(message.subject, message.body);
+  const isSensitiveVerification = Boolean(
+    result.sensitiveVerification ||
+      (result.decidedBy !== 'health' && isSensitiveVerificationMessage(message)),
+  );
+  const verificationCode = isSensitiveVerification
+    ? result.verificationCode ?? extractVerificationCode(message.subject, message.body)
+    : undefined;
   const template = TEMPLATE[result.importance] ?? 'grey';
 
   if (isDigest && !isSensitiveVerification) {

@@ -36,7 +36,10 @@ export interface MailSignalEvent {
 }
 
 export function buildMailSignalEvent(message: MailMessage, result: TriageResult): MailSignalEvent {
-  const sensitiveVerification = Boolean(result.sensitiveVerification || isSensitiveVerificationMessage(message));
+  const sensitiveVerification = Boolean(
+    result.sensitiveVerification ||
+      (result.decidedBy !== 'health' && isSensitiveVerificationMessage(message)),
+  );
   return {
     schema: 'signal.v1',
     source: 'mailsift',
