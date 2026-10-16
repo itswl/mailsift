@@ -317,8 +317,8 @@ describe('installable app', () => {
 
   it('gives the status bar a colour for each scheme and reaches under a notch', async () => {
     const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
-    expect(page).toContain('prefers-color-scheme: light');
-    expect(page).toContain('prefers-color-scheme: dark');
+    expect(page).toContain("meta[name=theme-color]");
+    expect(page).toContain("a.setAttribute('content',d?'black-translucent':'default')");
     expect(page).toContain('viewport-fit=cover');
     expect(page).toContain('apple-touch-icon');
     expect(page).toContain('safe-area-inset-top');
@@ -345,7 +345,7 @@ describe('colour theme', () => {
     // System dark yields to an explicit light choice, and an explicit dark
     // choice applies under a light system.
     expect(page).toContain('@media(prefers-color-scheme:dark){:root:not([data-theme=light])');
-    expect(page).toContain(':root[data-theme=dark]{--bg:#15171a');
+    expect(page).toContain(':root[data-theme=dark]{--bg:#15171b');
   });
 
   it('applies the choice before the body renders', async () => {
@@ -361,8 +361,8 @@ describe('colour theme', () => {
     // An installed app paints the status bar from this meta; leaving it behind
     // would keep the top of the screen in the other theme.
     const page = await shell();
-    expect(page).toContain('<meta name="theme-color" content="#ffffff">');
-    expect(page).toContain("meta.setAttribute('content', isDark ? '#15171a' : '#ffffff')");
+    expect(page).toContain('<meta name="theme-color" content="#f4f5f7">');
+    expect(page).toContain("meta.setAttribute('content', isDark ? '#15171b' : '#f4f5f7')");
   });
 
   it('keeps following the system while the choice is auto', async () => {
@@ -392,14 +392,17 @@ describe('layout', () => {
   it('styles the version as quiet supporting text at the bottom', async () => {
     const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
     expect(page).toContain('.version{color:var(--muted);font-size:11px;font-weight:400;white-space:nowrap}');
-    expect(page).toContain('footer.version{text-align:center;padding:12px 14px 20px}');
+    expect(page).toContain('footer.version{text-align:center;padding:8px 14px 20px}');
     expect(page).toContain('.login .version{text-align:center;margin:14px 0 0}');
   });
 
   it('keeps both header switches on the first row of a phone', async () => {
-    // Two switches and the count no longer share one line at 390px. The count
-    // wraps inside its own box instead of pushing a switch onto a second row.
-    expect(String((await routeWeb(request(), url('/'), '', seeded())).body)).toContain('#totals{flex:1 1 0;min-width:0}');
+    // At narrow widths the wordmark yields to the install and theme controls,
+    // keeping the complete action row within the phone viewport.
+    const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
+    expect(page).toContain('class="header-actions"');
+    expect(page).toContain('@media(max-width:370px)');
+    expect(page).toContain('.brand strong{display:none}');
   });
 });
 
