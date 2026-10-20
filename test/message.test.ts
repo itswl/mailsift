@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { decodeEntities, extractBody, htmlToText } from '../src/imap/message.js';
+import {
+  containsSensitiveVerificationContent,
+  decodeEntities,
+  extractBody,
+  extractVerificationCode,
+  htmlToText,
+  isSensitiveVerificationMessage,
+} from '../src/imap/message.js';
 
 /** Build a structurally complete RFC822 message. */
 function raw(headers: string, body: string): Buffer {
@@ -132,5 +139,40 @@ describe('htmlToText', () => {
   it('removes tags and script/style content and collapses whitespace', () => {
     const html = '<div>  你好 <script>alert(1)</script><b>世界</b>\n\n<style>p{}</style></div>';
     expect(htmlToText(html)).toBe('你好 世界');
+  });
+});
+
+describe('sensitive verification detection', () => {
+  it('recognises labelled English and Chinese codes', () => {
+    expect(containsSensitiveVerificationContent('Your ChatGPT code', 'Your verification code is 123456'))
+      .toBe(true);
+    expect(extractVerificationCode('Your ChatGPT code', 'Your verification code is 123456'))
+      .toBe('123456');
+    expect(containsSensitiveVerificationContent('验证码', '您的验证码是 123456，5 分钟内有效')).toBe(true);
+    expect(extractVerificationCode('验证码', '您的验证码是 123456，5 分钟内有效')).toBe('123456');
+  });
+
+  it('matches OTP as a standalone word', () => {
+    expect(containsSensitiveVerificationContent('登录确认', 'Your OTP is 482913')).toBe(true);
+    expect(extractVerificationCode('登录确认', 'Your OTP is 482913')).toBe('482913');
+    // Adjacent CJK characters do not form an opaque run.
+    expect(isSensitiveVerificationMessage({ subject: '安全', body: 'OTP已发送至邮箱' })).toBe(true);
+  });
+
+  it('ignores a keyword embedded in base64 image data', () => {
+    // The real false positive: a ChatGPT marketing mail whose inline image data
+    // contained "otp" between alphanumeric characters. It was flagged as a code
+    // mail, so its subject, body, and summary were all hidden from the user.
+    const body = [
+      '分享一张穿搭照片，查找相似单品。',
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJIzMotpvAAAAAElFTkSuQmCC',
+    ].join('\n');
+    expect(isSensitiveVerificationMessage({ subject: '根据照片匹配风格', body })).toBe(false);
+    expect(extractVerificationCode('根据照片匹配风格', body)).toBeUndefined();
+  });
+
+  it('ignores a keyword embedded in a token or URL', () => {
+    expect(containsSensitiveVerificationContent('Weekly picks', 'https://e.example.com/c?token=9otp8x')).toBe(false);
+    expect(containsSensitiveVerificationContent('Weekly picks', 'iVBORw0KGgoAAAANSUhE/otp/AAAA')).toBe(false);
   });
 });

@@ -250,9 +250,33 @@ export const SENSITIVE_LOCAL_KEYWORDS = [
   'code to verify', 'code for sign-in', 'code for login', 'otp',
 ] as const;
 
+/**
+ * Characters that make up an opaque run: base64 image data, tracking tokens,
+ * and the like. A short keyword such as "otp" inside one of these is not a word.
+ */
+const OPAQUE_RUN = /[a-z0-9+/=_-]/i;
+
+/**
+ * Chinese keywords are matched as plain substrings; ASCII keywords must stand
+ * on their own. Without the token check, a marketing mail whose inline image
+ * data happens to contain "otp" is mistaken for a verification-code mail and
+ * its body is hidden from the digest and the notification.
+ */
+function containsKeyword(haystack: string, keyword: string): boolean {
+  const needle = keyword.toLowerCase();
+  if (/[^\x00-\x7f]/.test(needle)) return haystack.includes(needle);
+
+  for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
+    const before = at === 0 ? '' : haystack[at - 1]!;
+    const after = haystack[at + needle.length] ?? '';
+    if (!OPAQUE_RUN.test(before) && !OPAQUE_RUN.test(after)) return true;
+  }
+  return false;
+}
+
 export function containsSensitiveVerificationContent(subject: string, body: string): boolean {
   const haystack = `${subject}\n${body}`.toLowerCase();
-  return SENSITIVE_LOCAL_KEYWORDS.some((keyword) => haystack.includes(keyword.toLowerCase()));
+  return SENSITIVE_LOCAL_KEYWORDS.some((keyword) => containsKeyword(haystack, keyword));
 }
 
 /** Extract a code only when a nearby label identifies it as an authentication code. */
