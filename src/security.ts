@@ -227,6 +227,16 @@ const SHORTENER_HOSTS = new Set([
 ]);
 const URL_SCHEME_PATTERN = /\b(?:https?|ftp):\/\/[^\s<>"'`]+/gi;
 const DANGEROUS_SCHEME_PATTERN = /\b(?:javascript|data|vbscript):[^\s<>"'`]+/gi;
+
+/** The finding a dangerous URL scheme produces, or null for any other scheme. */
+function dangerousSchemeCode(value: string): string | null {
+  const colon = value.indexOf(':');
+  const scheme = colon === -1 ? value : value.slice(0, colon + 1);
+  if (scheme === 'javascript:') return 'link_javascript';
+  if (scheme === 'vbscript:') return 'link_vbscript';
+  if (scheme === 'data:') return 'link_data';
+  return null;
+}
 const ATTRIBUTE_URL_PATTERN = /\b(?:href|src|action)\s*=\s*["']([^"']+)["']/gi;
 const BARE_WEB_URL_PATTERN = /\bwww\.[a-z0-9.-]+\.[a-z]{2,}(?:\/[^\s<>"'`]*)?/gi;
 
@@ -274,9 +284,8 @@ export function inspectLinkRisks(
     findings.push(finding);
   };
   for (const scheme of dangerousSchemes) {
-    const code = scheme.toLowerCase().startsWith('javascript:')
-      ? 'link_javascript'
-      : scheme.toLowerCase().startsWith('vbscript:') ? 'link_vbscript' : 'link_data';
+    const code = dangerousSchemeCode(scheme.toLowerCase());
+    if (!code) continue;
     addFinding({ code, severity: 'warning', detail: `The body contains a ${code.replace('link_', '')} URL scheme; it was not opened.` });
   }
 
