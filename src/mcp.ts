@@ -26,7 +26,7 @@ import {
   CATEGORIES, pushThreshold, resolveLlmBaseUrl, spamBonus, spamBonusWarning, suppressSelfForwards,
 } from './services/triage.js';
 import { retryAttempts } from './services/delivery.js';
-import { HEARTBEAT_KEY, IDLE_WAKE_KEY } from './services/watcher.js';
+import { HEARTBEAT_KEY, IDLE_WAKE_KEY, type PollStats } from './services/watcher.js';
 import { routeWeb, webUiEnabled } from './web.js';
 import { idleEnabled, idleFolderTokens } from './imap/idle.js';
 import {
@@ -840,7 +840,9 @@ export function createServer(
  * The endpoint is /mcp. Set MCP_TOKEN before binding outside loopback or anyone
  * who can reach the port can read triage results.
  */
-export async function startMcpHttp(): Promise<import('node:http').Server> {
+export async function startMcpHttp(
+  options: { onRefresh?: () => Promise<PollStats> } = {},
+): Promise<import('node:http').Server> {
   const port = Number(process.env.MCP_PORT ?? 8410);
   const host = process.env.MCP_BIND ?? '127.0.0.1';
   const token = process.env.MCP_TOKEN?.trim() ?? '';
@@ -874,7 +876,7 @@ export async function startMcpHttp(): Promise<import('node:http').Server> {
           }
           const webStore = new StateStore();
           try {
-            const answer = await routeWeb(req, url, token, webStore, client);
+            const answer = await routeWeb(req, url, token, webStore, client, { onRefresh: options.onRefresh });
             const headers: Record<string, string> = { 'content-type': answer.contentType };
             if (answer.cookie) headers['set-cookie'] = answer.cookie;
             if (answer.cacheControl) headers['cache-control'] = answer.cacheControl;

@@ -294,6 +294,8 @@ sink is healthy. Use MCP `health` and `recovery_status` for those details.
 
 The browser view remains read-only in the strict sense: mailbox calls fetch a message body or a selected MIME part under a read-only lock. Use MCP with the separate write token for the small audited action set; sending, replying, deleting, and other mailbox management still belong in a real webmail client such as Roundcube.
 
+The header's refresh button runs a poll immediately instead of waiting for the next interval. It scans the same folders the scheduled poll does, spam included, then reloads the view. A click during a running poll joins it rather than opening a second set of IMAP connections, and manual presses are rate-limited per client. The button appears only when the page is served by the long-running service; the standalone MCP server has no poller to trigger.
+
 Off by default. A page a browser can reach is a wider surface than a JSON-RPC endpoint, so enable it deliberately, keep `MCP_BIND` on loopback, and put TLS in front of it if you reach it from a phone.
 
 Signing in posts the token and exchanges it for an `HttpOnly` cookie that lasts six months and is renewed on each visit, so a browser in regular use is never asked again. The form carries an account field so a password manager will offer to save the token rather than leaving you to type it. An installed app keeps its own cookies on iOS, so expect to sign in once inside it even if the browser is already signed in.

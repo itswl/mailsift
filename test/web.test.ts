@@ -499,3 +499,74 @@ describe('language', () => {
     expect(STRINGS['zh-CN']['error.unconfigured']).toBeTruthy();
   });
 });
+
+describe('refresh', () => {
+  const stats = {
+    accountsOk: 2, accountsFailed: 0, fetched: 9, fresh: 2,
+    pushed: 1, queued: 1, spamRescued: 0, failures: [] as string[],
+  };
+  const pageRequest = (): IncomingMessage =>
+    request({ headers: { cookie: `${SESSION_COOKIE}=secret` } });
+  const refreshRequest = (): IncomingMessage =>
+    request({ method: 'POST', url: '/api/refresh', headers: { cookie: `${SESSION_COOKIE}=secret` } });
+
+  it('leaves the button out when there is no poller to run', async () => {
+    // The standalone MCP server has no watcher, so a button there could only fail.
+    const store = seeded();
+    const page = String((await routeWeb(pageRequest(), url('/'), 'secret', store)).body);
+    expect(page).not.toContain('id="refresh"');
+    const answer = await routeWeb(refreshRequest(), url('/api/refresh'), 'secret', store);
+    expect(answer.status).toBe(503);
+    expect(JSON.parse(String(answer.body))).toMatchObject({ error: 'refresh_unavailable' });
+  });
+
+  it('offers a button that asks the poller for new mail', async () => {
+    const store = seeded();
+    const onRefresh = async () => stats;
+    const page = String((await routeWeb(pageRequest(), url('/'), 'secret', store, 'reader', { onRefresh })).body);
+    expect(page).toContain('id="refresh"');
+    expect(page).toContain('id="refresh-status"');
+
+    const answer = await routeWeb(refreshRequest(), url('/api/refresh'), 'secret', store, 'clicker-ok', { onRefresh });
+    expect(answer.status).toBe(200);
+    expect(answer.cacheControl).toBe('no-store');
+    expect(JSON.parse(String(answer.body))).toMatchObject({ fresh: 2 });
+    expect(store.listMcpAudit(10)).toContainEqual(
+      expect.objectContaining({ action: 'web:refresh', client: 'clicker-ok', success: true }),
+    );
+  });
+
+  it('requires a session like the rest of the view', async () => {
+    const answer = await routeWeb(
+      request({ method: 'POST', url: '/api/refresh' }), url('/api/refresh'), 'secret', seeded(), 'anon',
+      { onRefresh: async () => stats },
+    );
+    expect(answer.status).toBe(401);
+  });
+
+  it('does not let a held-down button hammer the mailboxes', async () => {
+    const store = seeded();
+    const onRefresh = async () => stats;
+    for (let n = 0; n < 6; n += 1) {
+      const answer = await routeWeb(refreshRequest(), url('/api/refresh'), 'secret', store, 'clicker-flood', { onRefresh });
+      expect(answer.status).toBe(200);
+    }
+    const refused = await routeWeb(refreshRequest(), url('/api/refresh'), 'secret', store, 'clicker-flood', { onRefresh });
+    expect(refused.status).toBe(429);
+    expect(refused.headers?.['retry-after']).toBe('60');
+    expect(JSON.parse(String(refused.body))).toMatchObject({ error: 'refresh_rate_limited' });
+  });
+
+  it('reports a failed poll without pretending it fetched anything', async () => {
+    const store = seeded();
+    const failing = async (): Promise<never> => { throw new Error('imap down'); };
+    const answer = await routeWeb(
+      refreshRequest(), url('/api/refresh'), 'secret', store, 'clicker-fail', { onRefresh: failing },
+    );
+    expect(answer.status).toBe(502);
+    expect(JSON.parse(String(answer.body))).toMatchObject({ error: 'refresh_failed' });
+    expect(store.listMcpAudit(10)).toContainEqual(
+      expect.objectContaining({ action: 'web:refresh', client: 'clicker-fail', success: false }),
+    );
+  });
+});

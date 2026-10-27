@@ -23,6 +23,7 @@ import {
 import { buildLink } from './links.js';
 import { renderDigest, type DigestItem } from './services/digest.js';
 import { CATEGORIES } from './services/triage.js';
+import type { PollStats } from './services/watcher.js';
 import { appleTouch180, favicon64, icon192, icon512, maskable512 } from './web-icons.js';
 import { isLanguage, LANGUAGES, STRINGS, t, type Language, type StringKey } from './web-strings.js';
 import type { StateStore } from './services/state.js';
@@ -67,6 +68,27 @@ export function allowAuthAttempt(client: string, now = Date.now()): boolean {
   return true;
 }
 
+/**
+ * Manual polls per client per minute.
+ *
+ * A poll opens every monitored IMAP connection, so a browser left on the page
+ * must not be able to turn a held-down button into a mailbox hammer. A handful
+ * is plenty for a person waiting on a verification code.
+ */
+const REFRESHES_PER_MINUTE = 6;
+const refreshWindows = new Map<string, { startedAt: number; count: number }>();
+
+export function allowManualRefresh(client: string, now = Date.now()): boolean {
+  const current = refreshWindows.get(client);
+  if (!current || now - current.startedAt >= 60_000) {
+    refreshWindows.set(client, { startedAt: now, count: 1 });
+    return true;
+  }
+  if (current.count >= REFRESHES_PER_MINUTE) return false;
+  current.count += 1;
+  return true;
+}
+
 export function webUiEnabled(): boolean {
   return (process.env.WEB_UI_ENABLED ?? 'false').toLowerCase() === 'true';
 }
@@ -85,6 +107,17 @@ export interface WebResponse {
   cookie?: string;
   cacheControl?: string;
   headers?: Record<string, string>;
+}
+
+/**
+ * What the page may do beyond reading what the poller stored.
+ *
+ * `onRefresh` is absent in the standalone MCP server, which has no watcher to
+ * poll with; the button and the endpoint then stay out of the page entirely
+ * rather than offering a control that can only fail.
+ */
+export interface WebOptions {
+  onRefresh?: (() => Promise<PollStats>) | undefined;
 }
 
 const json = (status: number, value: unknown): WebResponse => ({
@@ -588,16 +621,24 @@ function themeBoot(): string {
  * their key, so the switch can reword them in place instead of reloading and
  * losing the filters.
  */
-export function renderApp(lang: Language): string {
+export function renderApp(lang: Language, canRefresh = false): string {
   const s = (key: StringKey): string => escapeHtml(t(lang, key));
   const worded = (tag: string, key: StringKey, attrs = ''): string =>
     `<${tag}${attrs ? ' ' + attrs : ''} data-i18n="${key}">${s(key)}</${tag}>`;
   const option = (value: string, key: StringKey): string => worded('option', key, `value="${value}"`);
+  // Icon-only, like the theme switch: the label lives in its title and in the
+  // accessible name, and the arrow spins while a poll is running.
+  const refresh = canRefresh
+    ? `<button id="refresh" type="button" class="switch refresh" aria-label="${s('refresh.label')}" title="${s('refresh.label')}">`
+      + '<svg class="refresh-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+      + '<path d="M20 11a8 8 0 1 0-2.34 5.66"/><path d="M20 4v7h-7"/></svg></button>'
+    : '';
   return page(lang, 'mailsift', `
     <header class="app-header">
       <div class="header-inner">
         <div class="brand"><img class="brand-mark" src="/icon-192.png?v=3" alt="" aria-hidden="true"><strong>mailsift</strong></div>
         <div class="header-actions">
+          ${refresh}
           <button id="install" type="button" class="switch install" data-i18n="pwa.install" hidden>${s('pwa.install')}</button>
           <button id="lang" type="button" class="switch" aria-label="${s('lang.label')}">${s('lang.face')}</button>
           <button id="theme" type="button" class="switch" aria-label="${s('theme.title')}"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 0 0 16z" fill="currentColor" stroke="none"/></svg></button>
@@ -606,6 +647,7 @@ export function renderApp(lang: Language): string {
     </header>
     <main class="app-main">
       <div id="network-status" class="network-status" role="status" aria-live="polite" hidden></div>
+      ${canRefresh ? '<div id="refresh-status" class="refresh-status" role="status" aria-live="polite" hidden></div>' : ''}
       <section class="overview" aria-label="${s('overview.title')}">
         <div class="overview-total"><span class="eyebrow" data-i18n="overview.total">${s('overview.total')}</span><strong id="overview-count">—</strong></div>
         <div class="overview-stat"><span data-i18n="overview.notified">${s('overview.notified')}</span><strong id="overview-pushed">—</strong></div>
@@ -703,6 +745,7 @@ border-bottom:1px solid var(--line)}
 .brand-mark{display:block;width:29px;height:29px;border-radius:9px;object-fit:cover}
 .switch{min-height:36px;padding:6px 10px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);font:inherit;font-size:13px;line-height:1.2;cursor:pointer;box-shadow:var(--shadow)}
 .switch:hover{border-color:var(--accent)}#theme{width:38px;min-width:38px;height:38px;padding:0;display:grid;place-items:center;color:var(--muted);border-color:transparent;background:transparent;box-shadow:none;transition:background .2s,color .2s,border-color .2s}#theme:hover{border-color:var(--line);background:var(--surface-muted);color:var(--fg)}.theme-icon{display:block;width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round;transition:transform .45s cubic-bezier(.2,.7,.2,1)}:root[data-theme=dark] .theme-icon{transform:rotate(180deg)}.install{color:var(--accent);font-weight:600}
+#refresh{width:38px;min-width:38px;height:38px;padding:0;display:grid;place-items:center;color:var(--muted);border-color:transparent;background:transparent;box-shadow:none;transition:background .2s,color .2s,border-color .2s}#refresh:hover{border-color:var(--line);background:var(--surface-muted);color:var(--fg)}#refresh:disabled{cursor:wait;color:var(--accent)}.refresh-icon{display:block;width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round}#refresh.running .refresh-icon{animation:refresh-spin .9s linear infinite}@keyframes refresh-spin{to{transform:rotate(360deg)}}
 .app-main{width:min(1120px,100%);margin:0 auto;padding:22px 20px 30px}
 .version{color:var(--muted);font-size:11px;font-weight:400;white-space:nowrap}
 footer.version{text-align:center;padding:8px 14px 20px}.login .version{text-align:center;margin:14px 0 0}
@@ -713,6 +756,7 @@ footer.version{text-align:center;padding:8px 14px 20px}.login .version{text-alig
 .overview-total strong{font-size:26px;line-height:1.1;letter-spacing:-.035em;font-variant-numeric:tabular-nums}
 .overview-stat strong{font-size:19px;line-height:1.2;font-variant-numeric:tabular-nums}
 .network-status{margin:0 0 12px;padding:10px 13px;border:1px solid color-mix(in srgb,var(--warning) 30%,var(--line));border-radius:10px;background:color-mix(in srgb,var(--warning) 8%,var(--card));color:var(--fg);font-size:13px}
+.refresh-status{position:fixed;left:50%;bottom:calc(18px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:7;max-width:calc(100vw - 32px);padding:9px 14px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);box-shadow:var(--shadow);font-size:13px;animation:refresh-toast .18s ease-out}.refresh-status.failed{border-color:color-mix(in srgb,var(--critical) 35%,var(--line));color:var(--critical)}@keyframes refresh-toast{from{opacity:0;transform:translate(-50%,6px)}}
 .filters{display:grid;gap:9px;margin:0 0 14px;padding:12px;border:1px solid var(--line);border-radius:14px;background:var(--card);box-shadow:var(--shadow)}
 .filter-primary{display:grid;grid-template-columns:minmax(180px,1fr) minmax(120px,.3fr) minmax(95px,.23fr);gap:8px}
 .filters select,.filters input:not([type=checkbox]){width:100%;min-width:0;min-height:40px;background:var(--input);color:var(--fg);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font:inherit;font-size:14px}
@@ -800,7 +844,7 @@ color:var(--muted);font-size:13px;cursor:pointer}
 .error{color:var(--critical);font-size:13px}
 /* iOS Safari zooms editable controls smaller than 16px when they receive focus. */
 @media(pointer:coarse){
-  .switch{min-height:42px}#theme{width:42px;min-width:42px;height:42px}
+  .switch{min-height:42px}#theme{width:42px;min-width:42px;height:42px}#refresh{width:42px;min-width:42px;height:42px}
   input:not([type=checkbox]):not([type=radio]):not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]),
   textarea,.filters select,.form-group select,#search-input,.filter-select{font-size:16px}
 }
@@ -1492,6 +1536,8 @@ function applyLanguage(next) {
   const button = $('#lang');
   button.textContent = t('lang.face');
   button.setAttribute('aria-label', t('lang.label'));
+  const refresh = $('#refresh');
+  if (refresh) { refresh.setAttribute('aria-label', t('refresh.label')); refresh.title = t('refresh.label'); }
   $('.overview').setAttribute('aria-label', t('overview.title'));
   $('#install-close').setAttribute('aria-label', t('pwa.close'));
   updateFilterSummary();
@@ -1539,6 +1585,51 @@ installHelp.addEventListener('click', (event) => { if (event.target === installH
 window.addEventListener('appinstalled', () => { pendingInstall = null; installButton.hidden = true; });
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+
+// Pull new mail now: the server runs a real poll, then the page reloads what
+// that poll wrote. Success gets a quiet toast; the network banner stays for
+// connectivity problems only. A click during a scheduled poll joins it, so
+// double-clicking does not open a second IMAP session.
+const refreshButton = $('#refresh');
+let refreshTimer;
+function refreshNotice(text, failed, sticky) {
+  const notice = $('#refresh-status');
+  if (!notice) return;
+  notice.textContent = text;
+  notice.classList.toggle('failed', Boolean(failed));
+  notice.hidden = false;
+  clearTimeout(refreshTimer);
+  if (!sticky) refreshTimer = setTimeout(() => { notice.hidden = true; }, 6000);
+}
+async function pollNow() {
+  if (!refreshButton || refreshButton.disabled) return;
+  refreshButton.disabled = true;
+  refreshButton.classList.add('running');
+  refreshButton.setAttribute('aria-label', t('refresh.running'));
+  refreshButton.title = t('refresh.running');
+  // A poll can take a while with slow providers, so the notice stays up until
+  // the request settles instead of disappearing mid-wait.
+  refreshNotice(t('refresh.running'), false, true);
+  try {
+    const response = await fetch('/api/refresh', { method: 'POST' });
+    if (response.status === 401) { location.reload(); return; }
+    if (response.status === 429) { refreshNotice(t('refresh.tooOften'), true); return; }
+    if (!response.ok) { refreshNotice(t('refresh.failed'), true); return; }
+    const stats = await response.json();
+    refreshNotice(stats.fresh > 0 ? fill('refresh.done', { count: stats.fresh }) : t('refresh.none'));
+    await refresh();
+    chrome();
+  } catch (e) {
+    refreshNotice(t('refresh.failed'), true);
+    setNetworkIssue(true);
+  } finally {
+    refreshButton.disabled = false;
+    refreshButton.classList.remove('running');
+    refreshButton.setAttribute('aria-label', t('refresh.label'));
+    refreshButton.title = t('refresh.label');
+  }
+}
+if (refreshButton) refreshButton.addEventListener('click', pollNow);
 
 let timer;
 filters.addEventListener('input', () => {
@@ -1635,6 +1726,31 @@ function sessionCookie(req: IncomingMessage, token: string): string {
 }
 
 /**
+ * Run the poll the refresh button asked for.
+ *
+ * The response carries the poller's own stats so the page can say how many new
+ * messages it found. A poll can read mail but changes nothing, keeping this
+ * route inside the same read-only boundary as the rest of the view.
+ */
+async function handleRefresh(
+  store: StateStore, client: string, options: WebOptions,
+): Promise<WebResponse> {
+  const onRefresh = options.onRefresh;
+  if (!onRefresh) return json(503, { error: 'refresh_unavailable' });
+  if (!allowManualRefresh(client)) {
+    return { ...json(429, { error: 'refresh_rate_limited' }), headers: { 'retry-after': '60' } };
+  }
+  try {
+    const stats = await onRefresh();
+    store.recordMcpAudit('web:refresh', client, true);
+    return json(200, stats);
+  } catch (error) {
+    store.recordMcpAudit('web:refresh', client, false, error instanceof Error ? error.message : String(error));
+    return json(502, { error: 'refresh_failed' });
+  }
+}
+
+/**
  * Serve one non-MCP request.
  *
  * Returns the response rather than writing it, so routing and authorization
@@ -1646,6 +1762,7 @@ export async function routeWeb(
   token: string,
   store: StateStore,
   client = 'unknown',
+  options: WebOptions = {},
 ): Promise<WebResponse> {
   const html = (status: number, body: string): WebResponse => ({ status, body, contentType: 'text/html; charset=utf-8' });
 
@@ -1679,12 +1796,17 @@ export async function routeWeb(
   }
 
   if (url.pathname === '/' && req.method === 'GET') {
-    const answer = html(200, renderApp(lang));
+    const answer = html(200, renderApp(lang, Boolean(options.onRefresh)));
     // Roll the session forward on each visit, so regular use never expires.
     // Only on the page: doing it on the polling calls would rewrite the cookie
     // every minute for nothing.
     const session = readCookie(req.headers.cookie, SESSION_COOKIE);
     if (token && session) answer.cookie = sessionCookie(req, session);
+    return answer;
+  }
+  if (url.pathname === '/api/refresh' && req.method === 'POST') {
+    const answer = await handleRefresh(store, client, options);
+    answer.cacheControl = 'no-store';
     return answer;
   }
   if (url.pathname === '/api/attachments' && req.method === 'GET') {

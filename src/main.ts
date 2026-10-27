@@ -20,6 +20,7 @@ import {
 import { sendDigest } from './services/digest.js';
 import { recordStartupFailure } from './services/health.js';
 import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
+import { PollCoordinator } from './services/poll-scheduler.js';
 import { IdleSupervisor, idleEnabled, idleFolderTokens } from './imap/idle.js';
 import { webUiEnabled } from './web.js';
 import { getLogger } from './logger.js';
@@ -200,18 +201,19 @@ function recover(): number {
   return 0;
 }
 
-async function runForever(watcher: Watcher): Promise<void> {
+async function runForever(coordinator: PollCoordinator): Promise<void> {
   const interval = Number(process.env.POLL_INTERVAL_SECONDS ?? 300) * 1000;
   log.info(`mailsift started; poll interval ${interval / 1000}s`);
 
   while (!stopping) {
     try {
-      await watcher.pollOnce();
+      await coordinator.now();
     } catch (error) {
       // One failed poll should not stop the service; the next poll may recover.
       log.error(`Poll failed: ${error}`);
     }
-    for (let waited = 0; waited < interval && !stopping; waited += 500) await sleep(500);
+    if (stopping) break;
+    await coordinator.wait(interval);
   }
   log.info('Exited');
 }
@@ -260,10 +262,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     return stats.failures.length ? 2 : 0;
   }
 
+  // The refresh button and the scheduled loop share this, so a click during a
+  // poll joins it rather than opening a second set of IMAP connections.
+  const coordinator = new PollCoordinator(() => watcher.pollOnce());
+
   let mcpServer: Server | undefined;
   if ((process.env.MCP_ENABLED ?? 'true').toLowerCase() === 'true') {
     try {
-      mcpServer = await startMcpHttp();
+      mcpServer = await startMcpHttp({ onRefresh: () => coordinator.now() });
     } catch (error) {
       log.error(`MCP startup failed: ${error}`);
       return 1;
@@ -282,13 +288,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     process.on(signal, () => {
       log.info(`Received ${signal}; exiting after the current poll.`);
       stopping = true;
+      coordinator.wake();
       if (mcpServer) mcpServer.close();
       // Log the IDLE sessions out now so the server keeps no zombie connections.
       void idle?.stop().catch((error) => log.warn(`Failed to stop IDLE listeners: ${error}`));
       void metrics.shutdown().catch((error) => log.warn(`Failed to flush OTel metrics: ${error}`));
     });
   }
-  await runForever(watcher);
+  await runForever(coordinator);
   await idle?.stop().catch((error) => log.warn(`Failed to stop IDLE listeners: ${error}`));
   return 0;
 }
