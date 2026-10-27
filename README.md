@@ -67,6 +67,21 @@ DIGEST_HOUR=9
 
 `MAIL_CONTEXT`, `MAIL_ALWAYS_IMPORTANT`, `MAIL_NEVER_IMPORTANT`, and `MAIL_KEYWORDS` customize classification. Keep `MAIL_CONTEXT` on one line in `.env`. Sender rules take three forms: `@bank.com` matches the address domain or a subdomain of it, `alerts@bank.com` matches exactly that address, and anything else is a substring test on the address and display name. The first two ignore the display name so a look-alike domain or a crafted name cannot trigger an always-important rule.
 
+### Two-stage triage (optional)
+
+By default one batched LLM call decides everything: the level, the category, and the summary. Setting the `DECIDER_*` variables splits that into two stages — a calibrated decision model (Cloudflare Clef on Workers AI) answers typed questions to decide `importance`, `category`, and `action_required` first, then the LLM above only writes the `summary`, `reason`, and `deadline`:
+
+```bash
+DECIDER_BASE_URL=https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare
+DECIDER_MODEL=clef-flash
+DECIDER_API_TOKEN=
+```
+
+Why: the decision model cannot invent a label outside the vocabulary (it answers a `choice`, not free text), returns a confidence with every answer, and screens a message for roughly a quarter of the tokens of the cheapest text model. The summary keeps the nuance only a generative model has.
+
+Behavior notes: the decision stage inherits `LLM_BODY_CHARS`, `LLM_REDACT_PII`, `LLM_SKIP_SENSITIVE`, and your `MAIL_CONTEXT`; verification-code mail is hidden from it exactly as from the LLM. If the decision service fails, the batch silently falls back to the single-stage pipeline; if only the summary stage fails, the validated decisions are kept and the summary degrades to the decision's level and confidence. Remove the `DECIDER_*` lines to return to the original flow.
+
+
 ### Gmail and Outlook OAuth
 
 Two guides in Discussions cover this:

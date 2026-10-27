@@ -53,6 +53,20 @@ DIGEST_HOUR=9
 
 `MAIL_CONTEXT`、`MAIL_ALWAYS_IMPORTANT`、`MAIL_NEVER_IMPORTANT` 和 `MAIL_KEYWORDS` 可用于定制分类规则。不要把 `MAIL_CONTEXT` 写成多行。发件人规则有三种写法：`@bank.com` 匹配发件地址的域名及其子域，`alerts@bank.com` 精确匹配该地址，其它写法按子串匹配地址和显示名。前两种不看显示名，避免仿冒域名或伪造显示名触发"始终重要"规则。
 
+### 两段式分诊（可选）
+
+默认一条批量 LLM 调用决定所有字段：级别、类别、摘要。配置 `DECIDER_*` 变量后拆成两段——先由校准型决策模型（Cloudflare Workers AI 上的 Clef）回答类型化问题，定下 `importance`、`category`、`action_required`；再由上面的 LLM 只写 `summary`、`reason`、`deadline`：
+
+```bash
+DECIDER_BASE_URL=https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare
+DECIDER_MODEL=clef-flash
+DECIDER_API_TOKEN=
+```
+
+为什么值得：决策模型回答的是选择题而不是自由文本，不可能编造词表外的类别，每个答案自带置信度，筛选一封邮件的 token 开销约为最便宜文本模型的四分之一；而摘要这种需要文字功底的活仍交给生成模型。
+
+行为说明：决策阶段同样遵守 `LLM_BODY_CHARS`、`LLM_REDACT_PII`、`LLM_SKIP_SENSITIVE` 和你的 `MAIL_CONTEXT`，验证码邮件对它同样隐藏内容。决策服务失败时整批静默回落到单段流程；只有摘要阶段失败时保留已定决策，摘要降级为"级别 + 置信度"。删掉 `DECIDER_*` 三行即回到原流程。
+
 ## Gmail / Outlook OAuth
 
 Discussions 里有两篇指南：

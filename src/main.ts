@@ -14,6 +14,7 @@ import { ConfigError, loadConfig, needsOAuth } from './config.js';
 import { TokenStore } from './imap/auth.js';
 import { StateStore } from './services/state.js';
 import { buildSink, usesLegacyWebhookNames, webhookEndpoint, webhookToken, WebhookSink } from './services/sink.js';
+import { deciderConfigured } from './services/decider.js';
 import {
   resolveLlmBaseUrl, spamBonusWarning, suppressSelfForwards, unanchoredSenderRules,
 } from './services/triage.js';
@@ -110,6 +111,12 @@ async function checkConfig(): Promise<number> {
           `${provider ? `${provider} -> ` : ''}${resolveLlmBaseUrl()}; ` +
           `output language: ${process.env.LLM_OUTPUT_LANGUAGE?.trim() || 'en'}`,
       );
+      if (deciderConfigured()) {
+        console.log(
+          `✅ Decider: ${process.env.DECIDER_MODEL ?? 'clef-flash'} @ ` +
+            `${process.env.DECIDER_BASE_URL?.trim()}; two-stage triage (decide, then summarize)`,
+        );
+      }
     } catch (error) {
       console.log(`❌ ${error instanceof Error ? error.message : error}`);
       return 1;
