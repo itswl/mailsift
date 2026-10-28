@@ -89,14 +89,18 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
   const subject = isSensitiveVerification ? '验证码邮件' : message.subject;
   const title = `${PREFIX[result.importance] ?? ''} ${spamTag}${subject}`.slice(0, 200);
 
-  const lines = [isSensitiveVerification ? '收到验证码邮件。' : esc(headline(result))];
+  const lines: string[] = [];
   if (isSensitiveVerification) {
+    // The code is the whole message. It leads the card unformatted so a phone
+    // shows it as text that can be read at a glance and selected, with no
+    // intro line pushing it down.
     lines.push(
-      '',
       verificationCode
-        ? `🔐 **验证码** \`${esc(verificationCode)}\``
+        ? `🔐 **验证码** ${esc(verificationCode)}`
         : '未能自动提取验证码，请打开原邮件查看。',
     );
+  } else {
+    lines.push(esc(headline(result)));
   }
   if (result.deadline) lines.push(`\n⏰ **Deadline** ${esc(result.deadline)}`);
   lines.push(
