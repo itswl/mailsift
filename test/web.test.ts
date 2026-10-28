@@ -253,6 +253,18 @@ describe('read-only data', () => {
     expect(await body('/api/message?id=%3Cabsent%40x%3E', store)).toMatchObject({ error: 'not found' });
   });
 
+  it('carries a verification code to the browser so the page can show it', async () => {
+    const store = seeded();
+    store.markSeen('k4', 'me@qq.com', '验证码邮件');
+    store.recordOutcome('k4', 'warning', true, {
+      messageId: '<code@x>', category: 'Security', summary: '收到验证码邮件。',
+      verificationCode: '227857', folder: 'INBOX', sender: 'no-reply@cursor.sh',
+    });
+    const answer = await body('/api/mail?importance=warning', store);
+    const row = (answer['mail'] as Array<Record<string, unknown>>).find((m) => m['messageId'] === '<code@x>');
+    expect(row).toMatchObject({ verificationCode: '227857' });
+  });
+
   it('has no route that changes anything', async () => {
     const store = seeded();
     for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {

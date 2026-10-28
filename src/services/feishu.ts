@@ -94,9 +94,13 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
 
   const lines: string[] = [];
   if (isSensitiveVerification) {
-    // The code already leads the card in the header, so the body only adds
-    // context -- and a hint when extraction failed.
-    if (!verificationCode) lines.push('未能自动提取验证码，请打开原邮件查看。');
+    // The header already carries the code; repeating it in the body keeps it
+    // readable and selectable inside the card, where the title may be clipped.
+    lines.push(
+      verificationCode
+        ? `🔐 **验证码** ${verificationCode}`
+        : '未能自动提取验证码，请打开原邮件查看。',
+    );
   } else {
     lines.push(esc(headline(result)));
   }

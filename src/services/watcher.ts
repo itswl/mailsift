@@ -338,6 +338,11 @@ export class Watcher {
       decidedBy: result.decidedBy,
       mailDate: message.date,
       snippet: snippet(message),
+      // The code is shown in the web view; it never reaches the LLM or the
+      // webhook payload, both of which still hide verification content.
+      ...(result.sensitiveVerification && result.verificationCode
+        ? { verificationCode: result.verificationCode }
+        : {}),
       ...(message.attachmentManifest ? { attachmentManifest: message.attachmentManifest } : {}),
     };
   }

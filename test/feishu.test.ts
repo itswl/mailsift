@@ -83,18 +83,19 @@ describe('self-contained cards', () => {
     expect(cardBody(card)).toContain('第 50 封');
   });
 
-  it('puts the verification code in the title and keeps the body for context', () => {
-    // The code is the whole message: it belongs on the title line, which is the
-    // largest and always-visible part of a phone notification.
+  it('puts the verification code in the title and repeats it in the body', () => {
+    // The title is the largest line on a phone; the body copy stays selectable
+    // inside the card, where a long title can be clipped.
     const card = buildCard(
       makeMessage({ subject: '验证码', body: '您的验证码是 227857' }),
       makeResult({ importance: 'warning', sensitiveVerification: true, verificationCode: '227857', deadline: '' }),
     );
     expect(cardTitle(card)).toBe('🟠 验证码邮件 227857');
     const body = cardBody(card);
-    expect(body).not.toContain('227857');
+    expect(body.startsWith('🔐 **验证码** 227857')).toBe(true);
+    expect(body).not.toContain('`227857`');
     expect(body).not.toContain('收到验证码邮件。');
-    expect(body.startsWith('---')).toBe(true);
+    expect(body).toContain('---');
   });
 
   it('asks the reader to open the message when no code was extracted', () => {

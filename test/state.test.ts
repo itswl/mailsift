@@ -79,6 +79,15 @@ describe('rich fields and queries', () => {
     expect(item?.snippet).toBe('正文');
   });
 
+  it('keeps an extracted verification code locally for the web view', () => {
+    const s = store();
+    seed(s, 'k1', { messageId: '<code@x>', verificationCode: '227857' });
+    expect(s.getMail('<code@x>')?.verificationCode).toBe('227857');
+    // Ordinary mail carries no code at all rather than an empty one.
+    seed(s, 'k2', { messageId: '<plain@x>' });
+    expect(s.getMail('<plain@x>')).not.toHaveProperty('verificationCode');
+  });
+
   it('filters by conditions', () => {
     const s = store();
     seed(s, 'k1', { importance: 'critical', pushed: true, messageId: '<1@x>', inSpam: true, sender: 'a@bank.com' });

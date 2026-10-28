@@ -77,6 +77,11 @@ const en = {
   'digest.title': 'Waiting for the next digest',
 
   'detail.from': 'From',
+  'detail.code': 'Verification code',
+  'detail.copyCode': 'Copy',
+  'detail.copied': 'Copied',
+  'detail.selected': 'Selected — copy manually',
+  'code.line': 'Verification code {code}',
   'detail.mailbox': 'Mailbox',
   'detail.judged': 'Judged',
   'detail.judgedAs': '{level} by {by}',
@@ -250,6 +255,11 @@ const zhCN: Record<StringKey, string> = {
   'digest.title': '下一期摘要预览',
 
   'detail.from': '发件人',
+  'detail.code': '验证码',
+  'detail.copyCode': '复制',
+  'detail.copied': '已复制',
+  'detail.selected': '已选中，请手动复制',
+  'code.line': '验证码 {code}',
   'detail.mailbox': '邮箱',
   'detail.judged': '判定',
   'detail.judgedAs': '{level} · {by}判定',

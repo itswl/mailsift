@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS seen (
   folder TEXT, in_spam INTEGER NOT NULL DEFAULT 0,
   importance TEXT, category TEXT, summary TEXT, reason TEXT, deadline TEXT,
   decided_by TEXT, pushed INTEGER NOT NULL DEFAULT 0,
-  mail_date TEXT, snippet TEXT, attachments_json TEXT, created_at TEXT NOT NULL
+  mail_date TEXT, snippet TEXT, attachments_json TEXT, verification_code TEXT, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS digest_queue (
   dedup_key TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
@@ -87,6 +87,7 @@ export interface MailRecord {
   decidedBy?: string;
   mailDate?: string;
   snippet?: string;
+  verificationCode?: string;
   attachmentManifest?: AttachmentManifest;
 }
 
@@ -111,6 +112,8 @@ export interface MailRow {
   mailDate: string | null;
   createdAt: string;
   snippet?: string | null;
+  /** Extracted one-time code, kept locally so the web view can show it. */
+  verificationCode?: string;
   attachmentManifest?: AttachmentManifest | null;
 }
 
@@ -214,7 +217,7 @@ export function notificationRetryDelayMs(attempt: number): number {
 const ROW_COLUMNS = [
   'dedup_key', 'message_id', 'thread_key', 'account', 'account_label', 'subject', 'sender', 'sender_name',
   'folder', 'in_spam', 'importance', 'category', 'summary', 'reason', 'deadline',
-  'decided_by', 'pushed', 'mail_date', 'attachments_json', 'created_at',
+  'decided_by', 'pushed', 'mail_date', 'attachments_json', 'verification_code', 'created_at',
 ] as const;
 
 function parseAttachmentManifest(value: unknown): AttachmentManifest | null {
@@ -271,6 +274,7 @@ function toRow(raw: Record<string, unknown>): MailRow {
     mailDate: (raw['mail_date'] as string) ?? null,
     createdAt: String(raw['created_at'] ?? ''),
     ...(raw['snippet'] !== undefined ? { snippet: raw['snippet'] as string } : {}),
+    ...(raw['verification_code'] ? { verificationCode: String(raw['verification_code']) } : {}),
     attachmentManifest: parseAttachmentManifest(raw['attachments_json']),
   };
 }
@@ -292,7 +296,9 @@ export class StateStore {
     // Additive migration for databases created before attachment metadata was
     // exposed. Multiple service processes may open the same DB concurrently.
     const seenColumns = this.db.prepare('PRAGMA table_info(seen)').all() as Array<Record<string, unknown>>;
-    for (const [name, definition] of [['attachments_json', 'TEXT'], ['thread_key', 'TEXT']] as const) {
+    for (const [name, definition] of [
+      ['attachments_json', 'TEXT'], ['thread_key', 'TEXT'], ['verification_code', 'TEXT'],
+    ] as const) {
       if (seenColumns.some((column) => column['name'] === name)) continue;
       try {
         this.db.exec(`ALTER TABLE seen ADD COLUMN ${name} ${definition}`);
@@ -440,7 +446,8 @@ export class StateStore {
       .prepare(
         `UPDATE seen SET importance = ?, pushed = ?, message_id = ?, thread_key = ?, account_label = ?,
            sender = ?, sender_name = ?, folder = ?, in_spam = ?, category = ?,
-           summary = ?, reason = ?, deadline = ?, decided_by = ?, mail_date = ?, snippet = ?, attachments_json = ?
+           summary = ?, reason = ?, deadline = ?, decided_by = ?, mail_date = ?, snippet = ?, attachments_json = ?,
+           verification_code = ?
          WHERE dedup_key = ?`,
       )
       .run(
@@ -451,6 +458,7 @@ export class StateStore {
         fields.summary ?? null, fields.reason ?? null, fields.deadline ?? null,
         fields.decidedBy ?? null, fields.mailDate ?? null, fields.snippet ?? null,
         fields.attachmentManifest ? JSON.stringify(fields.attachmentManifest) : null,
+        fields.verificationCode ?? null,
         dedupKey,
       );
   }

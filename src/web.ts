@@ -796,6 +796,14 @@ border-radius:8px;background:var(--card);color:var(--fg);font:inherit;cursor:poi
    out of its grid column. */
 .detail dd{margin:0}
 .detail pre{white-space:pre-wrap;word-break:break-word;margin:8px 0 0;font:13px/1.5 ui-monospace,monospace}
+/* The code is the point of a verification mail: keep it large, spaced out and
+   selectable, with the label and the copy button quiet around it. */
+.detail .code{margin:2px 0 10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;
+background:var(--input);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.detail .code .code-label{font-size:12px;color:var(--muted)}
+.detail .code b{font:600 20px/1.2 ui-monospace,monospace;letter-spacing:.14em;user-select:all}
+.detail .code button{margin-left:auto;font:inherit;font-size:12px;padding:5px 10px;border-radius:7px;
+border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
 .actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 .actions a,.actions button{font:inherit;font-size:13px;padding:6px 11px;border-radius:8px;
 border:1px solid var(--line);background:var(--input);color:var(--fg);text-decoration:none;cursor:pointer}
@@ -1230,11 +1238,41 @@ function safetySection(box, row) {
   box.appendChild(section);
 }
 
+function verificationBlock(row) {
+  const wrap = el('div', 'code');
+  wrap.appendChild(el('span', 'code-label', t('detail.code')));
+  const value = el('b', null, row.verificationCode);
+  wrap.appendChild(value);
+  const copy = el('button', null, t('detail.copyCode'));
+  copy.type = 'button';
+  copy.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(row.verificationCode);
+      copy.textContent = t('detail.copied');
+    } catch {
+      // Clipboard access needs a secure context; selecting the digits keeps a
+      // long-press copy working when it is unavailable.
+      const range = document.createRange();
+      range.selectNodeContents(value);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      copy.textContent = t('detail.selected');
+    }
+    setTimeout(() => { copy.textContent = t('detail.copyCode'); }, 1600);
+  };
+  wrap.appendChild(copy);
+  return wrap;
+}
+
 function detail(row) {
   const box = el('div', 'detail');
   box.appendChild(el('h3', null, row.subject || t('noSubject')));
   const dl = el('dl');
   const add = (k, v) => { if (!v) return; dl.appendChild(el('dt', null, t(k))); dl.appendChild(el('dd', null, v)); };
+  // A verification code is the reason the message exists, so it comes before
+  // the metadata and can be copied in one tap.
+  if (row.verificationCode) box.appendChild(verificationBlock(row));
   add('detail.from', (row.senderName ? row.senderName + ' ' : '') + '<' + (row.sender || '') + '>');
   add('detail.mailbox', (row.accountLabel || row.account) + ' · ' + (row.folder || ''));
   add('detail.judged', fill('detail.judgedAs', { level: word('level.', row.importance), by: word('by.', row.decidedBy) })
@@ -1289,7 +1327,9 @@ function rowOf(m) {
   top.appendChild(el('span', 'who', m.senderName || m.sender || t('unknownSender')));
   top.appendChild(el('span', 'when', when(m.mailDate || m.createdAt)));
   b.appendChild(top);
-  b.appendChild(el('div', 'sum', m.summary || m.subject || ''));
+  b.appendChild(el('div', 'sum', m.verificationCode
+    ? fill('code.line', { code: m.verificationCode })
+    : (m.summary || m.subject || '')));
   const meta = el('div', 'meta');
   if (m.category) meta.appendChild(el('span', 'chip', word('category.', m.category)));
   if (m.inSpam) meta.appendChild(el('span', 'chip', t('spam')));
@@ -1313,7 +1353,9 @@ function rowOfThread(thread) {
   top.appendChild(el('span', 'who', m.senderName || m.sender || t('unknownSender')));
   top.appendChild(el('span', 'when', when(m.mailDate || m.createdAt)));
   b.appendChild(top);
-  b.appendChild(el('div', 'sum', m.subject || m.summary || t('noSubject')));
+  b.appendChild(el('div', 'sum', m.verificationCode
+    ? fill('code.line', { code: m.verificationCode })
+    : (m.subject || m.summary || t('noSubject'))));
   const meta = el('div', 'meta');
   meta.appendChild(el('span', 'chip', fill('thread.count', { count: thread.messageCount || 1 })));
   if (m.category) meta.appendChild(el('span', 'chip', word('category.', m.category)));
