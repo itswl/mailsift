@@ -87,24 +87,22 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
 
   const spamTag = message.inSpam ? '[Recovered from spam] ' : '';
   const subject = isSensitiveVerification ? '验证码邮件' : message.subject;
-  const title = `${PREFIX[result.importance] ?? ''} ${spamTag}${subject}`.slice(0, 200);
+  // A verification code belongs in the title: it is the whole message, and the
+  // header is the largest, always-visible line on a phone notification.
+  const codeSuffix = isSensitiveVerification && verificationCode ? ` ${verificationCode}` : '';
+  const title = `${PREFIX[result.importance] ?? ''} ${spamTag}${subject}${codeSuffix}`.slice(0, 200);
 
   const lines: string[] = [];
   if (isSensitiveVerification) {
-    // The code is the whole message. It leads the card unformatted so a phone
-    // shows it as text that can be read at a glance and selected, with no
-    // intro line pushing it down.
-    lines.push(
-      verificationCode
-        ? `🔐 **验证码** ${esc(verificationCode)}`
-        : '未能自动提取验证码，请打开原邮件查看。',
-    );
+    // The code already leads the card in the header, so the body only adds
+    // context -- and a hint when extraction failed.
+    if (!verificationCode) lines.push('未能自动提取验证码，请打开原邮件查看。');
   } else {
     lines.push(esc(headline(result)));
   }
   if (result.deadline) lines.push(`\n⏰ **Deadline** ${esc(result.deadline)}`);
+  if (lines.length > 0) lines.push('');
   lines.push(
-    '',
     '---',
     `**From** ${esc(message.fromName || message.fromAddr)} \\<${esc(message.fromAddr)}\\>`,
     `**Account** ${message.accountLabel} · ${message.folder}`,

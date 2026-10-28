@@ -83,25 +83,28 @@ describe('self-contained cards', () => {
     expect(cardBody(card)).toContain('第 50 封');
   });
 
-  it('leads with the verification code, unformatted and without an intro line', () => {
-    // The code is the whole message: it should be the first thing on the card,
-    // as plain text a phone can read and select, not inline code.
-    const body = cardBody(buildCard(
+  it('puts the verification code in the title and keeps the body for context', () => {
+    // The code is the whole message: it belongs on the title line, which is the
+    // largest and always-visible part of a phone notification.
+    const card = buildCard(
       makeMessage({ subject: '验证码', body: '您的验证码是 227857' }),
-      makeResult({ importance: 'warning', sensitiveVerification: true, verificationCode: '227857' }),
-    ));
-    expect(body.startsWith('🔐 **验证码** 227857')).toBe(true);
-    expect(body).not.toContain('`227857`');
+      makeResult({ importance: 'warning', sensitiveVerification: true, verificationCode: '227857', deadline: '' }),
+    );
+    expect(cardTitle(card)).toBe('🟠 验证码邮件 227857');
+    const body = cardBody(card);
+    expect(body).not.toContain('227857');
     expect(body).not.toContain('收到验证码邮件。');
-    expect(body).toContain('---');
+    expect(body.startsWith('---')).toBe(true);
   });
 
   it('asks the reader to open the message when no code was extracted', () => {
-    const body = cardBody(buildCard(
+    const card = buildCard(
       makeMessage({ subject: '验证码', body: '请查收' }),
       makeResult({ importance: 'warning', sensitiveVerification: true }),
-    ));
-    expect(body).toContain('未能自动提取验证码，请打开原邮件查看。');
+    );
+    expect(cardTitle(card)).toBe('🟠 验证码邮件');
+    const body = cardBody(card);
+    expect(body.startsWith('未能自动提取验证码，请打开原邮件查看。')).toBe(true);
     expect(body).not.toContain('收到验证码邮件。');
   });
 });
