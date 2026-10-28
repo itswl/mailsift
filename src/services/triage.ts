@@ -8,7 +8,7 @@
  */
 import { z } from 'zod';
 import { IMPORTANCE, IMPORTANCE_RANK, type Importance, type Rules } from '../config.js';
-import { deciderConfigured, decideMessages, type DeciderDecision } from './decider.js';
+import { aiGatewayHeaders, deciderConfigured, decideMessages, type DeciderDecision } from './decider.js';
 import {
   containsSensitiveVerificationContent,
   extractVerificationCode,
@@ -534,6 +534,7 @@ async function callLlm(body: Record<string, unknown>): Promise<unknown> {
     headers: {
       Authorization: `Bearer ${process.env.LLM_API_KEY ?? ''}`,
       'Content-Type': 'application/json',
+      ...aiGatewayHeaders(),
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(Number(process.env.LLM_TIMEOUT_SECONDS ?? 60) * 1000),

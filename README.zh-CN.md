@@ -67,6 +67,8 @@ DECIDER_API_TOKEN=
 
 行为说明：决策阶段同样遵守 `LLM_BODY_CHARS`、`LLM_REDACT_PII`、`LLM_SKIP_SENSITIVE` 和你的 `MAIL_CONTEXT`，验证码邮件对它同样隐藏内容。决策服务失败时整批静默回落到单段流程；只有摘要阶段失败时保留已定决策，摘要降级为"级别 + 置信度"。删掉 `DECIDER_*` 三行即回到原流程。
 
+设置 `AI_GATEWAY_ID`（如 `default`）可让两个阶段都经过 Cloudflare AI Gateway，获得逐请求的分析、日志与限流。网关不改变模型、响应内容和免费 Neurons 额度；当分诊端点不在 Cloudflare 时保持该变量为空即可。
+
 ## Gmail / Outlook OAuth
 
 Discussions 里有两篇指南：

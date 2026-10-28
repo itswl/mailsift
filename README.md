@@ -81,6 +81,8 @@ Why: the decision model cannot invent a label outside the vocabulary (it answers
 
 Behavior notes: the decision stage inherits `LLM_BODY_CHARS`, `LLM_REDACT_PII`, `LLM_SKIP_SENSITIVE`, and your `MAIL_CONTEXT`; verification-code mail is hidden from it exactly as from the LLM. If the decision service fails, the batch silently falls back to the single-stage pipeline; if only the summary stage fails, the validated decisions are kept and the summary degrades to the decision's level and confidence. Remove the `DECIDER_*` lines to return to the original flow.
 
+Set `AI_GATEWAY_ID` (e.g. `default`) to route both stages through a Cloudflare AI Gateway for per-request analytics, logs, and rate limiting. The gateway changes nothing about the models, their responses, or the free Neuron allocation; leave the variable unset when the triage endpoints are not Cloudflare.
+
 
 ### Gmail and Outlook OAuth
 

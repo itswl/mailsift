@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
 import { makeMessage } from './helpers.js';
 import type { Rules } from '../src/config.js';
-import { deciderConfigured, decideMessages, mapDeciderAnswers } from '../src/services/decider.js';
+import { aiGatewayHeaders, deciderConfigured, decideMessages, mapDeciderAnswers } from '../src/services/decider.js';
 import { triage } from '../src/services/triage.js';
 
 const RULES: Rules = {
@@ -94,6 +94,61 @@ describe('deciderConfigured', () => {
   it('stays off without a token even when a URL is set', () => {
     process.env.DECIDER_BASE_URL = 'https://api.cloudflare.com/client/v4/accounts/acc/ai/run/@cf/cloudflare';
     expect(deciderConfigured()).toBe(false);
+  });
+});
+
+describe('aiGatewayHeaders', () => {
+  it('is empty unless AI_GATEWAY_ID is set', () => {
+    expect(aiGatewayHeaders()).toEqual({});
+    process.env.AI_GATEWAY_ID = 'default';
+    expect(aiGatewayHeaders()).toEqual({ 'cf-aig-gateway-id': 'default' });
+    process.env.AI_GATEWAY_ID = '  spaced  ';
+    expect(aiGatewayHeaders()).toEqual({ 'cf-aig-gateway-id': 'spaced' });
+  });
+
+  it('attaches the gateway header to both stages when configured', async () => {
+    enableDecider();
+    process.env.AI_GATEWAY_ID = 'default';
+    const seenHeaders: Array<Record<string, string>> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown, init?: RequestInit) => {
+        seenHeaders.push(init?.headers as Record<string, string>);
+        if (String(input).includes('/ai/run/')) {
+          return clefResponse({
+            importance: { choice: 'info' },
+            category: { choice: 'Marketing' },
+            action_required: { noul: 0.1 },
+          });
+        }
+        return llmResponse([{ index: 0, summary: 's', reason: 'r' }]);
+      }),
+    );
+
+    await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
+    expect(seenHeaders).toHaveLength(2);
+    for (const headers of seenHeaders) {
+      expect(headers['cf-aig-gateway-id']).toBe('default');
+    }
+  });
+
+  it('omits the gateway header when not configured', async () => {
+    enableDecider();
+    const seenHeaders: Array<Record<string, string>> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown, init?: RequestInit) => {
+        seenHeaders.push(init?.headers as Record<string, string>);
+        return String(input).includes('/ai/run/')
+          ? clefResponse({ importance: { choice: 'info' }, category: { choice: 'Marketing' }, action_required: { noul: 0.1 } })
+          : llmResponse([{ index: 0, summary: 's', reason: 'r' }]);
+      }),
+    );
+
+    await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES);
+    for (const headers of seenHeaders) {
+      expect(headers['cf-aig-gateway-id']).toBeUndefined();
+    }
   });
 });
 

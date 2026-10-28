@@ -94,6 +94,17 @@ export function deciderConfigured(): boolean {
   return Boolean(process.env.DECIDER_API_TOKEN?.trim() && deciderEndpoint());
 }
 
+/**
+ * Extra request headers that route a call through a Cloudflare AI Gateway, so
+ * its analytics and logs show every decision and summary. Set AI_GATEWAY_ID to
+ * the gateway name (e.g. "default") to enable; leave it unset when the triage
+ * endpoints are not Cloudflare, since the header is meaningless elsewhere.
+ */
+export function aiGatewayHeaders(): Record<string, string> {
+  const gateway = process.env.AI_GATEWAY_ID?.trim();
+  return gateway ? { 'cf-aig-gateway-id': gateway } : {};
+}
+
 function deciderEndpoint(): string {
   const base = process.env.DECIDER_BASE_URL?.trim().replace(/\/+$/, '');
   if (!base) return '';
@@ -196,6 +207,7 @@ export async function decideMessages(
           headers: {
             Authorization: `Bearer ${process.env.DECIDER_API_TOKEN ?? ''}`,
             'Content-Type': 'application/json',
+            ...aiGatewayHeaders(),
           },
           body: JSON.stringify({ model, state: decisionState(message, rules), questions: QUESTIONS }),
           signal: AbortSignal.timeout(timeout),
