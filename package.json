@@ -19,17 +19,17 @@
     "mcp:prod": "node --disable-warning=ExperimentalWarning dist/src/mcp.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@opentelemetry/api": "^1.10.0",
     "@opentelemetry/exporter-metrics-otlp-proto": "^0.300.0",
     "@opentelemetry/sdk-metrics": "^3.0.0",
-    "imapflow": "^2.8.0",
-    "mailparser": "^3.12.0",
+    "imapflow": "^2.9.1",
+    "mailparser": "^3.12.4",
     "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/mailparser": "^3.9.0",
-    "@types/node": "^26.6.5",
+    "@types/node": "^26.6.6",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
