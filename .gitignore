@@ -7,3 +7,6 @@ data/
 *.db-*
 tokens/
 .DS_Store
+
+# Playwright MCP screenshots and snapshots taken while working on the UI
+.playwright-mcp/
