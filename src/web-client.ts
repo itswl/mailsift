@@ -447,7 +447,6 @@ window.addEventListener('resize', () => {
 let connectionProblem = !navigator.onLine;
 let lastFetchAt = null;
 let pollNarration = null, narrationTimer;
-let pullText = null;
 function setNetworkIssue(active) {
   const banner = $('#network');
   const text = active ? t(navigator.onLine ? 'network.unavailable' : 'network.offline') : '';
@@ -733,7 +732,6 @@ function restoreIdentity(root, selector) {
 }
 healthLine.onclick = openHealth;
 function statusLine() {
-  if (pullText) return [pullText, false];
   if (connectionProblem) return [lastFetchAt ? fill('status.offline', { time: hhmm(lastFetchAt) }) : '', true];
   if (pollNarration) return [pollNarration.text, pollNarration.warn];
   const parts = [];
@@ -2039,38 +2037,6 @@ async function pollNow() {
   }
 }
 if (refreshButton) refreshButton.addEventListener('click', pollNow);
-
-// Pull to check, only where the browser's own pull is gone: the installed app.
-if (standalone && refreshButton && matchMedia('(pointer: coarse)').matches) {
-  const title = $('.title');
-  let startY = null, pulling = false, pulled = 0;
-  document.addEventListener('touchstart', (e) => {
-    if (window.scrollY > 0 || document.querySelector('dialog[open]')) { startY = null; return; }
-    startY = e.touches[0].clientY; pulled = 0; pulling = false;
-  }, { passive: true });
-  document.addEventListener('touchmove', (e) => {
-    if (startY === null) return;
-    const dy = e.touches[0].clientY - startY;
-    if (dy < 12) return;
-    pulling = true;
-    pulled = Math.min(36, dy / 2);
-    title.style.transition = 'none';
-    title.style.transform = 'translateY(' + pulled + 'px)';
-    pullText = t(dy > 64 ? 'pull.release' : 'pull.hint');
-    renderStatus();
-  }, { passive: true });
-  const release = () => {
-    if (!pulling) { startY = null; return; }
-    const go = pulled >= 32;
-    title.style.transition = 'transform .2s cubic-bezier(.2,.7,.2,1)';
-    title.style.transform = '';
-    startY = null; pulling = false; pullText = null;
-    renderStatus();
-    if (go) pollNow();
-  };
-  document.addEventListener('touchend', release, { passive: true });
-  document.addEventListener('touchcancel', release, { passive: true });
-}
 
 // ---- Keyboard, where there is one ----
 if (matchMedia('(pointer: fine)').matches) {
