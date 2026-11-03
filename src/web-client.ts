@@ -39,6 +39,7 @@ const $ = (s) => document.querySelector(s);
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const list = $('#list'), filters = $('#filters'), lane = $('#lane'), header = $('.app-header');
 const sheet = $('#sheet'), pane = $('#pane'), filterSheet = $('#filter-sheet'), installHelp = $('#install-help');
+const healthSheet = $('#health-sheet'), healthLine = $('#health');
 const MAIL_PAGE_SIZE = 100;
 // A code is lifted above the list for ten minutes, and its digits go quiet after fifteen.
 const FRESH_CODE_MS = 10 * 60 * 1000;
@@ -119,6 +120,19 @@ function ago(ms) {
     const hours = Math.floor(minutes / 60);
     return hours < 24 ? rtf.format(-hours, 'hour') : rtf.format(-Math.floor(hours / 24), 'day');
   } catch (e) { return ''; }
+}
+// "since 09:14" today, "since yesterday 09:14", otherwise the day and the time.
+function sinceText(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const now = new Date();
+  if (dayKey(d) === dayKey(now)) return hhmm(d);
+  return dayPhrase(d, now) + '\\u00a0' + hhmm(d);
+}
+// A day label for the middle of an English sentence: "today", not "Today".
+function dayPhrase(d, now) {
+  const label = dayLabel(d, now);
+  return lang === 'en' && (label === t('day.today') || label === t('day.yesterday')) ? label.toLowerCase() : label;
 }
 function when(row, now) {
   const d = dateOf(row);
@@ -292,7 +306,18 @@ function closeSheet(dialog, viaHistory) {
     if (dialog === filterSheet) filtersOpen.setAttribute('aria-expanded', 'false');
     const back = sheetReturnFocus;
     sheetReturnFocus = null;
-    if (back && back.isConnected && back.focus) back.focus({ preventScroll: true });
+    // A redraw while the sheet was open may have replaced the opener; its
+    // successor carries the same identity or key.
+    const identity = back && !back.isConnected && back.dataset
+      ? back.dataset.focus ? '[data-focus="' + CSS.escape(back.dataset.focus) + '"]'
+        : back.dataset.key ? '#digest [data-key="' + CSS.escape(back.dataset.key) + '"]' : null
+      : null;
+    // A code that arrived while the sheet was in the way takes the focus it
+    // was owed, brought into view: the list may have been scrolled far down.
+    const owed = takeOwedFocus(dialog);
+    if (owed) owed.scrollIntoView({ block: 'center' });
+    const target = owed || (back && back.isConnected ? back : identity ? document.querySelector(identity) : null);
+    if (target && target.focus) target.focus({ preventScroll: true });
   };
   if (reduceMotion()) finish();
   else {
@@ -330,7 +355,7 @@ function enableDrag(dialog) {
   head.addEventListener('pointerup', end);
   head.addEventListener('pointercancel', end);
 }
-for (const dialog of [sheet, filterSheet, installHelp]) {
+for (const dialog of [sheet, filterSheet, installHelp, healthSheet]) {
   dialog.addEventListener('cancel', (e) => {
     e.preventDefault();
     if (dialog === filterSheet && dialog.classList.contains('popover')) closeFilters();
@@ -346,6 +371,7 @@ for (const dialog of [sheet, filterSheet, installHelp]) {
 $('#sheet-done').onclick = () => closeSheet(sheet, false);
 $('#install-close').onclick = () => closeSheet(installHelp, false);
 $('#install-done').onclick = () => closeSheet(installHelp, false);
+$('#health-done').onclick = () => closeSheet(healthSheet, false);
 window.addEventListener('popstate', () => {
   const open = document.querySelector('dialog[open]');
   if (open && open.classList.contains('popover')) closeFilters();
@@ -443,11 +469,18 @@ function narrate(text, warn, holdMs) {
   if (text && holdMs) narrationTimer = setTimeout(() => { pollNarration = null; renderStatus(); }, holdMs);
 }
 let announceTimer;
+// Texts announced within the same moment are joined, not dropped: the wait
+// and a failing mailbox can both have something to say on the way in.
+let announcePending = '';
 function announce(text) {
   const region = $('#announce');
   region.textContent = '';
   clearTimeout(announceTimer);
-  announceTimer = setTimeout(() => { region.textContent = text; }, 50);
+  announcePending = announcePending && announcePending !== text ? announcePending + ' \\u00b7 ' + text : text;
+  announceTimer = setTimeout(() => {
+    region.textContent = announcePending;
+    announcePending = '';
+  }, 50);
 }
 let toastTimer;
 function toast(text, failed) {
@@ -464,6 +497,8 @@ function toast(text, failed) {
 // The last answers are kept so a language switch can reword the page from
 // them instead of asking the server again.
 let lastMail = null, lastThreads = null, lastSummary = null, lastDigest = null, loadFailed = false;
+// Set while the lane waits for a code the page was opened for (see startCodeWait).
+let codeWait = null;
 let nextCursor = null, loadingMail = false, loadMoreFailed = false, mailRequestId = 0;
 let selectedKey = null, openKey = null;
 let washNext = false;
@@ -600,7 +635,103 @@ function renderStatus() {
   node.classList.toggle('warn', warn);
   // Writing the same words again would have the live region say them again.
   if (node.textContent !== text) node.textContent = text;
+  renderHealthLine();
 }
+
+// ---- Mailboxes the poller cannot read ----
+// The heartbeat is written after every poll, even one in which a mailbox
+// failed, so "checked a minute ago" alone could vouch for a mailbox nobody has
+// read for days. The line under the status names it, and opens the details.
+function failingMailboxes() {
+  const all = lastSummary && Array.isArray(lastSummary.mailboxes) ? lastSummary.mailboxes : [];
+  return all.filter((m) => m.failing)
+    .sort((a, b) => (Date.parse(a.lastSuccessAt || '') || 0) - (Date.parse(b.lastSuccessAt || '') || 0));
+}
+function renderHealthLine() {
+  const down = failingMailboxes();
+  healthLine.hidden = !down.length;
+  if (!down.length) { healthLine.dataset.text = ''; return; }
+  const first = down[0];
+  const text = down.length > 1 ? fill('status.mailboxesDown', { count: down.length })
+    : first.lastSuccessAt ? fill('status.mailboxDown', { name: first.name, since: sinceText(first.lastSuccessAt) })
+      : fill('status.mailboxNever', { name: first.name });
+  if (healthLine.dataset.text === text) return;
+  healthLine.dataset.text = text;
+  healthLine.replaceChildren(textNode(text), icon('i-chevron'));
+  announce(text);
+}
+function renderHealth() {
+  const body = healthSheet.querySelector('.sheet-body');
+  body.replaceChildren();
+  const now = new Date();
+  for (const m of (lastSummary && lastSummary.mailboxes) || []) {
+    const row = el('div', 'mailbox' + (m.failing ? ' failing' : ''));
+    const head = el('div', 'mailbox-head');
+    head.appendChild(el('span', 'mark ' + (m.failing ? 'critical' : 'info')));
+    head.appendChild(el('b', null, m.name));
+    head.appendChild(el('span', 'mailbox-address', m.address));
+    row.appendChild(head);
+    let state;
+    const once = m.consecutiveFailures === 1 ? '1' : '';
+    if (m.failing) state = m.lastSuccessAt
+      ? fill('mailboxes.failing' + once, { since: sinceText(m.lastSuccessAt), count: m.consecutiveFailures })
+      : fill('mailboxes.failingNever' + once, { count: m.consecutiveFailures });
+    else state = m.lastSuccessAt ? fill('mailboxes.ok', { ago: ago(Math.max(0, now - new Date(m.lastSuccessAt))) }) : t('mailboxes.never');
+    row.appendChild(el('p', 'mailbox-state', state));
+    if (m.fix && STRINGS[lang]['mailboxes.fix.' + m.fix]) row.appendChild(el('p', 'mailbox-fix', t('mailboxes.fix.' + m.fix)));
+    if (m.command) {
+      const box = el('div', 'mailbox-command');
+      const code = el('code', null, m.command);
+      const copy = el('button', 'text-btn', t('detail.copyCode'));
+      copy.type = 'button';
+      copy.dataset.focus = 'copy-' + m.address;
+      copy.onclick = async () => {
+        try { await navigator.clipboard.writeText(m.command); copy.textContent = t('detail.copied'); }
+        catch (e) {
+          const range = document.createRange();
+          range.selectNodeContents(code);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          copy.textContent = t('detail.selected');
+        }
+        setTimeout(() => { copy.textContent = t('detail.copyCode'); }, 1600);
+      };
+      box.appendChild(code);
+      box.appendChild(copy);
+      row.appendChild(box);
+    }
+    body.appendChild(row);
+  }
+  const waiting = lastSummary ? Number(lastSummary.outboxPending || 0) : 0;
+  if (waiting > 0) body.appendChild(el('p', 'mailbox-outbox', waiting === 1 ? t('mailboxes.outbox1') : fill('mailboxes.outbox', { count: waiting })));
+}
+function openHealth() {
+  renderHealth();
+  openSheet(healthSheet, {});
+}
+// The minute refresh redraws the open sheet so its times stay true, but not
+// while a command is selected for copying by hand, and keeps the focus.
+function redrawHealth() {
+  const selection = window.getSelection();
+  if (selection && !selection.isCollapsed && healthSheet.contains(selection.anchorNode)) return;
+  const focus = focusIdentity(healthSheet);
+  renderHealth();
+  restoreIdentity(healthSheet, focus);
+}
+// What a redraw needs to put the focus back: a control's key or identity.
+function focusIdentity(root) {
+  const a = document.activeElement;
+  if (!a || !root.contains(a) || !a.dataset) return null;
+  if (a.dataset.key) return '[data-key="' + CSS.escape(a.dataset.key) + '"]';
+  if (a.dataset.focus) return '[data-focus="' + CSS.escape(a.dataset.focus) + '"]';
+  return null;
+}
+function restoreIdentity(root, selector) {
+  const again = selector ? root.querySelector(selector) : null;
+  if (again) again.focus({ preventScroll: true });
+}
+healthLine.onclick = openHealth;
 function statusLine() {
   if (pullText) return [pullText, false];
   if (connectionProblem) return [lastFetchAt ? fill('status.offline', { time: hhmm(lastFetchAt) }) : '', true];
@@ -714,6 +845,7 @@ function markSelected() {
 }
 
 // ---- The lane: the newest code, when it is fresh ----
+let laneSender = '';
 function freshCode(rows, now) {
   let best = null;
   for (const r of rows || []) {
@@ -724,9 +856,19 @@ function freshCode(rows, now) {
   return best;
 }
 function renderLane(rows, now) {
-  const fresh = filters.view.value === 'threads' ? null : freshCode(rows, now);
+  const threads = filters.view.value === 'threads';
+  const fresh = threads ? null : freshCode(rows, now);
   lane.replaceChildren();
+  if (!fresh && codeWait && !threads) {
+    // Opened for a code that has not arrived yet: say so where it will appear.
+    lane.hidden = false;
+    const wait = el('div', 'lane-wait');
+    wait.appendChild(el('span', 'eyebrow', t('code.waiting')));
+    lane.appendChild(wait);
+    return null;
+  }
   lane.hidden = !fresh;
+  laneSender = fresh ? fresh.senderName || fresh.sender || '' : '';
   if (!fresh) return null;
   const b = codeButton(fresh, 'lane-copy');
   if (washNext && !renderedKeys.has(rowKey(fresh))) b.classList.add('arrived');
@@ -736,12 +878,38 @@ function renderLane(rows, now) {
 }
 
 // ---- The list ----
+function widenButton() {
+  const widen = el('button', 'text-btn', t('empty.widen'));
+  widen.type = 'button';
+  widen.dataset.focus = 'empty-widen';
+  widen.onclick = () => setFilters({ hours: '168' });
+  return widen;
+}
 function emptyBlock() {
   const box = el('div', 'empty');
+  const down = failingMailboxes();
+  if (down.length && !filtersActive()) {
+    // Not quiet: a mailbox that could not be read says nothing either way.
+    box.appendChild(el('h3', null, t('empty.blind')));
+    const first = down[0];
+    box.appendChild(el('p', null, first.lastSuccessAt
+      ? fill('empty.blindHint', { name: first.name, since: sinceText(first.lastSuccessAt) })
+      : fill('empty.blindNever', { name: first.name })));
+    const details = el('button', 'text-btn', t('mailboxes.title'));
+    details.type = 'button';
+    details.dataset.focus = 'blind-mailboxes';
+    details.onclick = openHealth;
+    box.appendChild(details);
+    return box;
+  }
   if (filtersActive()) {
-    box.appendChild(el('p', null, t('empty')));
+    // Most often the window is simply too short for what was asked, so the
+    // longer window is offered before clearing everything.
+    box.appendChild(el('p', null, filters.codesOnly.checked ? t('code.none') : t('empty')));
+    if (Number(filters.hours.value) <= 72) box.appendChild(widenButton());
     const clear = el('button', 'text-btn', t('filter.clearAll'));
     clear.type = 'button';
+    clear.dataset.focus = 'empty-clear';
     clear.onclick = clearFilters;
     box.appendChild(clear);
     return box;
@@ -750,12 +918,7 @@ function emptyBlock() {
   box.appendChild(el('h3', null, t('empty.quiet')));
   const at = lastSummary && lastSummary.lastPollAt ? new Date(lastSummary.lastPollAt) : null;
   box.appendChild(el('p', null, at && !isNaN(at) ? fill('empty.quietHint', { time: hhmm(at) }) : t('empty.quietHintPlain')));
-  if (Number(filters.hours.value) <= 72) {
-    const widen = el('button', 'text-btn', t('empty.widen'));
-    widen.type = 'button';
-    widen.onclick = () => setFilters({ hours: '168' });
-    box.appendChild(widen);
-  }
+  if (Number(filters.hours.value) <= 72) box.appendChild(widenButton());
   return box;
 }
 function installLine() {
@@ -799,6 +962,7 @@ function focusedListControl() {
   if (!list.contains(a)) return null;
   const li = a.closest('li.row');
   if (li) return { key: li.dataset.key, code: a.classList.contains('code-copy') };
+  if (a.dataset && a.dataset.focus) return { focus: a.dataset.focus };
   return a.classList.contains('load-more') ? { more: true } : null;
 }
 function restoreFocus(f) {
@@ -806,6 +970,7 @@ function restoreFocus(f) {
   let target = null;
   if (f.lane) target = lane.querySelector('.lane-copy');
   else if (f.more) target = list.querySelector('.load-more');
+  else if (f.focus) target = list.querySelector('[data-focus="' + CSS.escape(f.focus) + '"]');
   else {
     const li = list.querySelector('li.row[data-key="' + CSS.escape(f.key) + '"]');
     if (li) target = (f.code && li.querySelector('.code-copy')) || li.querySelector('.who');
@@ -819,8 +984,60 @@ function sinceLine(tag, count) {
 }
 function renderList() {
   const focus = focusedListControl();
+  const free = Boolean(codeWait) && mayMoveFocus();
   buildList();
+  // A code drawn while the lane waited for one ends the wait and takes the
+  // focus the page was opened for, unless the reader is busy elsewhere.
+  const arrived = codeWait && lane.querySelector('.lane-copy');
+  if (arrived) {
+    codeWait = null;
+    if (free) {
+      owedFocus = null;
+      arrived.scrollIntoView({ block: 'center' });
+      arrived.focus({ preventScroll: true });
+      return;
+    }
+    oweFocus({ lane: true });
+    narrateCode(fill('code.arrived', { sender: laneSender }));
+  }
   restoreFocus(focus);
+}
+let codeSaid = '';
+function narrateCode(text) {
+  codeSaid = text;
+  narrate(text, false, 8000);
+}
+// What arrived while a modal sheet was open is focused when that sheet
+// closes. A popover is not owed anything: the reader is working in it.
+let owedFocus = null;
+function oweFocus(what) {
+  // The only dialog opened without showModal is the desk filter popover.
+  const sheet = document.querySelector('dialog[open]:not(.popover)');
+  owedFocus = sheet ? Object.assign({ sheet }, what) : null;
+}
+function takeOwedFocus(dialog) {
+  const what = owedFocus;
+  owedFocus = null;
+  if (!what || what.sheet !== dialog) return null;
+  if (what.lane) return lane.querySelector('.lane-copy');
+  const li = arrivalRow(what.key);
+  return li ? li.querySelector('.code-copy') || li.querySelector('.who') : null;
+}
+// The row an arrival shows in: its own, or in the threads view its thread's.
+function arrivalRow(key) {
+  const own = list.querySelector('li.row[data-key="' + CSS.escape(key) + '"]');
+  if (own || filters.view.value !== 'threads') return own;
+  const thread = (lastThreads || []).find((th) => th.latest && rowKey(th.latest) === key);
+  return thread ? list.querySelector('li.row[data-key="' + CSS.escape(threadKeyOf(thread)) + '"]') : null;
+}
+// Focus moves to what arrived only from where nobody is busy: not out of a
+// field being typed in, and not from under an open sheet or popover.
+function mayMoveFocus() {
+  if (document.querySelector('dialog[open]')) return false;
+  const a = document.activeElement;
+  if (!a || a === document.body) return true;
+  if (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable) return false;
+  return lane.contains(a) || list.contains(a);
 }
 function buildList() {
   const now = new Date();
@@ -1313,38 +1530,25 @@ matchMedia(WIDE).addEventListener('change', () => {
 // ---- Digest ----
 const LEVEL_RANK = { critical: 3, warning: 2, info: 1 };
 function digestItem(item) {
-  const line = el('p', 'digest-item');
-  line.appendChild(el('b', null, item.fromName || item.from || t('unknownSender')));
-  line.appendChild(textNode(' \\u2014 '));
-  line.appendChild(el('span', 'gist', item.summary || item.subject || ''));
-  if (item.threadCount > 1) line.appendChild(textNode(' \\u00d7' + item.threadCount));
-  if (item.deadline) { line.appendChild(textNode(' \\u00b7 ')); line.appendChild(el('span', 'due', t('detail.deadline') + ' ' + item.deadline)); }
+  // An entry with a key opens that message; older entries have none.
+  const line = el(item.key ? 'button' : 'p', 'digest-item');
+  if (item.key) {
+    line.type = 'button';
+    line.dataset.key = item.key;
+    line.onclick = () => openFromLink(item.key, false);
+  }
+  const text = el('span', 'digest-line');
+  text.appendChild(el('b', null, item.fromName || item.from || t('unknownSender')));
+  text.appendChild(textNode(' \\u2014 '));
+  text.appendChild(el('span', 'gist', item.summary || item.subject || ''));
+  if (item.threadCount > 1) text.appendChild(textNode(' \\u00d7' + item.threadCount));
+  if (item.deadline) { text.appendChild(textNode(' \\u00b7 ')); text.appendChild(el('span', 'due', t('detail.deadline') + ' ' + item.deadline)); }
+  line.appendChild(text);
   return line;
 }
-function renderDigest() {
-  const section = $('#digest');
-  section.replaceChildren();
-  const g = lastDigest;
-  if (!g || !g.pending || g.enabled === false) { section.hidden = true; return; }
-  section.hidden = false;
-  section.appendChild(el('h2', null, t('digest.title')));
-  // When it goes out, worked out by the server that sends it and shown in this
-  // device's own clock.
-  const next = g.nextAt ? new Date(g.nextAt) : null;
-  if (next && !isNaN(next)) {
-    const now = new Date();
-    const tomorrow = new Date(now);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const whenWord = dayKey(next) === dayKey(tomorrow) ? t('digest.tomorrow') : dayLabel(next, now);
-    const key = g.pending === 1 ? 'digest.meta1' : 'digest.meta';
-    section.appendChild(el('p', 'digest-meta', fill(key, { when: whenWord, time: hhmm(next), count: g.pending })));
-  }
-  const items = Array.isArray(g.items) ? g.items : null;
-  if (!items) {
-    // An older server: the rendered text, minus its markdown marks.
-    section.appendChild(el('p', 'digest-fallback', String(g.preview || '').replace(/\\*\\*/g, '').replace(/^- /gm, '')));
-    return;
-  }
+// Which digest blocks the reader has expanded, so a redraw does not fold them again.
+const digestExpanded = new Set();
+function appendDigestGroups(container, items, block) {
   const groups = [];
   const spam = items.filter((i) => i.inSpam);
   if (spam.length) groups.push({ label: t('digest.spamGroup'), cls: 'spam', items: spam });
@@ -1361,7 +1565,7 @@ function renderDigest() {
   }
   const wrap = el('div', 'digest-groups');
   let shown = 0, hidden = 0;
-  const limit = isWide() ? Infinity : 6;
+  const limit = isWide() || digestExpanded.has(block) ? Infinity : 6;
   const overflow = [];
   for (const group of groups) {
     const box = el('div', 'digest-group');
@@ -1374,13 +1578,90 @@ function renderDigest() {
     }
     wrap.appendChild(box);
   }
-  section.appendChild(wrap);
+  container.appendChild(wrap);
   if (hidden) {
     const more = el('button', 'text-btn', fill('digest.more', { count: hidden }));
     more.type = 'button';
-    more.onclick = () => { for (const line of overflow) line.hidden = false; more.remove(); };
-    section.appendChild(more);
+    more.dataset.focus = 'more-' + block;
+    more.onclick = () => {
+      digestExpanded.add(block);
+      for (const line of overflow) line.hidden = false;
+      const next = overflow[0];
+      more.remove();
+      if (next) next.focus({ preventScroll: true });
+    };
+    container.appendChild(more);
   }
+}
+// The sent digest opens the first time it is seen and stays as the reader
+// leaves it for the rest of the visit; afterwards it is one quiet line.
+let sentDigestKey = null, sentDigestOpen = false;
+function renderSentDigest(section, last) {
+  if (sentDigestKey !== last.sentAt) {
+    sentDigestKey = last.sentAt;
+    sentDigestOpen = readStorage('digestSeen') !== last.sentAt;
+    writeStorage('digestSeen', last.sentAt);
+  }
+  const block = el('div', 'digest-sent');
+  const head = el('button', 'digest-sent-head');
+  head.type = 'button';
+  head.dataset.focus = 'sent-head';
+  head.setAttribute('aria-expanded', String(sentDigestOpen));
+  const sentAt = new Date(last.sentAt);
+  head.appendChild(el('span', 'digest-sent-title', t('digest.lastTitle')));
+  head.appendChild(el('span', 'digest-meta', fill(last.count === 1 ? 'digest.lastMeta1' : 'digest.lastMeta', {
+    when: dayPhrase(sentAt, new Date()), time: hhmm(sentAt), count: last.count,
+  })));
+  head.appendChild(icon('i-chevron'));
+  const body = el('div', 'digest-sent-body');
+  body.hidden = !sentDigestOpen;
+  appendDigestGroups(body, last.items, 'sent');
+  head.onclick = () => {
+    sentDigestOpen = body.hidden;
+    body.hidden = !sentDigestOpen;
+    head.setAttribute('aria-expanded', String(sentDigestOpen));
+  };
+  block.appendChild(head);
+  block.appendChild(body);
+  section.appendChild(block);
+}
+// The minute refresh redraws the digest only when what it says has changed,
+// and puts the focus back on the same control when it does.
+let digestDrawn = '';
+function drawDigest(force) {
+  const said = JSON.stringify(lastDigest) + '|' + lang + '|' + dayKey(new Date());
+  if (!force && said === digestDrawn) return;
+  digestDrawn = said;
+  const section = $('#digest');
+  const focus = focusIdentity(section);
+  renderDigest();
+  restoreIdentity(section, focus);
+}
+function renderDigest() {
+  const section = $('#digest');
+  section.replaceChildren();
+  const g = lastDigest;
+  const upcoming = Boolean(g && g.pending && g.enabled !== false);
+  const last = g && g.last && Array.isArray(g.last.items) && g.last.items.length ? g.last : null;
+  section.hidden = !upcoming && !last;
+  if (upcoming) {
+    section.appendChild(el('h2', null, t('digest.title')));
+    // When it goes out, worked out by the server that sends it and shown in
+    // this device's own clock.
+    const next = g.nextAt ? new Date(g.nextAt) : null;
+    if (next && !isNaN(next)) {
+      const now = new Date();
+      const tomorrow = new Date(now);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      const whenWord = dayKey(next) === dayKey(tomorrow) ? t('digest.tomorrow') : dayLabel(next, now);
+      const key = g.pending === 1 ? 'digest.meta1' : 'digest.meta';
+      section.appendChild(el('p', 'digest-meta', fill(key, { when: whenWord, time: hhmm(next), count: g.pending })));
+    }
+    if (Array.isArray(g.items)) appendDigestGroups(section, g.items, 'next');
+    // An older server: the rendered text, minus its markdown marks.
+    else section.appendChild(el('p', 'digest-fallback', String(g.preview || '').replace(/\\*\\*/g, '').replace(/^- /gm, '')));
+  }
+  if (last) renderSentDigest(section, last);
 }
 
 // ---- Loading ----
@@ -1473,7 +1754,13 @@ async function chrome() {
     const p = new URLSearchParams();
     p.set('hours', filters.hours.value);
     const s = await (await fetch('/api/summary?' + p.toString())).json();
+    const hadSummary = Boolean(lastSummary);
+    const downBefore = failingMailboxes().map((m) => m.address).join();
     lastSummary = s;
+    askForPoll();
+    // An empty list picks its words from the summary, which usually lands
+    // after the list: "quiet" is not to be said while a mailbox is unread.
+    if (list.querySelector('.empty') && (!hadSummary || failingMailboxes().map((m) => m.address).join() !== downBefore)) renderList();
     if (!filters.category.dataset.filled) {
       for (const c of s.categories || []) filters.category.appendChild(new Option(word('category.', c), c));
       for (const a of s.accounts || []) filters.account.appendChild(new Option(a.name, a.address));
@@ -1495,7 +1782,8 @@ async function chrome() {
     renderLede();
     renderStatus();
     renderTokens();
-    renderDigest();
+    drawDigest();
+    if (healthSheet.open) redrawHealth();
   } catch (e) {
     setNetworkIssue(true);
   }
@@ -1514,11 +1802,86 @@ function afterFirstLoad() {
     openFromLink(key, false);
   }
   if (wantsCode) {
-    const target = lane.hidden ? list.querySelector('.has-code .code-copy') : lane.querySelector('.lane-copy');
+    const target = lane.querySelector('.lane-copy');
     if (target) { target.scrollIntoView({ block: 'center' }); target.focus({ preventScroll: true }); }
-    else narrate(t('code.none'), false, 6000);
+    else startCodeWait();
   }
   syncUrl();
+}
+
+// ---- Waiting for a code that is on its way ----
+// The shortcut is usually pressed right after asking a site for a code, which
+// often has not arrived yet. Rather than say "no code" and stop, the lane
+// waits a few minutes, reading only what the poller has already stored.
+const CODE_WAIT_MS = 3 * 60 * 1000;
+const CODE_WAIT_POLL_MS = 2500;
+function startCodeWait() {
+  codeWait = { until: Date.now() + CODE_WAIT_MS, asked: false };
+  renderList();
+  announce(t('code.waiting'));
+  tickCodeWait();
+}
+// Mail that IDLE is not watching, spam among it, arrives only with the next
+// poll; ask for one, once, through the same rate-limited path as the refresh
+// button. Its narration counts the mailboxes, which the summary knows.
+function askForPoll() {
+  if (!codeWait || codeWait.asked || !lastSummary) return;
+  codeWait.asked = true;
+  if (refreshButton) pollNow();
+}
+async function tickCodeWait() {
+  if (!codeWait) return;
+  if (Date.now() > codeWait.until) { endCodeWait(null); return; }
+  askForPoll();
+  if (!document.hidden && !loadingMail) {
+    try {
+      const r = await fetch('/api/mail?codesOnly=true&hours=1&limit=5');
+      if (r.ok && codeWait) {
+        const data = await r.json();
+        const now = new Date();
+        // A fresh code ends the wait. So does a fresh verification email whose
+        // code could not be read: the code is in it, like a fresh code that
+        // was already there would simply have been shown.
+        const rows = (Array.isArray(data.mail) ? data.mail : []).filter((m) => now - dateOf(m) < FRESH_CODE_MS);
+        const arrived = rows.find((m) => m.verificationCode) || rows[0];
+        if (arrived && !loadingMail) {
+          await refresh();
+          // Drawn in the lane, renderList has ended the wait already.
+          if (codeWait) endCodeWait(arrived);
+          return;
+        }
+      }
+    } catch (e) {}
+  }
+  setTimeout(tickCodeWait, CODE_WAIT_POLL_MS);
+}
+function endCodeWait(arrived) {
+  const free = mayMoveFocus();
+  codeWait = null;
+  renderList();
+  if (!arrived) {
+    // Nothing new came. An older code may still be the one wanted.
+    const older = list.querySelector('.has-code .code-copy');
+    if (older && free) older.focus({ preventScroll: false });
+    narrateCode(t('code.noneNew'));
+    return;
+  }
+  const sender = arrived.senderName || arrived.sender || '';
+  const li = arrivalRow(rowKey(arrived));
+  if (!li) {
+    // Kept off the page by a filter or by the threads view.
+    const hidden = filtersActive();
+    narrateCode(arrived.verificationCode
+      ? fill(hidden ? 'code.arrivedHidden' : 'code.arrived', { sender })
+      : t(hidden ? 'code.unreadHidden' : 'code.unread'));
+    return;
+  }
+  if (free) {
+    owedFocus = null;
+    li.scrollIntoView({ block: 'center' });
+    (li.querySelector('.code-copy') || li.querySelector('.who')).focus({ preventScroll: true });
+  } else oweFocus({ key: rowKey(arrived) });
+  narrateCode(arrived.verificationCode ? fill('code.arrived', { sender }) : t('code.unread'));
 }
 
 // ---- Theme: a two-state switch, the half-filled disc naming the destination theme. ----
@@ -1560,7 +1923,7 @@ function renderAll() {
   renderStatus();
   renderTokens();
   renderList();
-  renderDigest();
+  drawDigest(true);
   renderPane(true);
 }
 function applyLanguage(next) {
@@ -1579,6 +1942,7 @@ function applyLanguage(next) {
   if (connectionProblem) setNetworkIssue(true);
   applyTheme(readTheme());
   renderAll();
+  if (healthSheet.open) redrawHealth();
   if (sheet.open && openKey) {
     const item = findItem(openKey);
     if (item) {
@@ -1651,11 +2015,18 @@ async function pollNow() {
     if (response.status === 429) { narrate(null); toast(t('refresh.tooOften'), false); return; }
     if (!response.ok) { narrate(null); toast(t('refresh.failed'), true); return; }
     const stats = await response.json();
-    if (stats.accountsFailed > 0) narrate(t('status.partial'), true, 6000);
-    else if (stats.fresh > 0) narrate(fill('status.new', { count: stats.fresh }), false, 6000);
-    else narrate(t('status.none'), false, 6000);
     await refresh();
-    chrome();
+    await chrome();
+    // What a code wait found is what the reader came for; a poll finishing
+    // at the same moment does not talk over it.
+    if (pollNarration && pollNarration.text === codeSaid) return;
+    if (stats.accountsFailed > 0) {
+      // Name the mailbox that did not answer, read from the summary the poll just updated.
+      const missed = lastSummary && Array.isArray(lastSummary.mailboxes)
+        ? lastSummary.mailboxes.filter((m) => m.consecutiveFailures > 0) : [];
+      narrate(missed.length === 1 ? fill('status.partialNamed', { name: missed[0].name }) : t('status.partial'), true, 6000);
+    } else if (stats.fresh > 0) narrate(fill('status.new', { count: stats.fresh }), false, 6000);
+    else narrate(t('status.none'), false, 6000);
   } catch (e) {
     narrate(null);
     toast(t('refresh.failed'), true);
@@ -1720,14 +2091,17 @@ if (matchMedia('(pointer: fine)').matches) {
       else { selectedKey = key; markSelected(); }
       const li = list.querySelector('li.row[data-key="' + CSS.escape(key) + '"]');
       if (li) li.scrollIntoView({ block: 'nearest' });
-    } else if (e.key === 'Enter' && selectedKey) {
+    } else if (e.key === 'Enter' && selectedKey && !(target instanceof Element && target !== document.body
+      && target.closest('button, a[href], summary, [role="button"]'))) {
+      // Enter opens the selected message only from nowhere in particular; on
+      // a button or link it does what that control does.
       e.preventDefault();
       openDetail(selectedKey);
     } else if (e.key === '/') {
       e.preventDefault();
       showSearch();
     } else if (e.key === 'c') {
-      const button = lane.hidden ? list.querySelector('.has-code .code-copy') : lane.querySelector('.lane-copy');
+      const button = lane.querySelector('.lane-copy') || list.querySelector('.has-code .code-copy');
       if (button) button.click();
     } else if (e.key === 'Escape' && selectedKey) {
       clearSelection();

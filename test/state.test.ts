@@ -241,3 +241,52 @@ describe('maintenance', () => {
     expect(s.getMeta('x')).toBe('b');
   });
 });
+
+describe('kept digests and feedback votes', () => {
+  it('keeps what a sent digest listed, with each entry\'s key', () => {
+    const s = new StateStore(':memory:');
+    expect(s.lastDigestLog()).toBeUndefined();
+    s.recordDigestLog('2026-11-03T01:00:00.000Z', [{ dedupKey: 'k1', payload: { subject: 'a', fromName: 'A' } }]);
+    s.recordDigestLog('2026-11-04T01:00:00.000Z', [{ dedupKey: 'k2', payload: { subject: 'b', fromName: 'B' } }]);
+    expect(s.lastDigestLog()).toEqual({ sentAt: '2026-11-04T01:00:00.000Z', items: [{ subject: 'b', fromName: 'B', key: 'k2' }] });
+  });
+
+  it('counts a feedback rule in messages, not labels', () => {
+    const s = new StateStore(':memory:');
+    s.markSeen('k1', 'me@x', 'promo');
+    s.recordOutcome('k1', 'warning', true, { messageId: '<k1@x>', sender: 'promo@shop.example' });
+    // The same message marked twice is one vote.
+    s.recordFeedback('<k1@x>', 'false_positive');
+    s.recordFeedback('<k1@x>', 'false_positive');
+    expect(s.feedbackRuleHints(2).neverImportant).toEqual([]);
+    s.markSeen('k2', 'me@x', 'promo 2');
+    s.recordOutcome('k2', 'warning', true, { messageId: '<k2@x>', sender: 'promo@shop.example' });
+    s.recordFeedback('<k2@x>', 'false_positive');
+    expect(s.feedbackRuleHints(2).neverImportant).toEqual(['promo@shop.example']);
+  });
+});
+
+describe('honest labels for old rows', () => {
+  it('relabels code mail an older release marked fallback as judged locally, once', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { DatabaseSync } = await import('node:sqlite');
+    const path = join(mkdtempSync(join(tmpdir(), 'mailsift-labels-')), 'state.db');
+    const first = new StateStore(path);
+    first.markSeen('code', 'me@x', '验证码邮件');
+    first.recordOutcome('code', 'warning', true, { decidedBy: 'fallback', summary: '收到验证码邮件。', verificationCode: '482913' });
+    first.markSeen('other', 'me@x', 'Weekly notes');
+    first.recordOutcome('other', 'info', false, { decidedBy: 'fallback', summary: 'LLM unavailable' });
+    first.close();
+    // As an older release left it: no record of the relabelling.
+    const raw = new DatabaseSync(path);
+    raw.prepare("DELETE FROM meta WHERE key = 'migrated_local_labels'").run();
+    raw.close();
+
+    const store = new StateStore(path);
+    expect(store.getMail('code')).toMatchObject({ decidedBy: 'local', verificationCode: '482913' });
+    expect(store.getMail('other')).toMatchObject({ decidedBy: 'fallback' });
+    store.close();
+  });
+});

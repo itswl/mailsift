@@ -144,7 +144,8 @@ describe('self-forwarded copies', () => {
 describe('keyword fallback', () => {
   it('catches high-risk signals such as verification codes', () => {
     const result = keywordFallback(makeMessage({ subject: '您的验证码是 123456' }), RULES);
-    expect(result).toMatchObject({ importance: 'warning', decidedBy: 'fallback' });
+    // Handled locally on purpose, which the page should not call a fallback.
+    expect(result).toMatchObject({ importance: 'warning', decidedBy: 'local' });
   });
 
   it('covers Traditional Chinese variants', () => {
@@ -212,7 +213,8 @@ describe('LLM layer', () => {
       [makeMessage({ subject: '验证码', messageId: '<1@x>' }), makeMessage({ messageId: '<2@x>' })],
       RULES,
     );
-    expect(results.every(([, result]) => result.decidedBy === 'fallback')).toBe(true);
+    // The code never went to the model; the other message fell back to keywords.
+    expect(results.map(([, result]) => result.decidedBy)).toEqual(['local', 'fallback']);
   });
 
   it('uses fallback for the batch and invokes the callback on failure', async () => {
@@ -221,7 +223,7 @@ describe('LLM layer', () => {
     process.env.LLM_SKIP_SENSITIVE = 'false';
     const seen: unknown[] = [];
     const [[, result]] = await triage([makeMessage({ subject: '您的验证码 9999', fromAddr: 'u@x.com' })], RULES, (e) => seen.push(e));
-    expect(result!.decidedBy).toBe('fallback');
+    expect(result!.decidedBy).toBe('local');
     expect(result!.importance).toBe('warning');
     expect(seen).toHaveLength(1);
     expect(seen[0]).toBeTruthy();
@@ -279,7 +281,7 @@ describe('LLM layer', () => {
     process.env.LLM_API_KEY = 'k';
     const [[, result]] = await triage([makeMessage({ subject: 'Your verification code is 123456' })], RULES);
     expect(spy).not.toHaveBeenCalled();
-    expect(result!.decidedBy).toBe('fallback');
+    expect(result!.decidedBy).toBe('local');
     expect(result!.reason).toContain('LLM skipped');
   });
 
@@ -466,5 +468,93 @@ describe('provider presets', () => {
   it('errors on an unknown provider instead of silently using the default', () => {
     process.env.LLM_PROVIDER = 'nope';
     expect(() => resolveLlmBaseUrl()).toThrow(/Unknown LLM_PROVIDER/);
+  });
+});
+
+describe('mail that stays on this machine', () => {
+  const token = 'https://medium.com/m/callback/email?token=0123456789abcdefABCDEF_-xyz&operation=login';
+
+  it('keeps a sign-in link out of the model and names it as one', async () => {
+    const spy = vi.fn();
+    vi.stubGlobal('fetch', spy);
+    process.env.LLM_API_KEY = 'k';
+    const [[, result]] = await triage([makeMessage({ subject: 'Sign in to Medium', body: `Click: ${token}` })], RULES);
+    expect(spy).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      importance: 'warning', decidedBy: 'local', sensitiveVerification: true, sensitiveKind: 'link', summary: '收到登录链接邮件。',
+    });
+    expect(result!.verificationCode).toBeUndefined();
+  });
+
+  it('lets a code through from a sender muted by feedback', async () => {
+    const rules = { ...RULES, feedbackNeverImportant: ['noreply@bank.example'] };
+    const [[, code]] = await triage([makeMessage({ fromAddr: 'noreply@bank.example', subject: '您的验证码是 482913' })], rules);
+    expect(code).toMatchObject({ importance: 'warning', verificationCode: '482913' });
+    expect(code!.reason).toContain('静音');
+    // The rest of that sender's mail stays muted.
+    const [[, promo]] = await triage([makeMessage({ fromAddr: 'noreply@bank.example', subject: 'Spring offers' })], rules);
+    expect(promo).toMatchObject({ importance: 'info', category: 'Feedback rule' });
+  });
+
+  it('still honours an explicit never-important rule for codes', async () => {
+    const rules = { ...RULES, neverImportant: ['noreply@bank.example'] };
+    const [[, code]] = await triage([makeMessage({ fromAddr: 'noreply@bank.example', subject: '您的验证码是 482913' })], rules);
+    expect(code).toMatchObject({ importance: 'info' });
+  });
+
+  it('shows the model only placeholders for a sign-in link when it is asked to judge one', async () => {
+    process.env.LLM_SKIP_SENSITIVE = 'false';
+    process.env.LLM_API_KEY = 'k';
+    const bodies: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init?: RequestInit) => {
+      bodies.push(String(init?.body ?? ''));
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ results: [
+        { index: 0, importance: 'info', category: 'Security', summary: 'x', reason: 'y', deadline: '', action_required: false },
+      ] }) } }] }), { status: 200 });
+    }));
+    const [[, result]] = await triage([makeMessage({ subject: 'Sign in to Medium', body: `Click: ${token}` })], RULES);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain('登录链接邮件（内容已隐藏）');
+    expect(bodies[0]).not.toContain('0123456789abcdefABCDEF');
+    expect(bodies[0]).not.toContain('Sign in to Medium');
+    // The model saw nothing to judge, so the link is still put in front of the reader.
+    expect(result).toMatchObject({ importance: 'warning', sensitiveKind: 'link', decidedBy: 'llm' });
+  });
+
+  it('keeps a reset link from the spam folder out of the push, with a warning', async () => {
+    const phish = makeMessage({
+      inSpam: true, folder: 'Junk', fromAddr: 'security@paypa1-support.xyz', subject: 'Reset your password immediately',
+      body: 'https://paypa1-support.xyz/login/session-7f3a9c2e1b4d8f6a0c5e',
+    });
+    const [[, result]] = await triage([phish], RULES);
+    expect(result).toMatchObject({ importance: 'info', actionRequired: false, sensitiveKind: 'link', decidedBy: 'local' });
+    expect(result!.reason).toContain('请勿打开');
+    // An always-important sender is still trusted there.
+    const trusted = { ...phish, fromAddr: 'alerts@bank.com' };
+    const [[, ruled]] = await triage([trusted], RULES);
+    expect(ruled).toMatchObject({ importance: 'critical', sensitiveKind: 'link' });
+  });
+
+  it('does not lift a sign-in link in bulk mail, even from a sender muted by feedback', async () => {
+    const promo = makeMessage({
+      fromAddr: 'news@shop.example', listUnsubscribe: true, subject: 'Log in to claim your welcome discount',
+      body: 'https://shop.example/login?token=Zx9Yw8Vu7Ts6Rq5Po4Nm',
+    });
+    const [[, plain]] = await triage([promo], RULES);
+    expect(plain).toMatchObject({ importance: 'info', sensitiveKind: 'link' });
+    const [[, muted]] = await triage([promo], { ...RULES, feedbackNeverImportant: ['news@shop.example'] });
+    expect(muted).toMatchObject({ importance: 'info', sensitiveKind: 'link' });
+    expect(muted!.reason).not.toContain('照常提醒');
+  });
+
+  it('leaves a repository notification about a password-reset change to the model', async () => {
+    mockLlm([{ index: 0, importance: 'info', category: 'Work', summary: 'PR review', reason: 'routine', deadline: '', action_required: false }]);
+    process.env.LLM_API_KEY = 'k';
+    const [[, result]] = await triage([makeMessage({
+      fromAddr: 'notifications@github.com', subject: 'Re: [acme/web] Fix password reset email template (PR #812)',
+      body: 'Looks good. https://github.com/notifications/unsubscribe-auth/AAB3XYZ0123456789ABCDEFGHIJKLMN',
+    })], { ...RULES, feedbackNeverImportant: ['notifications@github.com'] });
+    expect(result!.sensitiveKind).toBeUndefined();
+    expect(result).toMatchObject({ importance: 'info' });
   });
 });

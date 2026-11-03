@@ -274,6 +274,195 @@ function containsKeyword(haystack: string, keyword: string): boolean {
   return false;
 }
 
+/**
+ * The summaries a verification-code message is stored with. They are set
+ * here, never by the model, so they also mark such a row for the codes
+ * filter: rows filed before the code itself was kept, and rows whose code
+ * could not be extracted, carry them without a stored code.
+ */
+export const VERIFICATION_SUMMARY = '收到验证码邮件。';
+export const VERIFICATION_SUMMARY_NO_CODE = '收到验证码邮件，但未能自动提取验证码。';
+export const VERIFICATION_SUMMARY_PREFIX = '收到验证码邮件';
+/** The summary a sign-in or password-reset link message is stored with. */
+export const SIGN_IN_LINK_SUMMARY = '收到登录链接邮件。';
+/** The same for a link nobody plainly asked for: one in bulk mail or a spam folder. */
+export const UNASKED_LINK_SUMMARY = '收到登录链接邮件（如果不是你刚刚请求的，请勿打开）。';
+export const UNASKED_LINK_REASON = '登录链接邮件内容已在本地隐藏；如果不是你刚刚请求的，请勿打开。';
+
+/**
+ * Sensitive mail comes in two kinds. A verification code is the message
+ * itself; a sign-in or password-reset link carries a token that grants the
+ * same access. Either is handled locally and kept out of the model, the
+ * notification excerpt and the webhook.
+ */
+export type SensitiveKind = 'code' | 'link';
+
+/** What stands in for a sensitive message's subject, summary and body wherever it is shown or sent. */
+export const SENSITIVE_WORDS: Record<SensitiveKind, {
+  subject: string; summary: string; hidden: string; snippet: string; reason: string;
+}> = {
+  code: {
+    subject: '验证码邮件', summary: VERIFICATION_SUMMARY, hidden: '验证码邮件（内容已隐藏）',
+    snippet: '验证码邮件（正文已隐藏）', reason: '验证码邮件内容已在本地隐藏。',
+  },
+  link: {
+    subject: '登录链接邮件', summary: SIGN_IN_LINK_SUMMARY, hidden: '登录链接邮件（内容已隐藏）',
+    snippet: '登录链接邮件（正文已隐藏）', reason: '登录链接邮件内容已在本地隐藏。',
+  },
+};
+
+/**
+ * Subject wording that announces a sign-in or password-reset link. Only the
+ * subject is read: a body that merely mentions signing in is ordinary mail,
+ * and a security alert about a new sign-in is not a link anyone should use.
+ */
+const SIGN_IN_LINK_SUBJECT = new RegExp([
+  String.raw`\b(?:sign|log)[\s-]?in\s+link\b`,
+  String.raw`\bmagic\s+link\b`,
+  // "Reset your password", "Reset your Dropbox password", "Reset password instructions"
+  String.raw`\breset\s+(?:your\s+)?(?:[\w'’-]+\s+){0,3}password\b`,
+  String.raw`\bpassword\s+reset\b`,
+  String.raw`\bforgot\s+(?:your\s+)?password\b`,
+  // "Sign in to Medium", "Log in to Acme", "Login to Acme", "Sign into Acme": the whole message is the link.
+  String.raw`^(?:sign|log)[\s-]?in\s*to\b`,
+  '(?:重置|重设|重設|找回|忘记|忘記)(?:您的|你的)?(?:登录|登錄)?密[码碼]',
+  '密[码碼](?:重置|重设|重設|找回)',
+  '登[录錄入](?:链接|鏈接|連結)',
+].join('|'), 'i');
+/**
+ * Forwarding prefixes and a sender's bracketed tag ("[Medium]", "【网易】"),
+ * read past so "Fwd: [Medium] Sign in to Medium" still starts with its verb.
+ * A tag with a slash is a repository thread and is kept for the check below.
+ */
+const SUBJECT_PREFIX = /^\s*(?:(?:fwd?|转发|轉發)\s*[:：]\s*|\[[^\]/]*\]\s*|【[^】]*】\s*)+/i;
+/**
+ * Subjects that talk about a reset without carrying one: replies, repository
+ * notification threads ("[owner/repo] Fix password reset email"), and the
+ * confirmation that a password was changed.
+ */
+const NOT_A_LINK_SUBJECT = new RegExp([
+  String.raw`^\s*(?:re|aw|回复|答复|回覆)\s*[:：]`,
+  String.raw`\[[\w.-]+\/[\w.-]+\]`,
+  String.raw`\b(?:successful(?:ly)?|succeeded|(?:has|have) been (?:reset|changed|updated)|was (?:reset|changed|updated))\b`,
+  '成功|已重置|已重设|已重設|已修改|已更改',
+].join('|'), 'i');
+const LINK = /https?:\/\/[^\s<>"'()[\]]+/g;
+/** Query parameters a sign-in or reset token travels in. */
+const TOKEN_PARAM = /^(?:t|key|code|otp|magic|ticket|auth|oobcode|nonce)$|token$/i;
+/** Signature parameters count only on a sign-in path; elsewhere they sign storage and media links. */
+const SIGNATURE_PARAM = /^(?:sig|signature)$/i;
+/** Path segments right after which the token sits: /password_reset/<token>, /reset/<uid>/<token>. */
+const TOKEN_PATH = /^(?:reset|password|passwords|password[-_]?resets?|reset[-_]?password|forgot[-_]?password|magic(?:[-_]?(?:link|login))?|email[-_]?login|login[-_]?links?|log[-_]?in|sign[-_]?in|verify|auth|callback|token|session|confirm|recover|recovery)$/i;
+/** Code-host routes: a repository named "auth" or "login" followed by a commit hash is not a sign-in link. */
+const CODE_ROUTE = /^(?:commit|commits|blob|tree|src|-|pull|pulls|merge_requests|issues|compare|releases|tags?)$/i;
+/** Links that carry a token for something else: unsubscribing, mail preferences. */
+const NOT_A_SIGN_IN_URL = /unsubscribe|opt-?out|preferences|email[-_]?settings/i;
+/** Links are looked for near the top; a token link sits there in every such mail. */
+const LINK_SCAN_CHARS = 20_000;
+
+/** Random-looking: letters mixed with digits, or with capitals past the first letter. */
+function scrambled(part: string): boolean {
+  return /[A-Za-z]/.test(part) && (/\d/.test(part) || (/[a-z]/.test(part) && /[A-Z]/.test(part.slice(1))));
+}
+
+/**
+ * A token rather than a word, an id or a slug: 16 or more characters once
+ * '-' and '_' are set aside, random-looking (see scrambled). Base64url tokens
+ * carry '-' and '_' themselves, and so do slugs ("Password-Reset-Flow",
+ * "set-up-2fa-on-your-account"), so a value with separators needs one
+ * random-looking stretch of 8 or more characters between them.
+ */
+function looksLikeToken(value: string): boolean {
+  const compact = value.replace(/[-_]/g, '');
+  if (compact.length < 16 || !scrambled(compact)) return false;
+  return !/[-_]/.test(value) || value.split(/[-_]/).some((part) => part.length >= 8 && scrambled(part));
+}
+
+/**
+ * The path and query inside a fragment, when the fragment is an app route or
+ * carries parameters: "#/reset?token=…", "#!/login/…", "#recovery_token=…".
+ * A plain anchor ("#Password_cracking") is a place on the page, not a path.
+ */
+function fragmentParts(hash: string): { path: string; query: string } {
+  const text = hash.replace(/^#/, '');
+  const route = /^!?\//.test(text);
+  const mark = text.indexOf('?');
+  if (route) {
+    const path = text.replace(/^!?/, '');
+    return mark >= 0 ? { path: path.slice(0, path.indexOf('?')), query: text.slice(mark + 1) } : { path, query: '' };
+  }
+  return text.includes('=') ? { path: '', query: text } : { path: '', query: '' };
+}
+
+/**
+ * Whether a path, as segments, puts a token right after a sign-in word, or
+ * after up to two short ids: Django's /reset/<uid>/<token>/, Drupal's
+ * /user/reset/<uid>/<timestamp>/<hash>/login.
+ */
+function tokenInPath(segments: string[]): boolean {
+  if (segments.some((segment) => CODE_ROUTE.test(segment))) return false;
+  return segments.some((segment, index) => {
+    if (!TOKEN_PATH.test(segment)) return false;
+    for (const next of segments.slice(index + 1, index + 4)) {
+      if (looksLikeToken(next)) return true;
+      if (next.length >= 16) return false; // a long segment that is not a token ends the search
+    }
+    return false;
+  });
+}
+
+/**
+ * Whether a link carries a sign-in or reset token where such tokens are put:
+ * a token parameter, the path segment after a sign-in word, or the same inside
+ * the fragment of a single-page app. A link wrapped by a scanner or a click
+ * tracker (Safe Links, SES) is unwrapped, twice at most.
+ */
+function hasSignInToken(raw: string, depth = 0): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (NOT_A_SIGN_IN_URL.test(url.pathname) || NOT_A_SIGN_IN_URL.test(url.hostname)) return false;
+  const fragment = fragmentParts(url.hash);
+  const segments = [...url.pathname.split('/'), ...fragment.path.split('/')].filter(Boolean).map(decodeSegment);
+  const signInPath = segments.some((segment) => TOKEN_PATH.test(segment));
+  const params = [...url.searchParams, ...new URLSearchParams(fragment.query)];
+  for (const [name, value] of params) {
+    if ((TOKEN_PARAM.test(name) || (signInPath && SIGNATURE_PARAM.test(name))) && looksLikeToken(value)) return true;
+  }
+  if (tokenInPath(segments)) return true;
+  if (depth >= 2) return false;
+  // A wrapped destination: a parameter value or a path segment that is itself a link.
+  const inner = [...params.map(([, value]) => value), ...segments].filter((value) => /^https?:\/\//i.test(value));
+  return inner.some((link) => hasSignInToken(link, depth + 1));
+}
+
+function decodeSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+export function containsSignInLink(subject: string, body: string): boolean {
+  const plain = subject.replace(SUBJECT_PREFIX, '');
+  if (NOT_A_LINK_SUBJECT.test(plain) || !SIGN_IN_LINK_SUBJECT.test(plain)) return false;
+  for (const link of body.slice(0, LINK_SCAN_CHARS).matchAll(LINK)) {
+    if (hasSignInToken(link[0])) return true;
+  }
+  return false;
+}
+
+/** Which kind of sensitive mail this is, if any. A code wins when a message offers both. */
+export function sensitiveKindOf(subject: string, body: string): SensitiveKind | undefined {
+  if (containsSensitiveVerificationContent(subject, body)) return 'code';
+  if (containsSignInLink(subject, body)) return 'link';
+  return undefined;
+}
+
 export function containsSensitiveVerificationContent(subject: string, body: string): boolean {
   const haystack = `${subject}\n${body}`.toLowerCase();
   return SENSITIVE_LOCAL_KEYWORDS.some((keyword) => containsKeyword(haystack, keyword));
@@ -336,7 +525,7 @@ export function extractVerificationCode(subject: string, body: string): string |
 }
 
 export function isSensitiveVerificationMessage(message: Pick<MailMessage, 'subject' | 'body'>): boolean {
-  return containsSensitiveVerificationContent(message.subject, message.body);
+  return sensitiveKindOf(message.subject, message.body) !== undefined;
 }
 
 const HTML_TAG = /<[^>]+>/g;
@@ -378,7 +567,8 @@ export function htmlToText(html: string): string {
 }
 
 export function snippet(message: MailMessage): string {
-  if (isSensitiveVerificationMessage(message)) return '验证码邮件（正文已隐藏）';
+  const kind = sensitiveKindOf(message.subject, message.body);
+  if (kind) return SENSITIVE_WORDS[kind].snippet;
   return message.body.slice(0, SNIPPET_CHARS);
 }
 

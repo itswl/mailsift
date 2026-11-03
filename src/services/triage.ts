@@ -10,10 +10,17 @@ import { z } from 'zod';
 import { IMPORTANCE, IMPORTANCE_RANK, type Importance, type Rules } from '../config.js';
 import { aiGatewayHeaders, deciderConfigured, decideMessages, type DeciderDecision } from './decider.js';
 import {
-  containsSensitiveVerificationContent,
   extractVerificationCode,
+  SENSITIVE_WORDS,
+  sensitiveKindOf,
+  SIGN_IN_LINK_SUMMARY,
   snippet,
+  UNASKED_LINK_REASON,
+  UNASKED_LINK_SUMMARY,
+  VERIFICATION_SUMMARY,
+  VERIFICATION_SUMMARY_NO_CODE,
   type MailMessage,
+  type SensitiveKind,
 } from '../imap/message.js';
 import { getLogger } from '../logger.js';
 
@@ -76,9 +83,14 @@ export interface TriageResult {
   deadline: string;
   category: string;
   actionRequired: boolean;
-  decidedBy: 'rule' | 'llm' | 'fallback' | 'health' | 'digest';
+  /** 'local' is mail handled on purpose without the model (codes, sign-in links); 'fallback' is the keyword stand-in for a model that failed. */
+  decidedBy: 'rule' | 'llm' | 'fallback' | 'local' | 'health' | 'digest';
+  /** A sign-in link nobody plainly asked for (bulk mail, a spam folder): outputs warn instead of inviting. */
+  sensitiveUnasked?: boolean;
   /** A locally detected authentication email; raw content stays out of summaries and snippets. */
   sensitiveVerification?: boolean;
+  /** Which kind of authentication email, so outputs can name it. Absent on records written before links were recognised. */
+  sensitiveKind?: SensitiveKind;
   /** Kept only long enough for the Feishu notification and any pending retry. */
   verificationCode?: string;
 }
@@ -403,8 +415,11 @@ export function applyRules(message: MailMessage, rules: Rules): TriageResult | u
 
 /** Safe fallback when the LLM is unavailable. */
 export function keywordFallback(message: MailMessage, rules: Rules): TriageResult {
-  if (containsSensitiveContent(message)) {
-    return sensitiveVerificationResult(extractVerificationCode(message.subject, message.body));
+  const kind = sensitiveKindOf(message.subject, message.body);
+  if (kind) {
+    return sensitiveVerificationResult(
+      kind === 'code' ? extractVerificationCode(message.subject, message.body) : undefined, undefined, false, kind,
+    );
   }
 
   const haystack = `${message.subject}\n${snippet(message)}`.toLowerCase();
@@ -433,25 +448,78 @@ function sensitiveVerificationResult(
   verificationCode: string | undefined,
   base?: TriageResult,
   ensurePush = false,
+  kind: SensitiveKind = 'code',
 ): TriageResult {
+  const link = kind === 'link';
+  const summary = link ? SIGN_IN_LINK_SUMMARY : verificationCode ? VERIFICATION_SUMMARY : VERIFICATION_SUMMARY_NO_CODE;
   return {
     importance: ensurePush && base?.importance === 'info' ? 'warning' : base?.importance ?? 'warning',
     score: ensurePush ? Math.max(base?.score ?? 0, 60) : base?.score ?? 60,
-    summary: verificationCode
-      ? '收到验证码邮件。'
-      : '收到验证码邮件，但未能自动提取验证码。',
-    reason: '验证码邮件在本地处理；LLM skipped，验证码内容不会发送给 LLM。',
+    summary,
+    reason: link
+      ? '登录链接邮件在本地处理；LLM skipped，链接不会发送给 LLM。'
+      : '验证码邮件在本地处理；LLM skipped，验证码内容不会发送给 LLM。',
     deadline: '',
     category: 'Security',
     actionRequired: ensurePush || (base?.actionRequired ?? true),
-    decidedBy: base?.decidedBy ?? 'fallback',
+    // Handled here on purpose, which is not the same as the keyword stand-in
+    // for a model that failed.
+    decidedBy: base?.decidedBy ?? 'local',
     sensitiveVerification: true,
-    ...(verificationCode ? { verificationCode } : {}),
+    sensitiveKind: kind,
+    ...(verificationCode && !link ? { verificationCode } : {}),
+  };
+}
+
+/**
+ * A sign-in or reset link nobody is plainly waiting for: one in bulk mail, or
+ * one the provider filed as spam, where a reset lure is the commonest
+ * phishing. It is hidden like any other, but never pushed on that account.
+ */
+function unaskedLink(message: MailMessage, kind: SensitiveKind | undefined): boolean {
+  return kind === 'link' && (message.inSpam || message.listUnsubscribe);
+}
+
+/**
+ * The verdict on an unasked link: the digest, unless a rule or the model (from
+ * the sender alone) rated it higher, and a warning in place of a call to act.
+ */
+function unaskedLinkResult(message: MailMessage, base?: TriageResult): TriageResult {
+  const quiet = !base || base.importance === 'info';
+  return {
+    ...sensitiveVerificationResult(undefined, base, false, 'link'),
+    ...(quiet ? { importance: 'info' as Importance, score: Math.min(base?.score ?? 20, 20) } : {}),
+    summary: UNASKED_LINK_SUMMARY,
+    actionRequired: false,
+    reason: `${message.inSpam ? '垃圾箱里的登录/重置链接邮件' : '群发邮件里的登录链接'}在本地处理${quiet ? '，不主动提醒' : ''}；`
+      + '链接不会发送给 LLM。如果不是你刚刚请求的，请勿打开。',
+    sensitiveUnasked: true,
   };
 }
 
 export function containsSensitiveContent(message: MailMessage): boolean {
-  return containsSensitiveVerificationContent(message.subject, message.body);
+  return sensitiveKindOf(message.subject, message.body) !== undefined;
+}
+
+/**
+ * The words that stand in for a hidden message in every output. A link nobody
+ * plainly asked for carries its warning instead of an invitation to use it.
+ */
+export function sensitiveWords(message: MailMessage, result: TriageResult): typeof SENSITIVE_WORDS[SensitiveKind] {
+  const words = SENSITIVE_WORDS[result.sensitiveKind ?? sensitiveKindOf(message.subject, message.body) ?? 'code'];
+  return result.sensitiveUnasked ? { ...words, summary: UNASKED_LINK_SUMMARY, reason: UNASKED_LINK_REASON } : words;
+}
+
+/**
+ * Whether an output must hide this message's content. The digest and health
+ * notices are written by mailsift from text that is already safe, so they are
+ * never sniffed: one digest line reading "收到验证码邮件" must not turn the
+ * whole digest into a code card, or lend it a number from the next line.
+ */
+export function hidesContent(message: MailMessage, result: TriageResult): boolean {
+  if (result.sensitiveVerification) return true;
+  if (result.decidedBy === 'health' || result.decidedBy === 'digest' || message.extra?.['digest']) return false;
+  return containsSensitiveContent(message);
 }
 
 /** Whether a copy forwarded in from another monitored mailbox should stay out of notifications. */
@@ -575,16 +643,16 @@ function requestBody(
         }
       : {}),
     emails: messages.map((m, index) => {
-      const sensitiveVerification = containsSensitiveContent(m);
+      const sensitive = sensitiveKindOf(m.subject, m.body);
       const threadContext = threadContexts?.get(m);
       return {
         index,
-        subject: sensitiveVerification ? '验证码邮件（内容已隐藏）' : safe(m.subject) || '(no subject)',
+        subject: sensitive ? SENSITIVE_WORDS[sensitive].hidden : safe(m.subject) || '(no subject)',
         from: safe(`${m.fromName} <${m.fromAddr}>`).trim(),
         in_spam: m.inSpam,
         is_bulk: m.listUnsubscribe,
         to_account: safe(m.account),
-        body: sensitiveVerification ? '验证码邮件（内容已隐藏）' : safe(m.body.slice(0, bodyChars)),
+        body: sensitive ? SENSITIVE_WORDS[sensitive].hidden : safe(m.body.slice(0, bodyChars)),
         ...(threadContext?.length ? {
           thread_context: threadContext.map((entry) => ({
             subject: safe(entry.subject).slice(0, 300),
@@ -718,6 +786,7 @@ async function classifyBatch(
   rules: Rules,
   onLlmResult?: LlmResultCallback,
   threadContexts?: ReadonlyMap<MailMessage, ThreadContextEntry[]>,
+  onDeciderResult?: LlmResultCallback,
 ): Promise<TriageResult[]> {
   if (messages.length === 0) return [];
   if (!process.env.LLM_API_KEY?.trim()) {
@@ -726,8 +795,11 @@ async function classifyBatch(
   }
 
   // Two-stage triage: the decision model classifies first; the LLM only explains.
-  const decisions = deciderConfigured() ? await decideMessages(messages, rules) : null;
+  const decisions = deciderConfigured()
+    ? await decideMessages(messages, rules, (error) => onDeciderResult?.(error))
+    : null;
   if (decisions) {
+    onDeciderResult?.(null);
     let parsed: z.infer<typeof LlmSummaryResponse>;
     try {
       const raw = await callLlmJson(messages, rules, threadContexts, decisions);
@@ -804,39 +876,60 @@ export async function triage(
   rules: Rules,
   onLlmResult?: LlmResultCallback,
   threadContexts?: ReadonlyMap<MailMessage, ThreadContextEntry[]>,
+  onDeciderResult?: LlmResultCallback,
 ): Promise<Array<[MailMessage, TriageResult]>> {
   const decided = new Map<number, TriageResult>();
-  const sensitiveCodes = new Map<number, string | undefined>();
+  const sensitive = new Map<number, { code: string | undefined; kind: SensitiveKind; unasked: boolean }>();
   const pending: Array<[number, MailMessage]> = [];
 
   messages.forEach((message, index) => {
-    const sensitiveVerification = containsSensitiveContent(message);
-    const verificationCode = sensitiveVerification
+    const kind = sensitiveKindOf(message.subject, message.body);
+    const verificationCode = kind === 'code'
       ? extractVerificationCode(message.subject, message.body)
       : undefined;
     const ruled = applyRules(message, rules);
-    if (ruled) {
-      decided.set(index, sensitiveVerification
-        ? sensitiveVerificationResult(verificationCode, ruled)
-        : ruled);
-    } else if (sensitiveVerification && skipSensitiveContent()) {
-      decided.set(index, sensitiveVerificationResult(verificationCode));
+    const unasked = unaskedLink(message, kind);
+    if (ruled && kind) {
+      // A sender muted by feedback stays muted, except for the mail nobody
+      // can afford to miss: a code or a sign-in link is something the reader
+      // asked for and is waiting on. An explicit never-important rule still
+      // wins, and a link in bulk mail or spam is not lifted.
+      const muted = ruled.category === 'Feedback rule' && ruled.importance === 'info';
+      if (unasked) {
+        decided.set(index, unaskedLinkResult(message, ruled));
+      } else {
+        const result = sensitiveVerificationResult(verificationCode, ruled, muted, kind);
+        decided.set(index, muted
+          ? { ...result, reason: `${result.reason} 发件人已被反馈规则静音，这类邮件仍照常提醒。` }
+          : result);
+      }
+    } else if (ruled) {
+      decided.set(index, ruled);
+    } else if (kind && skipSensitiveContent()) {
+      decided.set(index, unasked
+        ? unaskedLinkResult(message)
+        : sensitiveVerificationResult(verificationCode, undefined, false, kind));
     } else {
       pending.push([index, message]);
-      if (sensitiveVerification) sensitiveCodes.set(index, verificationCode);
+      if (kind) sensitive.set(index, { code: verificationCode, kind, unasked });
     }
   });
 
   const batchSize = Number(process.env.LLM_BATCH_SIZE ?? 10);
   for (let start = 0; start < pending.length; start += batchSize) {
     const chunk = pending.slice(start, start + batchSize);
-    const outcomes = await classifyBatch(chunk.map(([, m]) => m), rules, onLlmResult, threadContexts);
-    chunk.forEach(([index], position) => {
+    const outcomes = await classifyBatch(chunk.map(([, m]) => m), rules, onLlmResult, threadContexts, onDeciderResult);
+    chunk.forEach(([index, message], position) => {
       const outcome = outcomes[position];
+      const hidden = sensitive.get(index);
       if (outcome) {
-        decided.set(index, sensitiveCodes.has(index)
-          ? sensitiveVerificationResult(sensitiveCodes.get(index), outcome, true)
-          : outcome);
+        decided.set(index, !hidden
+          ? outcome
+          : hidden.unasked
+            // Only the model's own verdict, from the sender alone, can lift it: the
+            // keyword stand-in for a missing or failed model is no judgement.
+            ? unaskedLinkResult(message, outcome.decidedBy === 'llm' ? outcome : undefined)
+            : sensitiveVerificationResult(hidden.code, outcome, true, hidden.kind));
       }
     });
   }

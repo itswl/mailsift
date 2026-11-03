@@ -14,7 +14,7 @@
  */
 import { timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
-import { loadConfig } from './config.js';
+import { loadConfig, type Account } from './config.js';
 import { escapeHtml } from './html.js';
 import {
   AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
@@ -22,6 +22,7 @@ import {
 } from './imap/client.js';
 import { buildLink } from './links.js';
 import { nextDigestAt, renderDigest, type DigestItem } from './services/digest.js';
+import { mailboxStatuses } from './services/health.js';
 import { CATEGORIES } from './services/triage.js';
 import { HEARTBEAT_KEY, type PollStats } from './services/watcher.js';
 import { clientScript, LANGUAGE_COOKIE, storeLanguageScript } from './web-client.js';
@@ -295,17 +296,24 @@ export async function handleApi(
     const hours = intParam(params, 'hours', 24, 24 * 90);
     // When the poller last finished, so the page can say how fresh it is. The
     // standalone MCP server shares the database, so it can usually say too.
+    // The heartbeat is written after every poll, even one in which a mailbox
+    // failed, so each mailbox's own state travels with it.
+    const accounts = configuredAccounts();
     return json(200, {
       ...store.summarize(hours),
       categories: CATEGORIES,
-      accounts: accountLabels(),
+      accounts: accounts.map((a) => ({ address: a.username, name: a.name })),
       lastPollAt: store.getMeta(HEARTBEAT_KEY) ?? null,
       pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 300),
+      mailboxes: mailboxStatuses(store, accounts),
+      outboxPending: store.notificationOutboxPending(),
     });
   }
 
   if (path === '/api/digest') {
-    const items = store.peekDigest() as DigestItem[];
+    // Each entry carries its key, so a line in the page opens that message.
+    const items = store.peekDigestEntries()
+      .map((entry) => ({ ...(entry.payload as DigestItem), key: entry.dedupKey }));
     // The rendered text is what Feishu will receive; the items let the page
     // lay the same queue out as a list instead of showing markdown source.
     // The send time is worked out here, by the clock that sends it, and the
@@ -317,6 +325,8 @@ export async function handleApi(
       items,
       enabled: next !== null,
       nextAt: next?.toISOString() ?? null,
+      // What went out last, for a morning's look after the queue is empty.
+      ...lastDigest(store),
     });
   }
 
@@ -568,12 +578,23 @@ async function handleAttachmentScanApi(
   }
 }
 
-function accountLabels(): Array<{ address: string; name: string }> {
+function configuredAccounts(): Account[] {
   try {
-    return loadConfig().accounts.map((a) => ({ address: a.username, name: a.name }));
+    return loadConfig().accounts;
   } catch {
     return [];
   }
+}
+
+/** A sent digest stays on the page for most of a day, then gives way to the next. */
+const LAST_DIGEST_HOURS = 18;
+
+function lastDigest(store: StateStore): { last?: { sentAt: string; count: number; items: Array<Record<string, unknown>> } } {
+  const logged = store.lastDigestLog();
+  if (!logged) return {};
+  const age = Date.now() - Date.parse(logged.sentAt);
+  if (!Number.isFinite(age) || age < 0 || age > LAST_DIGEST_HOURS * 3_600_000) return {};
+  return { last: { sentAt: logged.sentAt, count: logged.items.length, items: logged.items } };
 }
 
 function providerOf(address: string): string {
@@ -671,6 +692,7 @@ export function renderApp(lang: Language, canRefresh = false): string {
         <section class="title" aria-label="${s('overview.title')}" data-i18n-label="overview.title">
           <p id="lede" class="lede pending">${s('lede.loading')}</p>
           <p id="status" class="status" role="status" aria-live="polite"></p>
+          <button id="health" type="button" class="health-line" aria-haspopup="dialog" aria-controls="health-sheet" hidden></button>
         </section>
         <form id="filters" class="controls" autocomplete="off">
           <div id="control-line" class="control-line">
@@ -707,6 +729,10 @@ export function renderApp(lang: Language, canRefresh = false): string {
     <footer class="version">${escapeHtml(webVersion())}</footer>
     <dialog id="sheet" class="sheet" aria-labelledby="sheet-title">
       <div class="sheet-head"><span class="handle"></span><span></span><button id="sheet-done" type="button" class="text-btn" data-i18n="done">${s('done')}</button></div>
+      <div class="sheet-body"></div>
+    </dialog>
+    <dialog id="health-sheet" class="sheet" aria-labelledby="health-title">
+      <div class="sheet-head"><span class="handle"></span><span></span><h2 id="health-title" data-i18n="mailboxes.title">${s('mailboxes.title')}</h2><button id="health-done" type="button" class="text-btn" data-i18n="done">${s('done')}</button></div>
       <div class="sheet-body"></div>
     </dialog>
     <dialog id="install-help" class="sheet install-help" aria-labelledby="install-title">

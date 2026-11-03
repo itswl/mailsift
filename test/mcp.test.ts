@@ -322,6 +322,11 @@ describe('recovery and health', () => {
     const healthy = await call(client, 'health');
     expect(healthy).toMatchObject({ healthy: true, failingAccounts: [] });
     expect(healthy['idle']).toMatchObject({ enabled: false });
+    // A fresh heartbeat does not vouch for a mailbox that keeps failing.
+    state.setMeta('account_fail_count:me@qq.com', '3');
+    expect(await call(client, 'health')).toMatchObject({
+      healthy: false, failingAccounts: [expect.objectContaining({ consecutiveFailures: 3 })],
+    });
   });
 
   it('describes the configured accounts and the recovery backlog', async () => {

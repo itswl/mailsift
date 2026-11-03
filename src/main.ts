@@ -18,12 +18,13 @@ import { deciderConfigured } from './services/decider.js';
 import {
   resolveLlmBaseUrl, spamBonusWarning, suppressSelfForwards, unanchoredSenderRules,
 } from './services/triage.js';
-import { sendDigest } from './services/digest.js';
+import { digestHour, sendDigest } from './services/digest.js';
 import { recordStartupFailure } from './services/health.js';
 import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
 import { PollCoordinator } from './services/poll-scheduler.js';
 import { IdleSupervisor, idleEnabled, idleFolderTokens } from './imap/idle.js';
 import { webUiEnabled } from './web.js';
+import { flushHeartbeats, heartbeatProblem, heartbeatUrl } from './services/heartbeat.js';
 import { getLogger } from './logger.js';
 import { metrics } from './metrics.js';
 import { startMcpHttp } from './mcp.js';
@@ -132,10 +133,14 @@ async function checkConfig(): Promise<number> {
   const spamWarning = spamBonusWarning();
   // A warning, not a misconfiguration: report it without failing the check.
   if (spamWarning) console.log(`   ⚠️  ${spamWarning}`);
+  const digest = digestHour();
   console.log(
     `   Poll interval: ${process.env.POLL_INTERVAL_SECONDS ?? 300}s; ` +
-      `digest: ${(process.env.DIGEST_ENABLED ?? 'true') === 'false' ? 'disabled' : `daily at ${process.env.DIGEST_HOUR ?? 9}:00`}`,
+      `digest: ${(process.env.DIGEST_ENABLED ?? 'true').toLowerCase() === 'false' ? 'disabled' : `daily at ${digest.hour}:00 server time`}`,
   );
+  if (digest.invalid !== undefined) {
+    console.log(`   ⚠️  DIGEST_HOUR=${digest.invalid} is not a whole hour from 0 to 23; using ${digest.hour}.`);
+  }
   if (idleEnabled()) {
     const interval = Number(process.env.POLL_INTERVAL_SECONDS ?? 300);
     console.log(`   IMAP IDLE: enabled for ${idleFolderTokens().join(', ')}; the poll interval is the reconciliation pass`);
@@ -153,6 +158,15 @@ async function checkConfig(): Promise<number> {
         : '   Web view: disabled (set WEB_UI_ENABLED=true for a read-only browser view)',
     );
   }
+  const monitor = heartbeatUrl();
+  const monitorProblem = heartbeatProblem();
+  console.log(
+    monitor
+      ? `   External heartbeat: pinging ${monitor.host} after each poll`
+      : monitorProblem
+        ? `   ⚠️  HEARTBEAT_PING_URL ${monitorProblem}; no heartbeat will be sent.`
+        : '   External heartbeat: off (set HEARTBEAT_PING_URL so a monitor notices when mailsift stops)',
+  );
   console.log(`   Total per-poll backfill limit: ${process.env.MAX_MESSAGES_PER_POLL_TOTAL ?? 500}`);
   console.log(`   Fresh lookbacks are backfilled in chunks of ${process.env.MAX_MESSAGES_PER_LOOKBACK ?? 500}`);
 
@@ -266,6 +280,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
   if (values.once) {
     const stats = await watcher.pollOnce();
+    // The ping is not awaited inside the poll; a cron run must not exit before it is sent.
+    await flushHeartbeats();
     return stats.failures.length ? 2 : 0;
   }
 

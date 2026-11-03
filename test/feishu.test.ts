@@ -221,3 +221,71 @@ describe('delivery semantics', () => {
       .toBe('delivered');
   });
 });
+
+describe('sign-in links in every output', () => {
+  const token = 'https://medium.com/m/callback/email?token=0123456789abcdefABCDEF_-xyz&operation=login';
+  const secret = '0123456789abcdefABCDEF';
+  const message = makeMessage({ subject: 'Sign in to Medium', body: `Click to sign in: ${token}` });
+  const result = makeResult({
+    importance: 'warning', sensitiveVerification: true, sensitiveKind: 'link', summary: '收到登录链接邮件。', decidedBy: 'local',
+  });
+
+  it('names the link mail as one and leaves the token behind', async () => {
+    const { buildMailSignalEvent } = await import('../src/services/signal.js');
+    const { toDigestItem } = await import('../src/services/digest.js');
+    const card = JSON.stringify(buildCard(message, result));
+    expect(card).toContain('登录链接邮件');
+    expect(card).toContain('登录链接已在本地隐藏');
+    expect(card).not.toContain('验证码');
+    const payload = JSON.stringify(buildWebhookPayload(message, result));
+    expect(payload).toContain('登录链接邮件');
+    const signal = JSON.stringify(buildMailSignalEvent(message, result));
+    const item = JSON.stringify(toDigestItem(message, result));
+    for (const output of [card, payload, signal, item]) {
+      expect(output).not.toContain(secret);
+      expect(output).not.toContain('Sign in to Medium');
+    }
+  });
+
+  it('hides the link even when the result does not say so', () => {
+    // A result from an older outbox entry, or a refactor that loses the flag:
+    // the message itself is read again.
+    const card = JSON.stringify(buildCard(message, makeResult({ importance: 'warning' })));
+    expect(card).not.toContain(secret);
+  });
+
+  it('warns rather than invites when the link came from the spam folder', () => {
+    const card = JSON.stringify(buildCard({ ...message, inSpam: true, folder: 'Junk' }, result));
+    expect(card).toContain('如果不是你刚刚请求的，请勿打开');
+    expect(card).not.toContain('请打开原邮件使用');
+  });
+});
+
+describe('a sign-in link nobody plainly asked for', () => {
+  const secret = 'Zx9Yw8Vu7Ts6Rq5Po4Nm';
+  const message = makeMessage({
+    listUnsubscribe: true, fromAddr: 'news@shop.example', subject: 'Log in to claim your welcome discount',
+    body: `https://shop.example/login?token=${secret}`,
+  });
+  const result = makeResult({
+    importance: 'warning', sensitiveVerification: true, sensitiveKind: 'link', sensitiveUnasked: true,
+    summary: '收到登录链接邮件（如果不是你刚刚请求的，请勿打开）。', decidedBy: 'rule', actionRequired: false,
+  });
+
+  it('warns in every output instead of inviting the reader to use it', async () => {
+    const { buildMailSignalEvent } = await import('../src/services/signal.js');
+    const { toDigestItem } = await import('../src/services/digest.js');
+    const payload = buildWebhookPayload(message, result) as { triage: { summary: string; reason: string; action_required: boolean } };
+    expect(payload.triage.summary).toContain('请勿打开');
+    expect(payload.triage.reason).toContain('请勿打开');
+    expect(payload.triage.action_required).toBe(false);
+    expect(buildMailSignalEvent(message, result).summary).toContain('请勿打开');
+    const item = toDigestItem(message, result);
+    expect(item.summary).toContain('请勿打开');
+    expect(item.actionRequired).toBe(false);
+    const card = JSON.stringify(buildCard(message, result));
+    expect(card).toContain('群发邮件里的登录/重置链接邮件');
+    expect(card).not.toContain('请打开原邮件使用');
+    for (const output of [JSON.stringify(payload), card, JSON.stringify(item)]) expect(output).not.toContain(secret);
+  });
+});
