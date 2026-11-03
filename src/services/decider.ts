@@ -17,9 +17,9 @@
  *   DECIDER_TIMEOUT_SECONDS   per-request timeout (default 15)
  */
 import type { Rules } from '../config.js';
-import type { MailMessage } from '../imap/message.js';
+import { SENSITIVE_WORDS, sensitiveKindOf, type MailMessage } from '../imap/message.js';
 import { getLogger } from '../logger.js';
-import { canonicalCategory, containsSensitiveContent, redactForLlm, type Category } from './triage.js';
+import { canonicalCategory, redactForLlm, type Category } from './triage.js';
 import type { Importance } from '../config.js';
 
 const log = getLogger('decider');
@@ -173,15 +173,16 @@ function decisionState(message: MailMessage, rules: Rules): Record<string, unkno
   const bodyChars = Number(process.env.LLM_BODY_CHARS ?? 1200);
   const redact = (process.env.LLM_REDACT_PII ?? 'true').toLowerCase() !== 'false';
   const safe = (value: string): string => (redact ? redactForLlm(value) : value);
-  const sensitiveVerification = containsSensitiveContent(message);
+  const kind = sensitiveKindOf(message.subject, message.body);
+  const hidden = kind ? SENSITIVE_WORDS[kind].hidden : undefined;
   return {
     user_context: safe(rules.context) || '(no additional user context)',
-    subject: sensitiveVerification ? '验证码邮件（内容已隐藏）' : safe(message.subject) || '(no subject)',
+    subject: hidden ?? (safe(message.subject) || '(no subject)'),
     from: safe(`${message.fromName} <${message.fromAddr}>`).trim(),
     in_spam: message.inSpam,
     is_bulk: message.listUnsubscribe,
     to_account: safe(message.account),
-    body: sensitiveVerification ? '验证码邮件（内容已隐藏）' : safe(message.body.slice(0, bodyChars)),
+    body: hidden ?? safe(message.body.slice(0, bodyChars)),
   };
 }
 
@@ -193,6 +194,7 @@ function decisionState(message: MailMessage, rules: Rules): Record<string, unkno
 export async function decideMessages(
   messages: MailMessage[],
   rules: Rules,
+  onFailure?: (error: unknown) => void,
 ): Promise<DeciderDecision[] | null> {
   if (messages.length === 0) return [];
   const endpoint = deciderEndpoint();
@@ -236,6 +238,9 @@ export async function decideMessages(
     return decisions;
   } catch (error) {
     log.warn(`Decider stage failed; falling back to single-stage triage: ${error}`);
+    // The batch still gets judged in one stage, so this is easy to miss: the
+    // caller turns repeated failures into a health alert.
+    onFailure?.(error);
     return null;
   }
 }

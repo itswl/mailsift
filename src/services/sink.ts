@@ -4,9 +4,11 @@
  * The webhook authentication uses a token header. Its signature modes sign
  * different payloads, so one header cannot satisfy both replay protection checks.
  */
-import { isSensitiveVerificationMessage, snippet, type MailMessage } from '../imap/message.js';
+import {
+  snippet, type MailMessage,
+} from '../imap/message.js';
 import { FeishuSink, type PushOutcome, type Sink } from './feishu.js';
-import type { TriageResult } from './triage.js';
+import { hidesContent, sensitiveWords, type TriageResult } from './triage.js';
 import { buildMailSignalEvent } from './signal.js';
 import { deliverWithRetry, isRetryableStatus, type RetryState } from './delivery.js';
 import { getLogger } from '../logger.js';
@@ -61,10 +63,8 @@ export function usesLegacyWebhookNames(): boolean {
  */
 export function buildWebhookPayload(message: MailMessage, result: TriageResult): Record<string, unknown> {
   const isDigest = Boolean(message.extra?.['digest']);
-  const sensitiveVerification = Boolean(
-    result.sensitiveVerification ||
-      (result.decidedBy !== 'health' && isSensitiveVerificationMessage(message)),
-  );
+  const sensitiveVerification = hidesContent(message, result);
+  const words = sensitiveWords(message, result);
   return {
     signal: buildMailSignalEvent(message, result),
     mail: {
@@ -73,7 +73,7 @@ export function buildWebhookPayload(message: MailMessage, result: TriageResult):
       folder: message.folder,
       in_spam: message.inSpam,
       message_id: message.messageId,
-      subject: sensitiveVerification ? '验证码邮件' : message.subject || '(no subject)',
+      subject: sensitiveVerification ? words.subject : message.subject || '(no subject)',
       from: message.fromAddr,
       from_name: message.fromName,
       date: message.date,
@@ -86,11 +86,11 @@ export function buildWebhookPayload(message: MailMessage, result: TriageResult):
     triage: {
       importance: result.importance,
       score: result.score,
-      summary: sensitiveVerification ? '收到验证码邮件。' : result.summary,
-      reason: sensitiveVerification ? '验证码邮件内容已在本地隐藏。' : result.reason,
+      summary: sensitiveVerification ? words.summary : result.summary,
+      reason: sensitiveVerification ? words.reason : result.reason,
       deadline: sensitiveVerification ? '' : result.deadline,
       category: sensitiveVerification ? 'Security' : result.category,
-      action_required: sensitiveVerification ? true : result.actionRequired,
+      action_required: sensitiveVerification ? !result.sensitiveUnasked : result.actionRequired,
       decided_by: result.decidedBy,
     },
   };

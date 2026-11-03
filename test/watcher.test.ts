@@ -461,3 +461,66 @@ describe('crash safety', () => {
     expect(spy).not.toHaveBeenCalled();
   });
 });
+
+describe('re-triage after an LLM outage', () => {
+  it('leaves a code it handled itself alone, stored code and all', async () => {
+    vi.restoreAllMocks(); // the real triage, not an earlier test's stub
+    process.env.PUSH_MIN_IMPORTANCE = 'critical';
+    process.env.LLM_API_KEY = 'k';
+    const { w, state } = watcher();
+    // A row as 0.1.97 left it: a code handled locally but labelled 'fallback',
+    // waiting in the digest, while the LLM was down.
+    state.markSeen('old-code', 'me@qq.com', '验证码邮件');
+    state.recordOutcome('old-code', 'warning', false, {
+      decidedBy: 'fallback', summary: '收到验证码邮件。', verificationCode: '482913',
+      snippet: '验证码邮件（正文已隐藏）', subject: '验证码邮件', folder: 'INBOX',
+    });
+    state.queueDigest('old-code', { subject: '验证码邮件' });
+    state.setMeta('llm_fail_count', '3');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ results: [
+      { index: 0, importance: 'info', category: 'Other', summary: 'ok', reason: 'ok', deadline: '', action_required: false },
+    ] }) } }] }), { status: 200 })));
+
+    await w.dispatch([makeMessage({ messageId: '<new@x>', subject: 'Weekly notes' })], stats());
+
+    const row = state.getMail('old-code');
+    expect(row).toMatchObject({ verificationCode: '482913', summary: '收到验证码邮件。' });
+  });
+});
+
+describe('sign-in link mail through dispatch', () => {
+  const token = 'https://medium.com/m/callback/email?token=0123456789abcdefABCDEF_-xyz&operation=login';
+
+  it('stores and queues it hidden, keeping its kind for a retried card', async () => {
+    vi.restoreAllMocks(); // the real triage
+    process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    const { w, state } = watcher(new RecordingSink('failed'));
+    await w.dispatch([makeMessage({ messageId: '<link@x>', subject: 'Sign in to Medium', body: `Click: ${token}` })], stats());
+
+    const row = state.getMail('<link@x>');
+    expect(row).toMatchObject({ subject: '登录链接邮件', summary: '收到登录链接邮件。' });
+    expect(JSON.stringify(row)).not.toContain('0123456789abcdefABCDEF');
+    const [entry] = state.pendingNotifications();
+    expect(entry!.result.sensitiveKind).toBe('link');
+    expect(JSON.stringify(entry)).not.toContain('0123456789abcdefABCDEF');
+    const { buildCard } = await import('../src/services/feishu.js');
+    const card = JSON.stringify(buildCard(entry!.message, entry!.result));
+    expect(card).toContain('登录链接');
+    expect(card).not.toContain('验证码');
+  });
+
+  it('does not push a reset link from spam when the model it would have asked is missing', async () => {
+    vi.restoreAllMocks();
+    process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    process.env.LLM_SKIP_SENSITIVE = 'false'; // asks the model, but no LLM_API_KEY: keyword fallback
+    const { w, sink, state } = watcher();
+    const s = stats();
+    await w.dispatch([makeMessage({
+      messageId: '<phish@x>', inSpam: true, folder: 'Junk', fromAddr: 'security@paypa1-support.xyz',
+      subject: 'Reset your password immediately', body: 'https://paypa1-support.xyz/login/session-7f3a9c2e1b4d8f6a0c5e',
+    })], s);
+    expect(s.pushed).toBe(0);
+    expect(sink.pushed).toHaveLength(0);
+    expect(state.getMail('<phish@x>')).toMatchObject({ importance: 'info', summary: '收到登录链接邮件（如果不是你刚刚请求的，请勿打开）。' });
+  });
+});

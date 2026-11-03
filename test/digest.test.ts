@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 import './setup.js';
 import { makeMessage, makeResult, RecordingSink } from './helpers.js';
 import {
-  DIGEST_MAX_CHARS, renderDigest, sendDigest, shouldSend, toDigestItem, type DigestItem,
+  DIGEST_MAX_CHARS, digestHour, nextDigestAt, renderDigest, sendDigest, shouldSend, toDigestItem, type DigestItem,
 } from '../src/services/digest.js';
 import { buildCard } from '../src/services/feishu.js';
+import { buildMailSignalEvent } from '../src/services/signal.js';
+import { buildWebhookPayload } from '../src/services/sink.js';
 import { StateStore } from '../src/services/state.js';
 
 function items(spam: number, inbox: number): DigestItem[] {
@@ -286,6 +288,142 @@ describe('send timing', () => {
     process.env.DIGEST_ENABLED = 'false';
     expect(shouldSend(new StateStore(':memory:'), new Date('2026-09-16T23:00:00'))).toBe(false);
   });
+
+  it('treats an hour that is not a whole hour from 0 to 23 as the default, everywhere', () => {
+    const state = new StateStore(':memory:');
+    for (const raw of ['24', '8.5', 'nine']) {
+      process.env.DIGEST_HOUR = raw;
+      expect(digestHour()).toEqual({ hour: 9, invalid: raw });
+      expect(shouldSend(state, new Date('2026-09-16T08:59:00'))).toBe(false);
+      expect(shouldSend(state, new Date('2026-09-16T09:00:00'))).toBe(true);
+      expect(nextDigestAt(state, new Date('2026-09-16T06:00:00'))?.getHours()).toBe(9);
+    }
+    process.env.DIGEST_HOUR = '0';
+    expect(digestHour()).toEqual({ hour: 0 });
+  });
+});
+
+/** Run fn with the process in another time zone; Node re-reads TZ when it is assigned. */
+async function inZone<T>(zone: string, fn: () => Promise<T> | T): Promise<T> {
+  const saved = process.env.TZ;
+  process.env.TZ = zone;
+  try {
+    return await fn();
+  } finally {
+    if (saved === undefined) delete process.env.TZ;
+    else process.env.TZ = saved;
+  }
+}
+
+/**
+ * Poll every five minutes from one instant to another, queueing one entry
+ * before each send so the delivered path does the bookkeeping. Returns the
+ * instants a digest went out.
+ */
+async function polls(state: StateStore, from: string, to: string, sink = new RecordingSink()): Promise<string[]> {
+  const sent: string[] = [];
+  for (let t = Date.parse(from); t <= Date.parse(to); t += 5 * 60_000) {
+    const at = new Date(t);
+    if (!shouldSend(state, at)) continue;
+    state.queueDigest(`entry-${t}`, items(0, 1)[0]!);
+    expect(await sendDigest(state, sink, at)).toBe(true);
+    sent.push(at.toISOString());
+  }
+  return sent;
+}
+
+describe('the digest calendar', () => {
+  it('goes out once a day at the hour when the hour falls before the UTC offset', async () => {
+    // At 07:00 in UTC+8 the UTC date is still yesterday's. Counting the day in
+    // UTC held the digest back to 08:00, and sent it twice on a first day.
+    await inZone('Asia/Shanghai', async () => {
+      process.env.DIGEST_HOUR = '7';
+      const state = new StateStore(':memory:');
+      const sink = new RecordingSink();
+      expect(await polls(state, '2026-11-02T16:00:00Z', '2026-11-05T15:55:00Z', sink)).toEqual([
+        '2026-11-02T23:00:00.000Z', '2026-11-03T23:00:00.000Z', '2026-11-04T23:00:00.000Z',
+      ]);
+      expect(state.getMeta('digest_last_sent_local_date')).toBe('2026-11-05 2026-11-04');
+      expect(new Set(sink.pushed.map(([message]) => message.messageId)).size).toBe(3);
+      expect(sink.pushed[1]![1].reason).toMatch(/^2026-11-04 daily digest/);
+      expect(nextDigestAt(state, new Date('2026-11-05T01:00:00Z'))?.toISOString()).toBe('2026-11-05T23:00:00.000Z');
+    });
+  });
+
+  it('goes out at the hour behind UTC too, where the old rule waited for the evening', async () => {
+    await inZone('America/New_York', async () => {
+      process.env.DIGEST_HOUR = '9';
+      const state = new StateStore(':memory:');
+      expect(await polls(state, '2026-11-02T05:00:00Z', '2026-11-05T04:55:00Z')).toEqual([
+        '2026-11-02T14:00:00.000Z', '2026-11-03T14:00:00.000Z', '2026-11-04T14:00:00.000Z',
+      ]);
+    });
+  });
+
+  it('after an upgrade behind UTC, sends when the old rule would have, then at the hour', async () => {
+    await inZone('America/New_York', async () => {
+      process.env.DIGEST_HOUR = '9';
+      const state = new StateStore(':memory:');
+      // 0.1.97 sent at 20:00 on 2 November, when the UTC date became the 3rd.
+      state.setMeta('digest_last_sent_date', '2026-11-03');
+      const upgraded = '2026-11-03T13:00:00Z'; // 08:00 local
+      // The page names the moment the next send will really happen.
+      expect(nextDigestAt(state, new Date('2026-11-03T15:00:00Z'))?.toISOString()).toBe('2026-11-04T00:00:00.000Z');
+      expect(await polls(state, upgraded, '2026-11-05T04:55:00Z')).toEqual([
+        '2026-11-04T00:00:00.000Z', // 19:00 on the 3rd: the UTC date changed, as before
+        '2026-11-04T14:00:00.000Z', // 09:00 on the 4th: the hour, from now on
+      ]);
+    });
+  });
+
+  it('after an upgrade ahead of UTC, sends when the old rule would have, then at the hour', async () => {
+    await inZone('Asia/Shanghai', async () => {
+      process.env.DIGEST_HOUR = '7';
+      const state = new StateStore(':memory:');
+      // 0.1.97 sent at 08:00 on 3 November, when the UTC date became the 3rd.
+      state.setMeta('digest_last_sent_date', '2026-11-03');
+      expect(nextDigestAt(state, new Date('2026-11-03T02:00:00Z'))?.toISOString()).toBe('2026-11-04T00:00:00.000Z');
+      const sink = new RecordingSink();
+      expect(await polls(state, '2026-11-03T02:00:00Z', '2026-11-05T15:55:00Z', sink)).toEqual([
+        '2026-11-04T00:00:00.000Z', // 08:00 on the 4th
+        '2026-11-04T23:00:00.000Z', // 07:00 on the 5th
+      ]);
+      // Two local days' digests that share a UTC date (the 4th) must not share an id.
+      const [first, second] = sink.pushed.map(([message]) => message.messageId);
+      expect(first).not.toBe(second);
+    });
+  });
+
+  it('after an upgrade, names the next send at the hour when the hour comes after UTC midnight', async () => {
+    await inZone('Asia/Shanghai', async () => {
+      process.env.DIGEST_HOUR = '9';
+      const state = new StateStore(':memory:');
+      state.setMeta('digest_last_sent_date', '2026-11-03'); // 09:00 on the 3rd
+      expect(nextDigestAt(state, new Date('2026-11-03T02:00:00Z'))?.toISOString()).toBe('2026-11-04T01:00:00.000Z');
+    });
+  });
+
+  it('names tomorrow at the hour even on a day the hour did not exist', async () => {
+    await inZone('Europe/London', async () => {
+      process.env.DIGEST_HOUR = '1';
+      const state = new StateStore(':memory:');
+      // Clocks go forward at 01:00 on 28 March 2027: the first poll at or after 1 is at 02:00.
+      expect(await polls(state, '2027-03-28T00:30:00Z', '2027-03-28T01:30:00Z')).toEqual(['2027-03-28T01:00:00.000Z']);
+      expect(nextDigestAt(state, new Date('2027-03-28T10:00:00Z'))?.toISOString()).toBe('2027-03-29T00:00:00.000Z');
+    });
+  });
+
+  it('does not trust the local record once an older release has sent since', async () => {
+    await inZone('Asia/Shanghai', async () => {
+      process.env.DIGEST_HOUR = '9';
+      const state = new StateStore(':memory:');
+      expect(await polls(state, '2026-11-01T00:30:00Z', '2026-11-01T01:30:00Z')).toEqual(['2026-11-01T01:00:00.000Z']);
+      // Rolled back: the old release sent at 09:00 on the 2nd, 3rd and 4th,
+      // writing only the UTC date.
+      state.setMeta('digest_last_sent_date', '2026-11-04');
+      expect(await polls(state, '2026-11-04T02:00:00Z', '2026-11-04T15:55:00Z')).toEqual([]);
+    });
+  });
 });
 
 describe('sending', () => {
@@ -298,6 +436,7 @@ describe('sending', () => {
     expect(await sendDigest(state, sink, at)).toBe(true);
     expect(state.digestPending()).toBe(0);
     expect(state.getMeta('digest_last_sent_date')).toBe(at.toISOString().slice(0, 10));
+    expect(state.getMeta('digest_last_sent_local_date')).toBe(`2026-09-16 ${at.toISOString().slice(0, 10)}`);
 
     const [message, result] = sink.pushed[0]!;
     expect(result.importance).toBe('info');
@@ -307,9 +446,43 @@ describe('sending', () => {
   it('records the date for an empty queue to avoid repeated checks', async () => {
     const state = new StateStore(':memory:');
     const sink = new RecordingSink();
-    expect(await sendDigest(state, sink, new Date('2026-09-16T09:00:00'))).toBe(false);
+    const at = new Date('2026-09-16T09:00:00');
+    expect(await sendDigest(state, sink, at)).toBe(false);
     expect(sink.pushed).toHaveLength(0);
-    expect(state.getMeta('digest_last_sent_date')).toBe('2026-09-16');
+    // The UTC date of a local 09:00 depends on the zone the suite runs in.
+    expect(state.getMeta('digest_last_sent_date')).toBe(at.toISOString().slice(0, 10));
+    expect(state.getMeta('digest_last_sent_local_date')).toBe(`2026-09-16 ${at.toISOString().slice(0, 10)}`);
+    expect(shouldSend(state, new Date('2026-09-16T23:00:00'))).toBe(false);
+  });
+
+  it('delivers a digest that lists a verification code as a digest', async () => {
+    // The code entry reads "收到验证码邮件". Sniffed like a mail, it turned the
+    // whole digest into a code card and borrowed a number from the next line.
+    const state = new StateStore(':memory:');
+    const code = toDigestItem(
+      makeMessage({ messageId: '<code@x>', subject: 'Your code', body: '验证码 482913' }),
+      makeResult({ importance: 'info', sensitiveVerification: true, verificationCode: '482913', summary: '收到验证码邮件。' }),
+    );
+    const order = toDigestItem(
+      makeMessage({ messageId: '<order@x>', subject: 'Order shipped' }),
+      makeResult({ importance: 'info', category: 'Delivery', summary: 'Order 20261103 shipped.' }),
+    );
+    state.queueDigest('code', code);
+    state.queueDigest('order', order);
+    const sink = new RecordingSink();
+    expect(await sendDigest(state, sink, new Date('2026-11-03T09:00:00'))).toBe(true);
+    const [message, result] = sink.pushed[0]!;
+
+    const card = JSON.stringify(buildCard(message, result));
+    expect(card).toContain('📮 Daily mail digest');
+    expect(card).toContain('Order 20261103 shipped.');
+    expect(card).not.toContain('验证码** 20261103');
+    expect(card).not.toContain('482913');
+
+    const payload = buildWebhookPayload(message, result) as { mail: { subject: string; snippet: string } };
+    expect(payload.mail.subject).toBe(message.subject);
+    expect(payload.mail.snippet).toContain('Order 20261103 shipped.');
+    expect(buildMailSignalEvent(message, result).title).toBe(message.subject);
   });
 
   it('retains the queue and does not record the date when delivery fails', async () => {
@@ -319,5 +492,15 @@ describe('sending', () => {
     expect(await sendDigest(state, new RecordingSink('failed'), at)).toBe(false);
     expect(state.digestPending()).toBe(1);
     expect(state.getMeta('digest_last_sent_date')).toBeUndefined();
+  });
+});
+
+describe('kept after sending', () => {
+  it('logs the sent entries before the queue is cleared', async () => {
+    const state = new StateStore(':memory:');
+    state.queueDigest('k1', { subject: 'queued', fromName: 'F', from: 'f@x', importance: 'info', category: 'Other' });
+    expect(await sendDigest(state, new RecordingSink(), new Date('2026-11-03T09:00:00'))).toBe(true);
+    expect(state.digestPending()).toBe(0);
+    expect(state.lastDigestLog()?.items).toEqual([expect.objectContaining({ key: 'k1', subject: 'queued' })]);
   });
 });

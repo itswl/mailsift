@@ -21,7 +21,7 @@ const nodeRequire = createRequire(import.meta.url);
 const { DatabaseSync } = nodeRequire('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSync = import('node:sqlite').DatabaseSync;
 import { getLogger } from '../logger.js';
-import { attachmentSafetyWarnings } from '../imap/message.js';
+import { attachmentSafetyWarnings, VERIFICATION_SUMMARY_PREFIX } from '../imap/message.js';
 import type { AttachmentInfo, AttachmentManifest, MailMessage } from '../imap/message.js';
 import type { TriageResult } from './triage.js';
 
@@ -67,6 +67,9 @@ CREATE TABLE IF NOT EXISTS mail_actions (
   success INTEGER NOT NULL, error TEXT, client TEXT, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS digest_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, sent_at TEXT NOT NULL, items TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_seen_created ON seen (created_at);
 CREATE INDEX IF NOT EXISTS idx_seen_importance ON seen (importance);
 CREATE INDEX IF NOT EXISTS idx_mail_actions_created ON mail_actions (created_at);
@@ -281,6 +284,8 @@ function toRow(raw: Record<string, unknown>): MailRow {
   };
 }
 
+const LOCAL_LABEL_MIGRATION_KEY = 'migrated_local_labels';
+
 export class StateStore {
   private readonly db: DatabaseSync;
 
@@ -334,6 +339,15 @@ export class StateStore {
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_outbox_retry ON notification_outbox (delivered_at, next_attempt_at, created_at)');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_seen_thread ON seen (thread_key, created_at)');
+    // Before 0.1.98, code mail mailsift handled itself was labelled
+    // 'fallback', which reads as a failed model and made it a candidate for
+    // re-triage after an LLM outage, where its stored code was lost. It was
+    // judged locally; say so, once.
+    if (this.getMeta(LOCAL_LABEL_MIGRATION_KEY) === undefined) {
+      this.db.prepare(`UPDATE seen SET decided_by = 'local' WHERE decided_by = 'fallback' AND summary LIKE ?`)
+        .run(`${VERIFICATION_SUMMARY_PREFIX}%`);
+      this.setMeta(LOCAL_LABEL_MIGRATION_KEY, new Date().toISOString());
+    }
   }
 
   close(): void {
@@ -486,7 +500,8 @@ export class StateStore {
     ).run(cutoff).changes);
     const mcpAudit = Number(this.db.prepare('DELETE FROM mcp_audit WHERE created_at < ?').run(cutoff).changes);
     const mailActions = Number(this.db.prepare('DELETE FROM mail_actions WHERE created_at < ?').run(cutoff).changes);
-    return seen + dead + outbox + mcpAudit + mailActions;
+    const digests = Number(this.db.prepare('DELETE FROM digest_log WHERE sent_at < ?').run(cutoff).changes);
+    return seen + dead + outbox + mcpAudit + mailActions + digests;
   }
 
   recordDeadLetter(input: {
@@ -673,11 +688,13 @@ export class StateStore {
 
   feedbackRuleHints(minSamples = 2): { alwaysImportant: string[]; neverImportant: string[] } {
     const rows = this.db.prepare(
-      `SELECT s.sender, f.label, COUNT(*) AS n
+      // Counted in messages, not labels: one message marked twice is one
+      // vote, or a single misjudged mail could mute its sender for good.
+      `SELECT s.sender, f.label, COUNT(DISTINCT f.dedup_key) AS n
        FROM feedback f JOIN seen s ON s.dedup_key = f.dedup_key
        WHERE s.sender IS NOT NULL AND s.sender != ''
          AND f.label IN ('missed', 'false_positive')
-       GROUP BY s.sender, f.label HAVING COUNT(*) >= ?`,
+       GROUP BY s.sender, f.label HAVING COUNT(DISTINCT f.dedup_key) >= ?`,
     ).all(Math.max(1, minSamples)) as Array<Record<string, unknown>>;
     const alwaysImportant: string[] = [];
     const neverImportant: string[] = [];
@@ -780,7 +797,13 @@ export class StateStore {
     }
     if (options.spamOnly) clauses.push('in_spam = 1');
     if (options.pushedOnly) clauses.push('pushed = 1');
-    if (options.codesOnly) clauses.push("verification_code IS NOT NULL AND verification_code != ''");
+    // A verification message without a stored code still belongs here: one
+    // filed before codes were kept, or one whose code could not be extracted,
+    // which is the one most worth opening.
+    if (options.codesOnly) {
+      clauses.push("((verification_code IS NOT NULL AND verification_code != '') OR summary LIKE ?)");
+      params.push(`${VERIFICATION_SUMMARY_PREFIX}%`);
+    }
     if (options.account) {
       clauses.push('(account = ? OR account_label = ?)');
       params.push(options.account, options.account);
@@ -958,6 +981,26 @@ export class StateStore {
     ).run(dedupKey, JSON.stringify(payload), now());
   }
 
+  /** Keep what a sent digest listed, so the page can still show it once the queue is cleared. */
+  recordDigestLog(sentAt: string, entries: Array<{ dedupKey: string; payload: unknown }>): void {
+    const items = entries.map((entry) => ({ ...(entry.payload as Record<string, unknown>), key: entry.dedupKey }));
+    this.db.prepare('INSERT INTO digest_log (sent_at, items) VALUES (?, ?)').run(sentAt, JSON.stringify(items));
+  }
+
+  /** The most recent sent digest, or undefined when none is kept. */
+  lastDigestLog(): { sentAt: string; items: Array<Record<string, unknown>> } | undefined {
+    const row = this.db.prepare('SELECT sent_at, items FROM digest_log ORDER BY id DESC LIMIT 1').get() as
+      | Record<string, unknown>
+      | undefined;
+    if (!row) return undefined;
+    try {
+      const items = JSON.parse(String(row['items'])) as unknown;
+      return Array.isArray(items) ? { sentAt: String(row['sent_at']), items: items as Array<Record<string, unknown>> } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   digestPending(): number {
     const row = this.db.prepare('SELECT COUNT(*) AS n FROM digest_queue').get() as Record<string, unknown>;
     return Number(row['n'] ?? 0);
@@ -1019,5 +1062,16 @@ export class StateStore {
     this.db
       .prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
       .run(key, value);
+  }
+
+  /** Several keys in one statement, so they are written together or not at all. */
+  setMetas(entries: Array<[string, string]>): void {
+    if (entries.length === 0) return;
+    this.db
+      .prepare(
+        `INSERT INTO meta (key, value) VALUES ${entries.map(() => '(?, ?)').join(', ')}
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(...entries.flat());
   }
 }

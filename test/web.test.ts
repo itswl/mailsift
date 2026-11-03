@@ -250,6 +250,21 @@ describe('read-only data', () => {
     expect(await body('/api/summary', store)).toMatchObject({ lastPollAt: '2026-11-02T08:00:00.000Z', pollIntervalSeconds: 900 });
   });
 
+  it('carries each mailbox\'s own state, since the heartbeat vouches for none of them', async () => {
+    process.env.MAIL_ACCOUNT_1 = 'gmail|me@gmail.com|pw';
+    process.env.MAIL_ACCOUNT_1_NAME = 'work';
+    const store = seeded();
+    store.setMeta('account_fail_count:me@gmail.com', '4');
+    store.setMeta('account_last_error:me@gmail.com', 'Error: invalid_grant');
+    store.setMeta('account_last_success:me@gmail.com', '2026-11-01T01:14:00.000Z');
+    const summary = await body('/api/summary', store);
+    expect(summary['mailboxes']).toEqual([expect.objectContaining({
+      name: 'work', address: 'me@gmail.com', failing: true, consecutiveFailures: 4, fix: 'google',
+      lastSuccessAt: '2026-11-01T01:14:00.000Z',
+    })]);
+    expect(summary).toMatchObject({ outboxPending: 0 });
+  });
+
   it('previews the digest queue', async () => {
     const store = seeded();
     store.queueDigest('k2', { subject: 'queued', importance: 'info', category: 'Marketing', threadCount: 1, date: '', summary: 'x', accountLabel: 'a', folder: 'INBOX', inSpam: false, from: 'f@x', fromName: 'F', deadline: '', actionRequired: false });
@@ -258,8 +273,12 @@ describe('read-only data', () => {
     // The send time is an instant, so a browser in another timezone shows it in its own clock.
     expect(new Date(String(digest['nextAt'])).getHours()).toBe(9);
     // Structured items travel with the rendered text, so the page can lay the
-    // queue out as a list rather than showing markdown source.
-    expect(digest['items']).toEqual([expect.objectContaining({ subject: 'queued', category: 'Marketing' })]);
+    // queue out as a list rather than showing markdown source; each carries
+    // its key so a line opens that message.
+    expect(digest['items']).toEqual([expect.objectContaining({ subject: 'queued', category: 'Marketing', key: 'k2' })]);
+    expect(digest['last']).toBeUndefined();
+    store.recordDigestLog(new Date().toISOString(), [{ dedupKey: 'k1', payload: { subject: 'sent', fromName: 'S' } }]);
+    expect(await body('/api/digest', store)).toMatchObject({ last: { count: 1, items: [expect.objectContaining({ key: 'k1' })] } });
     process.env.DIGEST_ENABLED = 'false';
     expect(await body('/api/digest', store)).toMatchObject({ enabled: false, nextAt: null });
   });
@@ -292,6 +311,15 @@ describe('read-only data', () => {
     // The "only verification codes" switch sees only that row, in either view.
     expect(await body('/api/mail?codesOnly=true', store)).toMatchObject({ count: 1 });
     expect(await body('/api/threads?codesOnly=true', store)).toMatchObject({ count: 1 });
+    // It also keeps verification mail whose code was never stored: filed before
+    // codes were kept, or with a code that could not be extracted.
+    store.markSeen('k5', 'me@qq.com', 'old code');
+    store.recordOutcome('k5', 'warning', true, { messageId: '<old@x>', category: 'Security', summary: '收到验证码邮件。' });
+    store.markSeen('k6', 'me@qq.com', 'unreadable code');
+    store.recordOutcome('k6', 'warning', true, {
+      messageId: '<unreadable@x>', category: 'Security', summary: '收到验证码邮件，但未能自动提取验证码。',
+    });
+    expect(await body('/api/mail?codesOnly=true', store)).toMatchObject({ count: 3 });
   });
 
   it('has no route that changes anything', async () => {
@@ -366,6 +394,8 @@ describe('installable app', () => {
     // A message opens in a sheet, the sentence sits over the list, and the
     // list itself is silent: one live region speaks for it.
     expect(page).toContain('<dialog id="sheet"');
+    expect(page).toContain('<dialog id="health-sheet"');
+    expect(page).toContain('id="health"');
     expect(page).toContain('id="lede"');
     expect(page).toContain('id="announce"');
     expect(page).toContain('<section id="list"></section>');

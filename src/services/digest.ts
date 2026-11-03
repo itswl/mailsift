@@ -4,8 +4,8 @@
  * The digest is the main review surface on a phone, so each line shows a summary
  * instead of a subject. Subjects often omit the useful context.
  */
-import { isSensitiveVerificationMessage, type MailMessage } from '../imap/message.js';
-import { headline, type TriageResult } from './triage.js';
+import { SENSITIVE_WORDS, sensitiveKindOf, type MailMessage } from '../imap/message.js';
+import { headline, sensitiveWords, type TriageResult } from './triage.js';
 import type { Sink } from './sink.js';
 import type { StateStore } from './state.js';
 import { getLogger } from '../logger.js';
@@ -13,6 +13,83 @@ import { getLogger } from '../logger.js';
 const log = getLogger('digest');
 
 export const DIGEST_SENT_KEY = 'digest_last_sent_date';
+/**
+ * The local calendar date of the last send, then the UTC date written with it:
+ * "2026-11-04 2026-11-03".
+ *
+ * The hour that lets a digest go out is local (DIGEST_HOUR against the
+ * server's clock), so "already sent today" must be counted on the same
+ * calendar. DIGEST_SENT_KEY holds the UTC date and is still written for
+ * anything that reads it. Comparing a local hour with that UTC date held the
+ * digest back until the UTC date changed whenever the hour fell before the
+ * local time of UTC midnight (before 08:00 in UTC+8, before 19:00 or 20:00 in
+ * New York), and sent it twice on a first day or after a day without polls.
+ */
+export const DIGEST_SENT_LOCAL_KEY = 'digest_last_sent_local_date';
+
+/** YYYY-MM-DD on the server's own calendar. */
+function localDay(at: Date): string {
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
+}
+
+/**
+ * The local date of the last send, when the local record can be trusted: it
+ * was written together with the UTC date that is still on record. A release
+ * from before the local record wrote only the UTC date, so after a rollback
+ * and an upgrade again the UTC date has moved on and the local one is stale.
+ */
+function localRecord(state: StateStore): string | undefined {
+  const [local, utc] = (state.getMeta(DIGEST_SENT_LOCAL_KEY) ?? '').split(' ');
+  return local && utc === state.getMeta(DIGEST_SENT_KEY) ? local : undefined;
+}
+
+/**
+ * Whether today's digest has gone out.
+ *
+ * Without a trusted local record (a database from before 0.1.98, or one an
+ * older release has sent from since) the UTC date is read with its old meaning
+ * until the next send writes both. The first digest after an upgrade therefore
+ * goes out when the old rule would have sent it, which in the setups that rule
+ * got wrong can be later than DIGEST_HOUR, or a second time that day when the
+ * upgrade lands between the old rule's two sends. From then on it goes out
+ * once a day at the hour.
+ */
+function sentToday(state: StateStore, at: Date): boolean {
+  const local = localRecord(state);
+  if (local === undefined) return state.getMeta(DIGEST_SENT_KEY) === at.toISOString().slice(0, 10);
+  return local === localDay(at);
+}
+
+/**
+ * Record a send (or a skipped empty queue) on both calendars, in one
+ * statement: a record half written would let the old rule decide again.
+ */
+export function markDigestSent(state: StateStore, at: Date): void {
+  const utc = at.toISOString().slice(0, 10);
+  state.setMetas([[DIGEST_SENT_KEY, utc], [DIGEST_SENT_LOCAL_KEY, `${localDay(at)} ${utc}`]]);
+}
+
+const DEFAULT_DIGEST_HOUR = 9;
+/**
+ * DIGEST_HOUR as the whole hour it is used as everywhere: an integer from 0
+ * to 23. Anything else is ignored in favour of the documented default, 9, and
+ * reported by --check, so the page never promises an hour the scheduler does
+ * not use.
+ */
+export function digestHour(): { hour: number; invalid?: string } {
+  const raw = process.env.DIGEST_HOUR?.trim();
+  if (!raw) return { hour: DEFAULT_DIGEST_HOUR };
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 && value <= 23
+    ? { hour: value }
+    : { hour: DEFAULT_DIGEST_HOUR, invalid: raw };
+}
+
+function digestEnabled(): boolean {
+  return (process.env.DIGEST_ENABLED ?? 'true').toLowerCase() !== 'false';
+}
+
 const MAX_SPAM_LINES = 15;
 /**
  * Backstop on how many entries are worth reading at once. The character budget
@@ -60,19 +137,21 @@ export interface DigestItem {
 }
 
 export function toDigestItem(message: MailMessage, result: TriageResult): DigestItem {
-  const sensitiveVerification = Boolean(result.sensitiveVerification || isSensitiveVerificationMessage(message));
+  const kind = result.sensitiveKind ?? sensitiveKindOf(message.subject, message.body);
+  const sensitiveVerification = Boolean(result.sensitiveVerification || kind);
+  const words = sensitiveWords(message, result);
   return {
     accountLabel: message.accountLabel,
     folder: message.folder,
     inSpam: message.inSpam,
-    subject: sensitiveVerification ? '验证码邮件' : message.subject || '(no subject)',
+    subject: sensitiveVerification ? words.subject : message.subject || '(no subject)',
     from: message.fromAddr,
     fromName: message.fromName,
     importance: result.importance,
     category: sensitiveVerification ? 'Security' : result.category,
-    summary: sensitiveVerification ? '收到验证码邮件。' : headline(result),
+    summary: sensitiveVerification ? words.summary : headline(result),
     deadline: sensitiveVerification ? '' : result.deadline,
-    actionRequired: sensitiveVerification ? true : result.actionRequired,
+    actionRequired: sensitiveVerification ? !result.sensitiveUnasked : result.actionRequired,
     ...(message.threadKey ? { threadKey: message.threadKey } : {}),
     threadCount: 1,
     date: message.date,
@@ -306,38 +385,48 @@ function markdownText(value: string): string {
 }
 
 export function shouldSend(state: StateStore, at: Date = new Date()): boolean {
-  if ((process.env.DIGEST_ENABLED ?? 'true').toLowerCase() === 'false') return false;
-  if (at.getHours() < Number(process.env.DIGEST_HOUR ?? 9)) return false;
-  return state.getMeta(DIGEST_SENT_KEY) !== at.toISOString().slice(0, 10);
+  if (!digestEnabled()) return false;
+  if (at.getHours() < digestHour().hour) return false;
+  return !sentToday(state, at);
 }
 
 /**
  * When the next digest is due, by the rule shouldSend applies: the first poll at
  * or after DIGEST_HOUR, on a day it has not gone out yet. Null when it is off.
- *
- * An hour that does not parse never holds a poll back in shouldSend, so it is
- * treated as midnight here. A digest already due but not yet sent reports
- * today's hour, which is when it became due.
+ * A digest already due but not yet sent reports today's hour, which is when it
+ * became due.
  */
 export function nextDigestAt(state: StateStore, now: Date = new Date()): Date | null {
-  if ((process.env.DIGEST_ENABLED ?? 'true').toLowerCase() === 'false') return null;
-  const raw = Number(process.env.DIGEST_HOUR ?? 9);
-  const hour = Number.isFinite(raw) ? Math.min(23, Math.max(0, Math.floor(raw))) : 0;
+  if (!digestEnabled()) return null;
+  const { hour } = digestHour();
   const at = new Date(now);
   at.setHours(hour, 0, 0, 0);
-  if (state.getMeta(DIGEST_SENT_KEY) === now.toISOString().slice(0, 10)) at.setDate(at.getDate() + 1);
-  return at;
+  if (!sentToday(state, now)) return at;
+  if (localRecord(state) !== undefined) {
+    // The day first, then the hour: set on a spring-forward day, an hour that
+    // does not exist would carry over to tomorrow as the next hour.
+    at.setDate(at.getDate() + 1);
+    at.setHours(hour, 0, 0, 0);
+    return at;
+  }
+  // Read the old way, today's send stands until the UTC date changes; the next
+  // one is the first moment after that at or past the hour.
+  const utcMidnight = new Date(now);
+  utcMidnight.setUTCHours(24, 0, 0, 0);
+  const thatDay = new Date(utcMidnight);
+  thatDay.setHours(hour, 0, 0, 0);
+  return thatDay > utcMidnight ? thatDay : utcMidnight;
 }
 
 /** Send the digest and record the date, including when the queue is empty. */
 export async function sendDigest(state: StateStore, sink: Sink, at: Date = new Date()): Promise<boolean> {
-  const today = at.toISOString().slice(0, 10);
+  const today = localDay(at);
   const entries = state.peekDigestEntries();
   const items = entries.map((entry) => entry.payload) as DigestItem[];
 
   if (items.length === 0) {
     log.info('Digest queue is empty; skipping.');
-    state.setMeta(DIGEST_SENT_KEY, today);
+    markDigestSent(state, at);
     return false;
   }
 
@@ -349,7 +438,9 @@ export async function sendDigest(state: StateStore, sink: Sink, at: Date = new D
     folder: 'digest',
     inSpam: false,
     uid: 0,
-    messageId: `<digest-${today}@mailsift>`,
+    // One id per send: two local days' digests can share a UTC date, and a
+    // receiver that de-duplicates on the id must not drop the second.
+    messageId: `<digest-${at.toISOString().replace(/[-:]|\.\d+/g, '')}@mailsift>`,
     subject: `Daily mail digest · ${items.length} messages (spam ${spamCount})`,
     fromAddr: 'digest@mailsift',
     fromName: 'mailsift',
@@ -373,8 +464,10 @@ export async function sendDigest(state: StateStore, sink: Sink, at: Date = new D
 
   const sent = (await sink.push(message, result)) === 'delivered';
   if (sent) {
+    // Kept so the page can still list what went out once the queue is empty.
+    state.recordDigestLog(at.toISOString(), entries);
     state.clearDigest(entries.map((entry) => entry.dedupKey));
-    state.setMeta(DIGEST_SENT_KEY, today);
+    markDigestSent(state, at);
   }
   log.info(`Digest sent: ${items.length} messages (success=${sent})`);
   return sent;

@@ -7,6 +7,8 @@ import {
   htmlToText,
   isSensitiveVerificationMessage,
 } from '../src/imap/message.js';
+import { containsSignInLink, sensitiveKindOf, snippet as messageSnippet } from '../src/imap/message.js';
+import { makeMessage } from './helpers.js';
 
 /** Build a structurally complete RFC822 message. */
 function raw(headers: string, body: string): Buffer {
@@ -174,5 +176,103 @@ describe('sensitive verification detection', () => {
   it('ignores a keyword embedded in a token or URL', () => {
     expect(containsSensitiveVerificationContent('Weekly picks', 'https://e.example.com/c?token=9otp8x')).toBe(false);
     expect(containsSensitiveVerificationContent('Weekly picks', 'iVBORw0KGgoAAAANSUhE/otp/AAAA')).toBe(false);
+  });
+});
+
+describe('sign-in and reset links', () => {
+  const token = 'https://medium.com/m/callback/email?token=0123456789abcdefABCDEF_-xyz&operation=login';
+  it('recognises a link mail by its subject and a token-bearing link', () => {
+    expect(containsSignInLink('Sign in to Medium', `Click to sign in: ${token}`)).toBe(true);
+    expect(containsSignInLink('[GitHub] Please reset your password', 'https://github.com/password_reset/AbCdEf0123456789AbCdEf0123')).toBe(true);
+    expect(containsSignInLink('重置密码', '点击 https://example.cn/reset?t=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 完成')).toBe(true);
+  });
+
+  it('leaves alerts and newsletters that merely mention signing in alone', () => {
+    expect(containsSignInLink('Your Apple ID was used to sign in to iCloud', `If this was not you: ${token}`)).toBe(false);
+    expect(containsSignInLink('New sign-in to your account', `Review: ${token}`)).toBe(false);
+    expect(containsSignInLink('Weekly newsletter', `Sign in to read more: ${token}`)).toBe(false);
+    expect(containsSignInLink('Sign in to Medium', 'Read https://medium.com/about')).toBe(false);
+  });
+
+  it('recognises the common reset and sign-in formats', () => {
+    const cases: Array<[string, string]> = [
+      ['Reset password instructions', 'https://gitlab.example.com/users/password/edit?reset_password_token=sPd3Kq9xYzAbCdEf1234'],
+      ['Reset your Dropbox password', 'https://www.dropbox.com/forgot_finish?t=AAB3xYz9876543210QwErTy'],
+      ['Forgot your password?', 'https://app.example.com/password/reset/3f9a2c7e1b5d4a8c9e0f1a2b'],
+      ['Login to Acme', 'https://acme.io/login?token=Zx9Yw8Vu7Ts6Rq5Po4Nm'],
+      ['Sign into Acme', 'https://acme.io/magic?code=Zx9Yw8Vu7Ts6Rq5Po4Nm'],
+      ['Fwd: [Medium] Sign in to Medium', token],
+      ['【网易】密码找回', 'https://reg.163.com/reset?ticket=8a7b6c5d4e3f2a1b0c9d8e7f'],
+      ['重置您的密码', 'https://example.cn/password/reset/9f8e7d6c5b4a3210fedcba98'],
+      ['密碼重設通知', 'https://example.tw/reset?token=9f8e7d6c5b4a3210fedcba98'],
+      ['Reset your password', 'https://example.com/reset/MQ/bk3n2c-6d1e1d5f8c9a0b3c2d1e/'],
+    ];
+    for (const [subject, body] of cases) expect(containsSignInLink(subject, body), subject).toBe(true);
+  });
+
+  it('leaves replies, notifications, confirmations and slugs alone', () => {
+    const cases: Array<[string, string]> = [
+      ['Re: [acme/web] Fix password reset email template (PR #812)', 'https://github.com/notifications/unsubscribe-auth/AAB3XYZ0123456789ABCDEFGHIJKLMN'],
+      ['[acme/web] Fix password reset email template (PR #812)', 'https://github.com/acme/web/pull/812#pullrequestreview-1234567890123'],
+      ['Re: Password reset flow — need your sign-off by Friday', 'https://docs.google.com/document/d/1aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdefgh/edit'],
+      ['Password reset successful', 'https://u123.ct.sendgrid.net/ls/click?upn=aBcD1234EfGh5678IjKl9012MnOp'],
+      ['Your password reset was successful', 'https://support.example.com/account-security-recovery-help'],
+      ['Sign in to view your October statement', 'https://bank.example.com/statements?qs=0123456789abcdef0123456789abcdef01234567'],
+      ['Log in to see your 5 new notifications', 'https://social.example.com/notifications?ref=email_digest_notifications_weekly'],
+      ['Log in to claim your 20% welcome discount', 'https://shop.us1.list-manage.com/track/click?u=abc123def456abc123def456&id=0123456789'],
+      ['您已成功重置密码', 'https://help.example.cn/articles/account-security-center-guide'],
+      ['Product update: password reset is now easier', 'https://example.com/password-reset-improvements-announcement'],
+      ['Reset your password', 'Unsubscribe: https://news.example.com/unsubscribe?token=0123456789abcdefABCDEF'],
+    ];
+    for (const [subject, body] of cases) expect(containsSignInLink(subject, body), subject).toBe(false);
+  });
+
+  it('finds the token in base64url, behind link wrappers and inside app fragments', () => {
+    const cases: Array<[string, string]> = [
+      ['Reset password instructions', 'https://gitlab.example.com/users/password/edit?reset_password_token=J8CWo_-2oUsZhRNgQyAL'],
+      ['Reset your password', 'https://nam12.safelinks.protection.outlook.com/?url=https%3A%2F%2Fapp.example.com%2Freset-password%3Ftoken%3DZx9Yw8Vu7Ts6Rq5Po4Nm&data=05%7C01'],
+      ['Reset your password', 'https://abc.r.us-east-1.awstrack.me/L0/https:%2F%2Fexample.com%2Freset%3Ftoken=Zx9Yw8Vu7Ts6Rq5Po4Nm/1/0100018b-abc/xyz='],
+      ['重置您的密码', 'https://admin.example.cn/#/reset-password?token=9f8e7d6c5b4a3210fedcba9876543210'],
+      ['Reset your password', 'https://app.netlify.com/#recovery_token=Zx9Yw8Vu7Ts6Rq5Po4Nm'],
+      ['Reset your password', 'https://app.example.com/password_resets/J8CWo_-2oUsZhRNgQyAL/edit'],
+    ];
+    for (const [subject, body] of cases) expect(containsSignInLink(subject, body), body).toBe(true);
+  });
+
+  it('accepts hex tokens and looks past short ids to the token', () => {
+    const cases: Array<[string, string]> = [
+      ['Reset your password', 'https://app.example.com/reset?token=2fd4e1c67a2d28fced849ee1bb76e7391b93eb12'],
+      ['Reset your password', 'https://app.example.com/password/reset/2fd4e1c67a2d28fced849ee1bb76e7391b93eb12'],
+      ['Reset your password at Example', 'https://example.com/user/reset/42/1793683768/Hk3dR9sQ2mZpXy7Lw0vT5nB8aEcFgJ1u/login'],
+    ];
+    for (const [subject, body] of cases) expect(containsSignInLink(subject, body), body).toBe(true);
+  });
+
+  it('leaves wiki pages, docs slugs and plain anchors alone', () => {
+    const cases: Array<[string, string]> = [
+      ['Password reset flow is documented now', 'https://github.com/acme/auth/wiki/Password-Reset-Flow'],
+      ['Password reset help', 'https://help.acme.com/login/how-to-set-up-2fa-on-your-account'],
+      ['Password reset for API clients', 'https://docs.acme.dev/auth/oauth2-client-credentials'],
+      ['Reset your password: read this first', 'https://en.wikipedia.org/wiki/Password#Password_cracking'],
+      ['Login link problems', 'https://wiki.example.com/wiki/Login#Troubleshooting_Login_Errors'],
+      ['Password reset fix is merged', 'https://bitbucket.org/acme/auth/src/9f2c4e1a7b3d5f6081a2b3c4d5e6f7a8b9c0d1e2/README.md'],
+    ];
+    for (const [subject, body] of cases) expect(containsSignInLink(subject, body), body).toBe(false);
+  });
+
+  it('does not take a commit hash or a storage signature for a sign-in token', () => {
+    const cases: Array<[string, string]> = [
+      ['Password reset fix is merged', 'https://github.com/acme/auth/commit/9f2c4e1a7b3d5f6081a2b3c4d5e6f7a8b9c0d1e2'],
+      ['Password reset fix is merged', 'https://gitlab.com/acme/login/-/blob/9f2c4e1a7b3d5f6081a2b3c4d5e6f7a8b9c0d1e2/README.md'],
+      ['Password reset policy update (Q4)', 'https://acme.blob.core.windows.net/docs/policy.pdf?sv=2022-11-02&sig=Zx9Yw8Vu7Ts6Rq5Po4NmAbCdEf%3D'],
+      ['Reset your password', 'https://blog.example.com/2026-year-in-review-and-what-comes-next'],
+    ];
+    for (const [subject, body] of cases) expect(containsSignInLink(subject, body), body).toBe(false);
+  });
+
+  it('prefers the code when a message carries both, and hides a link mail like a code mail', () => {
+    expect(sensitiveKindOf('Your verification code is 123456', `or use ${token}`)).toBe('code');
+    expect(sensitiveKindOf('Sign in to Medium', token)).toBe('link');
+    expect(messageSnippet(makeMessage({ subject: 'Sign in to Medium', body: `Click: ${token}` }))).toBe('登录链接邮件（正文已隐藏）');
   });
 });

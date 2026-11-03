@@ -10,7 +10,9 @@
  * Run with: npx tsx scripts/web-preview.ts [--port 8499] [--token secret]
  *
  * The refresh button is wired to a pretend poll that files one more message,
- * a verification code, so that path can be exercised without IMAP.
+ * a verification code, so that path can be exercised without IMAP. A digest
+ * sent this morning is on record, and --failing leaves one mailbox failing to
+ * sign in, so the status line and its mailbox sheet have something to say.
  */
 import { mkdtempSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -20,7 +22,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 import type { AttachmentManifest } from '../src/imap/message.js';
-import type { DigestItem } from '../src/services/digest.js';
+import { markDigestSent, type DigestItem } from '../src/services/digest.js';
 import { StateStore, type MailRecord } from '../src/services/state.js';
 import { HEARTBEAT_KEY, type PollStats } from '../src/services/watcher.js';
 import { routeWeb } from '../src/web.js';
@@ -42,6 +44,7 @@ const { values } = parseArgs({
   options: {
     port: { type: 'string', default: '8499' },
     token: { type: 'string', default: '' },
+    failing: { type: 'boolean', default: false },
   },
 });
 const port = Number(values.port);
@@ -204,6 +207,30 @@ function seed(): void {
     });
   });
   DIGEST.forEach((item, index) => store.queueDigest(`preview-digest-${index}`, item));
+  // This morning's digest, already sent, listing three of the fixtures.
+  const sentAt = new Date();
+  if (sentAt.getHours() < 9) sentAt.setDate(sentAt.getDate() - 1);
+  sentAt.setHours(9, 0, 0, 0);
+  store.recordDigestLog(sentAt.toISOString(), [12, 14, 17].map((n) => {
+    const fixture = FIXTURES[n - 1]!;
+    return {
+      dedupKey: `preview-${String(n).padStart(2, '0')}`,
+      payload: {
+        accountLabel: fixture.accountLabel, folder: fixture.fields.folder ?? 'INBOX', inSpam: Boolean(fixture.fields.inSpam),
+        subject: fixture.subject, from: fixture.fields.sender ?? '', fromName: fixture.fields.senderName ?? '',
+        importance: fixture.importance, category: fixture.fields.category ?? 'Other', summary: fixture.fields.summary ?? '',
+        deadline: fixture.fields.deadline ?? '', actionRequired: false, threadCount: 1, date: sentAt.toISOString(),
+      },
+    };
+  }));
+  // ...and marked sent, as sendDigest would, so "Next digest" points past it.
+  markDigestSent(store, sentAt);
+  if (values.failing) {
+    store.setMeta('account_fail_count:me@gmail.com', '3');
+    store.setMeta('account_last_error:me@gmail.com', 'Error: Authentication failed');
+    store.setMeta('account_last_failure:me@gmail.com', new Date().toISOString());
+    store.setMeta('account_last_success:me@gmail.com', new Date(Date.now() - 26 * 3_600_000).toISOString());
+  }
   // A poll finished a few minutes ago, so the status line has something to say.
   store.setMeta(HEARTBEAT_KEY, new Date(Date.now() - 3 * 60_000).toISOString());
   store.close();

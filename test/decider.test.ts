@@ -285,3 +285,77 @@ describe('two-stage triage', () => {
     expect(String(spy.mock.calls[0]![0])).not.toContain('/ai/run/');
   });
 });
+
+describe('decision service outages reach the alert', () => {
+  it('reports a failed decision stage to the caller, and a working one as null', async () => {
+    enableDecider();
+    process.env.LLM_API_KEY = 'k';
+    let decider = 'down';
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      if (String(input).includes('/ai/run/')) {
+        return decider === 'down'
+          ? new Response('unauthorized', { status: 401 })
+          : clefResponse({ importance: { choice: 'info' }, category: { choice: 'Marketing' }, action_required: { noul: 0.1 } });
+      }
+      return llmResponse([{ index: 0, importance: 'info', category: 'Other', summary: 's', reason: 'r', deadline: '', action_required: false }]);
+    }));
+    const outcomes: unknown[] = [];
+    await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES, undefined, undefined, (error) => outcomes.push(error));
+    expect(outcomes).toHaveLength(1);
+    expect(String(outcomes[0])).toContain('401');
+    decider = 'up';
+    await triage([makeMessage({ fromAddr: 'u@x.com' })], RULES, undefined, undefined, (error) => outcomes.push(error));
+    expect(outcomes[1]).toBeNull();
+  });
+
+  it('alerts once from the watcher, however many batches failed in one poll', async () => {
+    enableDecider();
+    process.env.LLM_API_KEY = 'k';
+    process.env.LLM_BATCH_SIZE = '1';
+    process.env.LLM_ALERT_AFTER_FAILURES = '1';
+    let calls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      if (String(input).includes('/ai/run/')) {
+        calls += 1;
+        // Fails two batches in three: alert and recovery used to alternate.
+        return calls % 3 === 0
+          ? clefResponse({ importance: { choice: 'info' }, category: { choice: 'Marketing' }, action_required: { noul: 0.1 } })
+          : new Response('rate limited', { status: 429 });
+      }
+      return llmResponse([{ index: 0, importance: 'info', category: 'Other', summary: 's', reason: 'r', deadline: '', action_required: false }]);
+    }));
+    const { StateStore } = await import('../src/services/state.js');
+    const { Watcher } = await import('../src/services/watcher.js');
+    const { RecordingSink } = await import('./helpers.js');
+    const sink = new RecordingSink();
+    const state = new StateStore(':memory:');
+    const watcher = new Watcher({ accounts: [], rules: RULES }, state, sink);
+    const stats = { accountsOk: 0, accountsFailed: 0, fetched: 0, fresh: 0, pushed: 0, queued: 0, spamRescued: 0, failures: [] as string[] };
+    const mail = Array.from({ length: 6 }, (_, n) => makeMessage({ messageId: `<m${n}@x>`, fromAddr: `u${n}@x.com` }));
+    await watcher.dispatch(mail, stats);
+    const health = sink.pushed.filter(([message]) => message.folder === 'health');
+    expect(health).toHaveLength(1);
+    expect(health[0]![0].body).toContain('Two-stage triage is off');
+  });
+});
+
+describe('what the decision service is shown', () => {
+  it('sees the link placeholder for a sign-in link mail, never the token', async () => {
+    enableDecider();
+    process.env.LLM_API_KEY = 'k';
+    process.env.LLM_SKIP_SENSITIVE = 'false';
+    const bodies: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
+      bodies.push(`${String(input)} ${String(init?.body ?? '')}`);
+      return String(input).includes('/ai/run/')
+        ? clefResponse({ importance: { choice: 'info' }, category: { choice: 'Security' }, action_required: { noul: 0.1 } })
+        : llmResponse([{ index: 0, summary: 's', reason: 'r' }]);
+    }));
+    await triage([makeMessage({
+      subject: 'Sign in to Medium', body: 'https://medium.com/m/callback/email?token=0123456789abcdefABCDEF_-xyz',
+    })], RULES);
+    const decider = bodies.find((b) => b.includes('/ai/run/'));
+    expect(decider).toContain('登录链接邮件（内容已隐藏）');
+    for (const body of bodies) expect(body).not.toContain('0123456789abcdefABCDEF');
+  });
+});

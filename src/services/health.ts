@@ -5,6 +5,7 @@
  * failures send critical alerts and a recovery notice, while one-poll blips
  * stay quiet.
  */
+import { existsSync } from 'node:fs';
 import type { Account } from '../config.js';
 import type { MailMessage } from '../imap/message.js';
 import type { TriageResult } from './triage.js';
@@ -22,6 +23,9 @@ export const STARTUP_ALERTED_AT_KEY = 'startup_alerted_at';
 export const ACCOUNT_LAST_SUCCESS_KEY = 'account_last_success:';
 export const ACCOUNT_LAST_FAILURE_KEY = 'account_last_failure:';
 export const ACCOUNT_LAST_ERROR_KEY = 'account_last_error:';
+export const DECIDER_FAIL_COUNT_KEY = 'decider_fail_count';
+export const DECIDER_FAILED_SINCE_KEY = 'decider_failed_since';
+export const DECIDER_ALERTED_AT_KEY = 'decider_alerted_at';
 
 function cooldownSeconds(): number {
   return Number(process.env.ACCOUNT_ALERT_COOLDOWN_SECONDS ?? 21_600);
@@ -40,8 +44,31 @@ function isAuthFailure(error: unknown): boolean {
   return [
     'authentication failed', 'invalid credentials', 'login failed',
     'invalid_grant', 'authenticationfailed', 'auth error', 'authenticate failed',
-  ].some((marker) => text.includes(marker));
+    // An OAuth account never authorized on this server, or whose token is
+    // stored where this process does not read.
+    'no authorization record',
+  ].some((marker) => text.includes(marker))
+    // A token request the provider refused. 408 and 429 are not refusals,
+    // and a 5xx is the provider's outage, not the user's sign-in.
+    || /token request failed: http 4(?!08|29)\d\d/.test(text);
 }
+
+/** mailsift's own OAuth setup on this server, not the provider: the token store or the client settings. */
+function isSetupFailure(error: unknown): boolean {
+  return /token store|requires? (?:gmail|outlook)_client_id|unknown oauth type/i.test(String(error));
+}
+
+type FailureKind = 'auth' | 'setup' | 'folders' | 'connection';
+
+function failureKind(error: unknown): FailureKind {
+  if (/no selectable folders/i.test(String(error))) return 'folders';
+  if (isSetupFailure(error)) return 'setup';
+  return isAuthFailure(error) ? 'auth' : 'connection';
+}
+
+const FAILURE_LABEL: Record<FailureKind, string> = {
+  auth: 'authentication', setup: 'OAuth setup', folders: 'folders', connection: 'connection',
+};
 
 function healthMessage(subject: string, body: string, key: string, stamp: string): MailMessage {
   return {
@@ -84,11 +111,37 @@ function info(reason: string): TriageResult {
   };
 }
 
-function remedy(account: Account, authFailure: boolean): string {
-  if (!authFailure) return 'If the failure continues, check network connectivity to the mail provider.';
+/**
+ * The command that re-authorizes one OAuth account, worded for how this
+ * process runs. Inside the image the host's npm script would write the token
+ * beside the checkout instead of into the container's volume, and without
+ * --account, --force walks through every OAuth account again.
+ */
+export function oauthCommand(account: Pick<Account, 'username'>): string {
+  const user = shellWord(account.username);
+  return existsSync('/.dockerenv')
+    ? `docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual --force --account=${user}`
+    : `npm run oauth -- --manual --force --account=${user}`;
+}
+
+/** An address as one POSIX shell word: "o'brien@x" or "a!b@x" must survive a paste. */
+function shellWord(value: string): string {
+  return /^[A-Za-z0-9@._+-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function remedy(account: Account, kind: FailureKind): string {
+  if (kind === 'folders') {
+    return 'The sign-in worked, but none of the configured folders could be opened. ' +
+      'Compare MAIL_ACCOUNT_N_FOLDERS with the folders `npm run probe` lists for this account.';
+  }
+  if (kind === 'setup') {
+    return 'mailsift could not use its own OAuth setup on this server. Check the token store ' +
+      '(TOKEN_STORE_PATH, data/tokens.json in the data volume) and the OAuth client settings in .env, then restart.';
+  }
+  if (kind === 'connection') return 'If the failure continues, check network connectivity to the mail provider.';
   if (account.auth === 'gmail_oauth') {
     return (
-      'Re-authorize: `npm run oauth -- --manual --force`.\n' +
+      `Re-authorize: \`${oauthCommand(account)}\`.\n` +
       'If this recurs every 7 days, the Google OAuth app is probably still in Testing. ' +
       'Publish the consent screen in Google Cloud Console.\n' +
       'Personal Gmail can use gmail_pw plus an app password instead.'
@@ -99,7 +152,7 @@ function remedy(account: Account, authFailure: boolean): string {
       'Check these likely causes:\n' +
       '1) Outlook.com IMAP is disabled. Open Settings -> Mail -> Forwarding and IMAP -> ' +
       'Allow devices and apps to use IMAP (disabled by default).\n' +
-      '2) OAuth expired: `npm run oauth -- --manual --force`.'
+      `2) OAuth expired: \`${oauthCommand(account)}\`.`
     );
   }
   return (
@@ -114,15 +167,65 @@ function hourStamp(): string {
   return new Date().toISOString().replace(/[-:T]/g, '').slice(0, 10);
 }
 
-function accountAlertThreshold(): number {
+export function accountAlertThreshold(): number {
   const value = Number(process.env.ACCOUNT_ALERT_AFTER_FAILURES ?? 2);
   return Number.isFinite(value) && value > 0 ? Math.max(1, Math.floor(value)) : 2;
+}
+
+/** Where one mailbox stands, as the web view shows it. */
+export interface MailboxStatus {
+  name: string;
+  address: string;
+  consecutiveFailures: number;
+  /** Failing for as many polls as it takes to raise an alert; a single blip stays quiet. */
+  failing: boolean;
+  lastSuccessAt: string | null;
+  lastFailureAt: string | null;
+  /** Which fix to suggest, only while failing. */
+  fix?: 'google' | 'outlook' | 'authorize' | 'password' | 'folders' | 'setup' | 'connection';
+  /** The re-authorization command, for OAuth accounts that are failing to sign in. */
+  command?: string;
+}
+
+/**
+ * Every configured mailbox and whether the poller can still read it.
+ *
+ * The heartbeat is written after every poll, even one in which a mailbox
+ * failed, so "checked a minute ago" alone could vouch for a mailbox that has
+ * not been read for days. This is what lets the page name it.
+ */
+export function mailboxStatuses(state: StateStore, accounts: Account[]): MailboxStatus[] {
+  const threshold = accountAlertThreshold();
+  return accounts.map((account) => {
+    const failures = Number(state.getMeta(FAIL_COUNT_KEY + account.username) || 0);
+    const failing = failures >= threshold;
+    const error = failing ? state.getMeta(ACCOUNT_LAST_ERROR_KEY + account.username) ?? '' : '';
+    const oauth = account.auth === 'gmail_oauth' || account.auth === 'outlook_oauth';
+    const kind = failureKind(error);
+    const fix: MailboxStatus['fix'] = !failing ? undefined
+      : kind !== 'auth' ? kind
+        // Never authorized here, or the token lives somewhere this process does not read.
+        : oauth && /no authorization record/i.test(error) ? 'authorize'
+          : account.auth === 'gmail_oauth' ? 'google'
+            : account.auth === 'outlook_oauth' ? 'outlook'
+              : 'password';
+    return {
+      name: account.name,
+      address: account.username,
+      consecutiveFailures: failures,
+      failing,
+      lastSuccessAt: state.getMeta(ACCOUNT_LAST_SUCCESS_KEY + account.username) || null,
+      lastFailureAt: state.getMeta(ACCOUNT_LAST_FAILURE_KEY + account.username) || null,
+      ...(fix ? { fix } : {}),
+      ...(fix === 'google' || fix === 'outlook' || fix === 'authorize' ? { command: oauthCommand(account) } : {}),
+    };
+  });
 }
 
 export async function recordAccountFailure(
   state: StateStore, sink: Sink, account: Account, error: unknown,
 ): Promise<boolean> {
-  const authFailure = isAuthFailure(error);
+  const kind = failureKind(error);
   const failures = Number(state.getMeta(FAIL_COUNT_KEY + account.username) ?? 0) + 1;
   state.setMeta(FAIL_COUNT_KEY + account.username, String(failures));
   state.setMeta(ACCOUNT_LAST_FAILURE_KEY + account.username, new Date().toISOString());
@@ -145,19 +248,19 @@ export async function recordAccountFailure(
   const body = [
     `**Monitoring stopped for ${account.name} (${account.username})**`,
     '',
-    `**Failure type**: ${authFailure ? 'authentication' : 'connection'}`,
+    `**Failure type**: ${FAILURE_LABEL[kind]}`,
     `**Consecutive failures**: ${failures}`,
     `**Error**: ${String(error).slice(0, 300)}`,
     '',
     '---',
-    remedy(account, authFailure),
+    remedy(account, kind),
     '',
     '⚠️ New mail from this account, including spam, will not be checked until recovery.',
   ].join('\n');
 
   const sent = await deliver(sink,
     healthMessage(`⚠️ Mail account unavailable: ${account.name}`, body, account.username, hourStamp()),
-    critical(`${account.name} ${authFailure ? 'authentication' : 'connection'} failure; monitoring coverage is lost`),
+    critical(`${account.name} ${FAILURE_LABEL[kind]} failure; monitoring coverage is lost`),
   );
   // A failed sink delivery must not put the account into the "alerted" state;
   // otherwise recovery would claim an outage was announced when it was not.
@@ -253,6 +356,71 @@ export async function recordLlmSuccess(state: StateStore, sink: Sink): Promise<b
     info('LLM calls restored'),
   );
   log.info(`LLM recovery notice sent=${sent}`);
+  return sent;
+}
+
+function warning(reason: string): TriageResult {
+  return {
+    importance: 'warning', score: 60, summary: '', reason, deadline: '',
+    category: 'Service failure', actionRequired: true, decidedBy: 'health',
+  };
+}
+
+/**
+ * The decision model failing is easy to miss: the batch falls back to one
+ * stage and every message is still judged, so nothing looks wrong. Repeated
+ * failures say so once, with the cooldown the other alerts use.
+ */
+export async function recordDeciderFailure(state: StateStore, sink: Sink, error: unknown): Promise<boolean> {
+  const failures = Number(state.getMeta(DECIDER_FAIL_COUNT_KEY) || 0) + 1;
+  state.setMeta(DECIDER_FAIL_COUNT_KEY, String(failures));
+  if (!state.getMeta(DECIDER_FAILED_SINCE_KEY)) state.setMeta(DECIDER_FAILED_SINCE_KEY, new Date().toISOString());
+
+  if (failures < Number(process.env.LLM_ALERT_AFTER_FAILURES ?? 2)) {
+    log.warn(`Decider failure ${failures}; alert threshold not reached: ${error}`);
+    return false;
+  }
+  if (withinCooldown(state, DECIDER_ALERTED_AT_KEY)) {
+    log.warn(`Decider still failing (${failures}); alert is in cooldown.`);
+    return false;
+  }
+
+  const since = state.getMeta(DECIDER_FAILED_SINCE_KEY) ?? new Date().toISOString();
+  const body = [
+    `**Two-stage triage is off** since ${since} (${failures} consecutive failures)`,
+    '',
+    `**Decision model**: ${process.env.DECIDER_MODEL ?? 'clef-flash'}`,
+    `**Error**: ${String(error).slice(0, 300)}`,
+    '',
+    '---',
+    'Every message is still judged, in one stage by the LLM. Check DECIDER_API_TOKEN and the Workers AI account: ' +
+      'the token may have expired or lost its permission.',
+  ].join('\n');
+
+  const sent = await deliver(sink,
+    healthMessage('⚠️ Two-stage triage off: the decision model is failing', body, 'decider', hourStamp()),
+    warning(`${process.env.DECIDER_MODEL ?? 'Decision model'} failed ${failures} consecutive times; triage runs in one stage`),
+  );
+  if (sent) state.setMeta(DECIDER_ALERTED_AT_KEY, new Date().toISOString());
+  log.error(`Decider outage alert sent=${sent}: ${error}`);
+  return sent;
+}
+
+export async function recordDeciderSuccess(state: StateStore, sink: Sink): Promise<boolean> {
+  if (!state.getMeta(DECIDER_FAIL_COUNT_KEY)) return false;
+  const hadAlerted = Boolean(state.getMeta(DECIDER_ALERTED_AT_KEY));
+  state.setMeta(DECIDER_FAIL_COUNT_KEY, '');
+  state.setMeta(DECIDER_FAILED_SINCE_KEY, '');
+  state.setMeta(DECIDER_ALERTED_AT_KEY, '');
+  if (!hadAlerted) {
+    log.info('Decider recovered (no alert was sent).');
+    return false;
+  }
+  const sent = await deliver(sink,
+    healthMessage('✅ Two-stage triage restored', '**The decision model answers again.**', 'decider-ok', String(Date.now())),
+    info('Decision model restored'),
+  );
+  log.info(`Decider recovery notice sent=${sent}`);
   return sent;
 }
 

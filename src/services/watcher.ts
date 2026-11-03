@@ -17,8 +17,9 @@ import {
 } from '../imap/client.js';
 import type { Folder } from '../imap/folders.js';
 import {
-  containsSensitiveVerificationContent, dedupKey, snippet, type MailMessage,
+  dedupKey, SENSITIVE_WORDS, sensitiveKindOf, snippet, type MailMessage,
 } from '../imap/message.js';
+import { pingHeartbeat } from './heartbeat.js';
 import {
   triage, effectiveRank, isSelfForward, pushThreshold, rank, suppressSelfForwards,
   type ThreadContextEntry, type TriageResult,
@@ -284,9 +285,9 @@ export class Watcher {
       const entries = [...history, ...earlier].slice(-limit);
       if (entries.length) contexts.set(message, entries);
 
-      const sensitive = containsSensitiveVerificationContent(message.subject, message.body);
+      const sensitive = sensitiveKindOf(message.subject, message.body);
       const current: ThreadContextEntry = {
-        subject: sensitive ? '验证码邮件（内容已隐藏）' : message.subject,
+        subject: sensitive ? SENSITIVE_WORDS[sensitive].hidden : message.subject,
         from: `${message.fromName} <${message.fromAddr}>`,
         date: message.date,
         summary: '',
@@ -393,12 +394,14 @@ export class Watcher {
       IMPORTANCE_RANK[(process.env.DIGEST_MIN_IMPORTANCE ?? 'info') as Importance] ?? 0;
     for (const [index, [message, result]] of results.entries()) {
       // A failed retry leaves the original fallback decision and digest entry
-      // untouched so a later recovery can try it again.
-      if (result.decidedBy === 'fallback') continue;
+      // untouched so a later recovery can try it again. Mail handled locally
+      // (a code, a sign-in link) never needed the model, and re-reading its
+      // hidden placeholder would only lose the code that was stored.
+      if (result.decidedBy === 'fallback' || result.sensitiveVerification) continue;
 
       const key = rows[index]!.dedupKey;
       const safeMessage = result.sensitiveVerification
-        ? { ...message, subject: '验证码邮件', body: '' }
+        ? { ...message, subject: SENSITIVE_WORDS[result.sensitiveKind ?? 'code'].subject, body: '' }
         : message;
       const forwardedCopy = Boolean(isSelfForward(message, rules));
       const shouldPush = !forwardedCopy && effectiveRank(message, result) >= pushLimit;
@@ -451,7 +454,7 @@ export class Watcher {
         this.state.clearDigest([key]);
       }
     }
-    const retriaged = results.filter(([, result]) => result.decidedBy !== 'fallback').length;
+    const retriaged = results.filter(([, result]) => result.decidedBy !== 'fallback' && !result.sensitiveVerification).length;
     log.info(`Re-triaged ${retriaged}/${rows.length} fallback digest messages after LLM recovery.`);
   }
 
@@ -465,17 +468,19 @@ export class Watcher {
     const wasUnavailable = Boolean(this.state.getMeta(health.LLM_FAIL_COUNT_KEY));
     const llmOutcomes: Array<unknown | null> = [];
     const onLlmResult = (error: unknown | null): void => { llmOutcomes.push(error); };
+    const deciderOutcomes: Array<unknown | null> = [];
+    const onDeciderResult = (error: unknown | null): void => { deciderOutcomes.push(error); };
 
     const rules = this.triageRules();
     const threadContexts = this.triageThreadContexts(messages);
-    for (const [message, result] of await triage(messages, rules, onLlmResult, threadContexts)) {
+    for (const [message, result] of await triage(messages, rules, onLlmResult, threadContexts, onDeciderResult)) {
       metrics.addCounter('mailsift.messages.triaged', 1, {
         provider: message.provider,
         importance: result.importance,
         decided_by: result.decidedBy,
       });
       const safeMessage = result.sensitiveVerification
-        ? { ...message, subject: '验证码邮件', body: '' }
+        ? { ...message, subject: SENSITIVE_WORDS[result.sensitiveKind ?? 'code'].subject, body: '' }
         : message;
       // Create the seen row before the outcome. An interruption before completion
       // leaves the message eligible for the next poll.
@@ -542,6 +547,18 @@ export class Watcher {
         else await health.recordLlmSuccess(this.state, this.sink);
       } catch (error) {
         log.error(`Failed to send LLM availability alert: ${error}`);
+      }
+    }
+    // One verdict per dispatch, a failure if any batch failed. A backfill runs
+    // many batches, and replaying each in turn let a flaky decision service
+    // send "off" and "restored" back to back within one poll.
+    if (deciderOutcomes.length > 0) {
+      const failure = deciderOutcomes.find((outcome) => outcome);
+      try {
+        if (failure) await health.recordDeciderFailure(this.state, this.sink, failure);
+        else await health.recordDeciderSuccess(this.state, this.sink);
+      } catch (error) {
+        log.error(`Failed to send decider availability alert: ${error}`);
       }
     }
     if (wasUnavailable && llmOutcomes.length > 0 && llmOutcomes.at(-1) === null) {
@@ -619,6 +636,8 @@ export class Watcher {
 
       // Write the heartbeat last: a poll stuck in IMAP must not appear healthy.
       this.state.setMeta(HEARTBEAT_KEY, new Date().toISOString());
+      // Tell an outside monitor the loop is alive; not awaited, never throws.
+      void pingHeartbeat();
       metrics.recordHistogram('mailsift.poll.duration_ms', performance.now() - started);
       metrics.addCounter('mailsift.polls.completed');
       log.info(summarizeStats(stats));

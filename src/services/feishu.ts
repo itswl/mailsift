@@ -9,11 +9,12 @@ import { IMPORTANCE_RANK, type Importance } from '../config.js';
 import { buildLink } from '../links.js';
 import {
   extractVerificationCode,
-  isSensitiveVerificationMessage,
+  SENSITIVE_WORDS,
+  sensitiveKindOf,
   snippet,
   type MailMessage,
 } from '../imap/message.js';
-import { effectiveRank, headline, type TriageResult } from './triage.js';
+import { effectiveRank, headline, hidesContent, type TriageResult } from './triage.js';
 import { deliverWithRetry, isRetryableStatus, type RetryState } from './delivery.js';
 import { getLogger } from '../logger.js';
 
@@ -65,10 +66,7 @@ function formatDate(raw: string): string {
 
 export function buildCard(message: MailMessage, result: TriageResult): Record<string, unknown> {
   const isDigest = Boolean(message.extra?.['digest']);
-  const isSensitiveVerification = Boolean(
-    result.sensitiveVerification ||
-      (result.decidedBy !== 'health' && isSensitiveVerificationMessage(message)),
-  );
+  const isSensitiveVerification = hidesContent(message, result);
   const verificationCode = isSensitiveVerification
     ? result.verificationCode ?? extractVerificationCode(message.subject, message.body)
     : undefined;
@@ -86,7 +84,8 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
   }
 
   const spamTag = message.inSpam ? '[Recovered from spam] ' : '';
-  const subject = isSensitiveVerification ? '验证码邮件' : message.subject;
+  const kind = result.sensitiveKind ?? sensitiveKindOf(message.subject, message.body) ?? 'code';
+  const subject = isSensitiveVerification ? SENSITIVE_WORDS[kind].subject : message.subject;
   // A verification code belongs in the title: it is the whole message, and the
   // header is the largest, always-visible line on a phone notification.
   const codeSuffix = isSensitiveVerification && verificationCode ? ` ${verificationCode}` : '';
@@ -97,9 +96,13 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
     // The header already carries the code; repeating it in the body keeps it
     // readable and selectable inside the card, where the title may be clipped.
     lines.push(
-      verificationCode
-        ? `🔐 **验证码** ${verificationCode}`
-        : '未能自动提取验证码，请打开原邮件查看。',
+      kind === 'link'
+        ? result.sensitiveUnasked || message.inSpam
+          ? `🔗 ${message.inSpam ? '来自垃圾箱的' : '群发邮件里的'}登录/重置链接邮件，内容已在本地隐藏。如果不是你刚刚请求的，请勿打开。`
+          : '🔗 登录链接已在本地隐藏，请打开原邮件使用。'
+        : verificationCode
+          ? `🔐 **验证码** ${verificationCode}`
+          : '未能自动提取验证码，请打开原邮件查看。',
     );
   } else {
     lines.push(esc(headline(result)));

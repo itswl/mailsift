@@ -31,8 +31,9 @@ import { routeWeb, webUiEnabled } from './web.js';
 import { idleEnabled, idleFolderTokens } from './imap/idle.js';
 import {
   ACCOUNT_LAST_ERROR_KEY, ACCOUNT_LAST_FAILURE_KEY, ACCOUNT_LAST_SUCCESS_KEY,
-  FAIL_COUNT_KEY, LLM_FAIL_COUNT_KEY,
+  accountAlertThreshold, DECIDER_FAIL_COUNT_KEY, FAIL_COUNT_KEY, LLM_FAIL_COUNT_KEY,
 } from './services/health.js';
+import { deciderConfigured } from './services/decider.js';
 
 const INSTRUCTIONS =
   'Query mailsift triage results. It monitors inboxes and spam folders, uses an LLM to assess importance, ' +
@@ -778,7 +779,13 @@ export function createServer(
       try {
         for (const account of loadConfig().accounts) {
           const count = store.getMeta(FAIL_COUNT_KEY + account.username);
-          if (count) failing.push({ account: account.name, consecutiveFailures: Number(count) });
+          if (count) {
+            failing.push({
+              account: account.name,
+              consecutiveFailures: Number(count),
+              lastSuccessAt: store.getMeta(ACCOUNT_LAST_SUCCESS_KEY + account.username) || null,
+            });
+          }
         }
       } catch (error) {
         failing.push({ error: String(error) });
@@ -794,7 +801,10 @@ export function createServer(
         lastPollAt: last ?? null,
         lastPollAgeSeconds: ageSeconds,
         pollIntervalSeconds: interval,
-        healthy: ageSeconds !== null && ageSeconds <= interval * 3 + 120,
+        // A fresh heartbeat alone is not health: it is written after every
+        // poll, including one in which a mailbox could not be read.
+        healthy: ageSeconds !== null && ageSeconds <= interval * 3 + 120
+          && !failing.some((entry) => Number(entry['consecutiveFailures'] ?? 0) >= accountAlertThreshold()),
           failingAccounts: failing,
         llm: {
           model: process.env.LLM_MODEL ?? null,
@@ -806,6 +816,10 @@ export function createServer(
             }
           })(),
           consecutiveFailures: Number(store.getMeta(LLM_FAIL_COUNT_KEY) ?? 0),
+        },
+        decider: {
+          configured: deciderConfigured(),
+          consecutiveFailures: Number(store.getMeta(DECIDER_FAIL_COUNT_KEY) || 0),
         },
         idle: { enabled: idleEnabled(), folders: idleFolderTokens(), lastWakeAt: idleWakes },
         // The thresholds that decide whether a message is notified. Without

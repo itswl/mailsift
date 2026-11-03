@@ -1,5 +1,7 @@
-import { dedupKey, isSensitiveVerificationMessage, type MailMessage } from '../imap/message.js';
-import { headline, type TriageResult } from './triage.js';
+import {
+  dedupKey, type MailMessage,
+} from '../imap/message.js';
+import { headline, hidesContent, sensitiveWords, type TriageResult } from './triage.js';
 
 /**
  * The source-neutral event sent alongside the legacy webhook payload.
@@ -36,18 +38,16 @@ export interface MailSignalEvent {
 }
 
 export function buildMailSignalEvent(message: MailMessage, result: TriageResult): MailSignalEvent {
-  const sensitiveVerification = Boolean(
-    result.sensitiveVerification ||
-      (result.decidedBy !== 'health' && isSensitiveVerificationMessage(message)),
-  );
+  const sensitiveVerification = hidesContent(message, result);
+  const words = sensitiveWords(message, result);
   return {
     schema: 'signal.v1',
     source: 'mailsift',
     type: 'email.received',
     source_event_id: message.messageId,
     occurred_at: message.date,
-    title: sensitiveVerification ? '验证码邮件' : message.subject || '(no subject)',
-    summary: sensitiveVerification ? '收到验证码邮件。' : headline(result),
+    title: sensitiveVerification ? words.subject : message.subject || '(no subject)',
+    summary: sensitiveVerification ? words.summary : headline(result),
     priority: result.importance,
     dedup_key: dedupKey(message),
     evidence_ref: {
