@@ -123,6 +123,8 @@ export interface QueryOptions {
   category?: string;
   spamOnly?: boolean;
   pushedOnly?: boolean;
+  /** Only rows that carry an extracted verification code. */
+  codesOnly?: boolean;
   account?: string;
   search?: string;
   limit?: number;
@@ -778,6 +780,7 @@ export class StateStore {
     }
     if (options.spamOnly) clauses.push('in_spam = 1');
     if (options.pushedOnly) clauses.push('pushed = 1');
+    if (options.codesOnly) clauses.push("verification_code IS NOT NULL AND verification_code != ''");
     if (options.account) {
       clauses.push('(account = ? OR account_label = ?)');
       params.push(options.account, options.account);

@@ -311,6 +311,24 @@ export function shouldSend(state: StateStore, at: Date = new Date()): boolean {
   return state.getMeta(DIGEST_SENT_KEY) !== at.toISOString().slice(0, 10);
 }
 
+/**
+ * When the next digest is due, by the rule shouldSend applies: the first poll at
+ * or after DIGEST_HOUR, on a day it has not gone out yet. Null when it is off.
+ *
+ * An hour that does not parse never holds a poll back in shouldSend, so it is
+ * treated as midnight here. A digest already due but not yet sent reports
+ * today's hour, which is when it became due.
+ */
+export function nextDigestAt(state: StateStore, now: Date = new Date()): Date | null {
+  if ((process.env.DIGEST_ENABLED ?? 'true').toLowerCase() === 'false') return null;
+  const raw = Number(process.env.DIGEST_HOUR ?? 9);
+  const hour = Number.isFinite(raw) ? Math.min(23, Math.max(0, Math.floor(raw))) : 0;
+  const at = new Date(now);
+  at.setHours(hour, 0, 0, 0);
+  if (state.getMeta(DIGEST_SENT_KEY) === now.toISOString().slice(0, 10)) at.setDate(at.getDate() + 1);
+  return at;
+}
+
 /** Send the digest and record the date, including when the queue is empty. */
 export async function sendDigest(state: StateStore, sink: Sink, at: Date = new Date()): Promise<boolean> {
   const today = at.toISOString().slice(0, 10);
