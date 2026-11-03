@@ -10,6 +10,7 @@ import { buildLink } from '../src/links.js';
 import { STRINGS, type StringKey } from '../src/web-strings.js';
 import { clientAddress } from '../src/mcp.js';
 import { StateStore } from '../src/services/state.js';
+import { HEARTBEAT_KEY } from '../src/services/watcher.js';
 
 function request(options: {
   method?: string; url?: string; headers?: Record<string, string>; body?: string;
@@ -225,6 +226,9 @@ describe('read-only data', () => {
     expect(await body('/api/mail?spamOnly=true', store)).toMatchObject({ count: 1 });
     expect(await body('/api/mail?q=vendor', store)).toMatchObject({ count: 3 });
     expect(await body('/api/mail?q=nothing', store)).toMatchObject({ count: 0 });
+    // The threads view honours the same switches, so turning one on there is not a no-op.
+    expect(await body('/api/threads?spamOnly=true', store)).toMatchObject({ count: 1 });
+    expect(await body('/api/threads?pushedOnly=true', store)).toMatchObject({ count: 2 });
   });
 
   it('bounds the window and the page size rather than trusting the query', async () => {
@@ -235,15 +239,29 @@ describe('read-only data', () => {
   });
 
   it('summarizes the window and offers the vocabularies the filters need', async () => {
-    const summary = await body('/api/summary', seeded());
-    expect(summary).toMatchObject({ total: 3, pushed: 2 });
+    const store = seeded();
+    const summary = await body('/api/summary', store);
+    expect(summary).toMatchObject({ total: 3, pushed: 2, lastPollAt: null, pollIntervalSeconds: 300 });
     expect(summary['categories']).toContain('Security');
+    // Once a poll has completed, the page can say how fresh the view is, and
+    // judge staleness against the interval actually configured.
+    store.setMeta(HEARTBEAT_KEY, '2026-11-02T08:00:00.000Z');
+    process.env.POLL_INTERVAL_SECONDS = '900';
+    expect(await body('/api/summary', store)).toMatchObject({ lastPollAt: '2026-11-02T08:00:00.000Z', pollIntervalSeconds: 900 });
   });
 
   it('previews the digest queue', async () => {
     const store = seeded();
     store.queueDigest('k2', { subject: 'queued', importance: 'info', category: 'Marketing', threadCount: 1, date: '', summary: 'x', accountLabel: 'a', folder: 'INBOX', inSpam: false, from: 'f@x', fromName: 'F', deadline: '', actionRequired: false });
-    expect(await body('/api/digest', store)).toMatchObject({ pending: 1 });
+    const digest = await body('/api/digest', store);
+    expect(digest).toMatchObject({ pending: 1, enabled: true });
+    // The send time is an instant, so a browser in another timezone shows it in its own clock.
+    expect(new Date(String(digest['nextAt'])).getHours()).toBe(9);
+    // Structured items travel with the rendered text, so the page can lay the
+    // queue out as a list rather than showing markdown source.
+    expect(digest['items']).toEqual([expect.objectContaining({ subject: 'queued', category: 'Marketing' })]);
+    process.env.DIGEST_ENABLED = 'false';
+    expect(await body('/api/digest', store)).toMatchObject({ enabled: false, nextAt: null });
   });
 
   it('returns a stored record without touching the mailbox unless asked', async () => {
@@ -251,6 +269,14 @@ describe('read-only data', () => {
     const one = await body('/api/message?id=%3Cone%40x%3E', store);
     expect(one).toMatchObject({ messageId: '<one@x>', importance: 'critical', body: null });
     expect(await body('/api/message?id=%3Cabsent%40x%3E', store)).toMatchObject({ error: 'not found' });
+  });
+
+  it('links a message opened on its own like a row of the list', async () => {
+    // A shared link opens a message outside the loaded window; it should still
+    // offer the provider's client.
+    process.env.MAIL_ACCOUNT_1 = 'gmail_pw|me@qq.com|pw';
+    const one = await body('/api/message?id=%3Cone%40x%3E', seeded());
+    expect(one).toMatchObject({ provider: 'gmail_pw', link: { exact: true } });
   });
 
   it('carries a verification code to the browser so the page can show it', async () => {
@@ -263,6 +289,9 @@ describe('read-only data', () => {
     const answer = await body('/api/mail?importance=warning', store);
     const row = (answer['mail'] as Array<Record<string, unknown>>).find((m) => m['messageId'] === '<code@x>');
     expect(row).toMatchObject({ verificationCode: '227857' });
+    // The "only verification codes" switch sees only that row, in either view.
+    expect(await body('/api/mail?codesOnly=true', store)).toMatchObject({ count: 1 });
+    expect(await body('/api/threads?codesOnly=true', store)).toMatchObject({ count: 1 });
   });
 
   it('has no route that changes anything', async () => {
@@ -312,10 +341,49 @@ describe('installable app', () => {
   it('describes an app that opens without browser chrome, with a maskable icon', async () => {
     const store = seeded();
     const answer = await routeWeb(request({ url: '/manifest.webmanifest' }), url('/manifest.webmanifest'), '', store);
-    const m = JSON.parse(String(answer.body)) as { display: string; icons: Array<{ purpose: string; sizes: string }> };
+    const m = JSON.parse(String(answer.body)) as {
+      id: string; display: string; display_override: string[]; icons: Array<{ purpose: string; sizes: string }>;
+      shortcuts: Array<{ name: string; url: string }>;
+    };
     expect(answer.contentType).toBe('application/manifest+json');
     expect(m.display).toBe('standalone');
+    expect(m.id).toBe('/');
+    expect(m.display_override).toEqual(['standalone']);
     expect(m.icons.some((i) => i.purpose === 'maskable' && i.sizes === '512x512')).toBe(true);
+    // A long press on the icon offers the two things worth a shortcut, worded in the reader's language.
+    expect(m.shortcuts.map((s) => s.url)).toEqual(['/?focus=code', '/?importance=critical']);
+    const zh = await routeWeb(
+      request({ url: '/manifest.webmanifest', headers: { 'accept-language': 'zh-CN' } }), url('/manifest.webmanifest'), '', store,
+    );
+    expect((JSON.parse(String(zh.body)) as typeof m).shortcuts[0]?.name).toBe('最新验证码');
+    // One URL, two bodies: no shared cache may hand one reader's language to another.
+    expect(answer.cacheControl).toContain('private');
+    expect(answer.headers?.['vary']).toContain('Accept-Language');
+  });
+
+  it('lays the page out for a phone that installed it', async () => {
+    const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
+    // A message opens in a sheet, the sentence sits over the list, and the
+    // list itself is silent: one live region speaks for it.
+    expect(page).toContain('<dialog id="sheet"');
+    expect(page).toContain('id="lede"');
+    expect(page).toContain('id="announce"');
+    expect(page).toContain('<section id="list"></section>');
+    // Selects belong inside the filter sheet; the page itself shows words and segments.
+    const sheetStart = page.indexOf('<dialog id="filter-sheet"');
+    const sheetEnd = page.indexOf('</dialog>', sheetStart);
+    expect(sheetStart).toBeGreaterThan(-1);
+    let at = page.indexOf('<select');
+    expect(at).toBeGreaterThan(-1);
+    while (at !== -1) {
+      expect(at).toBeGreaterThan(sheetStart);
+      expect(at).toBeLessThan(sheetEnd);
+      at = page.indexOf('<select', at + 1);
+    }
+    expect(page).toContain('interactive-widget=resizes-content');
+    expect(page).not.toContain('innerHTML');
+    // A link cut off mid-escape must not stop the script before it draws anything.
+    expect(page).not.toContain('decodeURIComponent(location.hash');
   });
 
   it('sends real PNG bytes, not a placeholder', async () => {
@@ -393,8 +461,8 @@ describe('layout', () => {
     // A URL or a message id has nowhere to wrap, so without this the row grows
     // past the viewport and the whole page scrolls sideways on a phone.
     const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
-    expect(page).toContain('.row,.detail,.card{overflow-wrap:anywhere');
-    expect(page).toContain('.detail h3{margin:0 0 6px;font-size:15px;overflow-wrap:anywhere}');
+    expect(page).toContain('.row,.detail,.lane,.digest{overflow-wrap:anywhere;min-width:0}');
+    expect(page).toContain('.detail h3{margin:0 0 6px;font-size:18px;line-height:1.3;font-weight:600;overflow-wrap:anywhere}');
   });
 
   it('keeps a definition value inside its own grid column', async () => {
@@ -537,7 +605,8 @@ describe('refresh', () => {
     const onRefresh = async () => stats;
     const page = String((await routeWeb(pageRequest(), url('/'), 'secret', store, 'reader', { onRefresh })).body);
     expect(page).toContain('id="refresh"');
-    expect(page).toContain('id="refresh-status"');
+    // The poll narrates itself in the status line under the title, not in a toast.
+    expect(page).toContain('id="status"');
 
     const answer = await routeWeb(refreshRequest(), url('/api/refresh'), 'secret', store, 'clicker-ok', { onRefresh });
     expect(answer.status).toBe(200);
