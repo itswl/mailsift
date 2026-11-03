@@ -1,7 +1,8 @@
 services:
   mailsift:
-    # Pull the published image. See docker-compose.build.yml to build from source.
-    image: ghcr.io/itswl/mailsift:${MAILSIFT_VERSION:-1.0.0}
+    # Pull the published image: latest, unless MAILSIFT_VERSION in .env pins a release.
+    # See docker-compose.build.yml to build from source.
+    image: ghcr.io/itswl/mailsift:${MAILSIFT_VERSION:-latest}
     pull_policy: missing
     container_name: mailsift
     restart: unless-stopped

@@ -1,375 +1,126 @@
 # mailsift
 
-Unified IMAP monitoring for important email. mailsift scans every configured mailbox—including spam folders—uses an LLM plus local rules to classify messages, and sends important results to Feishu or a generic webhook.
+mailsift watches all your IMAP mailboxes, spam folders included. It judges each new message with your own rules and an LLM, pushes the ones that matter to Feishu or a webhook, and gathers the rest into a daily digest.
 
-> mailsift is an assistant, not a mail client. It is read-only by default. A separate write token can enable a small audited set of mailbox actions (mark, star, and move); it never sends, replies to, deletes, or silently changes mail. Classification can be wrong, so keep using your mail client as the source of truth.
+> mailsift is an assistant, not a mail client. It is read-only by default and never sends, replies to or deletes mail; a separate write token can enable a small audited set of actions (mark, star and move). Classification can be wrong, so keep using your mail client as the source of truth.
 
 中文文档：[README.zh-CN.md](README.zh-CN.md)。
 
 ## Features
 
-- Any IMAP provider, with multiple accounts.
-- Spam-folder monitoring with provider-specific folder-name detection.
-- Personal rules plus LLM classification; keyword fallback when the LLM is not configured or fails.
-- Real-time push notifications and a daily digest.
-- Verification codes appear in the Feishu card itself (the webhook payload and signal event only say that one arrived); recognised sign-in and password-reset links stay on the host, and neither is sent to the LLM; how they are recognised is described below.
-- An optional outbound heartbeat (`HEARTBEAT_PING_URL`), so a monitor elsewhere notices when mailsift itself stops.
-- Crash-safe cursor handling and recovery for interrupted processing.
-- Optional MCP server for querying local triage results.
-- Conversation grouping, bounded search across triage text and attachment metadata, and an optional audited mailbox action surface.
+- **Every mailbox, spam included.** Any IMAP provider and any number of accounts, Gmail and Outlook through OAuth. Spam folders are found per provider and checked like the inbox.
+- **Judged, not just filtered.** Your sender rules decide first; an LLM rates the rest critical, warning or info, with a one-line summary and the reason. Without an LLM, or while it fails, keyword rules keep mail moving.
+- **Pushed when it matters.** Important mail goes to Feishu or your webhook as soon as mailsift sees it, within seconds with IMAP IDLE. The rest waits for one daily digest.
+- **Codes at a glance.** A verification code is shown in the Feishu card and, in the web view, as one large copy button. Codes and sign-in links never reach the LLM.
+- **A web view for your phone.** A read-only page you can install to the home screen: what arrived, how it was judged and why, with search and filters.
+- **An MCP server**, so an AI assistant can list, search and read your triaged mail.
+- **Says when it cannot see.** Alerts when a mailbox or the LLM keeps failing, and an optional heartbeat lets an outside monitor notice if mailsift itself stops.
 
 ## Quick start
+
+You need Docker with Compose.
 
 ```bash
 git clone https://github.com/itswl/mailsift.git
 cd mailsift
 cp .env.example .env
-vim .env
-docker compose up -d
 ```
 
-At minimum, configure one mailbox, one output (`FEISHU_WEBHOOK_URL` or `WEBHOOK_URL`), and optionally an LLM API key. For local development with Node >= 22.5:
+Edit `.env`. These lines are the minimum; the rest of `.env.example` can stay as it is for now.
 
 ```bash
-npm install
-npm run check
-npm run dev
-```
-
-## Configuration
-
-All settings are environment variables. See [.env.example](.env.example) for the complete template.
-
-```bash
+# A mailbox: provider|address|password. The password is usually an app password.
 MAIL_ACCOUNT_1=qq|me@qq.com|app-password
-MAIL_ACCOUNT_1_NAME=personal-qq
-MAIL_ACCOUNT_1_FOLDERS=all
 
-MAIL_ACCOUNT_2=imap|me@example.com|password|imap.example.com
+# Where important mail goes: a Feishu bot, a webhook (WEBHOOK_URL), or both.
+FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/...
 
-FEISHU_WEBHOOK_URL=
-WEBHOOK_URL=
-WEBHOOK_TOKEN=
-
+# The LLM. Leave the key empty to run on keyword rules alone.
 LLM_PROVIDER=deepseek
-LLM_MODEL=deepseek-flash
 LLM_API_KEY=
 
-PUSH_MIN_IMPORTANCE=warning
-SPAM_RANK_BONUS=0
-DIGEST_ENABLED=true
-DIGEST_HOUR=9
+# Docker needs a token for its MCP and web port: any long random string,
+# for example the output of `openssl rand -hex 32`.
+MCP_TOKEN=
 ```
 
-`MAIL_ACCOUNT_N_FOLDERS` accepts `all`, `INBOX,spam`, or explicit folder names. The `all` token excludes sent, drafts, trash, and provider-wide virtual views. The `spam` token detects the provider's spam folder.
+Compose runs the `latest` image. To upgrade only when you choose, also pin a release in `.env`, such as `MAILSIFT_VERSION=0.1.99`; the Releases page lists them.
 
-`SUPPRESS_SELF_FORWARDS=true` (the default) stops one message notifying twice when your mailboxes forward to each other. A forwarded copy is a new message with its own Message-ID, so deduplication cannot recognise it, but its sender is one of the configured accounts. Such a copy is recorded and stays searchable through `list_mail`, but it is neither pushed nor repeated in the daily digest, since the original was already triaged at its source. It costs no LLM call either. Mail you send to yourself inside a single mailbox is unaffected, and an explicit `MAIL_ALWAYS_IMPORTANT` sender still wins.
-
-`SPAM_RANK_BONUS` lifts spam-folder mail by whole importance levels, so with the default `PUSH_MIN_IMPORTANCE=warning` a bonus of `1` pushes every spam-folder message: warning and critical were already above the line and info now sits on it. Leave it at `0` unless `PUSH_MIN_IMPORTANCE` is `critical` and you want spam-folder warnings to break through anyway. Catching a message wrongly filed as spam does not need it, because triage assesses spam normally and rates a real bill or code warning or critical there. `--check` warns about the combinations that deliver the whole spam folder.
-
-`DIGEST_HOUR` is a whole hour from 0 to 23 on the server's own clock, so set `TZ` (the compose file defaults it to `Asia/Shanghai`); any other value falls back to 9, and `--check` says so. The digest goes out with the first poll after that hour, once per local calendar day. Up to 0.1.97 the "already sent today" check used the UTC date, which got any hour earlier than the local time of UTC midnight wrong: before 08:00 in UTC+8, and in zones behind UTC most of the day, including the default 9 across the Americas. Those digests went out when the UTC date changed (08:00 in UTC+8, 19:00 or 20:00 in New York) instead of at the hour, and twice on a first day or after a day without polls. After upgrading, the first digest goes out when the old rule would have sent it, and every one after that at the hour.
-
-`MAIL_CONTEXT`, `MAIL_ALWAYS_IMPORTANT`, `MAIL_NEVER_IMPORTANT`, and `MAIL_KEYWORDS` customize classification. Keep `MAIL_CONTEXT` on one line in `.env`. Sender rules take three forms: `@bank.com` matches the address domain or a subdomain of it, `alerts@bank.com` matches exactly that address, and anything else is a substring test on the address and display name. The first two ignore the display name so a look-alike domain or a crafted name cannot trigger an always-important rule.
-
-### Two-stage triage (optional)
-
-By default one batched LLM call decides everything: the level, the category, and the summary. Setting the `DECIDER_*` variables splits that into two stages — a calibrated decision model (Cloudflare Clef on Workers AI) answers typed questions to decide `importance`, `category`, and `action_required` first, then the LLM above only writes the `summary`, `reason`, and `deadline`:
+Start it and follow the log:
 
 ```bash
-DECIDER_BASE_URL=https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare
-DECIDER_MODEL=clef-flash
-DECIDER_API_TOKEN=
+docker compose up -d
+docker compose logs -f
 ```
 
-Why: the decision model cannot invent a label outside the vocabulary (it answers a `choice`, not free text), returns a confidence with every answer, and screens a message for roughly a quarter of the tokens of the cheapest text model. The summary keeps the nuance only a generative model has.
+`docker compose run --rm mailsift node dist/src/main.js --check` validates the configuration without polling.
 
-Behavior notes: the decision stage inherits `LLM_BODY_CHARS`, `LLM_REDACT_PII`, `LLM_SKIP_SENSITIVE`, and your `MAIL_CONTEXT`; verification-code mail is hidden from it exactly as from the LLM. If the decision service fails, the batch falls back to the single-stage pipeline. After `LLM_ALERT_AFTER_FAILURES` polls in a row in which it failed, an alert says so; it is not repeated within `ACCOUNT_ALERT_COOLDOWN_SECONDS` while the service keeps failing, and a recovery notice follows once it answers again; if only the summary stage fails, the validated decisions are kept and the summary degrades to the decision's level and confidence. Remove the `DECIDER_*` lines to return to the original flow.
+Without Docker, use Node 22.5 or newer: `npm install`, `npm run check`, then `npm run dev`.
 
-Set `AI_GATEWAY_ID` (e.g. `default`) to route both stages through a Cloudflare AI Gateway for per-request analytics, logs, and rate limiting. The gateway changes nothing about the models, their responses, or the free Neuron allocation; leave the variable unset when the triage endpoints are not Cloudflare.
+## Settings worth a look
 
+[.env.example](.env.example) lists every setting with a short explanation. The ones most people change:
 
-### Gmail and Outlook OAuth
+- `MAIL_ACCOUNT_N_NAME`, `MAIL_ACCOUNT_N_FOLDERS`: a mailbox's display name, and which folders to watch: `INBOX,spam` (the default), `all`, or folder names.
+- `MAIL_CONTEXT`: one sentence about you and what you want pushed. The LLM reads it with every message.
+- `MAIL_ALWAYS_IMPORTANT`, `MAIL_NEVER_IMPORTANT`: senders always marked critical or info, such as `@bank.com`.
+- `PUSH_MIN_IMPORTANCE`: the lowest level pushed in real time (default `warning`).
+- `LLM_OUTPUT_LANGUAGE`: the language of summaries: `en`, `zh-CN`, `auto` or any language name.
+- `DIGEST_HOUR`: the digest's hour on the server's clock (default `9`). Set `TZ` to your time zone.
+- `IMAP_IDLE_ENABLED=true`: wake on new mail instead of waiting for the next poll.
+- `WEB_UI_ENABLED=true`: the [web view](#web-view).
 
-Two guides in Discussions cover this:
+[docs/configuration.md](docs/configuration.md) explains them in depth.
 
-- [Authorising Gmail and Outlook](../../discussions/46), step by step against the scopes and redirect this code actually uses, including the two traps that cost the most time: a Google consent screen left in Testing expires refresh tokens every 7 days, and Outlook.com ships with IMAP switched off.
-- [Forwarding](../../discussions/47), which is how to skip Gmail's OAuth altogether by forwarding the whole mailbox to an account that uses a password. Spam needs a filter to come along, since plain forwarding leaves it behind. Outlook has no equivalent, because neither its forwarding setting nor an inbox rule touches Junk, so an Outlook mailbox is worth the OAuth. The same guide covers what to do when two monitored mailboxes forward to each other.
+## Gmail and Outlook
 
-Gmail and Outlook require OAuth for most accounts:
-
-```bash
-npm run oauth
-```
-
-For a headless server or Docker:
+Most Gmail and Outlook accounts need OAuth instead of a password. Add the account without one (`MAIL_ACCOUNT_2=gmail|me@gmail.com`, or `outlook|…`), then authorize it once:
 
 ```bash
 docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual
 ```
 
-The refresh-token store is `data/tokens.json`. Treat it as a long-lived mailbox credential, keep it out of version control, and preserve its file ownership in Docker (`uid 10001`). Personal Gmail can use `gmail_pw` with an app password instead of OAuth; Google Workspace cannot.
+It prints a URL: open it on any computer, approve access, and paste the address you are redirected to back into the terminal. Outside Docker, `npm run oauth` does the same in a local browser.
 
-### Polling and backfill limits
+Two guides in Discussions cover the provider side:
 
-The first scan uses `INITIAL_LOOKBACK_DAYS` (default `3`). If a fresh folder or a folder whose UIDVALIDITY changed returns more than `MAX_MESSAGES_PER_LOOKBACK` messages (default `500`), mailsift processes the oldest bounded chunk and continues the backfill on later polls. It never advances past an unprocessed backlog just to avoid repeated work.
+- [Authorising Gmail and Outlook](../../discussions/46), step by step against the scopes and redirect this code actually uses, including the two traps that cost the most time: a Google consent screen left in Testing expires refresh tokens every 7 days, and Outlook.com ships with IMAP switched off.
+- [Forwarding](../../discussions/47), which is how to skip Gmail's OAuth altogether by forwarding the whole mailbox to an account that uses a password.
 
-Each folder is limited to `MAX_MESSAGES_PER_POLL` (default `200`). All accounts and folders share `MAX_MESSAGES_PER_POLL_TOTAL` (default `500`). When the ordinary total cap is reached, unprocessed folders keep their cursors and continue on the next poll. Selected UIDs are processed oldest-first so a cap does not skip older mail.
+Personal Gmail can also use `gmail_pw` with an app password; Google Workspace cannot.
 
-Messages up to `MAX_MESSAGE_SOURCE_BYTES` (default `5 MiB`) use the normal MIME parser. For larger messages, mailsift reads only the selected `text/plain` body part, falling back to HTML, so a large attachment is not pulled into triage. If that text body alone exceeds the limit, the message is recorded as a dead letter and can be inspected through `list_dead_letters`; `list_attachments` can still look up its files by account and Message-ID.
+## Web view
 
-The MCP recovery tools expose `recovery_status` always, and `retry_dead_letter` only when the write credential below is configured. Retrying rewinds one folder cursor so the next normal poll can fetch the message again; it does not modify the mailbox.
+Set `WEB_UI_ENABLED=true` and open `http://<host>:8410/` (the `MCP_PORT`). Sign in with `MCP_TOKEN`; the browser stays signed in.
 
-MCP also provides `observability` for processing, delivery, dead-letter, feedback, and mailbox-action totals, plus the access audit grouped by tool. `list_audit` shows recent tool/resource events and audited mailbox actions with bounded targets, without credentials or message bodies. `record_feedback` records `false_positive`, `missed`, `handled`, and `correct` labels for later rule and triage evaluation, and also requires the write credential. `list_threads` groups messages by their References/In-Reply-To root, while `search_mail` also checks the stored body preview and attachment metadata.
+The page lists what arrived, grouped by day, with the model's one-line summary, level and category. Tap a message for the reason, the full text, attachments and safety clues. Verification codes are set large and copy on tap. On a phone, add the page to the home screen: its **Latest code** shortcut opens on the newest code and waits for one that is still on its way.
 
-After two feedback records for the same sender, `missed` feedback infers an always-important rule and `false_positive` feedback infers a never-important rule. Explicit environment rules take precedence; inspect inferred rules with MCP `feedback_rules`.
-
-State is stored in SQLite (`data/mailsift.db`). Docker persists it in the `mailsift-data` named volume.
-
-### Real-time wake-ups with IMAP IDLE
-
-`IMAP_IDLE_ENABLED=true` keeps one read-only connection per account and IDLE folder (`IMAP_IDLE_FOLDERS`, default `INBOX`) open. When the server reports new mail, mailsift fetches that folder at once on the same connection and runs the usual deduplicate, triage, and deliver pipeline, so a wake-up costs no extra login. Polling continues as the reconciliation pass and catches anything a notification missed; with IDLE on, `POLL_INTERVAL_SECONDS` can usually be raised to 900-1800. `npm run probe` shows whether a server advertises IDLE; accounts without it stay on polling. Listeners reconnect with backoff after a drop, log out cleanly on shutdown, and the MCP `health` tool reports the last wake-up per account.
-
-## OpenTelemetry metrics
-
-Metrics are instrumented with OpenTelemetry and disabled by default. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to send OTLP metrics to an OpenTelemetry Collector. The instruments cover poll duration, account outcomes, triage decisions, notifications, dead letters, and the outbox. Attributes intentionally use only low-cardinality values such as provider, outcome, channel, importance, and decision source.
-
-`LLM_SKIP_SENSITIVE=true` keeps verification codes, one-time passwords, and auth-code messages in the local keyword/rule path. They remain eligible for normal notifications, but their content is never sent to the configured LLM.
-
-Sign-in and password-reset links are handled the same way. mailsift recognises one by two things together: a subject that offers a sign-in link, a magic link or a password reset (or starts "Sign in to …", "Log in to …"), and a link in the body that carries a token where tokens are put, either in a parameter such as `token=`, `code=` or `reset_password_token=`, or after a path segment such as `/reset/` or `/login/`, mixing letters with digits. Replies, repository notification threads ("[owner/repo] …"), confirmations that a password was changed, slugs and unsubscribe links do not count. Such a message is judged locally, and the push, the digest, the webhook payload and the signal event say only that a link arrived, so the link that would sign someone in never leaves the host; open the original message to use it. Even with `LLM_SKIP_SENSITIVE=false`, the LLM sees placeholders in place of both kinds. A sender you muted through feedback still gets its codes and sign-in links through, because that is mail you asked for and are waiting on; an explicit `MAIL_NEVER_IMPORTANT` rule still wins. A sign-in link in bulk mail or in a spam folder is the exception: a reset lure is the commonest phishing, so it is hidden all the same but kept for the digest, and every output carries a warning not to open it unless you asked for it. Only an always-important rule, or with `LLM_SKIP_SENSITIVE=false` the model judging from the sender alone, can push it. In the web view these messages say they were judged by a "local check", which is not the keyword fallback used when the LLM fails. It is a heuristic: a link mail it does not recognise is triaged like any other message.
-
-`LLM_REDACT_PII=true` (the default) redacts email addresses, phone numbers, payment card numbers, and resident ID numbers from fields sent to the LLM. Card and ID numbers are only redacted when their checksum holds, so waybill, order, and invoice numbers stay readable in summaries. Local state and notifications keep the original values. Set it to `false` only when the configured endpoint is trusted and the additional context is necessary.
-
-`LLM_THREAD_CONTEXT_MESSAGES` (default `3`, range `0`-`5`) adds recent earlier messages from the same mailbox thread to a new message's LLM input. It uses stored subjects, senders, summaries, and bounded snippets, plus bounded snippets from earlier messages fetched in the same poll. It does not fetch older messages or persist additional body text. Context is sent only when the message already needs LLM classification, and the normal PII redaction applies. Set it to `0` to disable.
-
-The LLM integration is OpenAI-compatible: mailsift posts to `${LLM_BASE_URL}/chat/completions` with `model`, `messages`, and (when enabled) `response_format: {"type":"json_object"}`. The response must provide JSON in `choices[0].message.content` with one result per input index. Set `LLM_JSON_MODE=false` for providers that reject `response_format`; mailsift also retries once without it when the rejection is explicit.
-
-`LLM_OUTPUT_LANGUAGE` sets the language of summaries and reasons: `en` (default), `zh-CN`, `zh-TW`, `auto` to follow each message, or any language name.
-
-Categories are not translated. They come from a fixed vocabulary, `Security`, `Finance`, `Delivery`, `Travel`, `Health`, `Legal`, `Work`, `Personal`, `Social`, `Marketing`, `System`, `Other`, and anything else the model returns is folded into `Other`. The daily digest groups by category and MCP callers search on it, so a stable vocabulary matters more than a vivid label. Rule-decided mail may also carry `Always important`, `Never important`, `Feedback rule` or `Forwarded copy`.
-
-If an LLM request fails, returns invalid JSON/schema, or returns duplicate or out-of-range indices, the affected batch uses the local fallback, because a misaligned index list cannot be trusted for any message in it. A message that is merely omitted from an otherwise valid response falls back on its own. Keyword matches remain warning-level and can be pushed; messages without a high-risk keyword become info and are queued for digest/review. Fallback does not stop polling. After `LLM_ALERT_AFTER_FAILURES` consecutive failures, mailsift sends an outage alert. When calls recover, it re-triages fallback messages that are still waiting in the digest, using their locally stored snippets; already delivered messages are left alone. If re-triage also fails, those digest entries stay available for a later retry.
-
-### Signal events
-
-Webhook deliveries retain the existing `mail` / `triage` payload and add a
-small source-neutral `signal.v1` event. It carries the triage summary and an MCP
-lookup reference instead of copying the raw message body. The reference can fetch
-a bounded normalized body from IMAP on demand without persisting it; set
-`MCP_LIVE_BODY_CHARS` to tune the returned body cap. Live lookup is read-only and
-bounded by `MCP_LIVE_SOURCE_BYTES`, `MCP_LIVE_LOOKBACK_DAYS`, and
-`MCP_LIVE_SEARCH_MAX_MESSAGES`.
-
-The reference is Bearer-authenticated only when `MCP_TOKEN` is configured. A
-loopback MCP listener with an empty token is intentionally unauthenticated, so
-do not expose it beyond the host. See [docs/signal-event-v1.md](docs/signal-event-v1.md)
-for the contract.
-
-## Running
-
-```bash
-docker compose up -d
-docker compose logs -f
-docker compose pull && docker compose up -d
-
-npm run check
-npm run dev -- --once
-npm run dev -- --once --dry-run
-npm run probe
-npm run probe -- --account me@example.com --no-counts
-npm run oauth -- --account me@example.com --manual --force
-npm run dev -- --digest-now
-npm run dev -- --healthcheck
-npm run dev -- --recover
-```
-
-`--once` polls once and exits with status `2` if an account fetch fails. `--check`
-validates configuration and OAuth authorization; `--dry-run` logs notifications
-without sending them; `--digest-now` sends the current digest; `--healthcheck`
-checks only whether a recent poll heartbeat exists; and `--recover` drops
-undispatched records and rewinds cursors after an interrupted run.
-
-`probe` checks folders and recent counts by default. Use `--no-counts` for a
-lighter connectivity/folder check, or `--account` to select one account. OAuth
-supports `--account`, `--manual`, and `--force`.
-
-Compose uses the released image version `1.0.0` by default. Set `MAILSIFT_VERSION`
-in `.env` when upgrading; this keeps deployments away from the mutable `latest`
-tag. The container stores SQLite state and OAuth refresh tokens in the
-`mailsift-data` named volume. A host-side `npm run oauth` writes to
-`./data/tokens.json`, which is not the Docker volume; run the OAuth command
-through `docker compose run --rm mailsift ...` when authorizing the container's
-accounts.
-
-To build from the checked-out source instead of pulling the image:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
-```
-
-For systemd, first run `npm install` and `npm run build`, then use
-[deploy/mailsift.service](deploy/mailsift.service). Change `WorkingDirectory` to
-the directory containing `.env` and `data/`, and change `ExecStart` if `which node`
-is not `/usr/bin/node`. The service user must own or be able to write the data
-directory; a dedicated low-privilege user is recommended. Recovery after an
-interrupted dispatch:
-
-```bash
-docker compose run --rm mailsift node dist/src/main.js --recover
-```
+Docker publishes the port on the host's loopback address only. To reach it from a phone, put a reverse proxy with TLS in front (and set `TRUSTED_PROXY=true`) or use a tunnel. More in [docs/web-view.md](docs/web-view.md).
 
 ## MCP
 
-The embedded MCP server is enabled by default in the main process. In Docker,
-`MCP_BIND` is the container listen address and `MCP_PUBLIC_HOST` is the host-side
-publish address. The Compose file uses `MCP_PORT` for both host and container
-ports; by default it is reachable only at `127.0.0.1:8410` on the host:
+The MCP server runs inside mailsift at `http://127.0.0.1:8410/mcp` (Streamable HTTP, `Authorization: Bearer <MCP_TOKEN>`). Add it to an MCP client and an assistant can list, search and read your triaged mail, preview the digest, or check mailbox health. It is read-only; a separate `MCP_WRITE_TOKEN` adds marking, starring and moving mail, all audited. See [docs/mcp.md](docs/mcp.md).
 
-```dotenv
-MCP_ENABLED=true
-MCP_PUBLIC_HOST=127.0.0.1
-MCP_BIND=0.0.0.0
-MCP_PORT=8410
-MCP_TOKEN=<random-long-token>
-```
-
-For public HTTP access, use a strong token and set `MCP_PUBLIC_HOST` deliberately.
-A non-loopback `MCP_BIND` refuses to start without `MCP_TOKEN`; loopback with an
-empty token is unauthenticated by design. The endpoint is `/mcp`, uses stateless
-Streamable HTTP, and applies `MCP_RATE_LIMIT_PER_MINUTE` (default `120`). Use
-HTTPS through a reverse proxy or tunnel because MCP carries mailbox data and
-bearer tokens must not cross the public internet over plain HTTP. For local
-stdio clients, point the command at `dist/src/mcp.js`.
-
-### The surface is read-only unless you opt in
-
-`manage_mail`, `record_feedback`, and `retry_dead_letter` are write tools, and
-they are not registered at all unless `MCP_WRITE_TOKEN` is set. `manage_mail`
-supports `mark_read`, `mark_unread`, `star`, `unstar`, and `move`; it refuses
-delete/trash destinations and never sends mail. Every operation resolves the
-Message-ID again inside a writable IMAP lock and records an audit row. The
-separate token keeps a leaked read credential from changing either mailbox
-contents or future triage policy.
-
-Set `MCP_WRITE_TOKEN` to a second secret that differs from `MCP_TOKEN`; reusing
-one value for both is refused at startup. Present it as the bearer token to get
-the full surface. `MCP_TOKEN` then stays a read-only credential, which is what
-the browser view and any shared client should hold. Over stdio the caller can
-already read the env file, so setting `MCP_WRITE_TOKEN` alone enables the write
-tools there without a second presentation.
-
-### Reading attachments
-
-`list_attachments` takes a configured account and Message-ID, and returns MIME
-metadata plus a `mailsift://imap/.../attachment/{partId}` resource URI for each
-file. Read the resource to fetch that one file from IMAP. The web view also lists
-and downloads attachments from a message's detail panel. Reads use a read-only
-mailbox lock; attachment bytes are never stored. New triage records keep only a
-bounded manifest of names, MIME types, part IDs, and reported sizes.
-
-`MCP_ATTACHMENT_MAX_BYTES` limits the decoded size of each on-demand file and
-defaults to 10 MiB (configuration is capped at 100 MiB). This limit is separate
-from `MCP_LIVE_SOURCE_BYTES`, so attachment reads fetch the selected MIME part
-without downloading the entire message source. Filenames are treated as
-untrusted data and files are delivered as downloads. mailsift returns image and
-PDF files as-is; it does not recognize images or extract PDF text.
-
-`scan_attachment` and the **Scan attachment** button read only a bounded decoded
-prefix, controlled by `MCP_ATTACHMENT_SCAN_BYTES` (default 1 MiB, hard cap 4 MiB).
-The local check looks for suspicious filename/MIME combinations and common
-executable, script, active-content, and container signatures. It does not unpack,
-execute, upload, persist, or claim to replace antivirus software.
-
-Link parsing reads at most `MCP_SAFETY_BODY_BYTES` (default 256 KiB, hard cap
-1 MiB) from a selected text body part. It reports scheme, IP-host, punycode,
-userinfo, and common shortener clues while omitting URL paths and query values.
-
-### Spam and safety clues
-
-The `inspect_mail_safety` tool checks a message's configured folder, mailing-list or bulk-mail headers, a From/Reply-To
-domain mismatch, attachment filename/MIME types, and links parsed from a bounded text body prefix. The web detail view
-offers the same check, and attachment lists show file-type cautions and a bounded scan button. Mailbox reads use a
-read-only lock; only the selected text body prefix is read for link parsing, and no link is opened.
-
-These are clues, not a spam or malware verdict. Mailing-list headers do not prove spam; sender fields can be forged.
-mailsift does not verify SPF, DKIM or DMARC, resolve or reputation-check links, unpack attachments, or provide an
-antivirus verdict. It does not move, delete, flag, or otherwise change messages as part of these checks.
-
-### Discovering folders
-
-`list_folders` takes the exact account address returned by `list_accounts` and
-lists its decoded IMAP folder paths, hierarchy delimiter, flags, special-use
-marker, and selectability. It uses IMAP LIST without opening folders or
-changing mail.
-
-Every tool and live resource call is audited by name, outcome, caller fingerprint,
-and (where useful) a bounded account/message/part target; rejected authentication
-attempts are included. `list_audit` returns recent rows and mailbox-action audit.
-Credentials, message bodies, and URL query strings are never stored in the audit.
-
-`health` reports the last poll heartbeat, account failures (with each failing
-account's last good check), LLM and decision-stage failure counts, and pending
-queues; `healthy` is false while a mailbox is at the alert threshold. The Docker healthcheck checks only the poll heartbeat; a
-healthy container does not prove that every account, LLM call, or notification
-sink is healthy. Use MCP `health` and `recovery_status` for those details.
-
-Every alert mailsift raises is sent by mailsift, so a stopped process or host is
-silent. Set `HEARTBEAT_PING_URL` to a push or heartbeat monitor (an Uptime Kuma
-push monitor, healthchecks.io, a Better Stack heartbeat) and mailsift sends it a
-plain GET after every completed poll; the monitor raises the alarm when the pings
-stop. The request carries nothing about mail, never holds up a poll, and only
-the monitor's host is logged, because the URL is usually its secret. A URL with a
-user name and password is not used, because fetch refuses to send one; `--check`
-shows whether a monitor is configured and why one is not used. A `--once` run
-waits for its ping before it exits.
-
-## Read-only web view
-
-`WEB_UI_ENABLED=true` serves a browser view of the triage results at `http://<host>:<MCP_PORT>/`, on the same port and behind the same `MCP_TOKEN` as MCP, because it is the same trust boundary. The page opens on one sentence, "11 messages, 6 of them notified, 1 critical.", whose numbers are filters, with a status line under it saying where the mail came from and when the mailboxes were last checked. Below it is a single list of judgements grouped by day: sender, the model's one-line summary, level and category, the deadline when there is one, and for critical mail the reason it was judged so. Filters (window, level, category, mailbox, spam only, notified only, codes only, messages or threads) and the search live in one form and are mirrored to the URL, so a reload or a shared link restores the view. The queue behind the next digest is listed at the end with the hour it will be sent, and the digest that last went out stays under it for 18 hours, open the first time it is seen and folded to one line after that; every entry in either opens its message, and every message links out to the provider's own client. The codes-only filter also lists verification emails whose code could not be extracted, so it shows every one of them, not only those with digits.
-
-A verification code is the most frequent reason to open the page, so it is never a sentence to read: the digits are set large in the row and are themselves the copy button. A code that arrived in the last ten minutes is lifted above the list with its sender and age, and `/?focus=code`, one of the two home-screen shortcuts the manifest offers next to `/?importance=critical`, lands on it. Codes older than fifteen minutes go grey, so a stale one is recognisable before it is pasted.
-
-The shortcut is usually pressed right after asking a site for a code, before it has arrived. With no fresh code to show, the lane says it is waiting and watches for up to three minutes, reading what the poller has stored every few seconds, and asks for one immediate poll through the same rate-limited path as the refresh button, so a code filed to spam is not left for the next interval. The code slides in already focused, unless you are busy elsewhere on the page (typing in the search field, focused on another control, or in an open sheet, which hands the focus to the code when it closes); the status line then says it came. A fresh verification email whose code could not be extracted counts as well, already there or arriving: its row is focused, because the code is in it. If nothing comes, the status line says no new code arrived.
-
-A mailbox that cannot be read says so instead of looking quiet. Once one has failed `ACCOUNT_ALERT_AFTER_FAILURES` polls in a row, a line under the status names it ("work-gmail not checked since yesterday 08:26"), and an empty list says that mail may be missing rather than that there is none. Tapping the line lists every mailbox with its last good check and failure count, and what usually fixes that kind of failure: a refused login, an OAuth account that was never authorized on this server, folders that cannot be opened, or a server that cannot be reached. For a Gmail or Outlook OAuth account it adds the exact re-authorization command with a copy button, written for Docker when mailsift runs in a container. Notifications still waiting in the outbox are counted there too. A refresh that a mailbox did not answer names it in the status line.
-
-Tapping a message opens it in a sheet that slides up over the list on a phone, and in a pane beside the list from 900px up. The sheet closes with Done, a drag on its handle, Escape or the system back gesture, because opening it pushes a history entry. The detail carries the judgement and its reason, the summary as prose, the provider link, and three things fetched live from the mailbox on request: the full text body, the attachment list with download and a bounded scan, and the spam and safety clues. Attachment files are downloaded and never cached or persisted by mailsift. On a desk, ↑ and ↓ move through the list, Enter opens, `c` copies the newest code, `/` focuses the search and Escape closes.
-
-The browser view remains read-only in the strict sense: mailbox calls fetch a message body or a selected MIME part under a read-only lock. Use MCP with the separate write token for the small audited action set; sending, replying, deleting, and other mailbox management still belong in a real webmail client such as Roundcube.
-
-The header's refresh button runs a poll immediately instead of waiting for the next interval. The page has no pull-to-refresh of its own: in the installed app, scrolling back to the top set it off too easily. It scans the same folders the scheduled poll does, spam included. The status line narrates it ("Checking 2 mailboxes…", then "Checked just now · 3 new") and the rows that arrived settle in with a tint that fades, so what changed is visible without comparing two lists. A click during a running poll joins it rather than opening a second set of IMAP connections, and manual presses are rate-limited per client. The button appears only when the page is served by the long-running service; the standalone MCP server has no poller to trigger. Its status line still says when the mailboxes were last checked, because it reads the same database, and falls back to when the view itself was last updated only before any poll has completed.
-
-Off by default. A page a browser can reach is a wider surface than a JSON-RPC endpoint, so enable it deliberately, keep `MCP_BIND` on loopback, and put TLS in front of it if you reach it from a phone.
-
-Signing in posts the token and exchanges it for an `HttpOnly` cookie that lasts six months and is renewed on each visit, so a browser in regular use is never asked again. The form carries an account field so a password manager will offer to save the token rather than leaving you to type it. An installed app keeps its own cookies on iOS, so expect to sign in once inside it even if the browser is already signed in.
-
-The header carries a two-state light/dark switch. The choice is stored in the browser and applied before the body renders, so it never flashes the other theme, and it moves the status bar colour with it rather than leaving the top of an installed app behind.
-
-Next to it is a language switch between English and Simplified Chinese. The page follows the browser's language until the switch is used; that choice is kept in a cookie, so the server renders the page, and the sign-in form before it, in that language from the first paint. Only the page's own words change. Subjects, summaries and reasons are shown as stored, in the language `LLM_OUTPUT_LANGUAGE` told the model to write, and the digest preview is the text that will actually be sent.
-
-It installs to a home screen: the manifest, a maskable icon and a service worker that caches nothing are served without a session, since a browser asks for them before it has one. The offer to install is a line in the list on a phone and a word in the header on a desk, and never appears inside the installed app. Installed, it opens without browser chrome, paints the status bar to match the page in either colour scheme, and reaches under a notch with the safe-area insets padded back. The worker deliberately caches nothing, because a page showing yesterday's triage would be worse than no page. Regenerate the icon with `npx tsx scripts/icons.ts` after changing the mark.
-
-To work on the page without a mailbox, `npx tsx scripts/web-preview.ts` serves it over a week of fixture mail at `http://127.0.0.1:8499/`; `--token` adds the sign-in form, and its refresh button files one more verification code each time it is pressed.
-
-Behind a reverse proxy, set `TRUSTED_PROXY=true`. Otherwise every request arrives from the proxy's address, the per-client rate limit collapses into one shared budget, and a single noisy caller can lock out your own browser and any MCP client. With it set, the limit and the audit log key on `CF-Connecting-IP`, `X-Real-IP` or the first `X-Forwarded-For` entry. Leave it off when the port is reached directly, since anyone can send those headers. Sign-in gets a separate, much smaller budget of its own, because it is the only route that answers without credentials.
-
-## Troubleshooting
-
-- **Repeated notifications:** messages are deduplicated by account plus Message-ID. `--recover` is for interrupted, undecided records.
-- **Nothing was notified:** call MCP `health` first. Its `delivery` block reports the push and digest thresholds, the spam bonus, and whether self-forwards are suppressed, which usually explains the decision without further digging. `recovery_status` then shows folder UID progress and any notification still queued for retry.
-- **Delivery failures:** a push that fails with a network error, a timeout, or HTTP 408/429/5xx is retried up to `SINK_RETRY_ATTEMPTS` times (default `3`, seconds apart) and then waits in the durable outbox. Outbox retries use persisted exponential backoff (`OUTBOX_RETRY_BASE_SECONDS`, default `60`; `OUTBOX_RETRY_MAX_SECONDS`, default `3600`), so a failed endpoint is not hammered on every poll. `recovery_status` shows the next attempt time.
-- **Outbox backlog:** only real failures wait there. An output that declines a message under its own threshold, such as `FEISHU_MIN_IMPORTANCE`, settles it immediately and the digest carries it, so a pending count in MCP `health` always means something is genuinely undelivered.
-- **QQ scans many messages:** some QQ IMAP endpoints ignore `SINCE`; the local UID cursor still preserves correctness.
-- **Messages marked read:** mailsift uses read-only mailbox locks and `BODY.PEEK[]`.
-- **LLM privacy:** `LLM_SKIP_SENSITIVE=true` keeps verification-code messages local, and `LLM_REDACT_PII=true` redacts common direct identifiers before sending fields to the LLM. Omit `LLM_API_KEY` for local keyword fallback or use a self-hosted endpoint.
-- **OAuth expiry:** access tokens refresh automatically. Re-authorize with `npm run oauth -- --account user@example.com --force` after revocation or credential changes.
-
-## Development
+## Everyday commands
 
 ```bash
-npm test
-npm run typecheck
-npm run build
+docker compose logs -f                                          # follow the log
+docker compose pull && docker compose up -d                     # upgrade (raise MAILSIFT_VERSION first if pinned)
+docker compose run --rm mailsift node dist/src/main.js --check  # validate the configuration
 ```
+
+Every command and flag is in [docs/deployment.md](docs/deployment.md#commands).
+
+## Documentation
+
+- [Configuration](docs/configuration.md): mailboxes and folders, outputs, push thresholds, your own rules, the digest, polling limits, IMAP IDLE, alerts.
+- [Triage](docs/triage.md): how mail is judged, the LLM and what it sees, two-stage triage, fallback, verification codes and sign-in links.
+- [Web view](docs/web-view.md): everything the browser view does.
+- [MCP](docs/mcp.md): tools, resources, the write token, attachments, safety clues, audit.
+- [Deployment and operations](docs/deployment.md): Docker, upgrades, systemd, OAuth details, commands, monitoring, recovery.
+- [Troubleshooting](docs/troubleshooting.md)
+- [Signal event v1](docs/signal-event-v1.md): the `signal` object in webhook payloads.
+- [Development](docs/development.md)
 
 ## License
 

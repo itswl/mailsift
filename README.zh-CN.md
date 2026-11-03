@@ -1,260 +1,126 @@
 # mailsift（中文说明）
 
-mailsift 用于统一监控多个 IMAP 邮箱，包括垃圾箱。它结合本地规则和大模型判断邮件重要性，将需要处理的邮件推送到飞书或通用 Webhook，其余邮件汇总为每日简报。
+mailsift 统一监控你的所有 IMAP 邮箱，包括垃圾箱。它用你自己的规则和大模型判断每封新邮件，把重要的推送到飞书或通用 Webhook，其余的汇总进每日日报。
 
-> 这是辅助工具，不是邮件客户端。mailsift 默认只读；单独配置写凭证后，可以执行少量有审计的标记、加星和移动操作，但不会发送、回复、删除邮件或静默修改邮箱。分类结果可能有误，请继续以邮件客户端为准。
+> 这是辅助工具，不是邮件客户端。mailsift 默认只读，不会发送、回复或删除邮件；单独配置写凭证后，可以执行少量有审计的标记、加星和移动操作。分类结果可能有误，请继续以邮件客户端为准。
 
-英文主文档见 [README.md](README.md)。
+English: [README.md](README.md)。详细文档在 [docs/](docs/) 目录，只有英文版。
+
+## 主要功能
+
+- **所有邮箱，包括垃圾箱。** 支持任意 IMAP 服务商和多个账号，Gmail、Outlook 通过 OAuth 接入。垃圾箱按服务商自动识别，和收件箱一样检查。
+- **判断，而不只是过滤。** 先按你的发件人规则判定，其余交给大模型评为紧急、警告或一般，并附一句话摘要和理由。没配大模型或它出错时，由关键词规则兜底，邮件照常处理。
+- **重要的及时推送。** 重要邮件一被发现就推送到飞书或 Webhook，开启 IMAP IDLE 后几秒内就到；其余的等每日日报。
+- **验证码一眼可见。** 验证码直接显示在飞书卡片里，在 Web 视图里则是一个点一下就复制的大号数字。验证码和登录链接都不会发给大模型。
+- **手机上的 Web 视图。** 一个可以添加到主屏幕的只读页面：收到了什么、怎么判的、为什么，支持搜索和筛选。
+- **MCP 服务器**，让 AI 助手可以列出、搜索和阅读分诊过的邮件。
+- **看不到时会说。** 邮箱或大模型持续失败时会告警；可选的外部心跳能让别处的监控发现 mailsift 自己停了。
 
 ## 快速开始
+
+需要 Docker 和 Compose。
 
 ```bash
 git clone https://github.com/itswl/mailsift.git
 cd mailsift
 cp .env.example .env
-vim .env
-docker compose up -d
 ```
 
-至少配置一个邮箱、一个输出出口（`FEISHU_WEBHOOK_URL` 或 `WEBHOOK_URL`），以及可选的大模型 API Key。Node >= 22.5 的本地运行方式：
+编辑 `.env`，至少填好下面几行，其余设置可以先保持 `.env.example` 里的值：
 
 ```bash
-npm install
-npm run check
-npm run dev
-```
-
-## 基本配置
-
-```bash
+# 邮箱：服务商|地址|密码。密码通常是授权码或应用专用密码。
 MAIL_ACCOUNT_1=qq|me@qq.com|授权码
-MAIL_ACCOUNT_1_NAME=QQ主号
-MAIL_ACCOUNT_1_FOLDERS=all
 
-FEISHU_WEBHOOK_URL=
-WEBHOOK_URL=
-WEBHOOK_TOKEN=
+# 重要邮件推送到哪里：飞书机器人、Webhook（WEBHOOK_URL），或两者都配。
+FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/...
 
+# 大模型。Key 留空则只用关键词规则。
 LLM_PROVIDER=deepseek
-LLM_MODEL=deepseek-flash
 LLM_API_KEY=
 
-PUSH_MIN_IMPORTANCE=warning
-SPAM_RANK_BONUS=0
-DIGEST_ENABLED=true
-DIGEST_HOUR=9
+# Docker 部署时，MCP 和 Web 视图所在的端口必须设置 token：任意长随机串，
+# 例如 `openssl rand -hex 32` 的输出。
+MCP_TOKEN=
 ```
 
-完整配置见 [.env.example](.env.example)。`MAIL_ACCOUNT_N_FOLDERS` 可填 `all`、`INBOX,spam` 或具体文件夹名；`all` 会排除已发送、草稿、回收站和服务商的虚拟视图，`spam` 会自动识别垃圾箱。
+Compose 默认运行 `latest` 镜像。如果想自己决定什么时候升级，再在 `.env` 里固定一个版本，例如 `MAILSIFT_VERSION=0.1.99`，可选版本见 Releases 页面。
 
-`SUPPRESS_SELF_FORWARDS=true`（默认）用于避免邮箱之间互相转发时同一封邮件通知两次。转发副本是一封全新邮件，有自己的 Message-ID，按 Message-ID 去重看不到它，但它的发件人正是被配置监控的某个账号。这类副本会被记录、可通过 `list_mail` 查到，但既不实时推送也不再出现在每日日报里，因为原件已经在源邮箱分诊过。它同样不消耗模型调用。在同一个邮箱内给自己发的邮件不受影响，显式的 `MAIL_ALWAYS_IMPORTANT` 仍然优先。
-
-`SPAM_RANK_BONUS` 按整级提升垃圾箱邮件，而 info 是最低一级，因此在默认的 `PUSH_MIN_IMPORTANCE=warning` 下把它设为 `1` 会推送垃圾箱里的每一封邮件：warning 和 critical 本来就在推送线之上，info 现在也正好压线。除非你把 `PUSH_MIN_IMPORTANCE` 调成 `critical` 又希望垃圾箱里的 warning 仍能穿透，否则保持 `0`。防止邮件被误判进垃圾箱并不需要它，因为分诊会正常评估垃圾箱邮件，真正的账单或验证码在那里也会被评为 warning 或 critical。`--check` 会对导致整箱推送的组合给出提示。
-
-`DIGEST_HOUR` 是服务器本地时钟上 0 到 23 之间的整点，所以要设置 `TZ`（compose 文件默认 `Asia/Shanghai`）；其他取值按 9 处理，`--check` 会提示。到点后的第一次轮询发出日报，每个本地日历日只发一次。0.1.97 及以前判断"今天是否已发"用的是 UTC 日期，凡是早于 UTC 零点所对应本地时间的小时都会出错：东八区是 8 点以前，比 UTC 慢的时区则一天中的大部分小时都受影响，包括美洲默认的 9 点。这些日报不是在设定的小时发出，而是等到 UTC 换日（东八区 8 点、纽约 19 点或 20 点），首日或一整天没有轮询之后还会发两次。升级后的第一期按旧规则本该发出的时间发出，之后都准点发送。
-
-`MAIL_CONTEXT`、`MAIL_ALWAYS_IMPORTANT`、`MAIL_NEVER_IMPORTANT` 和 `MAIL_KEYWORDS` 可用于定制分类规则。不要把 `MAIL_CONTEXT` 写成多行。发件人规则有三种写法：`@bank.com` 匹配发件地址的域名及其子域，`alerts@bank.com` 精确匹配该地址，其它写法按子串匹配地址和显示名。前两种不看显示名，避免仿冒域名或伪造显示名触发"始终重要"规则。
-
-### 两段式分诊（可选）
-
-默认一条批量 LLM 调用决定所有字段：级别、类别、摘要。配置 `DECIDER_*` 变量后拆成两段——先由校准型决策模型（Cloudflare Workers AI 上的 Clef）回答类型化问题，定下 `importance`、`category`、`action_required`；再由上面的 LLM 只写 `summary`、`reason`、`deadline`：
-
-```bash
-DECIDER_BASE_URL=https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare
-DECIDER_MODEL=clef-flash
-DECIDER_API_TOKEN=
-```
-
-为什么值得：决策模型回答的是选择题而不是自由文本，不可能编造词表外的类别，每个答案自带置信度，筛选一封邮件的 token 开销约为最便宜文本模型的四分之一；而摘要这种需要文字功底的活仍交给生成模型。
-
-行为说明：决策阶段同样遵守 `LLM_BODY_CHARS`、`LLM_REDACT_PII`、`LLM_SKIP_SENSITIVE` 和你的 `MAIL_CONTEXT`，验证码邮件对它同样隐藏内容。决策服务失败时整批回落到单段流程。连续 `LLM_ALERT_AFTER_FAILURES` 次轮询里它都失败，就发一条告警说明；只要它一直失败，`ACCOUNT_ALERT_COOLDOWN_SECONDS` 内不会重复告警，恢复后再发一条恢复通知；只有摘要阶段失败时保留已定决策，摘要降级为"级别 + 置信度"。删掉 `DECIDER_*` 三行即回到原流程。
-
-设置 `AI_GATEWAY_ID`（如 `default`）可让两个阶段都经过 Cloudflare AI Gateway，获得逐请求的分析、日志与限流。网关不改变模型、响应内容和免费 Neurons 额度；当分诊端点不在 Cloudflare 时保持该变量为空即可。
-
-## Gmail / Outlook OAuth
-
-Discussions 里有两篇指南：
-
-- [Gmail / Outlook 的 OAuth 授权](../../discussions/46)，对照代码实际请求的 scope 和回调地址写的，含两个最耗时间的坑：Google 同意屏幕停在「测试」会让 refresh token 每 7 天过期，以及 Outlook.com 默认关闭 IMAP。
-- [邮箱转发](../../discussions/47)，讲怎样用整箱转发完全绕开 Gmail 的 OAuth。要连垃圾邮件一起转需要用过滤器，因为默认转发不带垃圾邮件。Outlook 没有对应做法，它的转发和收件箱规则都不作用于垃圾邮件，所以 Outlook 值得花力气配 OAuth。这篇同时说明两个被监控的邮箱互相转发时该怎么办。
-
-Gmail 和 Outlook 通常需要 OAuth：
-
-```bash
-npm run oauth
-```
-
-无浏览器的服务器或 Docker：
-
-```bash
-docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual
-```
-
-长期凭据保存在 `data/tokens.json`，不要提交到仓库。个人 Gmail 可用 `gmail_pw` 加应用专用密码绕过 OAuth；Google Workspace 不支持此方式。
-
-## 轮询和补账限制
-
-首次扫描使用 `INITIAL_LOOKBACK_DAYS`（默认 3 天）。如果首次扫描或 UIDVALIDITY 变化后的单个文件夹回看超过 `MAX_MESSAGES_PER_LOOKBACK`（默认 500）封，mailsift 会先处理最旧的一批，后续轮询继续补账；不会为了避免重复补账而越过尚未处理的邮件。
-
-单个文件夹每轮最多处理 `MAX_MESSAGES_PER_POLL`（默认 200）封。所有账号和文件夹合计受 `MAX_MESSAGES_PER_POLL_TOTAL`（默认 500）限制。普通全局上限触发时，尚未处理的文件夹保留游标，下一轮继续。UID 按从老到新处理，避免截断时跳过旧邮件。
-
-不超过 `MAX_MESSAGE_SOURCE_BYTES`（默认 5 MiB）的邮件按原来的 MIME 解析路径处理。更大的邮件只读取 `text/plain` 正文部件，没有时再读取 HTML，因此大附件不会被带入分诊。如果正文部件本身也超过上限，邮件会记为 dead letter，可通过 `list_dead_letters` 查询；知道邮箱账号和 Message-ID 后，仍可用 `list_attachments` 单独查找并读取附件。
-
-MCP 恢复工具始终提供 `recovery_status`；`retry_dead_letter` 只在配置了下文的写凭证后才注册。重试只会回退对应文件夹的本地游标，下一轮正常轮询会重新拉取邮件，不会修改邮箱内容。
-
-MCP 还提供 `observability` 查看处理、投递、dead-letter、反馈和邮箱操作统计，以及按工具分组的访问审计。`list_audit` 可查看近期工具/资源调用和邮箱操作审计，目标只保留有限的账号、Message-ID、部件标识，不保存凭证或正文。`record_feedback` 记录 `false_positive`、`missed`、`handled`、`correct`，供后续规则和分类评估使用，同样需要写凭证。`list_threads` 按 References/In-Reply-To 根键聚合会话，`search_mail` 还会检索已保存的正文片段和附件元数据。
-
-同一发件人累计两次 `missed` 反馈会推断为重要发件人，两次 `false_positive` 会推断为低优先级发件人；显式环境规则优先。可通过 MCP `feedback_rules` 查看推断规则。
-
-状态保存在 SQLite 的 `data/mailsift.db` 中，Docker 使用 `mailsift-data` 命名卷持久化。
-
-## IMAP IDLE 实时唤醒
-
-`IMAP_IDLE_ENABLED=true` 会为每个账号的每个 IDLE 文件夹（`IMAP_IDLE_FOLDERS`，默认 `INBOX`）保持一条只读长连接。服务器通知有新邮件时，mailsift 立刻在同一条连接上抓取该文件夹，并走正常的去重、分诊、投递流水线，因此一次唤醒不产生额外登录。定时轮询继续作为对账机制运行，兜住通知漏掉的邮件；开启 IDLE 后通常可以把 `POLL_INTERVAL_SECONDS` 调到 900～1800。`npm run probe` 会显示服务器是否支持 IDLE，不支持的账号继续使用轮询。长连接断开后按退避重连，进程退出时会正常 LOGOUT，MCP `health` 会报告每个账号最近一次唤醒时间。
-
-## OpenTelemetry 指标
-
-指标使用 OpenTelemetry，默认关闭。设置 `OTEL_EXPORTER_OTLP_ENDPOINT` 后即可把 OTLP 指标发送到 OpenTelemetry Collector，覆盖轮询耗时、账号结果、分类决策、通知、dead-letter 和 outbox。指标属性只使用 provider、结果、通道、重要性和决策来源等低基数值，不放邮箱地址、Message-ID 或主题。
-
-`LLM_SKIP_SENSITIVE=true` 会让验证码、一次性密码和认证码邮件始终走本地规则/关键词路径，不发送给 LLM；它们仍可正常触发通知。
-
-登录链接和重置密码链接同样处理。mailsift 同时看两点来识别：主题里写着登录链接、magic link、重置/找回密码（或以 "Sign in to …"、"Log in to …" 开头），并且正文里有一条把令牌放在惯常位置的链接：要么在 `token=`、`code=`、`reset_password_token=` 这类参数里，要么在 `/reset/`、`/login/` 这类路径段之后，且是字母和数字混排的随机串。回复、代码仓库的通知线程（"[owner/repo] …"）、"密码已重置成功"一类的确认、普通的文章链接和退订链接都不算。命中的邮件在本地判定；实时推送、日报、Webhook 载荷和 signal 事件都只说"收到一封登录链接邮件"，能直接登录的那条链接不会离开这台机器，使用时请打开原邮件。即使 `LLM_SKIP_SENSITIVE=false`，LLM 看到的也只是这两类邮件的占位文字。通过反馈静音的发件人，验证码和登录链接仍会照常提醒，因为这是你主动要来、正在等的邮件；显式的 `MAIL_NEVER_IMPORTANT` 规则仍然优先。群发邮件或垃圾箱里的登录链接是例外：重置密码是最常见的钓鱼手法，所以它同样被隐藏，但只进日报，所有输出都会提示"如果不是你刚刚请求的，请勿打开"。只有始终重要的规则，或者在 `LLM_SKIP_SENSITIVE=false` 时模型仅凭发件人判断，才能让它被推送。Web 视图里这类邮件标为"本地"判定，与 LLM 出错时的关键词兜底不是一回事。这是启发式识别：没认出来的登录链接邮件会像普通邮件一样分诊。
-
-`LLM_REDACT_PII=true`（默认）会在发送给 LLM 前脱敏邮件地址、电话号码、银行卡号和身份证号；银行卡号和身份证号只在校验位成立时才脱敏，因此运单号、订单号、发票号通常会保留在摘要里。本地状态及通知保留原始值。只有在确认网关可信且确实需要更多上下文时，才考虑关闭它。
-
-`LLM_THREAD_CONTEXT_MESSAGES`（默认 `3`，范围 `0`–`5`）会把同一邮箱会话中较早的邮件加入新邮件的 LLM 输入。使用本地已保存的主题、发件人、摘要和限长片段，也会带上同一轮扫描中更早邮件的限长片段；不会重新读取旧邮件，也不会额外持久化正文。只有本来就需要 LLM 分类的邮件才会带上上下文，且同样应用 PII 脱敏。设为 `0` 可关闭。
-
-LLM 接口必须兼容 OpenAI 的 `/chat/completions`：请求使用 `model`、`messages`，并在启用时带上 `response_format: {"type":"json_object"}`；响应需要在 `choices[0].message.content` 中返回 JSON，并为每封输入邮件提供对应的 `index`。如果服务商不支持 `response_format`，可设置 `LLM_JSON_MODE=false`；服务商明确拒绝时 mailsift 也会自动重试一次。
-
-`LLM_OUTPUT_LANGUAGE` 决定摘要和原因的语言：`en`（默认）、`zh-CN`、`zh-TW`、`auto`（跟随每封邮件的语言）或任意语言名称。
-
-分类不参与翻译。它来自一份固定词表：`Security`、`Finance`、`Delivery`、`Travel`、`Health`、`Legal`、`Work`、`Personal`、`Social`、`Marketing`、`System`、`Other`，模型返回的其它值一律归入 `Other`。日报按分类分组、MCP 调用方也按它检索，因此词表的稳定比标签的贴切更重要。规则层判定的邮件还可能带 `Always important`、`Never important`、`Feedback rule` 或 `Forwarded copy`。
-
-如果 LLM 请求失败、返回无效 JSON/结构，或返回重复/越界的序号，该批邮件会整体使用本地 fallback，因为序号错位后整批结果都不可信。仅遗漏了个别序号时，只有被遗漏的那封邮件走 fallback。命中高风险关键词的邮件仍按 warning 处理并可能实时推送；未命中的邮件按 info 处理，进入日报/待复核队列。fallback 不会停止轮询。连续失败达到 `LLM_ALERT_AFTER_FAILURES` 后会发送故障告警，恢复后发送恢复通知；已经在 fallback 期间处理的邮件不会自动重新分诊，应检查对应时段的日报。
-
-## 运行和恢复
+启动并查看日志：
 
 ```bash
 docker compose up -d
 docker compose logs -f
-npm run check
-npm run dev -- --once
-npm run dev -- --once --dry-run
-npm run probe
-npm run probe -- --account me@example.com --no-counts
-npm run oauth -- --account me@example.com --manual --force
-npm run dev -- --digest-now
-npm run dev -- --healthcheck
-npm run dev -- --recover
 ```
 
-`--once` 执行一次轮询；`--check` 校验配置和 OAuth 授权；`--dry-run` 只记录通知、不发送；`--digest-now` 立即发送当前日报；`--healthcheck` 只检查最近是否有轮询心跳；`--recover` 在中断后清理未完成记录并回退游标。`probe` 默认检查文件夹和近期数量，`--no-counts` 可省略数量查询，`--account` 可只检查一个账号。OAuth 支持 `--account`、`--manual` 和 `--force`。
+`docker compose run --rm mailsift node dist/src/main.js --check` 可以只校验配置，不执行轮询。
 
-Compose 默认使用已发布的 `1.0.0` 镜像。升级时在 `.env` 设置 `MAILSIFT_VERSION`，避免使用可变的 `latest` 标签。容器把 SQLite 状态和 OAuth refresh token 保存在 `mailsift-data` 命名卷中。宿主机直接执行 `npm run oauth` 写入的是 `./data/tokens.json`，不会自动进入 Docker 命名卷；给容器账号授权时应使用：
+不用 Docker 时需要 Node 22.5 及以上：`npm install`、`npm run check`，然后 `npm run dev`。
+
+## 常用设置
+
+[.env.example](.env.example) 列出了全部设置并附有简短说明。最常改的是这些：
+
+- `MAIL_ACCOUNT_N_NAME`、`MAIL_ACCOUNT_N_FOLDERS`：邮箱的显示名，以及监控哪些文件夹：`INBOX,spam`（默认）、`all` 或具体文件夹名。
+- `MAIL_CONTEXT`：用一句话说明你是谁、希望推送什么。大模型判断每封邮件时都会读它。
+- `MAIL_ALWAYS_IMPORTANT`、`MAIL_NEVER_IMPORTANT`：始终标为紧急或一般的发件人，例如 `@bank.com`。
+- `PUSH_MIN_IMPORTANCE`：实时推送的最低级别（默认 `warning`）。
+- `LLM_OUTPUT_LANGUAGE`：摘要的语言：`en`、`zh-CN`、`auto` 或任意语言名称。
+- `DIGEST_HOUR`：日报在服务器时钟上的发送整点（默认 `9`）。记得把 `TZ` 设成你的时区。
+- `IMAP_IDLE_ENABLED=true`：新邮件一到就唤醒，不必等下一次轮询。
+- `WEB_UI_ENABLED=true`：开启下面的 [Web 视图](#web-视图)。
+
+每项的详细说明见 [docs/configuration.md](docs/configuration.md)。
+
+## Gmail / Outlook
+
+大多数 Gmail 和 Outlook 账号需要用 OAuth 而不是密码。添加账号时不填密码（`MAIL_ACCOUNT_2=gmail|me@gmail.com`，或 `outlook|…`），然后授权一次：
 
 ```bash
 docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual
 ```
 
-从当前源码构建而不是拉取镜像：
+它会打印一个链接：在任意一台电脑上打开、同意授权，再把跳转后的完整地址粘贴回终端。不用 Docker 时，`npm run oauth` 会在本机浏览器里完成同样的步骤。
 
-```bash
-docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
-```
+Discussions 里有两篇指南讲服务商那边的设置：
 
-systemd 模板见 [deploy/mailsift.service](deploy/mailsift.service)。先执行 `npm install` 和 `npm run build`，再把 `WorkingDirectory` 改为包含 `.env` 和 `data/` 的目录；如果 `which node` 不是 `/usr/bin/node`，还要修改 `ExecStart`。运行用户必须能写入 data 目录，建议使用低权限专用用户。处理过程中被中断时：
+- [Gmail / Outlook 的 OAuth 授权](../../discussions/46)，对照代码实际请求的 scope 和回调地址写的，含两个最耗时间的坑：Google 同意屏幕停在「测试」会让 refresh token 每 7 天过期，以及 Outlook.com 默认关闭 IMAP。
+- [邮箱转发](../../discussions/47)，讲怎样用整箱转发完全绕开 Gmail 的 OAuth。
 
-```bash
-docker compose run --rm mailsift node dist/src/main.js --recover
-```
+个人 Gmail 也可以用 `gmail_pw` 加应用专用密码；Google Workspace 不支持这种方式。
 
-## 通知重试
+## Web 视图
 
-推送因网络错误、超时或 HTTP 408/429/5xx 失败时，会先按 `SINK_RETRY_ATTEMPTS`（默认 `3`，间隔数秒）立即重试，仍失败再进入持久化 outbox，由下一轮轮询继续投递。端点持续不可用时，每次推送只尝试一次，直到有一次投递成功，避免拖长轮询。
+设置 `WEB_UI_ENABLED=true`，然后打开 `http://<host>:8410/`（即 `MCP_PORT`），用 `MCP_TOKEN` 登录，浏览器会一直保持登录。
 
-只有真正的投递失败会留在 outbox。出口按自身阈值（如 `FEISHU_MIN_IMPORTANCE`）主动拒绝的消息会当场了结并交给日报，因此 MCP `health` 里的待投递数量始终代表真实积压。`SPAM_RANK_BONUS` 对所有投递决策生效，包括飞书自身阈值，调高它确实会把更多垃圾箱邮件推送到通知渠道。
+页面按天列出收到的邮件，带有模型的一句话摘要、级别和分类。点开一封可以看到判定理由、完整正文、附件和安全线索。验证码以大号数字显示，点一下就复制。在手机上把页面添加到主屏幕后，它的「最新验证码」快捷方式会直接打开最新的验证码，验证码还没到时会等它到。
 
-## 只读 Web 视图
-
-设置 `WEB_UI_ENABLED=true` 后，浏览器访问 `http://<host>:<MCP_PORT>/` 可以看到分诊结果，与 MCP 同端口、同 `MCP_TOKEN`，因为两者的信任边界相同。页面开头是一句话——"11 封邮件，其中 6 封已推送，1 封紧急。"——句中的数字就是筛选按钮，下面一行状态说明邮件来自哪里、邮箱最近一次是什么时候检查的。再往下是按天分组的一列判定：发件人、模型的一句话摘要、级别与分类、有截止日期时显示截止日期，紧急邮件还会带上判定理由。筛选（时间窗口、级别、分类、邮箱、只看垃圾箱、只看已推送、只看验证码、邮件或会话视图）和搜索都放在同一个表单里，并同步到 URL，刷新页面或分享链接都能恢复到同样的视图。下一期日报的待发队列列在页面末尾，并标出发送时间；刚发出的那一期在它下面保留 18 小时，第一次看到时展开，之后折叠成一行。两期里的每一条都能点开对应邮件，每封邮件都提供跳转到服务商客户端的链接。"只看验证码"也会列出没能自动提取出验证码的验证码邮件，所以它显示的是全部验证码邮件，而不只是带数字的那些。
-
-验证码是打开这个页面最常见的原因，所以它从来不是一句需要阅读的话：数字在列表行里就以大号字显示，数字本身就是复制按钮。十分钟内收到的验证码会被提到列表上方，带着发件人和时间；manifest 提供的两个主屏幕快捷方式之一 `/?focus=code`（另一个是 `/?importance=critical`）会直接落在它上面。超过十五分钟的验证码会变灰，粘贴之前就能看出它可能已过期。
-
-这个快捷方式通常是刚在网站上点了"发送验证码"就按的，这时验证码往往还没到。没有新验证码可显示时，那一栏会说正在等，并在最多三分钟里每隔几秒读一次轮询器已存下的结果，同时请求一次立即轮询（与刷新按钮走同一个限流通道），免得被分进垃圾箱的验证码要等下一个轮询周期。验证码到达时直接滑入并获得焦点；如果你正忙着页面上的别的事（在搜索框里打字、焦点在别的控件上，或开着某个面板，面板关闭时焦点会交给验证码），焦点不动，状态行会告诉你验证码到了。没能提取出验证码的新验证码邮件同样算数，无论是打开页面时已经在、还是之后才到：焦点会落在那一行上，因为验证码就在邮件里。什么都没等到时，状态行会说没有等到新验证码。
-
-读不到的邮箱会直说，而不是看起来很安静。某个邮箱连续 `ACCOUNT_ALERT_AFTER_FAILURES` 次轮询失败后，状态行下方会多一行写明是哪个邮箱、多久没检查了（"work-gmail 自昨天 08:26 起未检查"），列表为空时也会说明这里可能缺邮件，而不是"没有邮件"。点这一行会列出每个邮箱最近一次成功检查的时间和失败次数，以及这类失败通常怎么修：登录被拒、OAuth 账号还没在这台服务器上授权、配置的文件夹打不开，或者连不上服务器。Gmail 或 Outlook 的 OAuth 账号还会给出可一键复制的完整重新授权命令，mailsift 跑在容器里时给的是 Docker 版本。仍在 outbox 里等待重发的通知数量也显示在这里。手动刷新时有邮箱没响应，状态行会点名。
-
-点一封邮件，手机上会从底部升起一张面板覆盖在列表上，900px 以上的屏幕则在列表旁边的窗格里打开。面板可以用"完成"、拖动顶部把手、Esc 或系统返回手势关闭，因为打开它时压入了一条历史记录。详情包含判定与理由、作为正文排版的摘要、服务商链接，以及三样按需从邮箱实时读取的内容：完整正文、附件列表（可下载、可做有限扫描）和垃圾邮件与安全线索。附件只下载到调用方，不会被 mailsift 缓存或持久化。在桌面上，↑ ↓ 在列表中移动，回车打开，`c` 复制最新的验证码，`/` 聚焦搜索，Esc 关闭。
-
-它是严格只读的：邮箱调用只会在只读锁下读取邮件正文或指定 MIME 部件。它不能标已读、加旗标、移动、删除或发信。**要读信和回信，请另外跑一个成熟的 webmail（比如 Roundcube）指向同一批账号**，这个视图负责分诊，不负责收发邮件。
-
-浏览器视图仍然严格只读；需要标记、加星或移动邮件时，使用带独立写凭证的 MCP 客户端。发送、回复和删除仍交给正式邮件客户端。默认关闭。浏览器可达的页面比 JSON-RPC 端点暴露面更大，请显式开启，保持 `MCP_BIND` 在回环地址，从手机访问时在前面放一层 TLS。
-
-顶栏的刷新按钮会立即执行一次轮询，不必等到下一个间隔。页面本身不提供下拉刷新：在安装到主屏幕的应用里，往回滚到顶部时太容易误触。它扫描的文件夹与定时轮询相同（包括垃圾箱）。状态行会播报过程（"正在检查 2 个邮箱…"，然后是"刚刚检查过 · 新增 3 封"），新到的邮件以一层慢慢褪去的底色落进列表，不用对比两份列表就能看出变化。如果在轮询进行中点击，会并入当前这次，不会另开一组 IMAP 连接；手动刷新也按客户端限流。只有由常驻服务提供页面时才会显示这个按钮，独立的 MCP 服务器没有可触发的轮询器。它读取同一个数据库，所以状态行照样显示邮箱最近一次检查的时间；只有在还没有完成过任何一次轮询时，才退而显示视图最近一次更新的时间。
-
-登录时 token 以 POST 提交并换成一个 `HttpOnly` cookie，有效期半年，每次打开页面都会续期，因此常用的浏览器不会再被问第二次。登录表单带一个账号字段，密码管理器会主动提示保存 token，不用手工输入。注意 iOS 上安装到主屏的应用有**独立的 cookie 存储**，即使 Safari 里已登录，应用内仍需登录一次。
-
-顶栏有一个浅色/深色两态切换按钮，不跟随系统自动变化。选择保存在浏览器里，并在页面渲染之前生效，因此不会闪过另一种配色；状态栏颜色也会跟着变。
-
-旁边是中英文切换按钮。未手动选择时页面跟随浏览器语言；点击切换后，选择保存在 cookie 里，服务端据此直接以所选语言渲染页面和登录表单，首屏就是对的语言，不会先闪过另一种。只有界面自身的文字会切换：主题、摘要和判定理由按存储原样显示，语言由 `LLM_OUTPUT_LANGUAGE` 决定；日报预览显示的就是将要发出的内容。
-
-可以添加到主屏幕作为独立应用：manifest、maskable 图标和一个不做缓存的 service worker 都不需要会话即可获取，因为浏览器在拿到会话之前就会请求它们。安装提示在手机上是列表里的一行字，在桌面上是顶栏里的一个词，在已安装的应用里从不出现。安装后不带浏览器界面打开，状态栏颜色跟随浅色或深色模式与页面一致，并用 safe-area 内边距适配刘海屏。worker 刻意不缓存任何内容，因为显示昨天分诊结果的页面还不如不显示。改动图标后用 `npx tsx scripts/icons.ts` 重新生成。
-
-不连邮箱也能调页面：`npx tsx scripts/web-preview.ts` 用一周的假邮件在 `http://127.0.0.1:8499/` 提供这个视图；加 `--token` 会出现登录表单，它的刷新按钮每按一次就多收到一封验证码邮件。
-
-**前面有反向代理时请设置 `TRUSTED_PROXY=true`。** 否则所有请求在应用看来都来自代理这一个地址，按客户端限流会退化成一个全局共享的额度，一个恶意调用者就能把你自己的浏览器和 MCP 客户端一起挡在外面。开启后，限流和审计日志会以 `CF-Connecting-IP`、`X-Real-IP` 或 `X-Forwarded-For` 的首个地址为准。端口直接暴露时不要开启，因为这些请求头谁都能伪造。登录接口另有一份小得多的独立额度，因为它是唯一无需凭据就会应答的路由。
+Docker 只把端口发布在宿主机的回环地址上。要从手机访问，请在前面放一个带 TLS 的反向代理（并设置 `TRUSTED_PROXY=true`），或者用隧道。详见 [docs/web-view.md](docs/web-view.md)。
 
 ## MCP
 
-排查"为什么没收到通知"时先调 `health`：它的 `delivery` 段会给出推送与日报阈值、垃圾箱加成及其风险提示、自转发是否被抑制、重试次数，通常不必再往下查就能解释这次判定。`recovery_status` 进一步给出各文件夹的 UID 进度和仍在排队重试的通知条目，是定位投递积压的地方。`list_mail` 支持按分类精确过滤，`list_digest` 可预览待发日报。
+MCP 服务器运行在 mailsift 进程内，地址是 `http://127.0.0.1:8410/mcp`（Streamable HTTP，`Authorization: Bearer <MCP_TOKEN>`）。把它加到 MCP 客户端里，AI 助手就能列出、搜索和阅读分诊过的邮件、预览日报、查看邮箱健康状况。它默认只读；另设一个 `MCP_WRITE_TOKEN` 后才能标记、加星和移动邮件，每次操作都有审计。详见 [docs/mcp.md](docs/mcp.md)。
 
-`list_attachments` 可按邮箱账号和 Message-ID 列出附件元数据，并为每个文件返回一个 MCP Resource URI；读取该 URI 会按需获取对应文件。网页详情也支持列出并下载附件。附件二进制不会持久化；新分诊记录只保留有数量上限的文件名、MIME 类型、部件 ID 和邮件服务器报告的大小。每个文件默认最多读取 10 MiB，可用 `MCP_ATTACHMENT_MAX_BYTES` 调整，最高 100 MiB。该上限与整封邮件的 `MCP_LIVE_SOURCE_BYTES` 分开计算，下载时只读取选中的 MIME 部件。图片和 PDF 会按原文件下载，暂不做图片识别或 PDF 文本提取。
-
-`scan_attachment` 以及网页中的“扫描附件”按钮只读取有限的解码前缀，大小由 `MCP_ATTACHMENT_SCAN_BYTES` 控制（默认 1 MiB，最高 4 MiB）。本地启发式检查文件名/MIME 是否可疑，并识别常见可执行文件、脚本、主动内容和容器签名；不会解包、执行、上传或持久化文件，也不宣称替代杀毒软件。
-
-链接解析最多读取 `MCP_SAFETY_BODY_BYTES`（默认 256 KiB，最高 1 MiB）的文本正文前缀，提示协议、IP 主机、punycode、用户信息段和常见短链线索；不会返回 URL 路径和查询参数。
-
-`inspect_mail_safety` 按需读取邮件信封、指定邮件头和 MIME 结构，提示它是否位于配置的垃圾邮件文件夹、是否带有群发邮件头、`From` 与 `Reply-To` 域名是否不同、附件文件名或 MIME 类型是否需要谨慎，以及有限正文前缀中的链接风险。网页邮件详情也可触发同样的检查，附件清单会直接显示文件类型提示。检查使用只读锁，只解析有限正文，不访问链接，也不读取附件内容。
-
-这些只是启发式线索，不是垃圾邮件或恶意软件判定。邮件列表头不代表垃圾邮件，发件人字段也可能伪造；不会验证 SPF/DKIM/DMARC，不会访问链接、解包附件或提供杀毒结论，也不会移动、删除或标记邮件。
-
-`list_folders` 接收 `list_accounts` 返回的邮箱地址，通过只读 IMAP LIST 列出解码后的文件夹路径、层级分隔符、标记、特殊用途和是否可选中。它不会打开文件夹，也不会修改邮件。
-
-内置 MCP 默认在主进程中开启。Docker 中，`MCP_BIND` 是容器内监听地址，`MCP_PUBLIC_HOST` 是宿主机发布地址；Compose 会让宿主机端口和容器端口都使用 `MCP_PORT`。默认只在宿主机回环地址提供服务：
-
-```dotenv
-MCP_ENABLED=true
-MCP_PUBLIC_HOST=127.0.0.1
-MCP_BIND=0.0.0.0
-MCP_PORT=8410
-MCP_TOKEN=<随机长 token>
-```
-
-需要公网访问时，必须显式设置 `MCP_PUBLIC_HOST` 并使用强 token。非回环 `MCP_BIND` 没有 `MCP_TOKEN` 时会拒绝启动；回环监听且 token 为空时是有意的不鉴权模式，因此不能把它暴露到主机之外。端点是 `/mcp`，使用无状态 Streamable HTTP，并默认按客户端每分钟 120 次请求限流，可通过 `MCP_RATE_LIMIT_PER_MINUTE` 调整。
-
-请通过反向代理或隧道使用 HTTPS；MCP 会返回邮箱数据，不能让 bearer token 通过公网明文 HTTP 传输。
-
-### 默认只读，写能力需显式开启
-
-`manage_mail`、`record_feedback` 和 `retry_dead_letter` 会改变状态，未设置 `MCP_WRITE_TOKEN` 时根本不会注册。`manage_mail` 支持 `mark_read`、`mark_unread`、`star`、`unstar` 和 `move`，拒绝移动到回收站/删除文件夹，也不会发送邮件。每次操作都会在可写 IMAP 锁内重新按 Message-ID 定位，并写入审计记录；独立写凭证可以避免读凭证泄露后修改邮箱或改变后续分诊规则。
-
-把 `MCP_WRITE_TOKEN` 设成与 `MCP_TOKEN` 不同的第二个密钥，二者相同会拒绝启动。用它作为 bearer token 才能拿到完整工具集；`MCP_TOKEN` 则保持为只读凭证，浏览器视图和任何共享客户端都应该只持有它。stdio 模式下调用方本来就能读取 env 文件，所以只要设置了 `MCP_WRITE_TOKEN`，写工具在 stdio 下直接可用，无需二次出示。
-
-每次工具和实时资源调用都会按名称、结果、调用方指纹和有限目标记入审计，鉴权失败同样记录；`list_audit` 可查看明细。审计不保存凭证、正文或 URL 查询参数。
-
-`health` 只反映最近一次轮询心跳、账号失败（附每个失败账号最近一次成功检查的时间）、LLM 与决策阶段的失败计数和待处理队列，有邮箱达到告警阈值时 `healthy` 为 false；通知 outbox 失败后按持久化指数退避重试，默认间隔 60 秒、120 秒、240 秒并上限 1 小时，可用 `OUTBOX_RETRY_BASE_SECONDS` 与 `OUTBOX_RETRY_MAX_SECONDS` 调整。Docker healthcheck 只检查轮询心跳，healthy 不代表所有账号、LLM 和通知出口都正常，应通过 MCP `health` 和 `recovery_status` 查看详细状态。
-
-mailsift 的所有告警都由它自己发出，进程或主机停了就什么也不会说。把 `HEARTBEAT_PING_URL` 设成一个推送式/心跳式监控地址（Uptime Kuma 的 push 监控、healthchecks.io、Better Stack heartbeat 等），mailsift 每完成一次轮询就向它发一个普通 GET，心跳停了由监控方报警。请求不带任何邮件信息，不会拖慢轮询；日志只记录监控方的主机名，因为 URL 本身通常就是密钥。带用户名和密码的 URL 不会被使用，因为 fetch 拒绝发送这种请求；`--check` 会显示是否已配置，以及没被使用的原因。`--once` 运行会等心跳发出后再退出。
-
-Signal Events 中的 MCP 引用只有设置 `MCP_TOKEN` 后才是 Bearer 鉴权引用；实时 IMAP 正文读取是有上限、只读、按需执行的，不会持久化原始正文。
-
-## 开发
+## 常用命令
 
 ```bash
-npm test
-npm run typecheck
-npm run build
+docker compose logs -f                                          # 查看日志
+docker compose pull && docker compose up -d                     # 升级（固定了版本时先调高 MAILSIFT_VERSION）
+docker compose run --rm mailsift node dist/src/main.js --check  # 校验配置
 ```
+
+全部命令和参数见 [docs/deployment.md](docs/deployment.md#commands)。
+
+## 文档（英文）
+
+- [Configuration](docs/configuration.md)：邮箱和文件夹、推送出口、推送阈值、自定义规则、日报、轮询限制、IMAP IDLE、告警。
+- [Triage](docs/triage.md)：邮件怎么判定、大模型能看到什么、两段式分诊、降级兜底、验证码和登录链接。
+- [Web view](docs/web-view.md)：浏览器视图的全部功能。
+- [MCP](docs/mcp.md)：工具、资源、写凭证、附件、安全线索、审计。
+- [Deployment and operations](docs/deployment.md)：Docker、升级、systemd、OAuth 细节、命令、监控、恢复。
+- [Troubleshooting](docs/troubleshooting.md)：常见问题排查。
+- [Signal event v1](docs/signal-event-v1.md)：Webhook 载荷里的 `signal` 对象。
+- [Development](docs/development.md)：开发、本地预览和发版。
 
 ## License
 
