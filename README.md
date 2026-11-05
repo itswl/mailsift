@@ -2,6 +2,8 @@
 
 mailsift watches all your IMAP mailboxes, spam folders included. It judges each new message with your own rules and an LLM, pushes the ones that matter to Feishu or a webhook, and gathers the rest into a daily digest.
 
+![The mailsift web view on a desktop: one list of judgements on the left, the selected message's detail pane on the right](docs/images/web-desktop.png)
+
 > mailsift is an assistant, not a mail client. It is read-only by default and never sends, replies to or deletes mail; a separate write token can enable a small audited set of actions (mark, star and move). Classification can be wrong, so keep using your mail client as the source of truth.
 
 中文文档：[README.zh-CN.md](README.zh-CN.md)。
@@ -94,6 +96,8 @@ Personal Gmail can also use `gmail_pw` with an app password; Google Workspace ca
 Set `WEB_UI_ENABLED=true` and open `http://<host>:8410/` (the `MCP_PORT`). Sign in with `MCP_TOKEN`; the browser stays signed in.
 
 The page lists what arrived, grouped by day, with the model's one-line summary, level and category. Tap a message for the reason, the full text, attachments and safety clues. Verification codes are set large and copy on tap. On a phone, add the page to the home screen: its **Latest code** shortcut opens on the newest code and waits for one that is still on its way.
+
+<img src="docs/images/web-mobile.png" alt="The same view on a phone: the summary sentence, a fresh verification code set large above the list, then the day's mail" width="340">
 
 Docker publishes the port on the host's loopback address only. To reach it from a phone, put a reverse proxy with TLS in front (and set `TRUSTED_PROXY=true`) or use a tunnel. More in [docs/web-view.md](docs/web-view.md).
 
