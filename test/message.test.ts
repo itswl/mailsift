@@ -251,6 +251,22 @@ describe('sensitive verification detection', () => {
       .toBe('083897');
   });
 
+  it('prefers the code in the subject over other numbers in the body', () => {
+    expect(extractVerificationCode('322435是你的Zoom验证码', '订单号 884422，请在 10 分钟内使用'))
+      .toBe('322435');
+  });
+
+  it('picks the candidate the message repeats', () => {
+    expect(extractVerificationCode('登录验证', '您的验证码已发送。882211 请在页面输入 882211 完成登录。'))
+      .toBe('882211');
+  });
+
+  it('leaves unrelated numbers alone when nothing marks them as a code', () => {
+    // The mail is a code mail, but this number is an order reference.
+    expect(extractVerificationCode('验证码邮件', '订单 123456 已发货，验证码另行发送'))
+      .toBeUndefined();
+  });
+
   it('ignores a keyword embedded in base64 image data', () => {
     // The real false positive: a ChatGPT marketing mail whose inline image data
     // contained "otp" between alphanumeric characters. It was flagged as a code

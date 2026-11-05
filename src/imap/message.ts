@@ -505,77 +505,118 @@ export function containsSensitiveVerificationContent(subject: string, body: stri
   });
 }
 
-/** Extract a code only when a nearby label identifies it as an authentication code. */
+/**
+ * Labels that mark a nearby number as an authentication code.
+ *
+ * These are words, not a pattern per phrasing: `extractVerificationCode` scores
+ * every candidate by its context, so a sender's new wording needs no new rule.
+ */
+const CODE_LABELS_STRONG = [
+  'verification code', 'verify code', 'verification_code', 'verificationcode',
+  'one-time code', 'one time code', 'one-time password', 'one time password',
+  'authentication code', 'authorization code', 'security code', 'sign-in code',
+  'sign in code', 'log-in code', 'log in code', 'login code', 'confirmation code',
+  'code challenge', 'passcode', 'otp',
+  '验证码', '驗證碼', '动态密码', '動態密碼', '一次性密码', '一次性密碼',
+  '身份验证码', '身份驗證碼', '安全码', '安全碼', '登录码', '登入碼',
+  '校验码', '校驗碼', '认证码', '認證碼',
+];
+const CODE_LABELS_WEAK = ['code', 'pin', 'password', '验证', '驗證', '代码', '代碼'];
+/** A delivery verb in front of the word "code" announces the value that follows. */
+const CODE_ANNOUNCEMENT = /\b(?:use|enter|type|input)\s+(?:this|the|following)\s+code\b|\bcode\s+(?:below|above)\b/i;
+const EXPIRY_HINT = /expir|有效|分钟内|minutes?\b|mins?\b|小时|hours?\b/i;
+/** Digits followed by one of these are a date, not a code. */
+const DATE_UNIT = /^\s*(?:年|月|日|[-\/])/;
+const CURRENCY_NEAR = /[¥$€£]|元/;
+
+/** How strongly the surrounding words say "this is the code". */
+function labelBonus(lower: string, start: number, end: number, floor: number): number {
+  // Look back only inside the region the candidate belongs to: the subject's
+  // label must not bless a number at the top of the body.
+  const before = lower.slice(Math.max(floor, start - 48), start);
+  const after = lower.slice(end, end + 32);
+  let best = 0;
+  for (const label of CODE_LABELS_STRONG) {
+    if (before.includes(label)) best = Math.max(best, 70);
+  }
+  if (best === 0) {
+    for (const label of CODE_LABELS_WEAK) {
+      if (before.includes(label)) { best = 25; break; }
+    }
+  }
+  // "322435 是你的 Zoom 验证码": the label follows, joined by a copula.
+  if (best < 50 && /^\s*(?:是|为|is\b)/i.test(after)) {
+    for (const label of CODE_LABELS_STRONG) {
+      if (after.includes(label)) best = Math.max(best, 50);
+    }
+  }
+  return best;
+}
+
+/** True when the code sits on a line of its own (only punctuation around it). */
+function isStandalone(text: string, start: number, end: number, value: string): boolean {
+  const lineStart = text.lastIndexOf('\n', start - 1) + 1;
+  const nextBreak = text.indexOf('\n', end);
+  const lineEnd = nextBreak === -1 ? text.length : nextBreak;
+  const rest = text.slice(lineStart, lineEnd).replace(value, '');
+  return rest.replace(/[\s:：=,，.。\-–—|()（）[\]「」<>"']/g, '').length === 0;
+}
+
+/**
+ * Pick the most likely verification code.
+ *
+ * Rather than trying phrasings in a fixed order, every 4-8 character token that
+ * contains a digit is a candidate, and the winner is the one whose context looks
+ * most like an authentication code: in the subject, next to a label, alone on a
+ * line, repeated, near an expiry notice. Links, dates, prices and years are
+ * discounted. This is the same tokenise-and-score approach mail clients use;
+ * adding a new sender wording means nothing here.
+ */
 export function extractVerificationCode(subject: string, body: string): string | undefined {
   if (!containsSensitiveVerificationContent(subject, body)) return undefined;
-  const text = withoutLinks(`${subject}\n${body}`);
+  const subjectText = withoutLinks(subject);
+  const text = `${subjectText}\n${withoutLinks(body)}`;
+  const lower = text.toLowerCase();
 
-  const token = '([A-Z0-9]{4,12})';
-  const chineseLabel = '验证码|驗證碼|动态密码|動態密碼|一次性密码|一次性密碼|身份验证码|身份驗證碼|安全码|安全碼|登录码|登入碼|校验码|校驗碼|认证码|認證碼';
-  const patterns = [
-    // A code written before its label: "322435 是你的 Zoom 验证码". Senders that
-    // put the code in the subject use this shape, and the label-first patterns
-    // below then latched onto an unrelated number further down the body.
-    new RegExp(
-      String.raw`\b${token}\s*(?:是|为)\s*(?:你的|您的|你|您)?[^\n]{0,20}?(?:${chineseLabel})`,
-      'i',
-    ),
-    // The same shape in English: "892391 is your X verification code". Unanchored,
-    // so a forwarded header or a subject prefix does not hide the code.
-    new RegExp(
-      String.raw`\b${token}\s+is\s+your\b[^\n]{0,100}\b(?:verification|authentication|authorization|security|login|log[ -]?in|sign[ -]?in|one[ -]?time)[ -]?(?:code|password|passcode|pin)\b`,
-      'i',
-    ),
-    new RegExp(
-      String.raw`^\s*${token}\s+is\s+your\b[^\n]{0,100}\b(?:verification|authentication|authorization)\s+code\b`,
-      'i',
-    ),
-    new RegExp(
-      String.raw`(?:verification|verify|confirmation|authentication|authorization|auth|security|login|log[ -]?in|sign[ -]?in|one[ -]?time(?:[ -]?password)?|passcode|otp)(?:\s+(?:code|password|passcode|number))?\s*(?:is\b\s*[:：=,，]?\s*|[:：=,，]\s*|(?:为|是)\s*[:：=]?\s*)${token}(?![A-Z0-9])`,
-      'i',
-    ),
-    new RegExp(
-      String.raw`(?:verification|verify|confirmation|authentication|authorization|auth|security|login|log[ -]?in|sign[ -]?in|one[ -]?time(?:[ -]?password)?|passcode|otp)(?:\s+(?:code|password|passcode|number))?\s+${token}(?![A-Z0-9])`,
-      'i',
-    ),
-    new RegExp(String.raw`(?:your\s+)?(?:code|passcode|password)\s*(?:is\s+|[:：=]\s*)${token}(?![A-Z0-9])`, 'i'),
-    new RegExp(
-      String.raw`(?:${chineseLabel})\s*(?:(?:为|是)\s*[:：=]?\s*|[:：=]\s*)?${token}(?![A-Z0-9])`,
-      'i',
-    ),
-    new RegExp(String.raw`(?:verification[_ -]?code|verificationCode)\s*[=:：]\s*${token}(?![A-Z0-9])`, 'i'),
-    new RegExp(
-      String.raw`(?:code challenge|one-time code challenge|enter the code below|enter this code)[\s\S]{0,240}?\b([0-9]{4,12})\b`,
-      'i',
-    ),
-    new RegExp(
-      // The broad fallback: a number near the label. A trailing date unit or
-      // separator means the digits are a date ("2026年…", "2026-11-05"), not a code.
-      String.raw`(?:${chineseLabel}|verification code|authorization code)[\s\S]{0,100}?\b([0-9]{4,12})\b(?![年月日/-])`,
-      'i',
-    ),
-    new RegExp(String.raw`\b(?:use|enter|type|input)\s+${token}\s+(?:to\s+)?(?:verify|authenticate|sign[ -]?in|log[ -]?in)\b`, 'i'),
-    new RegExp(
-      String.raw`\b(?:use|enter|type|input)\s+(?:this|the|following)\s+(?:code|passcode)\s+to\s+(?:verify|authenticate|sign[ -]?in|log[ -]?in)\s*[:：=]?\s*${token}(?![A-Z0-9])`,
-      'i',
-    ),
-    new RegExp(
-      String.raw`\b(?:use|enter|type|input)\s+(?:this|the|following)\s+(?:\d[ -]?digit\s+)?(?:verification\s+)?(?:code|passcode)\s+(?:to\s+(?:verify|authenticate|sign[ -]?in|log[ -]?in)\s*)?[:：=]\s*${token}(?![A-Z0-9])`,
-      'i',
-    ),
-    new RegExp(
-      String.raw`\b(?:sign[ -]?in|log[ -]?in|verify|authenticate)[^.!?\n]{0,50}\b(?:use|enter|type|input)\s+(?:this|the|following)\s+(?:\d[ -]?digit\s+)?(?:verification\s+)?(?:code|passcode)\s*[:：=]\s*${token}(?![A-Z0-9])`,
-      'i',
-    ),
-    ...ANNOUNCED_CODE_PATTERNS,
-  ];
+  const best = new Map<string, { score: number; count: number }>();
+  const candidateRe = /(?<![A-Za-z0-9])([A-Za-z0-9]{4,8})(?![A-Za-z0-9])/g;
+  for (const match of text.matchAll(candidateRe)) {
+    const value = match[1]!;
+    if (!/\d/.test(value)) continue;
+    const start = match.index!;
+    const end = start + value.length;
 
-  for (const pattern of patterns) {
-    const candidate = pattern.exec(text)?.[1];
-    // Requiring a digit avoids mistaking words such as "expires" for a code.
-    if (candidate && /\d/.test(candidate)) return candidate;
+    let score = 0;
+    const inSubject = start < subjectText.length;
+    if (inSubject) score += 90;
+    const label = labelBonus(lower, start, end, inSubject ? 0 : subjectText.length + 1);
+    score += label;
+    // The announcement can sit a sentence away from the code it introduces.
+    if (CODE_ANNOUNCEMENT.test(lower.slice(Math.max(0, start - 160), start))) score += 55;
+    if (isStandalone(text, start, end, value)) score += 40;
+    const context = text.slice(Math.max(0, start - 100), Math.min(text.length, end + 100));
+    if (EXPIRY_HINT.test(context)) score += 20;
+    if (DATE_UNIT.test(text.slice(end))) score -= 90;
+    if (/^(?:19|20)\d{2}$/.test(value) && label === 0) score -= 70;
+    if (CURRENCY_NEAR.test(text.slice(Math.max(0, start - 2), start))
+      || CURRENCY_NEAR.test(text.slice(end, end + 2))) score -= 40;
+    if (text.slice(end, end + 1) === '%') score -= 30;
+
+    const previous = best.get(value);
+    if (previous) {
+      previous.count += 1;
+      if (score > previous.score) previous.score = score;
+      continue;
+    }
+    best.set(value, { score, count: 1 });
   }
-  return undefined;
+
+  let winner: { value: string; score: number } | undefined;
+  for (const [value, entry] of best) {
+    const score = entry.score + (entry.count > 1 ? 20 : 0);
+    if (!winner || score > winner.score) winner = { value, score };
+  }
+  return winner && winner.score >= 60 ? winner.value : undefined;
 }
 
 export function isSensitiveVerificationMessage(message: Pick<MailMessage, 'subject' | 'body'>): boolean {
