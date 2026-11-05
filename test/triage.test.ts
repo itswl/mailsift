@@ -156,6 +156,19 @@ describe('keyword fallback', () => {
     expect(keywordFallback(makeMessage({ subject: '您的驗證碼為 123456' }), RULES).importance).toBe('warning');
   });
 
+  it('treats an announced code with no keyword as a verification mail', () => {
+    // BCPoker wrote "Use the code below to complete your registration: 083897"
+    // and never said "verification code", so the model saw the code and the
+    // info verdict kept the mail out of the notification channel.
+    const result = keywordFallback(makeMessage({
+      subject: 'Verify your account',
+      body: 'Use the code below to complete your registration: 083897',
+    }), RULES);
+    expect(result).toMatchObject({
+      importance: 'warning', decidedBy: 'local', sensitiveVerification: true, verificationCode: '083897',
+    });
+  });
+
   it('archives uncertain messages instead of interrupting the user', () => {
     // Fallback classification is weak; over-alerting would flood the channel and make real messages easier to miss.
     const result = keywordFallback(makeMessage({ subject: '关于下周的安排' }), RULES);

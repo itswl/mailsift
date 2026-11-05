@@ -202,6 +202,30 @@ describe('sensitive verification detection', () => {
     expect(isSensitiveVerificationMessage({ subject: '安全', body: 'OTP已发送至邮箱' })).toBe(true);
   });
 
+  it('recognises a code announced below the fold', () => {
+    // The BCPoker mail said "Use the code below to complete your registration:
+    // 083897" and never used the words "verification code", so it reached the
+    // model as an ordinary info mail and was never pushed.
+    const subject = 'Verify your account';
+    const body = [
+      'VERIFY YOUR ACCOUNT',
+      'Use the code below to complete your registration: 083897',
+      'For your security, do not share this code with anyone.',
+      "If you didn't request this, please ignore this message.",
+    ].join('\n');
+    expect(containsSensitiveVerificationContent(subject, body)).toBe(true);
+    expect(extractVerificationCode(subject, body)).toBe('083897');
+  });
+
+  it('leaves promo codes and prose without a code alone', () => {
+    expect(containsSensitiveVerificationContent('Weekly sale', 'Use code SAVE20 at checkout'))
+      .toBe(false);
+    expect(containsSensitiveVerificationContent('Update', 'The code below is where the bug hides'))
+      .toBe(false);
+    expect(containsSensitiveVerificationContent('Release notes', 'Our code is public now'))
+      .toBe(false);
+  });
+
   it('ignores a keyword embedded in base64 image data', () => {
     // The real false positive: a ChatGPT marketing mail whose inline image data
     // contained "otp" between alphanumeric characters. It was flagged as a code

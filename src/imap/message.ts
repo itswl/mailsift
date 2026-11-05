@@ -464,9 +464,32 @@ export function sensitiveKindOf(subject: string, body: string): SensitiveKind | 
   return undefined;
 }
 
+/**
+ * A code announced by a delivery phrase, with or without the words
+ * "verification code": "Use the code below to complete your registration:
+ * 083897". A colon or equals sign must introduce the code, and the candidate
+ * must contain a digit, so "use code SAVE20" and prose are left alone.
+ */
+const ANNOUNCED_CODE_PATTERNS = [
+  new RegExp(
+    String.raw`\b(?:use|enter|type|input)\s+(?:this|the|following)\s+code(?:\s+(?:below|above))?[\s\S]{0,120}?[:：=]\s*([A-Z0-9]{4,12})(?![A-Z0-9])`,
+    'i',
+  ),
+  new RegExp(String.raw`\b(?:the\s+)?code\s+(?:below|above)\s*[:：=]\s*([A-Z0-9]{4,12})(?![A-Z0-9])`, 'i'),
+];
+
 export function containsSensitiveVerificationContent(subject: string, body: string): boolean {
-  const haystack = `${subject}\n${body}`.toLowerCase();
-  return SENSITIVE_LOCAL_KEYWORDS.some((keyword) => containsKeyword(haystack, keyword));
+  const text = `${subject}\n${body}`;
+  const haystack = text.toLowerCase();
+  if (SENSITIVE_LOCAL_KEYWORDS.some((keyword) => containsKeyword(haystack, keyword))) return true;
+  // Some senders never write "verification code"; they announce the code with a
+  // delivery phrase instead ("Use the code below to complete your registration:
+  // 083897"). That is still a one-time code, so it must stay out of the model
+  // and always be pushed.
+  return ANNOUNCED_CODE_PATTERNS.some((pattern) => {
+    const candidate = pattern.exec(text)?.[1];
+    return Boolean(candidate && /\d/.test(candidate));
+  });
 }
 
 /** Extract a code only when a nearby label identifies it as an authentication code. */
@@ -515,6 +538,7 @@ export function extractVerificationCode(subject: string, body: string): string |
       String.raw`\b(?:sign[ -]?in|log[ -]?in|verify|authenticate)[^.!?\n]{0,50}\b(?:use|enter|type|input)\s+(?:this|the|following)\s+(?:\d[ -]?digit\s+)?(?:verification\s+)?(?:code|passcode)\s*[:：=]\s*${token}(?![A-Z0-9])`,
       'i',
     ),
+    ...ANNOUNCED_CODE_PATTERNS,
   ];
 
   for (const pattern of patterns) {
