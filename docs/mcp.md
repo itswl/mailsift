@@ -4,6 +4,8 @@ mailsift includes an MCP server, so an AI assistant can list, search and read yo
 
 - [Connecting](#connecting)
 - [Tools and resources](#tools-and-resources)
+- [Prompts](#prompts)
+- [Errors](#errors)
 - [Write tools and the write token](#write-tools-and-the-write-token)
 - [Attachments](#attachments)
 - [Spam and safety clues](#spam-and-safety-clues)
@@ -53,9 +55,47 @@ For local stdio clients, point the command at `dist/src/mcp.js` (or `npm run mcp
 | `record_feedback` | Write: label a message `false_positive`, `missed`, `handled` or `correct`. |
 | `retry_dead_letter` | Write: rewind one folder cursor so the next poll retries a dead letter. |
 
-Resources: `mailsift://mail/{messageId}` reads a stored triage record, `mailsift://imap/{account}/{messageId}` fetches a bounded normalized body from IMAP on demand, and `mailsift://imap/{account}/{messageId}/attachment/{partId}` fetches one attachment. Nothing fetched live is persisted. The webhook's [signal event](signal-event-v1.md) carries the second form as its reference.
+### Resources
+
+| Resource | What it reads |
+| --- | --- |
+| `mailsift://search-syntax` | Every filter the tools accept, the category and importance vocabularies, and what the store does not hold. Rendered from the constants the triage code uses, so it cannot describe a vocabulary that no longer exists. |
+| `mailsift://mail/{messageId}` | One stored judgement as a markdown page: headers, how it was judged and why, the bounded body preview, the attachment list. |
+| `mailsift://thread/{threadKey}` | A whole conversation as one markdown page, oldest first. Thread keys come from `list_threads`. |
+| `mailsift://imap/{account}/{messageId}` | A bounded normalized body, fetched from the mailbox on demand. |
+| `mailsift://imap/{account}/{messageId}/attachment/{partId}` | One attachment, fetched on demand. |
+
+The first three are markdown because a model reads them: the headings say what each field means, which a JSON object has to be told. The same records are still JSON from `get_mail` and `list_threads`, which is what an application should parse. Nothing fetched live is persisted. The webhook's [signal event](signal-event-v1.md) carries the `mailsift://imap/...` form as its reference.
 
 `list_folders` takes the exact account address returned by `list_accounts` and lists its decoded IMAP folder paths, hierarchy delimiter, flags, special-use marker, and selectability. It uses IMAP LIST without opening folders or changing mail.
+
+## Prompts
+
+Prompts are workflows, not questions. Each one fixes an order of tool calls that works and says when to stop, because a model asked something broad usually starts with a search, and a search cannot answer a question about mail that was never delivered.
+
+| Prompt | Arguments | What it does |
+| --- | --- | --- |
+| `catch_up` | `hours`, optional `focus` | Reports what arrived and what needs action, reading `mail_summary`, `list_mail` and the pending digest rather than searching. |
+| `why_not_notified` | `about` | Diagnoses a missing notification in order: was the mailbox read, was it judged above the threshold, was it delivered. Starts at `health`, which answers most cases on its own. |
+| `review_triage` | `hours` | Goes through recent judgements and records feedback on the wrong ones. Asks before recording anything, because two records for one sender become a standing rule. Registered only where `MCP_WRITE_TOKEN` is configured. |
+
+## Errors
+
+Every failure carries a `code` a caller can branch on, a message, and a `hint` naming the next move. Tools answer with `isError` and the body as JSON; resource reads carry the same body in the JSON-RPC error's `data`.
+
+| Code | Means |
+| --- | --- |
+| `NOT_FOUND` | The id is unknown to mailsift. |
+| `ACCOUNT_UNKNOWN` | That address is not one of the monitored mailboxes. |
+| `INVALID_ARGUMENT` | An argument does not match the schema, or a resource URI is malformed. |
+| `MAILBOX_UNAVAILABLE` | The mailbox itself could not be read just now. Stored records stay available. |
+| `ATTACHMENT_UNSUPPORTED` | Skipped by the size or type limit. |
+| `ACTION_REFUSED` | `manage_mail` was asked for an action or destination that is not allowed. |
+| `WRITE_DISABLED` | No write credential is configured. |
+| `SERVER_MISCONFIGURED` | mailsift cannot read its own settings. This needs a person, not another call. |
+| `PROVIDER_ERROR` | Anything else. The underlying message is never passed through, because it can carry a credential. |
+
+A Message-ID that was never seen is not an error: `get_mail` answers `found: false`, because absence is a result.
 
 ## Write tools and the write token
 

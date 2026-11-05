@@ -99,7 +99,7 @@ Docker 只把端口发布在宿主机的回环地址上。要从手机访问，�
 
 ## MCP
 
-MCP 服务器运行在 mailsift 进程内，地址是 `http://127.0.0.1:8410/mcp`（Streamable HTTP，`Authorization: Bearer <MCP_TOKEN>`）。把它加到 MCP 客户端里，AI 助手就能列出、搜索和阅读分诊过的邮件、预览日报、查看邮箱健康状况。它默认只读；另设一个 `MCP_WRITE_TOKEN` 后才能标记、加星和移动邮件，每次操作都有审计。详见 [docs/mcp.md](docs/mcp.md)。
+MCP 服务器运行在 mailsift 进程内，地址是 `http://127.0.0.1:8410/mcp`（Streamable HTTP，`Authorization: Bearer <MCP_TOKEN>`）。把它加到 MCP 客户端里，AI 助手就能列出、搜索和阅读分诊过的邮件、预览日报、查看邮箱健康状况。它还以 prompt 的形式提供了这些工具该怎么配合用：盘点收件箱，或者排查某封邮件为什么没通知到你。它默认只读；另设一个 `MCP_WRITE_TOKEN` 后才能标记、加星和移动邮件，每次操作都有审计。详见 [docs/mcp.md](docs/mcp.md)。
 
 ## 常用命令
 

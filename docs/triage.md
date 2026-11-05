@@ -3,6 +3,7 @@
 This page explains how mailsift decides what a message is worth, and what it sends to the LLM.
 
 - [How a message is judged](#how-a-message-is-judged)
+- [What the model is shown](#what-the-model-is-shown)
 - [The LLM](#the-llm)
 - [Two-stage triage](#two-stage-triage)
 - [When the LLM fails](#when-the-llm-fails)
@@ -17,6 +18,14 @@ This page explains how mailsift decides what a message is worth, and what it sen
 5. Without an LLM, or when a call fails, the local keyword fallback decides.
 
 The result is a level (`critical`, `warning` or `info`), a category, a one-line summary, the reason, and a deadline when there is one. The level decides what is pushed and what waits for the digest (see [Configuration](configuration.md#what-gets-pushed)).
+
+## What the model is shown
+
+Before any of this, the body is cleaned: the quoted history below a reply, and the signature at the end, are removed.
+
+The budget is the reason. Only the first `LLM_BODY_CHARS` of a body (1200 by default) is sent, and the stored preview is shorter still, so a reply that answers in one line would otherwise spend the rest of both on last week's mail and a footer. Three quote markers are recognised, in English and in what QQ, 163, Foxmail and Outlook write in Chinese: an attribution line (`On ... wrote:`, `... 写道：`), an original-message separator, and a header block (`From:`/`Sent:`/`To:`, `发件人：`/`发送时间：`/`收件人：`). A forwarded message is deliberately kept, header block and all, because its content is usually the point.
+
+Both steps give the whole text back when they would leave nothing, and the signature is kept when under 200 characters would be left, so a message that is only "Thanks" or only a quoted block still reaches triage intact. Cleaning happens once, when the message is first read, so it also shapes the stored preview, the digest and what `search_mail` matches on. The full body is untouched: `mailsift://imap/{account}/{messageId}` still fetches the message as the mailbox has it.
 
 ## The LLM
 

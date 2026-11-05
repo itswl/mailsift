@@ -32,6 +32,47 @@ Content-Type: text/plain; charset=utf-8`,
     expect(body).not.toContain('Received:');
   });
 
+  it('drops the quoted history a reply carries, so the model reads only the new text', async () => {
+    const source = raw(
+      'Content-Type: text/plain; charset=utf-8',
+      [
+        '好的，这笔款项我今天安排付掉，发票请寄到公司地址，收到后我会再确认一次给你。',
+        '',
+        '在 2026年11月3日 10:00，财务 <billing@example.com> 写道：',
+        '> 发票 42 号金额 CNY 496.00，请在 30 日前支付。',
+        '> 财务部',
+      ].join('\r\n'),
+    );
+    const { body } = await extractBody(source);
+
+    expect(body).toContain('今天安排付掉');
+    expect(body).not.toContain('写道');
+    expect(body).not.toContain('496.00');
+  });
+
+  it('keeps a verification code that arrives with a signature', async () => {
+    const source = raw(
+      'Content-Type: text/plain; charset=utf-8',
+      ['您的验证码是 123456，5 分钟内有效。', '', '谢谢', '安全团队'].join('\r\n'),
+    );
+    const { body } = await extractBody(source);
+
+    expect(extractVerificationCode('验证码', body)).toBe('123456');
+  });
+
+  it('finds a quote marker in HTML mail, where it is inside a div', async () => {
+    const source = raw(
+      'Content-Type: text/html; charset=utf-8',
+      '<div>Yes, Friday works for me and I will bring the signed contract along.</div>'
+        + '<div class="gmail_quote"><div>On Mon, 3 Nov 2026 at 10:00, Ada &lt;ada@example.com&gt; wrote:</div>'
+        + '<blockquote>Can we meet on Friday?</blockquote></div>',
+    );
+    const { body } = await extractBody(source);
+
+    expect(body).toContain('Friday works for me');
+    expect(body).not.toContain('Can we meet');
+  });
+
   it('decodes quoted-printable', async () => {
     const source = raw(
       `Content-Type: text/plain; charset=utf-8
