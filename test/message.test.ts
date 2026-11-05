@@ -226,6 +226,31 @@ describe('sensitive verification detection', () => {
       .toBe(false);
   });
 
+  it('reads a code written before its label', () => {
+    // Zoom writes "322435 是你的 Zoom 验证码"; the label-first patterns then
+    // latched onto whatever number appeared next in the body.
+    const body = '验证你的电子邮件\n请在接下来的 10 分钟内输入此代码以进行注册： 322435';
+    expect(extractVerificationCode('322435是你的Zoom验证码', body)).toBe('322435');
+    expect(extractVerificationCode('892391 is your X verification code', 'Confirm your email address'))
+      .toBe('892391');
+  });
+
+  it('ignores numbers inside links and image paths', () => {
+    // The forwarded Zoom mail carried .../l/84442/... and .../2020-05-20/... ;
+    // both used to outrank the real code.
+    const body = [
+      '[Zoom Logo] <https://zoom.us/l/84442/2020-05-20/blf6y3/logo.png>',
+      '验证你的电子邮件',
+      '请在接下来的10分钟内输入此代码以进行注册： 322435',
+    ].join('\n');
+    expect(extractVerificationCode('转发: 322435是你的Zoom验证码', body)).toBe('322435');
+  });
+
+  it('does not mistake a date near the label for the code', () => {
+    expect(extractVerificationCode('验证码', '您的验证码已发送\n有效期至 2026-11-05\n083897'))
+      .toBe('083897');
+  });
+
   it('ignores a keyword embedded in base64 image data', () => {
     // The real false positive: a ChatGPT marketing mail whose inline image data
     // contained "otp" between alphanumeric characters. It was flagged as a code

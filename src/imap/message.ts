@@ -478,6 +478,18 @@ const ANNOUNCED_CODE_PATTERNS = [
   new RegExp(String.raw`\b(?:the\s+)?code\s+(?:below|above)\s*[:：=]\s*([A-Z0-9]{4,12})(?![A-Z0-9])`, 'i'),
 ];
 
+/**
+ * Tracking ids live in links and image paths; only the visible sentence
+ * carries the code. Strip them before looking for digits, so a 5-digit path
+ * segment cannot outrank the real code.
+ */
+function withoutLinks(text: string): string {
+  return text
+    .replace(/\[https?:\/\/[^\]]*\]/gi, ' ')
+    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')
+    .replace(/<[^<>\s]+@[^<>\s]+>/g, ' ');
+}
+
 export function containsSensitiveVerificationContent(subject: string, body: string): boolean {
   const text = `${subject}\n${body}`;
   const haystack = text.toLowerCase();
@@ -486,19 +498,34 @@ export function containsSensitiveVerificationContent(subject: string, body: stri
   // delivery phrase instead ("Use the code below to complete your registration:
   // 083897"). That is still a one-time code, so it must stay out of the model
   // and always be pushed.
+  const visible = withoutLinks(text);
   return ANNOUNCED_CODE_PATTERNS.some((pattern) => {
-    const candidate = pattern.exec(text)?.[1];
+    const candidate = pattern.exec(visible)?.[1];
     return Boolean(candidate && /\d/.test(candidate));
   });
 }
 
 /** Extract a code only when a nearby label identifies it as an authentication code. */
 export function extractVerificationCode(subject: string, body: string): string | undefined {
-  const text = `${subject}\n${body}`;
   if (!containsSensitiveVerificationContent(subject, body)) return undefined;
+  const text = withoutLinks(`${subject}\n${body}`);
 
   const token = '([A-Z0-9]{4,12})';
+  const chineseLabel = '验证码|驗證碼|动态密码|動態密碼|一次性密码|一次性密碼|身份验证码|身份驗證碼|安全码|安全碼|登录码|登入碼|校验码|校驗碼|认证码|認證碼';
   const patterns = [
+    // A code written before its label: "322435 是你的 Zoom 验证码". Senders that
+    // put the code in the subject use this shape, and the label-first patterns
+    // below then latched onto an unrelated number further down the body.
+    new RegExp(
+      String.raw`\b${token}\s*(?:是|为)\s*(?:你的|您的|你|您)?[^\n]{0,20}?(?:${chineseLabel})`,
+      'i',
+    ),
+    // The same shape in English: "892391 is your X verification code". Unanchored,
+    // so a forwarded header or a subject prefix does not hide the code.
+    new RegExp(
+      String.raw`\b${token}\s+is\s+your\b[^\n]{0,100}\b(?:verification|authentication|authorization|security|login|log[ -]?in|sign[ -]?in|one[ -]?time)[ -]?(?:code|password|passcode|pin)\b`,
+      'i',
+    ),
     new RegExp(
       String.raw`^\s*${token}\s+is\s+your\b[^\n]{0,100}\b(?:verification|authentication|authorization)\s+code\b`,
       'i',
@@ -513,7 +540,7 @@ export function extractVerificationCode(subject: string, body: string): string |
     ),
     new RegExp(String.raw`(?:your\s+)?(?:code|passcode|password)\s*(?:is\s+|[:：=]\s*)${token}(?![A-Z0-9])`, 'i'),
     new RegExp(
-      String.raw`(?:验证码|驗證碼|动态密码|動態密碼|一次性密码|一次性密碼|身份验证码|身份驗證碼|安全码|安全碼|登录码|登入碼|校验码|校驗碼|认证码|認證碼)\s*(?:(?:为|是)\s*[:：=]?\s*|[:：=]\s*)?${token}(?![A-Z0-9])`,
+      String.raw`(?:${chineseLabel})\s*(?:(?:为|是)\s*[:：=]?\s*|[:：=]\s*)?${token}(?![A-Z0-9])`,
       'i',
     ),
     new RegExp(String.raw`(?:verification[_ -]?code|verificationCode)\s*[=:：]\s*${token}(?![A-Z0-9])`, 'i'),
@@ -522,7 +549,9 @@ export function extractVerificationCode(subject: string, body: string): string |
       'i',
     ),
     new RegExp(
-      String.raw`(?:验证码|驗證碼|verification code|authorization code)[\s\S]{0,100}?\b([0-9]{4,12})\b`,
+      // The broad fallback: a number near the label. A trailing date unit or
+      // separator means the digits are a date ("2026年…", "2026-11-05"), not a code.
+      String.raw`(?:${chineseLabel}|verification code|authorization code)[\s\S]{0,100}?\b([0-9]{4,12})\b(?![年月日/-])`,
       'i',
     ),
     new RegExp(String.raw`\b(?:use|enter|type|input)\s+${token}\s+(?:to\s+)?(?:verify|authenticate|sign[ -]?in|log[ -]?in)\b`, 'i'),
