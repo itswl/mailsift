@@ -16,6 +16,10 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { z } from 'zod';
 import { loadConfig } from './config.js';
+import { McpToolError, toResourceError, toToolError } from './mcp-errors.js';
+import { mailRecordToMarkdown, threadToMarkdown } from './mcp-markdown.js';
+import { registerPrompts } from './mcp-prompts.js';
+import { renderSearchSyntax, SEARCH_SYNTAX_URI } from './mcp-syntax.js';
 import {
   applyMessageAction, discoverMailboxFolders, fetchAttachmentByMessageId, fetchAttachmentManifestByMessageId,
   fetchByMessageId, inspectMailSafety, scanAttachmentByMessageId, MAIL_ACTIONS, MailActionError,
@@ -218,10 +222,34 @@ export function createServer(
           return result;
         } catch (error) {
           store.recordMcpAudit(name, client, false, auditTarget(args[0]));
-          throw error;
+          // Every tool failure leaves as a typed body, so no handler has to
+          // build one and no provider message escapes unredacted.
+          return toToolError(error);
         }
       }) as never,
     )) as typeof server.registerTool;
+
+  /**
+   * registerResource, with the same typed failures as the tools.
+   *
+   * A resource read has no `isError` result to put a body in, so the structured
+   * reason travels in the JSON-RPC error's `data` instead. Each handler keeps
+   * its own audit row, because only it knows what it was asked for.
+   */
+  const registerResource: typeof server.registerResource = ((name: string, ...rest: unknown[]) => {
+    const cb = rest.pop();
+    return server.registerResource(
+      name as never,
+      ...(rest as [never, never]),
+      (async (...args: unknown[]) => {
+        try {
+          return await (cb as (...a: unknown[]) => unknown)(...args);
+        } catch (error) {
+          throw toResourceError(error);
+        }
+      }) as never,
+    );
+  }) as typeof server.registerResource;
 
   registerTool(
     'list_mail',
@@ -341,7 +369,7 @@ export function createServer(
     },
     async (args) => {
       const account = loadConfig().accounts.find((candidate) => candidate.username === args.account);
-      if (!account) throw new Error('mail account not found');
+      if (!account) throw new McpToolError('ACCOUNT_UNKNOWN', 'mail account not found');
       const found = await fetchAttachmentManifestByMessageId(account, args.messageId);
       if (!found) return json({ found: false, account: args.account, messageId: args.messageId });
       return json({
@@ -370,7 +398,7 @@ export function createServer(
     },
     async (args) => {
       const account = loadConfig().accounts.find((candidate) => candidate.username === args.account);
-      if (!account) throw new Error('mail account not found');
+      if (!account) throw new McpToolError('ACCOUNT_UNKNOWN', 'mail account not found');
       const report = await inspectMailSafety(account, args.messageId);
       return json(report
         ? { found: true, ...report }
@@ -393,7 +421,7 @@ export function createServer(
     },
     async (args) => {
       const account = loadConfig().accounts.find((candidate) => candidate.username === args.account);
-      if (!account) throw new Error('mail account not found');
+      if (!account) throw new McpToolError('ACCOUNT_UNKNOWN', 'mail account not found');
       const report = await scanAttachmentByMessageId(account, args.messageId, args.partId);
       return json(report
         ? { found: true, account: args.account, messageId: args.messageId, ...report }
@@ -401,34 +429,69 @@ export function createServer(
     },
   );
 
-  server.registerResource(
+  /** A resource id arrives percent-encoded, and a malformed one must not throw inside the router. */
+  const decodeVariable = (raw: unknown): string | undefined => {
+    if (typeof raw !== 'string') return undefined;
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return undefined;
+    }
+  };
+
+  registerResource(
     'mail-record',
     new ResourceTemplate('mailsift://mail/{messageId}', { list: undefined }),
-    { mimeType: 'application/json', description: 'Read one stored mailsift triage record by Message-ID.' },
+    {
+      mimeType: 'text/markdown',
+      description:
+        'Read one stored triage record by Message-ID, as a markdown page. get_mail returns the same record as JSON.',
+    },
     async (uri, variables) => {
-      const rawMessageId = variables['messageId'];
-      let messageId: string | undefined;
-      if (typeof rawMessageId === 'string') {
-        try {
-          messageId = decodeURIComponent(rawMessageId);
-        } catch {
-          messageId = undefined;
-        }
-      }
+      const messageId = decodeVariable(variables['messageId']);
       const found = messageId ? store.getMail(messageId) : undefined;
       store.recordMcpAudit('resource:mail-record', client, Boolean(found), messageId);
-      if (!found) throw new Error('mail record not found');
+      if (!found) throw new McpToolError('NOT_FOUND', 'mail record not found');
       return {
-        contents: [{
-          uri: uri.href,
-          mimeType: 'application/json',
-          text: JSON.stringify({ found: true, ...found }, null, 2),
-        }],
+        contents: [{ uri: uri.href, mimeType: 'text/markdown', text: mailRecordToMarkdown(found) }],
       };
     },
   );
 
-  server.registerResource(
+  registerResource(
+    'mail-thread',
+    new ResourceTemplate('mailsift://thread/{threadKey}', { list: undefined }),
+    {
+      mimeType: 'text/markdown',
+      description:
+        'Read one conversation as a markdown page, oldest first. Thread keys come from list_threads.',
+    },
+    async (uri, variables) => {
+      const threadKey = decodeVariable(variables['threadKey']);
+      const rows = threadKey ? store.getThreadMail(threadKey) : [];
+      store.recordMcpAudit('resource:mail-thread', client, rows.length > 0, threadKey);
+      if (rows.length === 0) throw new McpToolError('NOT_FOUND', 'no stored messages for that thread key');
+      return {
+        contents: [{ uri: uri.href, mimeType: 'text/markdown', text: threadToMarkdown(threadKey!, rows) }],
+      };
+    },
+  );
+
+  registerResource(
+    'search-syntax',
+    SEARCH_SYNTAX_URI,
+    {
+      mimeType: 'text/markdown',
+      description:
+        'Every filter the mail tools accept, the category and importance vocabularies, and what is not stored. Read this before filtering.',
+    },
+    async (uri) => {
+      store.recordMcpAudit('resource:search-syntax', client, true, undefined);
+      return { contents: [{ uri: uri.href, mimeType: 'text/markdown', text: renderSearchSyntax() }] };
+    },
+  );
+
+  registerResource(
     'mail-source',
     new ResourceTemplate('mailsift://imap/{account}/{messageId}', { list: undefined }),
     {
@@ -439,7 +502,7 @@ export function createServer(
       const rawAccount = variables['account'];
       const rawMessageId = variables['messageId'];
       if (typeof rawAccount !== 'string' || typeof rawMessageId !== 'string') {
-        throw new Error('account and messageId are required');
+        throw new McpToolError('INVALID_ARGUMENT', 'account and messageId are required');
       }
       let accountName: string;
       let messageId: string;
@@ -447,21 +510,21 @@ export function createServer(
         accountName = decodeURIComponent(rawAccount);
         messageId = decodeURIComponent(rawMessageId);
       } catch {
-        throw new Error('invalid encoded mail resource URI');
+        throw new McpToolError('INVALID_ARGUMENT', 'invalid encoded mail resource URI');
       }
       const account = loadConfig().accounts.find((candidate) => candidate.username === accountName);
       if (!account) {
         store.recordMcpAudit('resource:mail-source', client, false, `${accountName}|${messageId}`);
-        throw new Error('mail account not found');
+        throw new McpToolError('ACCOUNT_UNKNOWN', 'mail account not found');
       }
       // This is the one path that reaches the mailbox itself, so it is audited
       // whether or not the fetch finds anything.
       const message = await fetchByMessageId(account, messageId).catch((error: unknown) => {
         store.recordMcpAudit('resource:mail-source', client, false, `${accountName}|${messageId}`);
-        throw error;
+        throw new McpToolError('MAILBOX_UNAVAILABLE', `could not read ${accountName}: ${String(error)}`);
       });
       store.recordMcpAudit('resource:mail-source', client, Boolean(message), `${accountName}|${messageId}`);
-      if (!message) throw new Error('message not found in configured read-only folders');
+      if (!message) throw new McpToolError('NOT_FOUND', 'message not found in configured read-only folders');
       const limit = liveBodyLimit();
       const body = message.body.slice(0, limit);
       return {
@@ -489,7 +552,7 @@ export function createServer(
     },
   );
 
-  server.registerResource(
+  registerResource(
     'mail-attachment',
     new ResourceTemplate('mailsift://imap/{account}/{messageId}/attachment/{partId}', { list: undefined }),
     {
@@ -502,7 +565,7 @@ export function createServer(
       const rawPartId = variables['partId'];
       if (typeof rawAccount !== 'string' || typeof rawMessageId !== 'string' || typeof rawPartId !== 'string') {
         store.recordMcpAudit('resource:mail-attachment', client, false, `${rawAccount}|${rawMessageId}|${rawPartId}`);
-        throw new Error('account, messageId, and partId are required');
+        throw new McpToolError('INVALID_ARGUMENT', 'account, messageId, and partId are required');
       }
       let accountName: string;
       let messageId: string;
@@ -513,19 +576,19 @@ export function createServer(
         partId = decodeURIComponent(rawPartId);
       } catch {
         store.recordMcpAudit('resource:mail-attachment', client, false, `${rawAccount}|${rawMessageId}|${rawPartId}`);
-        throw new Error('invalid encoded attachment resource URI');
+        throw new McpToolError('INVALID_ARGUMENT', 'invalid encoded attachment resource URI');
       }
       const account = loadConfig().accounts.find((candidate) => candidate.username === accountName);
       if (!account) {
         store.recordMcpAudit('resource:mail-attachment', client, false, `${accountName}|${messageId}|${partId}`);
-        throw new Error('mail account not found');
+        throw new McpToolError('ACCOUNT_UNKNOWN', 'mail account not found');
       }
       const downloaded = await fetchAttachmentByMessageId(account, messageId, partId).catch((error: unknown) => {
         store.recordMcpAudit('resource:mail-attachment', client, false, `${accountName}|${messageId}|${partId}`);
-        throw error;
+        throw new McpToolError('MAILBOX_UNAVAILABLE', `could not read ${accountName}: ${String(error)}`);
       });
       store.recordMcpAudit('resource:mail-attachment', client, Boolean(downloaded), `${accountName}|${messageId}|${partId}`);
-      if (!downloaded) throw new Error('message not found in configured read-only folders');
+      if (!downloaded) throw new McpToolError('NOT_FOUND', 'message not found in configured read-only folders');
       return {
         contents: [{
           uri: uri.href,
@@ -614,15 +677,23 @@ export function createServer(
           ...(args.destination ? { destinationFolder: args.destination } : {}),
         };
         try {
-          if (!stored?.messageId || !stored.account) throw new Error('mail record not found');
+          if (!stored?.messageId || !stored.account) throw new McpToolError('NOT_FOUND', 'mail record not found');
           const account = loadConfig().accounts.find((candidate) => candidate.username === stored.account);
-          if (!account) throw new Error('mail account is no longer configured');
+          if (!account) throw new McpToolError('ACCOUNT_UNKNOWN', 'mail account is no longer configured');
           const result = await applyMessageAction(account, stored.messageId, args.action, args.destination);
           if (!result) throw new MailActionError('not_found', 'message not found in configured folders');
           store.recordMailAction({ ...audit, success: true, sourceFolder: result.sourceFolder, ...(result.destinationFolder ? { destinationFolder: result.destinationFolder } : {}) });
           return json({ success: true, ...result });
         } catch (error) {
           store.recordMailAction({ ...audit, success: false, error: String(error) });
+          // The IMAP layer's own refusals (unknown action, trash destination,
+          // server rejection) carry a code of their own; keep it as the reason.
+          if (error instanceof MailActionError) {
+            throw new McpToolError(
+              error.code === 'not_found' ? 'NOT_FOUND' : 'ACTION_REFUSED',
+              `${error.code}: ${error.message}`,
+            );
+          }
           throw error;
         }
       },
@@ -691,7 +762,7 @@ export function createServer(
     },
     async (args) => {
       const account = loadConfig().accounts.find((candidate) => candidate.username === args.account);
-      if (!account) throw new Error('mail account not found');
+      if (!account) throw new McpToolError('ACCOUNT_UNKNOWN', 'mail account not found');
       const folders = await discoverMailboxFolders(account);
       return json({
         account: { name: account.name, address: account.username },
@@ -840,6 +911,8 @@ export function createServer(
       });
     },
   );
+
+  registerPrompts(server, { writable });
 
   return server;
 }

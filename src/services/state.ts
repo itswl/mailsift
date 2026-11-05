@@ -859,6 +859,25 @@ export class StateStore {
     ).map(toRow);
   }
 
+  /**
+   * Every stored message in one thread, oldest first, for the thread resource.
+   *
+   * Unlike getThreadContext this spans accounts and keeps undecided rows: a
+   * reader asking for a conversation wants all of it, not the part that was
+   * triaged, and the same thread can land in two monitored mailboxes.
+   */
+  getThreadMail(threadKey: string, limit = 50): MailRow[] {
+    const safeLimit = Math.max(1, Math.min(Math.floor(limit), 200));
+    return (
+      this.db.prepare(
+        `SELECT ${ROW_COLUMNS.join(', ')}, snippet FROM seen
+         WHERE thread_key = ?
+         ORDER BY COALESCE(mail_date, created_at) ASC, created_at ASC
+         LIMIT ?`,
+      ).all(threadKey, safeLimit) as Array<Record<string, unknown>>
+    ).map(toRow);
+  }
+
   /** Group the bounded local mail view into conversation-like threads. */
   queryThreads(options: QueryOptions = {}): MailThread[] {
     const requested = Math.max(1, Math.min(options.limit ?? 30, 200));

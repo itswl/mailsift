@@ -4,6 +4,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { allowMcpRequest, createServer } from '../src/mcp.js';
 import { StateStore } from '../src/services/state.js';
+import { IMPORTANCE } from '../src/config.js';
+import { CATEGORIES } from '../src/services/triage.js';
 import { makeMessage, makeResult } from './helpers.js';
 
 /**
@@ -221,16 +223,92 @@ describe('queries', () => {
 });
 
 describe('resources', () => {
-  it('reads one stored record by Message-ID', async () => {
+  it('reads one stored record by Message-ID, as markdown a model can read', async () => {
     const client = await connect(seeded());
     const { contents } = await client.readResource({ uri: 'mailsift://mail/%3Cone%40x%3E' });
     const [first] = contents as Array<{ text: string; mimeType: string }>;
-    expect(JSON.parse(first!.text)).toMatchObject({ found: true, messageId: '<one@x>' });
+    expect(first!.mimeType).toBe('text/markdown');
+    expect(first!.text).toContain('<one@x>');
+    expect(first!.text).toMatch(/^# /);
+    // The JSON form is still available from the tool, so nothing is lost.
+    expect(await call(client, 'get_mail', { messageId: '<one@x>' })).toMatchObject({ messageId: '<one@x>' });
   });
 
   it('fails a read for a record that does not exist', async () => {
     const client = await connect(seeded());
-    await expect(client.readResource({ uri: 'mailsift://mail/%3Cabsent%40x%3E' })).rejects.toThrow();
+    await expect(client.readResource({ uri: 'mailsift://mail/%3Cabsent%40x%3E' })).rejects.toThrow(/NOT_FOUND/);
+  });
+
+  it('serves the search syntax from the vocabulary the triage code uses', async () => {
+    const client = await connect(seeded());
+    const { contents } = await client.readResource({ uri: 'mailsift://search-syntax' });
+    const [first] = contents as Array<{ text: string; mimeType: string }>;
+    expect(first!.mimeType).toBe('text/markdown');
+    for (const category of CATEGORIES) expect(first!.text).toContain(category);
+    for (const level of IMPORTANCE) expect(first!.text).toContain(level);
+    expect(first!.text).toContain('Forwarded copy');
+  });
+
+  it('lists the resources it offers', async () => {
+    const client = await connect(seeded());
+    const { resourceTemplates } = await client.listResourceTemplates();
+    const uris = resourceTemplates.map((t) => t.uriTemplate);
+    expect(uris).toContain('mailsift://mail/{messageId}');
+    expect(uris).toContain('mailsift://thread/{threadKey}');
+  });
+});
+
+describe('prompts', () => {
+  it('offers the read-only workflows and names the tools to use', async () => {
+    const client = await connect(seeded());
+    const { prompts } = await client.listPrompts();
+    const names = prompts.map((p) => p.name);
+    expect(names).toContain('catch_up');
+    expect(names).toContain('why_not_notified');
+    // record_feedback is a write tool, so its workflow is not offered read-only.
+    expect(names).not.toContain('review_triage');
+
+    const { messages } = await client.getPrompt({ name: 'catch_up', arguments: { hours: '48' } });
+    const text = (messages[0]!.content as { text: string }).text;
+    expect(text).toContain('48');
+    expect(text).toContain('list_digest');
+  });
+
+  it('adds the feedback workflow only where the write tools exist', async () => {
+    const client = await connect(seeded(), true);
+    const { prompts } = await client.listPrompts();
+    expect(prompts.map((p) => p.name)).toContain('review_triage');
+  });
+});
+
+describe('tool errors', () => {
+  /** The structured body a failing tool now answers with. */
+  async function errorBody(client: Client, name: string, args: Record<string, unknown>) {
+    const result = await client.callTool({ name, arguments: args });
+    expect(result).toMatchObject({ isError: true });
+    const [first] = result.content as Array<{ text: string }>;
+    return JSON.parse(first!.text) as { code: string; message: string; hint?: string };
+  }
+
+  it('names an unknown mailbox and points at the tool that lists the real ones', async () => {
+    process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|secret';
+    const client = await connect(seeded());
+    const body = await errorBody(client, 'list_folders', { account: 'nobody@example.com' });
+    expect(body.code).toBe('ACCOUNT_UNKNOWN');
+    expect(body.hint).toMatch(/list_accounts/);
+  });
+
+  it('separates its own broken configuration from a caller mistake', async () => {
+    // No MAIL_ACCOUNT_* is set here, so loading the configuration fails.
+    const client = await connect(seeded());
+    const body = await errorBody(client, 'list_folders', { account: 'me@qq.com' });
+    expect(body.code).toBe('SERVER_MISCONFIGURED');
+  });
+
+  it('answers a Message-ID it has never seen without calling it an error', async () => {
+    // Absence is an answer here: the tool reports found:false rather than failing.
+    const client = await connect(seeded());
+    expect(await call(client, 'get_mail', { messageId: '<absent@x>' })).toMatchObject({ found: false });
   });
 });
 

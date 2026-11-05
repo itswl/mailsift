@@ -99,7 +99,7 @@ Docker publishes the port on the host's loopback address only. To reach it from 
 
 ## MCP
 
-The MCP server runs inside mailsift at `http://127.0.0.1:8410/mcp` (Streamable HTTP, `Authorization: Bearer <MCP_TOKEN>`). Add it to an MCP client and an assistant can list, search and read your triaged mail, preview the digest, or check mailbox health. It is read-only; a separate `MCP_WRITE_TOKEN` adds marking, starring and moving mail, all audited. See [docs/mcp.md](docs/mcp.md).
+The MCP server runs inside mailsift at `http://127.0.0.1:8410/mcp` (Streamable HTTP, `Authorization: Bearer <MCP_TOKEN>`). Add it to an MCP client and an assistant can list, search and read your triaged mail, preview the digest, or check mailbox health. It also ships the workflows those tools are meant to be used in, as prompts: catch up on the mailbox, or work out why something never reached you. It is read-only; a separate `MCP_WRITE_TOKEN` adds marking, starring and moving mail, all audited. See [docs/mcp.md](docs/mcp.md).
 
 ## Everyday commands
 

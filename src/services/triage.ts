@@ -60,6 +60,18 @@ export const FALLBACK_KEYWORDS = [
  * searched on, so they stay in English even when summaries are written in
  * another language.
  */
+/**
+ * Categories a rule assigns without consulting the model. They are not part of
+ * CATEGORIES because the model must never choose one, but callers filter and
+ * search on them, so they are named here rather than written out at each site.
+ */
+export const RULE_CATEGORIES = {
+  alwaysImportant: 'Always important',
+  neverImportant: 'Never important',
+  feedback: 'Feedback rule',
+  forwardedCopy: 'Forwarded copy',
+} as const;
+
 export const CATEGORIES = [
   'Security', 'Finance', 'Delivery', 'Travel', 'Health', 'Legal',
   'Work', 'Personal', 'Social', 'Marketing', 'System', 'Other',
@@ -374,7 +386,7 @@ export function applyRules(message: MailMessage, rules: Rules): TriageResult | u
   const allow = matches(message, rules.alwaysImportant);
   if (allow) {
     return {
-      importance: 'critical', score: 100, category: 'Always important', actionRequired: true,
+      importance: 'critical', score: 100, category: RULE_CATEGORIES.alwaysImportant, actionRequired: true,
       decidedBy: 'rule', summary: '', reason: `Sender matched always-important rule "${allow}"`, deadline: '',
     };
   }
@@ -383,7 +395,7 @@ export function applyRules(message: MailMessage, rules: Rules): TriageResult | u
   const forwardedFrom = isSelfForward(message, rules);
   if (forwardedFrom) {
     return {
-      importance: 'info', score: 0, category: 'Forwarded copy', actionRequired: false,
+      importance: 'info', score: 0, category: RULE_CATEGORIES.forwardedCopy, actionRequired: false,
       decidedBy: 'rule', summary: '',
       reason: `Forwarded in from ${forwardedFrom}, a mailbox this service already monitors; the original was triaged there`,
       deadline: '',
@@ -392,21 +404,21 @@ export function applyRules(message: MailMessage, rules: Rules): TriageResult | u
   const deny = matches(message, rules.neverImportant);
   if (deny) {
     return {
-      importance: 'info', score: 0, category: 'Never important', actionRequired: false,
+      importance: 'info', score: 0, category: RULE_CATEGORIES.neverImportant, actionRequired: false,
       decidedBy: 'rule', summary: '', reason: `Sender matched never-important rule "${deny}"`, deadline: '',
     };
   }
   const feedbackAllow = matches(message, rules.feedbackAlwaysImportant ?? []);
   if (feedbackAllow) {
     return {
-      importance: 'critical', score: 100, category: 'Feedback rule', actionRequired: true,
+      importance: 'critical', score: 100, category: RULE_CATEGORIES.feedback, actionRequired: true,
       decidedBy: 'rule', summary: '', reason: `Feedback marked sender important "${feedbackAllow}"`, deadline: '',
     };
   }
   const feedbackDeny = matches(message, rules.feedbackNeverImportant ?? []);
   if (feedbackDeny) {
     return {
-      importance: 'info', score: 0, category: 'Feedback rule', actionRequired: false,
+      importance: 'info', score: 0, category: RULE_CATEGORIES.feedback, actionRequired: false,
       decidedBy: 'rule', summary: '', reason: `Feedback marked sender low priority "${feedbackDeny}"`, deadline: '',
     };
   }
@@ -894,7 +906,7 @@ export async function triage(
       // can afford to miss: a code or a sign-in link is something the reader
       // asked for and is waiting on. An explicit never-important rule still
       // wins, and a link in bulk mail or spam is not lifted.
-      const muted = ruled.category === 'Feedback rule' && ruled.importance === 'info';
+      const muted = ruled.category === RULE_CATEGORIES.feedback && ruled.importance === 'info';
       if (unasked) {
         decided.set(index, unaskedLinkResult(message, ruled));
       } else {

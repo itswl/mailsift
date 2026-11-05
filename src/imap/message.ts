@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import type { MessageStructureObject } from 'imapflow';
 import { simpleParser } from 'mailparser';
+import { cleanBody, normalizeWhitespace } from './body.js';
 
 export const SNIPPET_CHARS = 400;
 export const MAX_ATTACHMENT_MANIFEST_ITEMS = 100;
@@ -530,7 +531,15 @@ export function isSensitiveVerificationMessage(message: Pick<MailMessage, 'subje
 
 const HTML_TAG = /<[^>]+>/g;
 const STYLE_BLOCK = /<(script|style)[^>]*>[\s\S]*?<\/\1>/gi;
-const WHITESPACE = /\s+/g;
+
+/**
+ * Block-level boundaries become line breaks before the tags are stripped.
+ *
+ * Quoted history is recognised by whole lines ("On ... wrote:", `>`, an Outlook
+ * header block), and in HTML mail those sit in their own `<div>` or `<p>`. Without
+ * this the entire message arrives as one line and none of them can be found.
+ */
+const HTML_BLOCK = /<\/?(?:div|p|br|tr|li|ul|ol|table|blockquote|h[1-6]|hr|pre|section|article|header|footer)\b[^>]*>/gi;
 
 /**
  * Decode HTML entities.
@@ -560,10 +569,13 @@ export function decodeEntities(text: string): string {
   });
 }
 
+/**
+ * HTML body to plain text, keeping the line structure quote detection needs.
+ * Callers that want a single line collapse the result themselves.
+ */
 export function htmlToText(html: string): string {
-  return decodeEntities(html.replace(STYLE_BLOCK, ' ').replace(HTML_TAG, ' '))
-    .replace(WHITESPACE, ' ')
-    .trim();
+  const withBreaks = html.replace(STYLE_BLOCK, ' ').replace(HTML_BLOCK, '\n').replace(HTML_TAG, ' ');
+  return normalizeWhitespace(decodeEntities(withBreaks));
 }
 
 export function snippet(message: MailMessage): string {
@@ -614,8 +626,9 @@ export async function extractBody(source: Buffer | undefined): Promise<{ body: s
     const parsed = await simpleParser(source, { skipImageLinks: true });
     // Prefer plain text and fall back to HTML.
     const text = parsed.text?.trim() || (parsed.html ? htmlToText(parsed.html) : '');
+    // Clean while the line structure is still there, then store as one line as before.
     return {
-      body: text.replace(/\s+/g, ' ').trim(),
+      body: cleanBody(text).replace(/\s+/g, ' ').trim(),
       hasAttachments: (parsed.attachments?.length ?? 0) > 0,
     };
   } catch {
