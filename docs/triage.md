@@ -43,6 +43,10 @@ Categories are not translated. They come from a fixed vocabulary, `Security`, `F
 
 `LLM_REDACT_PII=true` (the default) redacts direct identifiers from fields sent to the LLM: email addresses, phone numbers, payment card numbers (Luhn-checked), IBANs (mod-97), resident IDs (ISO 7064), US SSNs, license plates, and common API keys or tokens. A value that fails its checksum is left alone, so waybill, order, and invoice numbers stay readable in summaries. The recogniser list runs most-specific first, so an IBAN is not half-eaten by the phone rule. Local state and notifications keep the original values. Set it to `false` only when the configured endpoint is trusted and the additional context is necessary.
 
+`LLM_SCAN_OUTPUT=false` (the default) counts direct identifiers that the model repeats in its summary or reason and logs a warning with the types and counts only — never the values. The text is not rewritten: the summary is for the reader, and silently changing it would hide the problem. Turn it on when tuning a new model or prompt; it costs one pass over each generated summary.
+
+The regression corpus in `test/fixtures/verification.ts` and `test/fixtures/redaction.ts` pins the shapes this logic must keep handling. When a real message defeats a heuristic, add it there (with synthetic values) before changing the rule.
+
 ## Two-stage triage
 
 By default one batched LLM call decides everything: the level, the category, and the summary. Setting the `DECIDER_*` variables splits that into two stages. A calibrated decision model (Cloudflare Clef on Workers AI) answers typed questions to decide `importance`, `category`, and `action_required` first, then the LLM above only writes the `summary`, `reason`, and `deadline`:

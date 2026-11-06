@@ -22,7 +22,7 @@ import {
   type SensitiveKind,
 } from '../imap/message.js';
 import { getLogger } from '../logger.js';
-import { redactForLlm } from './redact.js';
+import { countIdentifiers, redactForLlm } from './redact.js';
 
 export { SENSITIVE_LOCAL_KEYWORDS } from '../imap/message.js';
 export { looksLikeChineseId, passesLuhn, redactForLlm } from './redact.js';
@@ -778,6 +778,7 @@ async function classifyBatch(
       logUsage(raw, messages.length);
       parsed = LlmSummaryResponse.parse(extractJson(contentOf(raw)));
       collectIndices(parsed.results, messages.length);
+      reportModelOutput(parsed.results);
     } catch (error) {
       // The decisions are already paid for and validated; losing them to a
       // summary outage would downgrade a sound classification to keywords.
@@ -814,6 +815,7 @@ async function classifyBatch(
     logUsage(raw, messages.length);
     parsed = LlmResponse.parse(extractJson(contentOf(raw)));
     collectIndices(parsed.results, messages.length);
+    reportModelOutput(parsed.results);
   } catch (error) {
     log.error(`LLM triage failed; using keyword fallback for the batch: ${error}`);
     onLlmResult?.(error);
@@ -840,6 +842,21 @@ async function classifyBatch(
       decidedBy: 'llm',
     };
   });
+}
+
+/** Report, but never rewrite, identifiers the model repeated back to us. */
+function reportModelOutput(items: ReadonlyArray<{ summary?: string; reason?: string }>): void {
+  if ((process.env.LLM_SCAN_OUTPUT ?? 'false').toLowerCase() !== 'true') return;
+  const counts: Record<string, number> = {};
+  for (const item of items) {
+    for (const [type, n] of Object.entries(countIdentifiers(`${item.summary ?? ''}\n${item.reason ?? ''}`))) {
+      counts[type] = (counts[type] ?? 0) + n;
+    }
+  }
+  const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
+  if (total === 0) return;
+  const detail = Object.entries(counts).sort().map(([type, n]) => `${type}=${n}`).join(', ');
+  log.warn(`Model output repeated ${total} direct identifier(s) (${detail}); text kept, only counted.`);
 }
 
 /** Triage a batch and return message/result pairs in input order. */

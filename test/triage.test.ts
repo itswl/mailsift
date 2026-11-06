@@ -7,6 +7,7 @@ import {
   keywordFallback, matchesSenderRule, outputLanguageDirective, redactForLlm, resolveLlmBaseUrl,
   spamBonusWarning, triage, unanchoredSenderRules,
 } from '../src/services/triage.js';
+import { countIdentifiers } from '../src/services/redact.js';
 
 const RULES: Rules = {
   alwaysImportant: ['billing@', '@bank.com'],
@@ -348,6 +349,13 @@ describe('LLM layer', () => {
     expect(redactForLlm('2026-11-05 发货，金额 1,234.56 元')).toBe('2026-11-05 发货，金额 1,234.56 元');
     // A phone grouping of the same length is not a card even when its digits pass Luhn.
     expect(redactForLlm('电话 +86 138-1234-5678')).toBe('电话 [PHONE]');
+  });
+
+  it('counts identifiers in model output without rewriting it', () => {
+    expect(countIdentifiers('Contact a@example.com, card 4111 1111 1111 1111'))
+      .toEqual({ EMAIL: 1, CARD: 1 });
+    // Placeholders and ordinary numbers are not identifiers.
+    expect(countIdentifiers('[EMAIL] [CARD] 订单 2345678901234567890')).toEqual({});
   });
 });
 

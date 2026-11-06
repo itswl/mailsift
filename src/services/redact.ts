@@ -117,6 +117,25 @@ const RECOGNIZERS: Recognizer[] = [
 ];
 
 /**
+ * Count the direct identifiers in a piece of text without changing it.
+ *
+ * Meant for model output: a summary that echoes an address or a card number is
+ * worth knowing about, but rewriting it would hide the problem from the reader
+ * and from the log. Only types and counts are reported, never values.
+ */
+export function countIdentifiers(text: string): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const { pattern, type, valid } of RECOGNIZERS) {
+    const global = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`);
+    for (const match of text.matchAll(global)) {
+      if (valid && !valid(match[0])) continue;
+      counts[type] = (counts[type] ?? 0) + 1;
+    }
+  }
+  return counts;
+}
+
+/**
  * Remove common direct identifiers before a message is sent to an LLM.
  *
  * Numeric identifiers are only treated as cards or ID numbers when their
