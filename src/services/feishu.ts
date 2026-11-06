@@ -67,7 +67,8 @@ function formatDate(raw: string): string {
 export function buildCard(message: MailMessage, result: TriageResult): Record<string, unknown> {
   const isDigest = Boolean(message.extra?.['digest']);
   const isSensitiveVerification = hidesContent(message, result);
-  const verificationCode = isSensitiveVerification
+  const kind = result.sensitiveKind ?? sensitiveKindOf(message.subject, message.body) ?? 'code';
+  const verificationCode = isSensitiveVerification && kind === 'code'
     ? result.verificationCode ?? extractVerificationCode(message.subject, message.body)
     : undefined;
   const template = TEMPLATE[result.importance] ?? 'grey';
@@ -84,7 +85,6 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
   }
 
   const spamTag = message.inSpam ? '[Recovered from spam] ' : '';
-  const kind = result.sensitiveKind ?? sensitiveKindOf(message.subject, message.body) ?? 'code';
   const subject = isSensitiveVerification ? SENSITIVE_WORDS[kind].subject : message.subject;
   // A verification code belongs in the title: it is the whole message, and the
   // header is the largest, always-visible line on a phone notification.
@@ -100,9 +100,11 @@ export function buildCard(message: MailMessage, result: TriageResult): Record<st
         ? result.sensitiveUnasked || message.inSpam
           ? `🔗 ${message.inSpam ? '来自垃圾箱的' : '群发邮件里的'}登录/重置链接邮件，内容已在本地隐藏。如果不是你刚刚请求的，请勿打开。`
           : '🔗 登录链接已在本地隐藏，请打开原邮件使用。'
-        : verificationCode
-          ? `🔐 **验证码** ${verificationCode}`
-          : '未能自动提取验证码，请打开原邮件查看。',
+        : kind === 'secret'
+          ? '🔑 邮件包含凭据或密钥，正文已在本地隐藏；请打开原邮件查看。'
+          : verificationCode
+            ? `🔐 **验证码** ${verificationCode}`
+            : '未能自动提取验证码，请打开原邮件查看。',
     );
   } else {
     lines.push(esc(headline(result)));

@@ -298,6 +298,20 @@ describe('LLM layer', () => {
     expect(result!.reason).toContain('LLM skipped');
   });
 
+  it('keeps a mail carrying credentials out of the LLM', async () => {
+    const spy = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', spy);
+    process.env.LLM_API_KEY = 'k';
+    const [[, result]] = await triage([makeMessage({
+      subject: 'Your new API key',
+      body: 'Keep it safe: -----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----',
+    })], RULES);
+    expect(spy).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ decidedBy: 'local', sensitiveKind: 'secret', sensitiveVerification: true });
+    expect(result!.summary).toContain('凭据');
+    expect(result!.actionRequired).toBe(false);
+  });
+
   it('redacts direct identifiers before LLM use', () => {
     expect(redactForLlm('Contact a@example.com or +86 138-1234-5678; card 4111 1111 1111 1111.'))
       .toBe('Contact [EMAIL] or [PHONE]; card [CARD].');

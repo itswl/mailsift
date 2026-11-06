@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  containsCredentialMaterial,
   containsSensitiveVerificationContent,
   decodeEntities,
   extractBody,
   extractVerificationCode,
+  extractVerificationCodeCandidates,
   htmlToText,
   isSensitiveVerificationMessage,
 } from '../src/imap/message.js';
@@ -202,6 +204,15 @@ describe('sensitive verification detection', () => {
     expect(isSensitiveVerificationMessage({ subject: '安全', body: 'OTP已发送至邮箱' })).toBe(true);
   });
 
+  it('does not mistake a mention of keys for a leak', () => {
+    // Only a private-key block, a JWT, or a provider-prefixed token counts.
+    expect(containsCredentialMaterial('Release notes', 'The API key is stored server-side.'))
+      .toBe(false);
+    expect(containsCredentialMaterial('Your key', 'sk-abcdefghijklmnopqrstuvwx')).toBe(true);
+    expect(containsCredentialMaterial('Login', 'Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U'))
+      .toBe(true);
+  });
+
   it('recognises a code announced below the fold', () => {
     // The BCPoker mail said "Use the code below to complete your registration:
     // 083897" and never used the words "verification code", so it reached the
@@ -259,6 +270,26 @@ describe('sensitive verification detection', () => {
   it('picks the candidate the message repeats', () => {
     expect(extractVerificationCode('登录验证', '您的验证码已发送。882211 请在页面输入 882211 完成登录。'))
       .toBe('882211');
+  });
+
+  it('joins a code split into two equal groups', () => {
+    expect(extractVerificationCode('Your verification code', 'Your verification code is 613 254'))
+      .toBe('613254');
+    expect(extractVerificationCode('验证码', '验证码是 4210-9987')).toBe('42109987');
+  });
+
+  it('does not join a phone number or an order fragment', () => {
+    // 3-4-4 is a phone grouping and "010 1234" is not two equal groups.
+    expect(extractVerificationCode('验证码邮件', '电话 138 0013 8000')).toBeUndefined();
+    expect(extractVerificationCode('验证码邮件', '订单 010 1234 已发货')).toBeUndefined();
+  });
+
+  it('takes the only code-shaped value when the mail has nothing else', () => {
+    // The mail is already known to be a code mail; one candidate with some
+    // signal is the answer even without a label beside it.
+    expect(extractVerificationCode('验证码', '请在页面输入 613 254 完成登录')).toBe('613254');
+    expect(extractVerificationCodeCandidates('验证码', '请在页面输入 613 254 完成登录'))
+      .toEqual([{ value: '613254', score: 25 }]);
   });
 
   it('leaves unrelated numbers alone when nothing marks them as a code', () => {

@@ -108,6 +108,18 @@ describe('self-contained cards', () => {
     expect(body.startsWith('未能自动提取验证码，请打开原邮件查看。')).toBe(true);
     expect(body).not.toContain('收到验证码邮件。');
   });
+
+  it('names a credential mail and keeps the key out of the card', () => {
+    const card = buildCard(
+      makeMessage({ subject: 'Your new API key', body: 'Keep it safe: sk-abcdefghijklmnopqrstuvwx' }),
+      makeResult({ importance: 'warning', sensitiveVerification: true, sensitiveKind: 'secret' }),
+    );
+    expect(cardTitle(card)).toBe('🟠 敏感邮件');
+    const body = cardBody(card);
+    expect(body).toContain('凭据或密钥');
+    expect(body).not.toContain('sk-');
+    expect(body).not.toContain('验证码');
+  });
 });
 
 describe('navigation buttons', () => {

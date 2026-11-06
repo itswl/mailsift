@@ -13,7 +13,6 @@ import {
   extractVerificationCode,
   SENSITIVE_WORDS,
   sensitiveKindOf,
-  SIGN_IN_LINK_SUMMARY,
   snippet,
   UNASKED_LINK_REASON,
   UNASKED_LINK_SUMMARY,
@@ -465,23 +464,30 @@ function sensitiveVerificationResult(
   kind: SensitiveKind = 'code',
 ): TriageResult {
   const link = kind === 'link';
-  const summary = link ? SIGN_IN_LINK_SUMMARY : verificationCode ? VERIFICATION_SUMMARY : VERIFICATION_SUMMARY_NO_CODE;
+  const secret = kind === 'secret';
+  const summary = link || secret
+    ? SENSITIVE_WORDS[kind].summary
+    : verificationCode ? VERIFICATION_SUMMARY : VERIFICATION_SUMMARY_NO_CODE;
   return {
     importance: ensurePush && base?.importance === 'info' ? 'warning' : base?.importance ?? 'warning',
     score: ensurePush ? Math.max(base?.score ?? 0, 60) : base?.score ?? 60,
     summary,
     reason: link
       ? '登录链接邮件在本地处理；LLM skipped，链接不会发送给 LLM。'
-      : '验证码邮件在本地处理；LLM skipped，验证码内容不会发送给 LLM。',
+      : secret
+        ? '邮件包含凭据或密钥，在本地处理；LLM skipped，正文不会发送给 LLM。'
+        : '验证码邮件在本地处理；LLM skipped，验证码内容不会发送给 LLM。',
     deadline: '',
     category: 'Security',
-    actionRequired: ensurePush || (base?.actionRequired ?? true),
+    // Nothing to do about a leaked key inside a notification; the reader opens
+    // the message itself if it matters.
+    actionRequired: secret ? false : ensurePush || (base?.actionRequired ?? true),
     // Handled here on purpose, which is not the same as the keyword stand-in
     // for a model that failed.
     decidedBy: base?.decidedBy ?? 'local',
     sensitiveVerification: true,
     sensitiveKind: kind,
-    ...(verificationCode && !link ? { verificationCode } : {}),
+    ...(verificationCode && !link && !secret ? { verificationCode } : {}),
   };
 }
 

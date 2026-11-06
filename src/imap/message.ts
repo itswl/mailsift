@@ -291,12 +291,26 @@ export const UNASKED_LINK_SUMMARY = '收到登录链接邮件（如果不是你�
 export const UNASKED_LINK_REASON = '登录链接邮件内容已在本地隐藏；如果不是你刚刚请求的，请勿打开。';
 
 /**
- * Sensitive mail comes in two kinds. A verification code is the message
+ * Sensitive mail comes in three kinds. A verification code is the message
  * itself; a sign-in or password-reset link carries a token that grants the
- * same access. Either is handled locally and kept out of the model, the
+ * same access; a mail with a private key, JWT or provider token is a leak
+ * waiting to happen. Each is handled locally and kept out of the model, the
  * notification excerpt and the webhook.
  */
-export type SensitiveKind = 'code' | 'link';
+export type SensitiveKind = 'code' | 'link' | 'secret';
+
+/** Strong credential shapes. A mail that merely says "API key" is not one. */
+export const PRIVATE_KEY_SOURCE = String.raw`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`;
+export const JWT_SOURCE = String.raw`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`;
+export const KEY_PREFIX_SOURCE = String.raw`\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|[sr]k_(?:live|test)_[A-Za-z0-9]{10,}|AKIA[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,})\b`;
+const CREDENTIAL_PATTERNS = [PRIVATE_KEY_SOURCE, JWT_SOURCE, KEY_PREFIX_SOURCE]
+  .map((source) => new RegExp(source));
+
+/** A private key block, a JWT, or a token with a known provider prefix. */
+export function containsCredentialMaterial(subject: string, body: string): boolean {
+  const text = `${subject}\n${body}`;
+  return CREDENTIAL_PATTERNS.some((pattern) => pattern.test(text));
+}
 
 /** What stands in for a sensitive message's subject, summary and body wherever it is shown or sent. */
 export const SENSITIVE_WORDS: Record<SensitiveKind, {
@@ -309,6 +323,11 @@ export const SENSITIVE_WORDS: Record<SensitiveKind, {
   link: {
     subject: '登录链接邮件', summary: SIGN_IN_LINK_SUMMARY, hidden: '登录链接邮件（内容已隐藏）',
     snippet: '登录链接邮件（正文已隐藏）', reason: '登录链接邮件内容已在本地隐藏。',
+  },
+  secret: {
+    subject: '敏感邮件', summary: '收到含凭据或密钥的邮件，正文已在本地隐藏。',
+    hidden: '敏感邮件（内容已隐藏）', snippet: '敏感邮件（正文已隐藏）',
+    reason: '检测到凭据或密钥，内容不会发送给 LLM。',
   },
 };
 
@@ -461,6 +480,7 @@ export function containsSignInLink(subject: string, body: string): boolean {
 export function sensitiveKindOf(subject: string, body: string): SensitiveKind | undefined {
   if (containsSensitiveVerificationContent(subject, body)) return 'code';
   if (containsSignInLink(subject, body)) return 'link';
+  if (containsCredentialMaterial(subject, body)) return 'secret';
   return undefined;
 }
 
@@ -554,69 +574,122 @@ function labelBonus(lower: string, start: number, end: number, floor: number): n
 }
 
 /** True when the code sits on a line of its own (only punctuation around it). */
-function isStandalone(text: string, start: number, end: number, value: string): boolean {
+function isStandalone(text: string, start: number, end: number, raw: string): boolean {
   const lineStart = text.lastIndexOf('\n', start - 1) + 1;
   const nextBreak = text.indexOf('\n', end);
   const lineEnd = nextBreak === -1 ? text.length : nextBreak;
-  const rest = text.slice(lineStart, lineEnd).replace(value, '');
+  const rest = text.slice(lineStart, lineEnd).replace(raw, '');
   return rest.replace(/[\s:：=,，.。\-–—|()（）[\]「」<>"']/g, '').length === 0;
 }
 
+export interface CodeCandidate {
+  value: string;
+  score: number;
+}
+
+/** A candidate must clear this to be shown; below it the extractor fails closed. */
+const CODE_SCORE_THRESHOLD = 60;
+/** Two equal groups ("613 254", "4210-9987") are a code shape of their own. */
+const SPLIT_CODE_BONUS = 25;
+
+function scoreCandidate(
+  text: string,
+  lower: string,
+  subjectLength: number,
+  start: number,
+  end: number,
+  value: string,
+  raw: string,
+  bonus = 0,
+): number {
+  let score = bonus;
+  const inSubject = start < subjectLength;
+  if (inSubject) score += 90;
+  const label = labelBonus(lower, start, end, inSubject ? 0 : subjectLength + 1);
+  score += label;
+  // The announcement can sit a sentence away from the code it introduces.
+  if (CODE_ANNOUNCEMENT.test(lower.slice(Math.max(0, start - 160), start))) score += 55;
+  if (isStandalone(text, start, end, raw)) score += 40;
+  const context = text.slice(Math.max(0, start - 100), Math.min(text.length, end + 100));
+  if (EXPIRY_HINT.test(context)) score += 20;
+  if (DATE_UNIT.test(text.slice(end))) score -= 90;
+  if (/^(?:19|20)\d{2}$/.test(value) && label === 0) score -= 70;
+  if (CURRENCY_NEAR.test(text.slice(Math.max(0, start - 2), start))
+    || CURRENCY_NEAR.test(text.slice(end, end + 2))) score -= 40;
+  if (text.slice(end, end + 1) === '%') score -= 30;
+  return score;
+}
+
 /**
- * Pick the most likely verification code.
+ * Rank every plausible code in the message.
  *
  * Rather than trying phrasings in a fixed order, every 4-8 character token that
- * contains a digit is a candidate, and the winner is the one whose context looks
- * most like an authentication code: in the subject, next to a label, alone on a
- * line, repeated, near an expiry notice. Links, dates, prices and years are
- * discounted. This is the same tokenise-and-score approach mail clients use;
- * adding a new sender wording means nothing here.
+ * contains a digit is a candidate, plus two equal digit groups joined by one
+ * space or hyphen ("613 254", "4210-9987"). The score comes from context: in the
+ * subject, next to a label, alone on a line, repeated, near an expiry notice.
+ * Links, dates, prices and years are discounted. This is the same
+ * tokenise-and-score approach mail clients use; adding a sender wording means
+ * nothing here.
  */
-export function extractVerificationCode(subject: string, body: string): string | undefined {
-  if (!containsSensitiveVerificationContent(subject, body)) return undefined;
+export function extractVerificationCodeCandidates(
+  subject: string,
+  body: string,
+): CodeCandidate[] {
+  if (!containsSensitiveVerificationContent(subject, body)) return [];
   const subjectText = withoutLinks(subject);
   const text = `${subjectText}\n${withoutLinks(body)}`;
   const lower = text.toLowerCase();
 
-  const best = new Map<string, { score: number; count: number }>();
+  const scored = new Map<string, { score: number; count: number }>();
+  const record = (value: string, score: number): void => {
+    const previous = scored.get(value);
+    if (previous) {
+      previous.count += 1;
+      if (score > previous.score) previous.score = score;
+      return;
+    }
+    scored.set(value, { score, count: 1 });
+  };
+
   const candidateRe = /(?<![A-Za-z0-9])([A-Za-z0-9]{4,8})(?![A-Za-z0-9])/g;
   for (const match of text.matchAll(candidateRe)) {
     const value = match[1]!;
     if (!/\d/.test(value)) continue;
     const start = match.index!;
     const end = start + value.length;
+    record(value, scoreCandidate(text, lower, subjectText.length, start, end, value, value));
+  }
 
-    let score = 0;
-    const inSubject = start < subjectText.length;
-    if (inSubject) score += 90;
-    const label = labelBonus(lower, start, end, inSubject ? 0 : subjectText.length + 1);
-    score += label;
-    // The announcement can sit a sentence away from the code it introduces.
-    if (CODE_ANNOUNCEMENT.test(lower.slice(Math.max(0, start - 160), start))) score += 55;
-    if (isStandalone(text, start, end, value)) score += 40;
-    const context = text.slice(Math.max(0, start - 100), Math.min(text.length, end + 100));
-    if (EXPIRY_HINT.test(context)) score += 20;
-    if (DATE_UNIT.test(text.slice(end))) score -= 90;
-    if (/^(?:19|20)\d{2}$/.test(value) && label === 0) score -= 70;
-    if (CURRENCY_NEAR.test(text.slice(Math.max(0, start - 2), start))
-      || CURRENCY_NEAR.test(text.slice(end, end + 2))) score -= 40;
-    if (text.slice(end, end + 1) === '%') score -= 30;
-
-    const previous = best.get(value);
-    if (previous) {
-      previous.count += 1;
-      if (score > previous.score) previous.score = score;
-      continue;
+  // "613 254" and "4210-9987": two equal groups are never a phone or an amount.
+  for (const pattern of [
+    /(?<![\w/+:(])(\d{3})[ -](\d{3})(?![\w/:-])/g,
+    /(?<![\w/+:(])(\d{4})[ -](\d{4})(?![\w/:-])/g,
+  ]) {
+    for (const match of text.matchAll(pattern)) {
+      const raw = match[0];
+      const value = `${match[1]}${match[2]}`;
+      const start = match.index!;
+      const end = start + raw.length;
+      record(value, scoreCandidate(
+        text, lower, subjectText.length, start, end, value, raw, SPLIT_CODE_BONUS,
+      ));
     }
-    best.set(value, { score, count: 1 });
   }
 
-  let winner: { value: string; score: number } | undefined;
-  for (const [value, entry] of best) {
-    const score = entry.score + (entry.count > 1 ? 20 : 0);
-    if (!winner || score > winner.score) winner = { value, score };
-  }
-  return winner && winner.score >= 60 ? winner.value : undefined;
+  return [...scored.entries()]
+    .map(([value, entry]) => ({ value, score: entry.score + (entry.count > 1 ? 20 : 0) }))
+    .sort((a, b) => b.score - a.score);
+}
+
+/** The single best code, or nothing when no candidate looks enough like one. */
+export function extractVerificationCode(subject: string, body: string): string | undefined {
+  const candidates = extractVerificationCodeCandidates(subject, body);
+  const best = candidates[0];
+  if (!best) return undefined;
+  // A mail already known to be a code mail that contains exactly one code-shaped
+  // value does not need a label next to it: the value is the only answer it has.
+  const floor = candidates.length === 1 ? 25 : CODE_SCORE_THRESHOLD;
+  return best.score >= floor ? best.value : undefined;
 }
 
 export function isSensitiveVerificationMessage(message: Pick<MailMessage, 'subject' | 'body'>): boolean {

@@ -12,6 +12,8 @@
  * what a single process needs: no NER model, no mapping store, no dependencies.
  */
 
+import { JWT_SOURCE, KEY_PREFIX_SOURCE, PRIVATE_KEY_SOURCE } from '../imap/message.js';
+
 interface Recognizer {
   pattern: RegExp;
   type: string;
@@ -77,9 +79,9 @@ const CN_MOBILE = /(?<!\d)1[3-9]\d{9}(?!\d)/;
 const CN_LANDLINE = /(?<!\d)0\d{2,3}[- ]\d{7,8}(?!\d)/;
 /** Province character + letter + five alphanumerics, with the usual suffix characters. */
 const CN_PLATE = /[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领][A-HJ-NP-Z][A-HJ-NP-Z0-9]{4,5}[A-HJ-NP-Z0-9挂学警港澳]/;
-const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/;
-const KEY_PREFIX = /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|[sr]k_(?:live|test)_[A-Za-z0-9]{10,}|AKIA[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,})\b/;
-const PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/;
+const JWT = new RegExp(JWT_SOURCE, 'g');
+const KEY_PREFIX = new RegExp(KEY_PREFIX_SOURCE, 'g');
+const PRIVATE_KEY = new RegExp(PRIVATE_KEY_SOURCE, 'g');
 const US_SSN = /(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)/;
 
 /**
