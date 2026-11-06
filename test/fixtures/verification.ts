@@ -161,4 +161,26 @@ export const VERIFICATION_CASES: VerificationCase[] = [
     code: undefined,
     kind: 'secret',
   },
+  {
+    name: 'jwt outside a link is still a credential',
+    subject: 'Your session token',
+    body: 'Token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U',
+    code: undefined,
+    kind: 'secret',
+  },
+  {
+    name: 'a bare jwt in prose is not a credential mail',
+    subject: 'API notes',
+    body: 'The response includes eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U for inspection.',
+    code: undefined,
+    kind: null,
+  },
+  {
+    name: 'signed unsubscribe link is not a credential mail',
+    // Proton's daily notification ends with a JWT in the unsubscribe URL.
+    subject: 'You have 1 new message',
+    body: 'You have 1 new message in your inbox. [Update preferences](https://account.example.com/unsubscribe/64#eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpYXQiOjE3OTM5NDMwNDUuMDU1Njg3LCJleHAiOjE3OTY1MzUwNDV9.abc123def456ghi789jkl)',
+    code: undefined,
+    kind: null,
+  },
 ];

@@ -303,13 +303,29 @@ export type SensitiveKind = 'code' | 'link' | 'secret';
 export const PRIVATE_KEY_SOURCE = String.raw`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`;
 export const JWT_SOURCE = String.raw`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`;
 export const KEY_PREFIX_SOURCE = String.raw`\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|[sr]k_(?:live|test)_[A-Za-z0-9]{10,}|AKIA[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,})\b`;
-const CREDENTIAL_PATTERNS = [PRIVATE_KEY_SOURCE, JWT_SOURCE, KEY_PREFIX_SOURCE]
-  .map((source) => new RegExp(source));
+/** A bare JWT is common in analytics and unsubscribe URLs; these words make it deliberate. */
+const JWT_CONTEXT = /(?:token|bearer|key|secret|credential|password|jwt|令牌|密钥|凭据|密钥)/i;
+const PRIVATE_KEY = new RegExp(PRIVATE_KEY_SOURCE);
+const KEY_PREFIX = new RegExp(KEY_PREFIX_SOURCE);
+const JWT = new RegExp(JWT_SOURCE, 'g');
 
-/** A private key block, a JWT, or a token with a known provider prefix. */
+/**
+ * A private key block, a provider-prefixed token, or a JWT the message presents
+ * as a credential.
+ *
+ * Links are removed first: newsletter unsubscribe URLs and tracking pixels
+ * routinely carry a JWT, and those are not secrets the reader needs warned
+ * about. A JWT in the visible text still has to sit near a word such as
+ * "token" or "bearer" to count.
+ */
 export function containsCredentialMaterial(subject: string, body: string): boolean {
-  const text = `${subject}\n${body}`;
-  return CREDENTIAL_PATTERNS.some((pattern) => pattern.test(text));
+  const text = withoutLinks(`${subject}\n${body}`);
+  if (PRIVATE_KEY.test(text) || KEY_PREFIX.test(text)) return true;
+  for (const match of text.matchAll(JWT)) {
+    const around = text.slice(Math.max(0, match.index - 60), match.index + match[0].length + 60);
+    if (JWT_CONTEXT.test(around)) return true;
+  }
+  return false;
 }
 
 /** What stands in for a sensitive message's subject, summary and body wherever it is shown or sent. */
@@ -480,8 +496,16 @@ export function containsSignInLink(subject: string, body: string): boolean {
 export function sensitiveKindOf(subject: string, body: string): SensitiveKind | undefined {
   if (containsSensitiveVerificationContent(subject, body)) return 'code';
   if (containsSignInLink(subject, body)) return 'link';
-  if (containsCredentialMaterial(subject, body)) return 'secret';
+  if (secretMailEnabled() && containsCredentialMaterial(subject, body)) return 'secret';
   return undefined;
+}
+
+/**
+ * Whether credential mail is treated as sensitive. Off, it is triaged like any
+ * other message; the values are still redacted before the model sees them.
+ */
+function secretMailEnabled(): boolean {
+  return (process.env.SENSITIVE_SECRET_MAIL ?? 'true').toLowerCase() !== 'false';
 }
 
 /**

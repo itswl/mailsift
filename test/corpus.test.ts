@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import './setup.js';
 import {
   containsSensitiveVerificationContent,
@@ -29,4 +29,18 @@ describe('redaction corpus', () => {
       expect(redactForLlm(item.input)).toBe(item.output);
     });
   }
+});
+
+describe('credential mail switch', () => {
+  afterEach(() => { delete process.env.SENSITIVE_SECRET_MAIL; });
+
+  it('treats credential mail as ordinary when turned off', () => {
+    const subject = 'Your new API key';
+    const body = 'Keep it safe: sk-abcdefghijklmnopqrstuvwx';
+    expect(sensitiveKindOf(subject, body)).toBe('secret');
+    process.env.SENSITIVE_SECRET_MAIL = 'false';
+    expect(sensitiveKindOf(subject, body)).toBeUndefined();
+    // The value is still kept away from the model.
+    expect(redactForLlm(body)).toContain('[KEY]');
+  });
 });
