@@ -314,6 +314,27 @@ describe('LLM layer', () => {
     // A valid check character with an impossible birth month is not an ID.
     expect(redactForLlm('11010520261301002X')).toBe('11010520261301002X');
   });
+
+  it('recognises bank accounts, keys and other identifiers instead of one pattern per leak', () => {
+    // IBANs used to be half-eaten by the phone rule; the mod-97 recogniser now
+    // claims them first.
+    expect(redactForLlm('IBAN GB82 WEST 1234 5698 7654 32')).toBe('IBAN [IBAN]');
+    expect(redactForLlm('SSN 123-45-6789')).toBe('SSN [SSN]');
+    expect(redactForLlm('车牌 京A12345')).toBe('车牌 [PLATE]');
+    expect(redactForLlm('手机 13800138000，座机 010-12345678')).toBe('手机 [PHONE]，座机 [PHONE]');
+    expect(redactForLlm('call (877) 880-3205')).toBe('call [PHONE]');
+    expect(redactForLlm('token ghp_abcdefghijklmnopqrstuvwxyz0123456789')).toBe('token [KEY]');
+    expect(redactForLlm('Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U'))
+      .toBe('Bearer [KEY]');
+  });
+
+  it('leaves numbers that only look like identifiers alone', () => {
+    // "118 2026" is a balance followed by a date; the phone rule must not take it.
+    expect(redactForLlm('积分余额 118 2026/09/20')).toBe('积分余额 118 2026/09/20');
+    expect(redactForLlm('2026-11-05 发货，金额 1,234.56 元')).toBe('2026-11-05 发货，金额 1,234.56 元');
+    // A phone grouping of the same length is not a card even when its digits pass Luhn.
+    expect(redactForLlm('电话 +86 138-1234-5678')).toBe('电话 [PHONE]');
+  });
 });
 
 describe('effective rank', () => {

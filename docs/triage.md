@@ -41,7 +41,7 @@ Categories are not translated. They come from a fixed vocabulary, `Security`, `F
 
 `LLM_THREAD_CONTEXT_MESSAGES` (default `3`, range `0`-`5`) adds recent earlier messages from the same mailbox thread to a new message's LLM input. It uses stored subjects, senders, summaries, and bounded snippets, plus bounded snippets from earlier messages fetched in the same poll. It does not fetch older messages or persist additional body text. Context is sent only when the message already needs LLM classification, and the normal PII redaction applies. Set it to `0` to disable.
 
-`LLM_REDACT_PII=true` (the default) redacts email addresses, phone numbers, payment card numbers, and resident ID numbers from fields sent to the LLM. Card and ID numbers are only redacted when their checksum holds, so waybill, order, and invoice numbers stay readable in summaries. Local state and notifications keep the original values. Set it to `false` only when the configured endpoint is trusted and the additional context is necessary.
+`LLM_REDACT_PII=true` (the default) redacts direct identifiers from fields sent to the LLM: email addresses, phone numbers, payment card numbers (Luhn-checked), IBANs (mod-97), resident IDs (ISO 7064), US SSNs, license plates, and common API keys or tokens. A value that fails its checksum is left alone, so waybill, order, and invoice numbers stay readable in summaries. The recogniser list runs most-specific first, so an IBAN is not half-eaten by the phone rule. Local state and notifications keep the original values. Set it to `false` only when the configured endpoint is trusted and the additional context is necessary.
 
 ## Two-stage triage
 
