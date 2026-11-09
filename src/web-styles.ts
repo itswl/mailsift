@@ -63,7 +63,6 @@ body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset
 .icon-btn svg{display:block;width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round}
 .theme-icon{transition:transform .45s cubic-bezier(.2,.7,.2,1)}:root[data-theme=dark] .theme-icon{transform:rotate(180deg)}
 #refresh:disabled{cursor:wait;color:var(--accent)}#refresh.running .refresh-icon{animation:spin .9s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
-#install{color:var(--accent);display:none}
 
 /* ---- Page ---- */
 .app-main{width:min(1200px,100%);margin:0 auto;padding:8px 0 24px}
@@ -299,7 +298,7 @@ button.digest-item{cursor:pointer;border-radius:6px}
 .pane{display:none}
 @media(min-width:900px){
   .app-header{padding-left:24px;padding-right:20px}.header-inner{min-height:56px}
-  #install{display:grid}.install-line{display:none}
+  .install-line{display:none}
   .app-main{display:grid;grid-template-columns:minmax(0,1fr) 420px;gap:32px;padding:12px 24px 40px;align-items:start}
   .title,.day,.row,.lane,.digest,.since{padding-left:12px;padding-right:12px}
   .lane,.digest{margin-left:0;margin-right:0}

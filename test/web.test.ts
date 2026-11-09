@@ -389,6 +389,15 @@ describe('installable app', () => {
     expect(answer.headers?.['vary']).toContain('Accept-Language');
   });
 
+  it('offers to install on a phone only, leaving a desk to the browser', async () => {
+    const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
+    // The header carries no install word; the phone's offer is a line in the list.
+    expect(page).not.toContain('id="install"');
+    expect(page).not.toContain('#install{');
+    expect(page).toContain("line.id = 'install-line'");
+    expect(page).toContain('.install-line{display:none}');
+  });
+
   it('lays the page out for a phone that installed it', async () => {
     const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
     // A message opens in a sheet, the sentence sits over the list, and the
@@ -508,7 +517,7 @@ describe('layout', () => {
   });
 
   it('keeps both header switches on the first row of a phone', async () => {
-    // At narrow widths the wordmark yields to the install and theme controls,
+    // At narrow widths the wordmark yields to the language and theme controls,
     // keeping the complete action row within the phone viewport.
     const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
     expect(page).toContain('class="header-actions"');

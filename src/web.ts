@@ -680,7 +680,6 @@ export function renderApp(lang: Language, canRefresh = false): string {
         <div class="brand"><img class="brand-mark" src="/icon-192.png?v=3" alt="" aria-hidden="true"><strong>mailsift</strong></div>
         <div class="header-actions">
           ${refresh}
-          <button id="install" type="button" class="word-btn" data-i18n="pwa.install" hidden>${s('pwa.install')}</button>
           <button id="lang" type="button" class="word-btn" aria-label="${s('lang.label')}">${s('lang.face')}</button>
           <button id="theme" type="button" class="icon-btn" aria-label="${s('theme.title')}"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 0 0 16z" fill="currentColor" stroke="none"/></svg></button>
         </div>
