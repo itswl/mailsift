@@ -64,7 +64,7 @@ Next to it is a language switch between English and Simplified Chinese. The page
 
 ## Installing to the home screen
 
-It installs to a home screen: the manifest, a maskable icon and a service worker that caches nothing are served without a session, since a browser asks for them before it has one. The offer to install is a line in the list on a phone and a word in the header on a desk, and never appears inside the installed app. Installed, it opens without browser chrome, paints the status bar to match the page in either colour scheme, and reaches under a notch with the safe-area insets padded back. The worker deliberately caches nothing, because a page showing yesterday's triage would be worse than no page.
+It installs to a home screen: the manifest, a maskable icon and a service worker that caches nothing are served without a session, since a browser asks for them before it has one. The offer to install is a line in the list on a phone, and never appears inside the installed app. On a desk the page makes no offer of its own and leaves installing to the browser. Installed, it opens without browser chrome, paints the status bar to match the page in either colour scheme, and reaches under a notch with the safe-area insets padded back. The worker deliberately caches nothing, because a page showing yesterday's triage would be worse than no page.
 
 ## Behind a reverse proxy
 

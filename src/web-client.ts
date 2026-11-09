@@ -1957,8 +1957,7 @@ $('#lang').onclick = () => {
   applyLanguage(next);
 };
 
-// ---- Install: a word in the header on a desk, a line in the list on a phone. ----
-const installButton = $('#install');
+// ---- Install: a line in the list on a phone. A desk browser offers its own. ----
 let pendingInstall = null;
 const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 const appleMobile = /iPhone|iPad|iPod/.test(navigator.userAgent)
@@ -1966,7 +1965,6 @@ const appleMobile = /iPhone|iPad|iPod/.test(navigator.userAgent)
 let installable = !standalone && appleMobile;
 function installDismissed() { return Number(readStorage('installDismissed') || 0) > Date.now(); }
 function updateInstallUi() {
-  installButton.hidden = !installable;
   if (lastMail || lastThreads) renderList();
 }
 updateInstallUi();
@@ -1990,7 +1988,6 @@ async function promptInstall() {
     openSheet(installHelp, {});
   }
 }
-installButton.addEventListener('click', promptInstall);
 window.addEventListener('appinstalled', () => { pendingInstall = null; installable = false; updateInstallUi(); });
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
