@@ -9,8 +9,9 @@ import { createTransport } from 'nodemailer';
 import { ConfigError, loadConfig, type Account } from '../src/config.js';
 import { findQuoteStart } from '../src/imap/body.js';
 import {
+  addressed, attachmentCharset, attachmentContentType, attachmentFilename, attachmentLimitBytes, describeBytes, forwardEnvelope,
   isSendableAddress, replyEnvelope, savesSentCopy, scopeAllowsSending, SendError, sendingStatus, sendMail,
-  smtpTransportOptions, type OutgoingMail, type ReplyOriginal,
+  smtpTransportOptions, transferAllowanceMs, type ForwardOriginal, type OutgoingMail, type ReplyOriginal,
 } from '../src/smtp.js';
 
 /** One conversation with the pretend server: who signed in, the envelope, and the message as received. */
@@ -656,5 +657,282 @@ describe('replying', () => {
     expect(parsed.references).toEqual(['<first@example.org>', '<original@example.org>']);
     expect(parsed.subject).toBe('Re: Dinner on Saturday?');
     expect(parsed.text).toContain('> Are you coming?');
+  });
+});
+
+describe('carrying files', () => {
+  it('sends each file byte for byte, in what the server receives and in the copy for Sent', async () => {
+    const { port, sessions } = await serving();
+    // Bytes a line-end rewrite would ruin, and a text file with bare line ends of its own.
+    const binary = Buffer.from([0x25, 0x50, 0x44, 0x46, 0x0d, 0x0a, 0x00, 0x0a, 0x0d, 0xff, 0xfe]);
+    const notes = Buffer.from('first line\nsecond line\n.a dot\n', 'utf8');
+    const sent = await sendMail(mailbox(), letter({
+      bcc: ['quiet@example.org'],
+      attachments: [
+        { filename: '季度报告.pdf', content: binary, contentType: 'application/pdf' },
+        { filename: 'notes.txt', content: notes, contentType: 'text/plain' },
+      ],
+    }), { transport: transportTo(port) });
+
+    expect(sent.raw.equals(sessions[0]!.data!)).toBe(true);
+    for (const raw of [sent.raw, sent.copy]) {
+      const parsed = await simpleParser(raw);
+      expect(parsed.text?.trim()).toBe('See you there.');
+      expect(parsed.attachments.map((file) => [file.filename, file.contentType, file.contentDisposition])).toEqual([
+        ['季度报告.pdf', 'application/pdf', 'attachment'],
+        ['notes.txt', 'text/plain', 'attachment'],
+      ]);
+      expect(parsed.attachments[0]!.content.equals(binary)).toBe(true);
+      expect(parsed.attachments[1]!.content.equals(notes)).toBe(true);
+    }
+    // The copy is the same message with its Bcc line, files and all.
+    expect(addressesOf((await simpleParser(sent.copy)).bcc)).toEqual(['quiet@example.org']);
+    expect(sent.copy.subarray(sent.copy.length - sent.raw.length).equals(sent.raw)).toBe(true);
+  });
+
+  it('sends a file under a plain name and a real type, whatever it was given', async () => {
+    const { port } = await serving();
+    const sent = await sendMail(mailbox(), letter({
+      attachments: [
+        { filename: 'x\r\nBcc: evil@example.org\r\n.pdf', content: Buffer.from('a'), contentType: 'text/html\r\nX-Injected: 1' },
+        { filename: '../../etc/passwd', content: Buffer.from('b'), contentType: 'Image/PNG' },
+      ],
+    }), { transport: transportTo(port) });
+    const wire = sent.raw.toString('latin1');
+    expect(wire).not.toMatch(/^Bcc:/im);
+    expect(wire).not.toMatch(/^X-Injected/im);
+    const parsed = await simpleParser(sent.raw);
+    expect(parsed.bcc).toBeUndefined();
+    expect(parsed.attachments.map((file) => file.filename)).toEqual(['xBcc: evil@example.org.pdf', 'passwd']);
+    // As written: a reader guesses a type from the name when told only that it is bytes.
+    expect(wire.match(/^Content-Type: (?!multipart|text\/plain)[^;\r\n]+/gim)).toEqual([
+      'Content-Type: application/octet-stream', 'Content-Type: image/png',
+    ]);
+  });
+
+  it('cleans a file name down to a name, and shortens a long one before its extension', () => {
+    expect(attachmentFilename('C:\\Users\\me\\Q3 report.pdf')).toBe('Q3 report.pdf');
+    expect(attachmentFilename('../../etc/passwd')).toBe('passwd');
+    expect(attachmentFilename('a\u0000b\r\n\t.txt')).toBe('ab.txt');
+    // Text turned around to make a program look like a document.
+    expect(attachmentFilename('invoice\u202Efdp.exe')).toBe('invoicefdp.exe');
+    expect(attachmentFilename('e\u0301te\u0301.txt')).toBe('\u00e9t\u00e9.txt');
+    for (const nothing of ['', '   ', '.', '..', 'folder/', undefined, null, 42]) {
+      expect(attachmentFilename(nothing), String(nothing)).toBe('attachment');
+    }
+    const long = attachmentFilename(`${'x'.repeat(300)}.pdf`);
+    expect(Array.from(long)).toHaveLength(180);
+    expect(long.endsWith('x.pdf')).toBe(true);
+    expect(attachmentFilename('y'.repeat(300))).toBe('y'.repeat(180));
+    // Characters, not halves of them.
+    const wide = attachmentFilename(`${'\u{1F600}'.repeat(200)}.png`);
+    expect(Array.from(wide)).toHaveLength(180);
+    expect(wide.isWellFormed()).toBe(true);
+    expect(wide.endsWith('.png')).toBe(true);
+  });
+
+  it('keeps a type only when it is one type and nothing else', () => {
+    expect(attachmentContentType('application/PDF')).toBe('application/pdf');
+    expect(attachmentContentType(' image/svg+xml ')).toBe('image/svg+xml');
+    expect(attachmentContentType('application/vnd.openxmlformats-officedocument.wordprocessingml.document'))
+      .toBe('application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    for (const odd of ['', 'pdf', 'text/plain; charset=utf-8', 'text/html\r\nX: 1', '/x', 'a/', '-a/b', 'a b/c', undefined, 7]) {
+      expect(attachmentContentType(odd), String(odd)).toBe('application/octet-stream');
+    }
+    // A type that makes the file a container, or a piece of a message, is bytes; a whole message is one.
+    for (const container of ['multipart/related', 'Multipart/Mixed', 'multipart/appledouble', 'message/partial', 'message/external-body']) {
+      expect(attachmentContentType(container), container).toBe('application/octet-stream');
+    }
+    expect(attachmentContentType('message/rfc822')).toBe('message/rfc822');
+  });
+
+  it('sends a file whose type says it is a container as the file it is, not as an empty part', async () => {
+    const { port, sessions } = await serving();
+    // A page saved by Chrome as one file: the browser calls it multipart/related.
+    const page = Buffer.from('From: <Saved by Blink>\r\nContent-Type: multipart/related; boundary="x"\r\n\r\n--x\r\n\r\n<p>hi</p>\r\n--x--\r\n');
+    const pieces = Buffer.from([0x00, 0x05, 0x16, 0x07, 0xff]);
+    const sent = await sendMail(mailbox(), letter({
+      attachments: [
+        { filename: 'Saved page.mhtml', content: page, contentType: 'multipart/related' },
+        { filename: 'Report.pages', content: pieces, contentType: 'multipart/appledouble' },
+      ],
+    }), { transport: transportTo(port) });
+    // Labelled as bytes; a reader then goes by the name, as it does for any such file.
+    expect(sent.raw.toString('latin1').match(/^Content-Type: (?!multipart\/mixed|text\/plain)[^;\r\n]+/gim)).toEqual([
+      'Content-Type: application/octet-stream', 'Content-Type: application/octet-stream',
+    ]);
+    for (const raw of [sessions[0]!.data!, sent.copy]) {
+      const parsed = await simpleParser(raw);
+      expect(parsed.attachments.map((file) => [file.filename, file.contentDisposition])).toEqual([
+        ['Saved page.mhtml', 'attachment'], ['Report.pages', 'attachment'],
+      ]);
+      expect(parsed.attachments[0]!.content.equals(page)).toBe(true);
+      expect(parsed.attachments[1]!.content.equals(pieces)).toBe(true);
+    }
+  });
+
+  it('labels a text file passed on in its own character set with it, and with nothing that is not one', async () => {
+    const { port } = await serving();
+    // "你好" in GB18030, with a line end of its own: the bytes a forward reads from the original.
+    const gb = Buffer.from([0xc4, 0xe3, 0xba, 0xc3, 0x0a]);
+    const sent = await sendMail(mailbox(), letter({
+      attachments: [
+        { filename: 'notes.txt', content: gb, contentType: 'text/plain', charset: 'GB18030' },
+        { filename: 'odd.txt', content: Buffer.from('a'), contentType: 'text/plain', charset: 'utf-8\r\nX-Injected: 1' },
+        { filename: 'scan.pdf', content: Buffer.from('b'), contentType: 'application/pdf', charset: 'utf-8' },
+      ],
+    }), { transport: transportTo(port) });
+    const wire = sent.raw.toString('latin1');
+    expect(wire).not.toMatch(/^X-Injected/im);
+    expect(wire).toMatch(/^Content-Type: text\/plain; charset=gb18030; name=notes\.txt/im);
+    expect(wire).toMatch(/^Content-Type: text\/plain; name=odd\.txt/im);
+    expect(wire).toMatch(/^Content-Type: application\/pdf; name=scan\.pdf/im);
+    const parsed = await simpleParser(sent.raw);
+    // Byte for byte as it was: nothing converted, no line end changed.
+    expect(parsed.attachments[0]!.content.equals(gb)).toBe(true);
+    expect(attachmentCharset(' Shift_JIS ')).toBe('shift_jis');
+    for (const odd of ['', 'a b', 'x'.repeat(41), '"utf-8"', 'utf-8;x=1', undefined, 8]) {
+      expect(attachmentCharset(odd), String(odd)).toBeUndefined();
+    }
+  });
+
+  it('gives a message with files the time they take to travel, and one without, none', () => {
+    expect(transferAllowanceMs(0)).toBe(0);
+    expect(transferAllowanceMs(-1)).toBe(0);
+    expect(transferAllowanceMs(Number.NaN)).toBe(0);
+    expect(transferAllowanceMs(1)).toBe(1000);
+    expect(transferAllowanceMs(256 * 1024)).toBe(1000);
+    expect(transferAllowanceMs(20 * 1024 * 1024)).toBe(80_000);
+  });
+
+  it('checks whom a message is for by itself, as sending does, so a caller can ask before doing anything slow', () => {
+    expect(addressed({ to: ['a@example.org', 'A@example.org'], cc: ['b@example.org'], bcc: ['a@EXAMPLE.org', 'c@example.org'] }))
+      .toEqual({ to: ['a@example.org'], cc: ['b@example.org'], bcc: ['c@example.org'] });
+    for (const mail of [
+      { to: ['bob@example'] }, { to: [] }, {}, { to: ['a@example.org'], cc: ['Ann <ann@example.org>'] },
+      { to: Array.from({ length: 51 }, (_, n) => `p${n}@example.org`) }, { to: 'a@example.org' },
+    ]) {
+      expect(() => addressed(mail as never), JSON.stringify(mail)).toThrow(SendError);
+    }
+  });
+
+  it('holds a message to a number of files and a size, before connecting', async () => {
+    const { port, sessions } = await serving();
+    const transport = transportTo(port);
+    const file = (bytes: number) => ({ filename: 'f.bin', content: Buffer.alloc(bytes), contentType: 'application/octet-stream' });
+    expect((await failure(sendMail(mailbox(), letter({ attachments: Array.from({ length: 21 }, () => file(1)) }), { transport }))).code)
+      .toBe('invalid');
+    process.env.SMTP_ATTACHMENT_MAX_BYTES = '10';
+    const over = await failure(sendMail(mailbox(), letter({ attachments: [file(6), file(5)] }), { transport }));
+    expect(over.code).toBe('invalid');
+    expect(over.message).toContain('10 bytes');
+    expect((await failure(sendMail(mailbox(), letter({ attachments: [{ filename: 'x', contentType: 'a/b' }] as never }), { transport }))).code)
+      .toBe('invalid');
+    expect(sessions).toHaveLength(0);
+    await sendMail(mailbox(), letter({ attachments: [file(5), file(5)] }), { transport });
+    expect(sessions).toHaveLength(1);
+  });
+
+  it('reads its limit from the setting, within a ceiling no provider would pass', () => {
+    expect(attachmentLimitBytes()).toBe(20 * 1024 * 1024);
+    for (const [value, expected] of [
+      ['1000', 1000], ['', 20 * 1024 * 1024], ['abc', 20 * 1024 * 1024], ['0', 20 * 1024 * 1024], ['-5', 20 * 1024 * 1024],
+      ['99999999999', 35 * 1024 * 1024],
+    ] as const) {
+      process.env.SMTP_ATTACHMENT_MAX_BYTES = value;
+      expect(attachmentLimitBytes(), value).toBe(expected);
+    }
+    expect(describeBytes(20 * 1024 * 1024)).toBe('20 MB');
+    expect(describeBytes(1536)).toBe('2 KB');
+    expect(describeBytes(10)).toBe('10 bytes');
+  });
+});
+
+describe('forwarding', () => {
+  const original = (overrides: Partial<ForwardOriginal> = {}): ForwardOriginal => ({
+    from: { name: 'Mia Chen', address: 'mia@example.org' },
+    to: [{ name: 'Me', address: 'me@example.com' }, { name: '', address: 'sam@example.org' }],
+    cc: [{ name: 'Lee', address: 'lee@example.org' }],
+    subject: 'Dinner on Saturday?',
+    date: '2026-11-03T10:00:00.000Z',
+    text: 'Are you coming?\n\nMia',
+    quoted: '',
+    ...overrides,
+  });
+
+  it('forwards under one Fwd:, saying who it was from, when and to whom, above its text as written', () => {
+    const forward = forwardEnvelope(original());
+    expect(forward.subject).toBe('Fwd: Dinner on Saturday?');
+    const lines = forward.forwarded.split('\n');
+    expect(lines).toEqual([
+      '---------- Forwarded message ----------',
+      'From: Mia Chen <mia@example.org>',
+      expect.stringMatching(/^Date: .*2026/),
+      'Subject: Dinner on Saturday?',
+      'To: Me <me@example.com>, sam@example.org',
+      'Cc: Lee <lee@example.org>',
+      '',
+      'Are you coming?',
+      '',
+      'Mia',
+    ]);
+    // Nobody in copy, no Cc line; the history under the text comes along too.
+    const plain = forwardEnvelope(original({ cc: [], quoted: '> earlier words' })).forwarded;
+    expect(plain).not.toMatch(/^Cc:/m);
+    expect(plain.endsWith('Mia\n\n> earlier words')).toBe(true);
+  });
+
+  it('leaves a subject that is already a forward alone', () => {
+    for (const subject of ['Fwd: Dinner', 'FW: Dinner', 'fw:Dinner', 'FWD：Dinner', '转发：周六聚餐', '轉發: 周六聚餐']) {
+      expect(forwardEnvelope(original({ subject })).subject, subject).toBe(subject);
+    }
+    expect(forwardEnvelope(original({ subject: 'Re: Dinner' })).subject).toBe('Fwd: Re: Dinner');
+    expect(forwardEnvelope(original({ subject: '' })).subject).toBe('Fwd:');
+  });
+
+  it('words the header in the reader\'s language, in forms mailsift reads as a forward rather than a quote', () => {
+    const chinese = forwardEnvelope(original(), 'zh-CN').forwarded.split('\n');
+    expect(chinese.slice(0, 2)).toEqual(['---------- 转发的邮件 ----------', '发件人：Mia Chen <mia@example.org>']);
+    expect(chinese).toContain('收件人：Me <me@example.com>, sam@example.org');
+    expect(chinese).toContain('抄送：Lee <lee@example.org>');
+    const english = forwardEnvelope(original()).forwarded.split('\n');
+    // Under a note of the forwarder's own, the forwarded message is the point, not history to strip.
+    expect(findQuoteStart(['See below.', '', ...english])).toBe(-1);
+    expect(findQuoteStart(['请看下面。', '', ...chinese])).toBe(-1);
+  });
+
+  it('puts every name on one line of its own text, and leaves out what is not known', () => {
+    const forward = forwardEnvelope(original({
+      from: { name: 'Mia\r\nBcc: evil@example.org', address: 'mia@example.org' },
+      to: [], cc: [], date: 'not a date', subject: 'Hi\r\nX-Injected: 1',
+    })).forwarded.split('\n');
+    expect(forward.slice(0, 4)).toEqual([
+      '---------- Forwarded message ----------',
+      'From: Mia Bcc: evil@example.org <mia@example.org>',
+      'Subject: Hi X-Injected: 1',
+      '',
+    ]);
+    const crowd = Array.from({ length: 60 }, (_, n) => ({ name: '', address: `p${n}@example.org` }));
+    const to = forwardEnvelope(original({ to: crowd })).forwarded.split('\n').find((line) => line.startsWith('To: '))!;
+    expect(to.split(', ')).toHaveLength(51);
+    expect(to.endsWith(', …')).toBe(true);
+  });
+
+  it('says a list was longer than the reader kept, where the reader cut it', () => {
+    // The reader keeps fifty of each; it says when there were more, and so does the forward.
+    const fifty = Array.from({ length: 50 }, (_, n) => ({ name: '', address: `p${n}@example.org` }));
+    const lines = forwardEnvelope(original({ to: fifty, toCut: true, cc: fifty.slice(0, 2), ccCut: true })).forwarded.split('\n');
+    const to = lines.find((line) => line.startsWith('To: '))!;
+    expect(to.split(', ')).toHaveLength(51);
+    expect(to.endsWith('p49@example.org, …')).toBe(true);
+    expect(lines.find((line) => line.startsWith('Cc: '))).toBe('Cc: p0@example.org, p1@example.org, …');
+    // Exactly fifty, and nobody cut: everyone, as it was.
+    expect(forwardEnvelope(original({ to: fifty })).forwarded).not.toContain('…');
+  });
+
+  it('carries the original to a size worth sending, and says where it stopped', () => {
+    const forward = forwardEnvelope(original({ text: 'x'.repeat(60_000) })).forwarded;
+    expect(forward.split('\n').at(-1)).toBe('[…]');
+    expect(forward.length).toBeLessThan(51_000);
   });
 });

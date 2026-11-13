@@ -3,8 +3,9 @@
  *
  * Reading what triage stored is the rest of the view. This file is where the
  * page stops being a window: marking a message dealt with, moving it in the
- * mailbox, correcting a judgement, sending a reply, asking the model a
- * question, and telling this server which devices want notifications.
+ * mailbox, correcting a judgement, sending a reply or a forward with what it
+ * carries, keeping each mailbox's signature, asking the model a question, and
+ * telling this server which devices want notifications.
  *
  * Three rules hold for every route here.
  *
@@ -29,8 +30,10 @@ import type { IncomingMessage } from 'node:http';
 import { loadConfig, type Account } from './config.js';
 import { MailboxUnreachableError } from './imap/connection.js';
 import {
-  appendToSent, applyWebMailAction, fetchReadableByMessageId, MAIL_ACTIONS, MailActionError,
-  type LiveMessage, type LookupHint, type MessageHint, type WebMailAction, type WebMailActionResult,
+  appendToSent, applyWebMailAction, AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
+  fetchAttachmentManifestByMessageId, fetchReadableByMessageId, MAIL_ACTIONS, MailActionError,
+  type AttachmentManifestLookup, type DownloadedAttachment, type LiveMessage, type LookupHint, type MessageHint,
+  type WebMailAction, type WebMailActionResult,
 } from './imap/client.js';
 import {
   askMail, AssistantError, assistantConfigured, draftReply, type AskAnswer, type DraftInput,
@@ -39,10 +42,12 @@ import { sendTestPush, vapidKeys } from './services/push-dispatcher.js';
 import { StateStore, type MailRow } from './services/state.js';
 import { isPushEndpoint, type PushSendResult } from './services/webpush.js';
 import {
-  replyEnvelope, savesSentCopy, SendError, sendingStatus, sendMail, type OutgoingMail, type SentMail,
+  addressed, attachmentCharset, attachmentContentType, attachmentFilename, attachmentLimitBytes, describeBytes,
+  forwardEnvelope, MAX_ATTACHMENTS, replyEnvelope, savesSentCopy, SendError, sendingStatus, sendMail, transferAllowanceMs,
+  type OutgoingAttachment, type OutgoingMail, type SentMail,
 } from './smtp.js';
 import {
-  json, rateWindow, readJson, text, textList, timedOut, within, type Session, type WebResponse,
+  json, rateWindow, readJson, readJsonOrSize, text, textList, timedOut, within, type Session, type TimedOut, type WebResponse,
 } from './web-http.js';
 import type { Language } from './web-strings.js';
 import { getLogger } from './logger.js';
@@ -56,6 +61,12 @@ export interface WebBackend {
     options?: { destination?: string; folderHint?: string; hint?: MessageHint },
   ) => Promise<WebMailActionResult | undefined>;
   send: (account: Account, mail: OutgoingMail) => Promise<SentMail>;
+  /** The original's attachments, as a forward offers them. */
+  attachments: (account: Account, messageId: string, hint?: LookupHint) => Promise<AttachmentManifestLookup | undefined>;
+  /** One of them, read for a forward, held to `limit` bytes. */
+  attachment: (
+    account: Account, messageId: string, partId: string, hint?: LookupHint, limit?: number,
+  ) => Promise<DownloadedAttachment | undefined>;
   appendSent: (account: Account, raw: Buffer) => Promise<string | undefined>;
   savesSentCopy: (account: Account) => boolean;
   sending: (account: Account) => { available: boolean; reason?: string };
@@ -75,6 +86,10 @@ export const defaultBackend: WebBackend = {
   read: fetchReadableByMessageId,
   act: applyWebMailAction,
   send: (account, mail) => sendMail(account, mail),
+  attachments: fetchAttachmentManifestByMessageId,
+  // Read to be sent on: the file's bytes as the sender attached them.
+  attachment: (account, messageId, partId, hint, limit) =>
+    fetchAttachmentByMessageId(account, messageId, partId, hint, { ...(limit !== undefined ? { limit } : {}), asStored: true }),
   appendSent: appendToSent,
   savesSentCopy,
   sending: sendingStatus,
@@ -366,9 +381,10 @@ const PAGE_ACTIONS = new Set<WebMailAction>(MAIL_ACTIONS);
  *
  * The MCP server gives a caller holding the write credential what a write
  * session of the page has, and it does so by running the page's own code:
- * markHandled, actOnMail, sendMessage and replyDraft below are what the
- * routes call. There is one implementation of each action and of every check
- * around it, so the two cannot drift apart. Work one of them starts may
+ * markHandled, actOnMail, sendMessage, replyDraft, forwardDraft and
+ * saveSignature below are what the routes call. There is one implementation
+ * of each action and of every check around it, so the two cannot drift
+ * apart. Work one of them starts may
  * outlast the call; `life` is ended when the call returns, as it is for a
  * request, so such work finishes on a database handle of its own.
  */
@@ -538,6 +554,85 @@ async function handleFeedback(req: IncomingMessage, store: StateStore, ctx: Acti
   return json(200, { recorded: true, label, rule, sender: row.sender });
 }
 
+// ---- Signatures ----
+
+/** A signature is a few lines under a letter, not a second letter. */
+export const SIGNATURE_MAX_CHARS = 2000;
+
+/** Each mailbox's own, since each signs as someone slightly different. */
+const signatureKey = (address: string): string => `signature:${address}`;
+
+/** The signature of a mailbox, '' when it has none. */
+export function signatureOf(store: StateStore, address: string): string {
+  return store.getMeta(signatureKey(address)) ?? '';
+}
+
+/**
+ * The text of a letter as it leaves: what was written, then the signature
+ * under the standard delimiter (two dashes and a space on a line of their
+ * own, which mail clients know to set apart), then what the letter carries
+ * along: the original quoted, for an answer, or the forwarded message. The
+ * page puts its letters together the same way in the browser, to the
+ * character. A forward may say nothing of its own, and then starts with the
+ * signature, or with the forwarded message, rather than with blank lines.
+ */
+export function letterText(body: string, signature: string, carried = ''): string {
+  let out = body.replace(/\s+$/, '');
+  if (signature.trim()) out += `${out ? '\n\n' : ''}-- \n${signature}`;
+  if (carried) out += `${out ? '\n\n' : ''}${carried}`;
+  return out;
+}
+
+/**
+ * A signature as it is kept: plain lines, nothing invisible, no blank lines
+ * around it, and without a delimiter of its own, which is added when the
+ * letter is put together and would otherwise be there twice.
+ */
+function cleanSignature(value: string): string {
+  return value
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '')
+    .replace(/^(?:[ \t]*\n)+/, '')
+    .replace(/^--[ \t]*(?:\n|$)/, '')
+    .replace(/^(?:[ \t]*\n)+/, '')
+    .replace(/\s+$/, '');
+}
+
+async function handleSignature(req: IncomingMessage, store: StateStore, ctx: ActionContext): Promise<WebResponse> {
+  if (ctx.session !== 'write') return readOnly();
+  // Two thousand characters, each of which JSON may spell in twelve bytes.
+  return saveSignature(await readJson(req, 32 * 1024), store, ctx);
+}
+
+/**
+ * Set the signature of one mailbox, or with empty text remove it. `body`:
+ * account (the mailbox's address) and text. Only a session that may send
+ * may change what is sent under the owner's name.
+ */
+export function saveSignature(
+  body: Record<string, unknown> | undefined, store: StateStore, ctx: ActionContext,
+): WebResponse {
+  if (ctx.session !== 'write') return readOnly();
+  const address = text(body?.['account'], 320).trim();
+  if (!address) return badRequest('account is required');
+  const given = body?.['text'];
+  if (given !== undefined && given !== null && typeof given !== 'string') return badRequest('text must be text');
+  const account = configuredAccounts().find((candidate) => candidate.username === address);
+  if (!account) return json(409, { error: 'this mailbox is not configured', code: 'unconfigured' });
+  const signature = cleanSignature(typeof given === 'string' ? given : '');
+  // Characters as a person counts them, so a signature with an emoji is not short-changed.
+  if (Array.from(signature).length > SIGNATURE_MAX_CHARS) {
+    return json(400, {
+      error: `a signature may be at most ${SIGNATURE_MAX_CHARS} characters`, code: 'signature_too_long', maxChars: SIGNATURE_MAX_CHARS,
+    });
+  }
+  if (signature) store.setMeta(signatureKey(account.username), signature);
+  else store.deleteMeta(signatureKey(account.username));
+  // That it changed, and for which mailbox; never what it says.
+  if (ctx.origin !== 'mcp') store.recordMcpAudit('web:signature', ctx.client, true, account.username);
+  return json(200, { account: account.username, signature });
+}
+
 // ---- Writing ----
 
 async function handleReply(params: URLSearchParams, store: StateStore, ctx: ActionContext): Promise<WebResponse> {
@@ -587,6 +682,90 @@ export async function replyDraft(
     ...envelope,
     sender, replyToElsewhere,
     canSend: sending.available, ...(sending.reason ? { reason: sending.reason } : {}),
+    // What goes under the answer, from the mailbox it leaves from, for the session that may send it.
+    ...(ctx.session === 'write' ? { signature: signatureOf(store, account.username) } : {}),
+  });
+}
+
+async function handleForward(params: URLSearchParams, store: StateStore, ctx: ActionContext): Promise<WebResponse> {
+  if (ctx.session !== 'write') return readOnly();
+  return forwardDraft({ key: params.get('key')?.trim() ?? '', language: params.get('language') ?? '' }, store, ctx);
+}
+
+/**
+ * The size a mailbox gives for a part is its encoded size; what it decodes
+ * to is about three quarters of that in base64. Said a little over rather
+ * than under, so a limit checked against it is not passed by surprise.
+ */
+function decodedSize(item: { sizeBytes?: number; transferEncoding?: string }): number | null {
+  if (item.sizeBytes === undefined) return null;
+  return item.transferEncoding === 'base64' ? Math.ceil(item.sizeBytes * 3 / 4) : item.sizeBytes;
+}
+
+/**
+ * What a forward of a message starts from: its subject, the forwarded block
+ * (who it was from, when, to whom, then its text), and the original's
+ * attachments, which a forward sends on by reference without the browser
+ * ever holding them. `language` words the block; the page's own by default.
+ */
+export async function forwardDraft(
+  asked: { key: string; language?: string }, store: StateStore, ctx: ActionContext,
+): Promise<WebResponse> {
+  const key = asked.key;
+  const row = key ? store.getMail(key) : undefined;
+  if (!row) return json(404, { error: 'not found', code: 'notFound' });
+  const account = accountOf(row);
+  if (!account) return json(409, { error: 'this mailbox is no longer configured', code: 'unconfigured' });
+  let live: LiveMessage | undefined;
+  try {
+    const found = await within(liveMessage(row, account, ctx.backend, whereabouts(store, row)), LIVE_TIMEOUT_MS);
+    if (timedOut(found)) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
+    live = found;
+    rememberWhereabouts(store, row, live);
+  } catch (error) {
+    return mailboxFailure(error, 'readFailed', 'mailbox read failed');
+  }
+  if (!live) return json(404, { error: 'message not found in the mailbox', code: 'actionNotFound' });
+  const r = live.readable;
+  const lang: Language = asked.language === 'en' || asked.language === 'zh-CN' ? asked.language : ctx.lang;
+  const envelope = forwardEnvelope({
+    from: r.from, to: r.to, cc: r.cc, subject: r.subject || row.subject || '', date: r.date ?? row.mailDate,
+    text: r.text, quoted: r.quoted,
+    ...(r.toTruncated ? { toCut: true } : {}), ...(r.ccTruncated ? { ccCut: true } : {}),
+  }, lang);
+
+  // The files go with the forward unless they are taken off. A list that
+  // cannot be read now does not stop the forward: the page says so, and the
+  // letter can still go without them.
+  let attachments: Array<{ partId: string; filename: string; contentType: string; size: number | null; inline: boolean }> = [];
+  let unavailable = false;
+  try {
+    // Asked where the read just found it, which is now on record.
+    const found = row.messageId
+      ? await within(ctx.backend.attachments(account, row.messageId, whereabouts(store, row)), LIVE_TIMEOUT_MS)
+      : undefined;
+    if (timedOut(found) || !found) unavailable = true;
+    else {
+      attachments = found.manifest.items.map((item) => ({
+        partId: item.partId,
+        filename: attachmentFilename(item.filename),
+        contentType: attachmentContentType(item.contentType),
+        size: decodedSize(item),
+        // Shown within the original's own body. A forward is plain text, so it carries them as files.
+        inline: item.inline,
+      }));
+    }
+  } catch (error) {
+    log.warn(`The attachments of a message being forwarded could not be listed: ${String(error).slice(0, 160)}`);
+    unavailable = true;
+  }
+  const sending = ctx.backend.sending(account);
+  return json(200, {
+    key: row.dedupKey, account: account.username, accountName: account.name,
+    subject: envelope.subject, forwarded: envelope.forwarded,
+    attachments, ...(unavailable ? { attachmentsUnavailable: true } : {}),
+    canSend: sending.available, ...(sending.reason ? { reason: sending.reason } : {}),
+    ...(ctx.session === 'write' ? { signature: signatureOf(store, account.username) } : {}),
   });
 }
 
@@ -613,7 +792,8 @@ function sendFailure(error: unknown): WebResponse {
  */
 const SEND_MEMORY_MS = 15 * 60_000;
 const SEND_MEMORY_MAX = 200;
-const sendJobs = new Map<string, { at: number; outcome: Promise<WebResponse> }>();
+/** `until`: when whoever is waiting for the letter stops, which a forward moves once it knows the size of its files. */
+const sendJobs = new Map<string, { at: number; outcome: Promise<WebResponse>; until: () => number }>();
 
 /** For tests: no memory of letters sent, and nobody's count of them. */
 export function forgetSends(): void {
@@ -627,28 +807,186 @@ export function earlierSend(id: string, now = Date.now()): Promise<WebResponse> 
   return job && now - job.at <= SEND_MEMORY_MS ? job.outcome : undefined;
 }
 
-function rememberSend(id: string, outcome: Promise<WebResponse>, now = Date.now()): void {
+function rememberSend(id: string, outcome: Promise<WebResponse>, until: () => number, now = Date.now()): void {
   for (const [known, job] of sendJobs) {
     if (now - job.at > SEND_MEMORY_MS || sendJobs.size >= SEND_MEMORY_MAX) sendJobs.delete(known);
     else break;
   }
-  sendJobs.set(id, { at: now, outcome });
+  sendJobs.set(id, { at: now, outcome, until });
 }
 
 const SEND_UNCERTAIN = (): WebResponse =>
   json(504, { error: 'the mail server did not confirm the message; check Sent before trying again', code: 'send_timeout' });
 
-async function handleSend(req: IncomingMessage, store: StateStore, ctx: ActionContext, life: Life): Promise<WebResponse> {
-  if (ctx.session !== 'write') return readOnly();
-  // Sized for a long letter with its quoted history, and nothing like an upload.
-  return sendMessage(await readJson(req, 700 * 1024), store, ctx, life);
+/**
+ * Wait for work until a time that may move while it runs: a send knows how
+ * long it may fairly take only once it has every file in hand.
+ */
+async function withinUntil<T>(work: Promise<T>, until: () => number): Promise<T | TimedOut> {
+  for (;;) {
+    const answer = await within(work, Math.max(0, until() - Date.now()));
+    if (!timedOut(answer) || until() <= Date.now()) return answer;
+  }
 }
 
 /**
- * Send one message from a mailbox. `body`: to, cc, bcc, subject, text; for
- * an answer replyTo (the stored message's key or Message-ID) and references,
- * for a new message account; and id, a name for this letter, under which
- * asking again does not send it twice.
+ * The most a letter's request may be: its files in base64, which is a third
+ * larger than they are, and the letter itself, which was allowed 700 KiB
+ * before it could carry anything. 28 MiB with the default limit on files.
+ */
+export function sendBodyLimit(): number {
+  return Math.max(28 * 1024 * 1024, Math.ceil(attachmentLimitBytes() / 3) * 4 + 700 * 1024 + MAX_ATTACHMENTS * 1024);
+}
+
+async function handleSend(req: IncomingMessage, store: StateStore, ctx: ActionContext, life: Life): Promise<WebResponse> {
+  if (ctx.session !== 'write') return readOnly();
+  const read = await readJsonOrSize(req, sendBodyLimit());
+  if (read.tooLarge) return sendTooLarge('bytes');
+  return sendMessage(read.body, store, ctx, life);
+}
+
+/**
+ * A letter with more attached than one message may carry. The limit is said
+ * in words, and in numbers for the page to say in its own.
+ */
+function sendTooLarge(why: 'files' | 'bytes', file?: string): WebResponse {
+  const limit = attachmentLimitBytes();
+  const most = `${describeBytes(limit)}, the most one message may carry`;
+  const error = why === 'files'
+    ? `a message may carry at most ${MAX_ATTACHMENTS} files`
+    : file ? `with ${file} the attachments come to more than ${most}` : `the attachments come to more than ${most}`;
+  return json(413, { error, code: 'send_too_large', maxBytes: limit, maxFiles: MAX_ATTACHMENTS, ...(file ? { file } : {}) });
+}
+
+/** A file a forward was to carry could not be had, so nothing was sent. */
+function forwardUnavailable(status: number, error: string, file?: string): WebResponse {
+  return json(status, { error: `${error}; nothing was sent`, code: 'forward_attachment_unavailable', ...(file ? { file } : {}) });
+}
+
+/** Bytes from base64 that decodes cleanly, or nothing. */
+function strictBase64(value: string): Buffer | undefined {
+  if (value.length % 4 !== 0) return undefined;
+  const bytes = Buffer.from(value, 'base64');
+  // Node passes over what is not base64 instead of refusing it. Encoding the
+  // bytes again gives back exactly what was sent only when nothing was skipped.
+  return bytes.toString('base64') === value ? bytes : undefined;
+}
+
+/** How many bytes base64 of this length decodes to, worked out without decoding it. */
+const base64Bytes = (value: string): number =>
+  Math.floor(value.length / 4) * 3 - (value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0);
+
+/**
+ * The files a letter brings with it, or the answer that refuses them.
+ * `value` is [{ name, type, data }], data in base64. What can be checked
+ * without decoding is checked first: how many, then how large from the
+ * length of the encoding. Then each file's encoding, strictly: a file that
+ * would arrive with bytes missing is not sent at all.
+ */
+function uploadedFiles(value: unknown, forwarding: number): { files: OutgoingAttachment[] } | { refused: WebResponse } {
+  const given = value ?? [];
+  if (!Array.isArray(given)) return { refused: badRequest('attachments must be a list') };
+  if (given.length + forwarding > MAX_ATTACHMENTS) return { refused: sendTooLarge('files') };
+  const entries: Array<{ name: unknown; type: unknown; data: string }> = [];
+  let total = 0;
+  for (const entry of given) {
+    const file = typeof entry === 'object' && entry !== null && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
+    const data = file['data'];
+    if (typeof data !== 'string') return { refused: badRequest('each attachment needs its data, in base64') };
+    total += base64Bytes(data);
+    entries.push({ name: file['name'], type: file['type'], data });
+  }
+  if (total > attachmentLimitBytes()) return { refused: sendTooLarge('bytes') };
+  const files: OutgoingAttachment[] = [];
+  for (const entry of entries) {
+    const filename = attachmentFilename(entry.name);
+    const content = strictBase64(entry.data);
+    if (!content) {
+      return { refused: json(400, { error: `${filename} is not cleanly encoded in base64`, code: 'send_attachment_invalid', file: filename }) };
+    }
+    files.push({ filename, content, contentType: attachmentContentType(entry.type) });
+  }
+  return { files };
+}
+
+const PART_ID = /^\d+(?:\.\d+)*$/;
+
+/** The parts of the original a forward sends on, each named once; undefined when the list is not one. */
+function forwardedParts(value: unknown): string[] | undefined {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) return undefined;
+  if (value.some((part) => typeof part !== 'string' || part.length > 40 || !PART_ID.test(part))) return undefined;
+  return [...new Set(value as string[])];
+}
+
+/** All the reading a forward's files may take before the letter itself is handed over. */
+const FORWARD_FETCH_MS = 90_000;
+
+/**
+ * Read the files a forward sends on from the original's own mailbox, within
+ * what the message may still carry. All of them or none: a forward that
+ * arrived without a file its writer saw in it would say something they did
+ * not mean. The list is read first, so that each part asked for is known to
+ * be one of the original's attachments and a file that cannot be had is
+ * named. Never throws.
+ */
+async function forwardedFiles(
+  backend: WebBackend, source: Account, messageId: string, hint: MessageHint | undefined, parts: string[], room: number,
+): Promise<{ files: OutgoingAttachment[] } | { refused: WebResponse }> {
+  const deadline = Date.now() + FORWARD_FETCH_MS;
+  const left = (): number => Math.max(0, deadline - Date.now());
+  let listed: AttachmentManifestLookup | undefined;
+  try {
+    const found = await within(backend.attachments(source, messageId, hint), Math.min(LIVE_TIMEOUT_MS, left()));
+    if (timedOut(found)) {
+      return { refused: forwardUnavailable(504, 'the mailbox did not list the attachments of the message being forwarded in time') };
+    }
+    listed = found;
+  } catch (error) {
+    log.warn(`The attachments of a message being forwarded could not be listed: ${String(error).slice(0, 160)}`);
+    return { refused: forwardUnavailable(502, 'the attachments of the message being forwarded could not be read from its mailbox') };
+  }
+  if (!listed) return { refused: forwardUnavailable(404, 'the message being forwarded is no longer in its mailbox') };
+
+  const files: OutgoingAttachment[] = [];
+  let free = room;
+  for (const part of parts) {
+    const item = listed.manifest.items.find((candidate) => candidate.partId === part);
+    if (!item) return { refused: forwardUnavailable(404, `the message being forwarded has no attachment ${part}`) };
+    const filename = attachmentFilename(item.filename);
+    let got: DownloadedAttachment | undefined;
+    try {
+      const fetched = await within(backend.attachment(source, messageId, part, hint, free), left());
+      if (timedOut(fetched)) return { refused: forwardUnavailable(504, `${filename} did not arrive from the mailbox in time`, filename) };
+      got = fetched;
+    } catch (error) {
+      if (error instanceof AttachmentTooLargeError) return { refused: sendTooLarge('bytes', filename) };
+      if (error instanceof AttachmentNotFoundError) {
+        return { refused: forwardUnavailable(404, `${filename} is no longer in the message being forwarded`, filename) };
+      }
+      log.warn(`An attachment of a message being forwarded could not be read: ${String(error).slice(0, 160)}`);
+      return { refused: forwardUnavailable(502, `${filename} could not be read from the mailbox`, filename) };
+    }
+    if (!got) return { refused: forwardUnavailable(404, `${filename} is no longer in the message being forwarded`, filename) };
+    if (got.content.length > free) return { refused: sendTooLarge('bytes', filename) };
+    free -= got.content.length;
+    // The bytes as the sender attached them; a text file keeps the character set they are in.
+    const contentType = attachmentContentType(item.contentType);
+    const charset = contentType.startsWith('text/') ? attachmentCharset(got.charset) : undefined;
+    files.push({ filename, content: got.content, contentType, ...(charset ? { charset } : {}) });
+  }
+  return { files };
+}
+
+/**
+ * Send one message from a mailbox. `body`: to, cc, bcc, subject, text, and
+ * attachments ([{ name, type, data }], data in base64); for an answer replyTo
+ * (the stored message's key or Message-ID) and references; for a forward
+ * forwardOf (the same) and forwardAttachments (part ids of the original's
+ * attachments, which are read from its mailbox here and never pass through
+ * the browser); for a new message, or a forward from another mailbox than
+ * the one it arrived in, account; and id, a name for this letter, under
+ * which asking again does not send it twice.
  */
 export async function sendMessage(
   body: Record<string, unknown> | undefined, store: StateStore, ctx: ActionContext, life: Life,
@@ -661,8 +999,20 @@ export async function sendMessage(
   const sendId = /^[A-Za-z0-9_-]{8,64}$/.test(named) ? named : '';
   const earlier = sendId ? sendJobs.get(sendId) : undefined;
   if (earlier && Date.now() - earlier.at <= SEND_MEMORY_MS) {
-    const answer = await within(earlier.outcome, SEND_TIMEOUT_MS);
+    // As long as the first request would have waited, and never less than a send is given.
+    const asked = Date.now() + SEND_TIMEOUT_MS;
+    const answer = await withinUntil(earlier.outcome, () => Math.max(asked, earlier.until()));
     return timedOut(answer) ? SEND_UNCERTAIN() : { ...answer };
+  }
+
+  // Whom it is for is checked before anything else is done for the letter: a
+  // forward would otherwise read every file it carries from the mailbox, and
+  // spend a send, only to be refused for an address with no dot in it.
+  const recipients = { to: textList(body['to']), cc: textList(body['cc']), bcc: textList(body['bcc']) };
+  try {
+    addressed(recipients);
+  } catch (error) {
+    return sendFailure(error);
   }
 
   if (!allowSend(ctx.client)) {
@@ -672,11 +1022,20 @@ export async function sendMessage(
   // A reply leaves from the mailbox that received the original: answering
   // from another address is how a thread loses its other half.
   const replyKey = text(body['replyTo'], 1200);
+  const forwardKey = text(body['forwardOf'], 1200);
+  if (replyKey && forwardKey) return badRequest('a letter answers a message or forwards one, not both');
   const original = replyKey ? store.getMail(replyKey) : undefined;
   // Read now: by the time the message has left, this handle may be closed.
   const originalPlace: ActHint = original ? actHint(store, original) : {};
   if (replyKey && !original) return json(404, { error: 'the message being answered was not found', code: 'notFound' });
-  const address = original ? original.account : text(body['account'], 320);
+  const forwarded = forwardKey ? store.getMail(forwardKey) : undefined;
+  if (forwardKey && !forwarded) return json(404, { error: 'the message being forwarded was not found', code: 'notFound' });
+  const parts = forwardedParts(body['forwardAttachments']);
+  if (!parts) return badRequest('forwardAttachments must be a list of attachment part ids');
+  if (parts.length && !forwarded) return badRequest('forwardAttachments needs forwardOf, the message they belong to');
+  // A forward is a new letter about an old one, so it may leave from any of
+  // the owner's mailboxes; by default, the one the original arrived in.
+  const address = original ? original.account : text(body['account'], 320) || (forwarded?.account ?? '');
   const account = configuredAccounts().find((candidate) => candidate.username === address);
   if (!account) return json(409, { error: 'this mailbox is not configured', code: 'unconfigured' });
   const sending = ctx.backend.sending(account);
@@ -684,29 +1043,68 @@ export async function sendMessage(
     return json(409, { error: 'this mailbox cannot send', code: 'send_not_configured', reason: sending.reason ?? 'no_smtp' });
   }
 
+  const uploads = uploadedFiles(body['attachments'], parts.length);
+  if ('refused' in uploads) return uploads.refused;
+  // The forwarded files are read from the mailbox the original is in, which
+  // need not be the one the forward leaves from.
+  const source = forwarded && parts.length ? accountOf(forwarded) : undefined;
+  if (forwarded && parts.length) {
+    if (!source) return json(409, { error: 'the mailbox the forwarded message is in is no longer configured', code: 'unconfigured' });
+    if (!forwarded.messageId) return forwardUnavailable(404, 'the message being forwarded cannot be found in its mailbox');
+  }
+  const forwardPlace = forwarded ? whereabouts(store, forwarded) : undefined;
+  const forwardMessageId = forwarded?.messageId ?? '';
+
   const mail: OutgoingMail = {
-    to: textList(body['to']),
-    cc: textList(body['cc']),
-    bcc: textList(body['bcc']),
+    ...recipients,
     subject: text(body['subject'], 2000),
     text: text(body['text'], 500_000),
+    ...(uploads.files.length ? { attachments: uploads.files } : {}),
   };
+  // Only an answer continues a thread. A forward starts a conversation of its own.
   if (original?.messageId && !original.messageId.startsWith('<generated-')) {
     mail.inReplyTo = original.messageId;
     mail.references = [...textList(body['references'], 30, 998), original.messageId];
   }
 
   const audit = { account: account.username, action: 'send', client: ctx.client };
-  // The whole of a send, from the server taking the message to the last note
-  // about it. It never rejects, and it runs to its end whether or not the
-  // request that started it is still waiting.
+  const about = replyKey || forwardKey || '(new message)';
+  // How long the request waits for the letter: the time any letter is given,
+  // and on top of it the time its files take to travel, base64 and all, to
+  // the mail server, and again to Sent for a provider whose copy is filed from
+  // here (allowed for every letter: waiting longer than needed costs nothing
+  // when the answer comes sooner). A forward's files are known only once they
+  // are read, so it is first given the time reading them may take, and then
+  // the time for what was read.
+  const travel = (files: OutgoingAttachment[]): number =>
+    2 * transferAllowanceMs(Math.ceil(files.reduce((sum, file) => sum + file.content.length, 0) / 3) * 4);
+  let until = Date.now() + SEND_TIMEOUT_MS + travel(uploads.files) + (parts.length ? FORWARD_FETCH_MS : 0);
+  // The whole of a send, from reading what a forward carries to the server
+  // taking the message to the last note about it. It never rejects, and it
+  // runs to its end whether or not the request that started it is still waiting.
   const outcome = (async (): Promise<WebResponse> => {
+    // Every file a forward carries is in hand before anything is handed over.
+    if (source && parts.length) {
+      const room = attachmentLimitBytes() - uploads.files.reduce((sum, file) => sum + file.content.length, 0);
+      const gathered = await forwardedFiles(ctx.backend, source, forwardMessageId, forwardPlace, parts, room);
+      if ('refused' in gathered) {
+        quietly('A forward that could not carry its files', () => record(ctx, store, life, (db) => db.recordMailAction({
+          ...audit, messageId: about, success: false, error: 'forward_attachment',
+        })));
+        // Nothing was sent: asking again is a new attempt.
+        if (sendId) sendJobs.delete(sendId);
+        return gathered.refused;
+      }
+      mail.attachments = [...(mail.attachments ?? []), ...gathered.files];
+      until = Date.now() + SEND_TIMEOUT_MS + travel(mail.attachments);
+    }
+
     let sent: SentMail;
     try {
       sent = await ctx.backend.send(account, mail);
     } catch (error) {
       quietly('A failed send', () => record(ctx, store, life, (db) => db.recordMailAction({
-        ...audit, messageId: replyKey || '(new message)', success: false,
+        ...audit, messageId: about, success: false,
         error: error instanceof SendError ? error.code : 'failed',
       })));
       // Nothing more will be learned about this attempt, so the name is
@@ -718,7 +1116,7 @@ export async function sendMessage(
     }
 
     // From here the message has left. Nothing below can turn that into a failure.
-    // Recorded without recipients or text: that a message left, from where, and when.
+    // Recorded without recipients, text or file names: that a message left, from where, and when.
     quietly('A sent message', () => record(ctx, store, life, (db) => db.recordMailAction(
       { ...audit, messageId: sent.messageId, success: true },
     )));
@@ -728,7 +1126,7 @@ export async function sendMessage(
     let savedCopy = true;
     if (!ctx.backend.savesSentCopy(account)) {
       try {
-        const folder = await within(ctx.backend.appendSent(account, sent.copy), ACTION_TIMEOUT_MS);
+        const folder = await within(ctx.backend.appendSent(account, sent.copy), ACTION_TIMEOUT_MS + transferAllowanceMs(sent.copy.length));
         savedCopy = !timedOut(folder) && Boolean(folder);
       } catch (error) {
         savedCopy = false;
@@ -736,9 +1134,12 @@ export async function sendMessage(
       }
     }
 
+    // Answering a message deals with it, and so does passing it on to whoever
+    // it was for. Only an answer is flagged answered in the mailbox: a forward is not one.
     let attention: number | undefined;
-    quietly('An answered message', () => record(ctx, store, life, (db) => {
+    quietly('An answered or forwarded message', () => record(ctx, store, life, (db) => {
       if (original) db.setHandled(original.dedupKey, true);
+      if (forwarded) db.setHandled(forwarded.dedupKey, true);
       attention = db.attentionCount();
     }));
     if (original) {
@@ -767,12 +1168,12 @@ export async function sendMessage(
       savedCopy, ...(attention !== undefined ? { attention } : {}),
     });
   })();
-  if (sendId) rememberSend(sendId, outcome);
+  if (sendId) rememberSend(sendId, outcome, () => until);
 
-  const answer = await within(outcome, SEND_TIMEOUT_MS);
+  const answer = await withinUntil(outcome, () => until);
   if (!timedOut(answer)) return answer;
   // Not known to have failed: the server may still take it, and that is recorded when it does.
-  store.recordMailAction({ ...audit, messageId: replyKey || '(new message)', success: false, error: 'timeout' });
+  store.recordMailAction({ ...audit, messageId: about, success: false, error: 'timeout' });
   return SEND_UNCERTAIN();
 }
 
@@ -957,11 +1358,13 @@ export async function routeActions(
     const answer = await (async (): Promise<WebResponse | undefined> => {
       if (path.startsWith('/api/push/')) return handlePush(path, req, store, ctx);
       if (path === '/api/reply' && req.method === 'GET') return handleReply(url.searchParams, store, ctx);
+      if (path === '/api/forward' && req.method === 'GET') return handleForward(url.searchParams, store, ctx);
       if (req.method !== 'POST') return undefined;
       if (path === '/api/handled') return handleHandled(req, store, ctx, life);
       if (path === '/api/action') return handleAction(req, store, ctx, life);
       if (path === '/api/feedback') return handleFeedback(req, store, ctx);
       if (path === '/api/send') return handleSend(req, store, ctx, life);
+      if (path === '/api/signature') return handleSignature(req, store, ctx);
       if (path === '/api/draft') return handleDraft(req, store, ctx);
       if (path === '/api/ask') return handleAsk(req, store, ctx);
       return undefined;

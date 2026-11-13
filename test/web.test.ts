@@ -8,6 +8,10 @@ import {
 } from '../src/web.js';
 import { buildLink } from '../src/links.js';
 import { STRINGS, type StringKey } from '../src/web-strings.js';
+import { clientScript } from '../src/web-client.js';
+import { letterText } from '../src/web-actions.js';
+import { attachmentFilename } from '../src/smtp.js';
+import { Script } from 'node:vm';
 import { clientAddress } from '../src/mcp.js';
 import { StateStore } from '../src/services/state.js';
 import { HEARTBEAT_KEY } from '../src/services/watcher.js';
@@ -714,5 +718,287 @@ describe('refresh', () => {
     expect(store.listMcpAudit(10)).toContainEqual(
       expect.objectContaining({ action: 'web:refresh', client: 'clicker-fail', success: false }),
     );
+  });
+});
+
+describe('the composer', () => {
+  const shell = async (headers: Record<string, string> = {}): Promise<string> =>
+    String((await routeWeb(request({ headers }), url('/'), '', seeded())).body);
+
+  /**
+   * Declarations of the page script, run on their own. The script is written
+   * with each top-level function closing on a line of its own, and each
+   * top-level table on a "};" line, which is what lets one be lifted out.
+   */
+  function lifted<T>(names: string[], expose: string, context: Record<string, unknown> = {}): T {
+    const script = clientScript();
+    const parts = names.map((name) => {
+      const plain = script.indexOf(`\nfunction ${name}(`);
+      const fn = plain !== -1 ? plain : script.indexOf(`\nasync function ${name}(`);
+      if (fn !== -1) return script.slice(fn, script.indexOf('\n}\n', fn) + 3);
+      const constant = script.indexOf(`\nconst ${name} = `);
+      expect(constant, name).toBeGreaterThan(-1);
+      const table = script.slice(constant).match(/^\nconst \w+ = \{\n/);
+      const end = table ? script.indexOf('\n};\n', constant) + 4 : script.indexOf(';\n', constant) + 2;
+      return script.slice(constant, end);
+    });
+    return new Script(`${parts.join('\n')}\n(${expose})`).runInNewContext(context) as T;
+  }
+  /** The page's words by key, filled in, in English, as the page shows them. */
+  const t = (key: string): string => STRINGS.en[key as StringKey] ?? key;
+  const fill = (key: string, vars: Record<string, unknown> = {}): string =>
+    Object.entries(vars).reduce((text, [name, value]) => text.split(`{${name}}`).join(String(value)), t(key));
+
+  it('shows Cc and Bcc with one switch, and offers to attach files', async () => {
+    const page = await shell();
+    expect(page).toContain('id="compose-cc-toggle" type="button" class="text-btn quiet" data-i18n="compose.ccBcc">Cc / Bcc<');
+    expect(page).toMatch(/<label id="compose-cc-row" class="cfield" hidden>/);
+    expect(page).toMatch(/<label id="compose-bcc-row" class="cfield" hidden>.*<input name="bcc"/);
+    // The paperclip at the end of the subject line opens a picker that takes several files at once.
+    expect(page).toMatch(/<input name="subject" type="text" aria-labelledby="compose-subject-label"><button id="compose-attach"[^>]*aria-label="Attach files"/);
+    // Each field is named by its own label alone, not by the buttons that share its line.
+    expect(page).toContain('<span class="label" id="compose-subject-label" data-i18n="compose.subject">Subject</span>');
+    expect(page).toMatch(/<span class="label" id="compose-to-label" data-i18n="compose.to">To<\/span><input name="to"[^>]* aria-labelledby="compose-to-label">/);
+    // What a restored draft still needs, and the pictures a forward leaves out, have lines of their
+    // own, outside the note that every other message replaces.
+    expect(page).toMatch(/<ul id="compose-files"[^>]*><\/ul>\s*<p id="compose-pictures" class="compose-pictures" hidden><\/p>\s*<p id="compose-lost" class="compose-lost" hidden><\/p>/);
+    expect(page).toContain('<input id="compose-file" type="file" multiple hidden>');
+    expect(page).toContain('<div id="compose-sig" class="compose-sig" hidden></div>');
+    expect(page).toContain('<ul id="compose-files" class="compose-files"');
+    expect(page).toContain('<symbol id="i-forward"');
+    const chinese = await shell({ 'accept-language': 'zh-CN' });
+    expect(chinese).toContain('>抄送 / 密送<');
+    expect(chinese).toContain('aria-label="添加附件"');
+  });
+
+  it('puts a letter together as MCP does: text, signature under its delimiter, then the quote or the forward', () => {
+    const page = lifted<(body: string, signature: string, carried: string) => string>(['letterText'], 'letterText');
+    const cases: Array<[string, string, string]> = [
+      ['Thanks!\n\n', 'Alex Lin\nMailsift Ltd', 'On Monday, Ann wrote:\n> Hello'],
+      ['Thanks!', '', '> Hello'],
+      ['Thanks!', '  ', ''],
+      ['FYI', 'Alex', '---------- Forwarded message ----------\nFrom: Ann'],
+      // A forward with nothing of its own to say, as either side puts it together.
+      [' ', 'Alex', 'FWD'],
+      ['\n', '', 'FWD'],
+      ['', 'Alex', ''],
+      ['', '', ''],
+    ];
+    for (const [body, signature, carried] of cases) expect(page(body, signature, carried)).toBe(letterText(body, signature, carried));
+    expect(page('Thanks!\n', 'Alex', '> Hello')).toBe('Thanks!\n\n-- \nAlex\n\n> Hello');
+    // A forward with nothing of its own to say starts with the signature, not with blank lines.
+    expect(page('  \n', 'Alex', 'fwd')).toBe('-- \nAlex\n\nfwd');
+    expect(page('', '', 'fwd')).toBe('fwd');
+  });
+
+  it('names a file as the server will send it, and numbers pasted pictures', () => {
+    const clean = lifted<(value: unknown) => string>(['UNSHOWABLE', 'cleanFileName'], 'cleanFileName');
+    const names = [
+      'C:\\Users\\me\\Q3 report.pdf', '/tmp/x/notes.txt', 'invoice\u202Efdp.exe', 'tab\there.txt', '', '.', '..',
+      'Cafe\u0301.pdf', `${'a'.repeat(300)}.docx`, `${'长'.repeat(200)}.pdf`, `${'b'.repeat(200)}.not-an-extension-at-all`,
+      ' spaced .txt ', 42,
+    ];
+    for (const name of names) expect(clean(name), String(name)).toBe(attachmentFilename(name));
+
+    const pasted = lifted<(taken: string[], type: string) => string>(['IMAGE_EXTENSIONS', 'pastedName'], 'pastedName');
+    expect(pasted([], 'image/png')).toBe('image-1.png');
+    expect(pasted(['image-1.png'], 'image/jpeg')).toBe('image-2.jpg');
+    expect(pasted(['notes.txt', 'image-2.png'], 'image/webp')).toBe('image-1.webp');
+    expect(pasted(['image-1.png', 'image-2.gif'], 'image/x-icon')).toBe('image-3.png');
+    expect(pasted([], 'image/heic')).toBe('image-1.heic');
+  });
+
+  it('gives a letter a new name when its files change, and the same name when nothing did', () => {
+    const key = lifted<(payload: unknown, files: unknown[]) => string>(['letterKey'], 'letterKey');
+    const payload = { account: 'me@qq.com', to: ['a@b.co'], bcc: ['c@d.co'], text: 'Hi', forwardOf: 'k1', forwardAttachments: ['2'] };
+    const report = { name: 'report.pdf', type: 'application/pdf', size: 1200, at: 1, file: {} };
+    const same = key(payload, [report]);
+    expect(key({ ...payload }, [{ ...report, file: { other: true } }])).toBe(same);
+    expect(key(payload, [])).not.toBe(same);
+    expect(key(payload, [report, { ...report, name: 'image-1.png' }])).not.toBe(same);
+    expect(key(payload, [{ ...report, size: 1201 }])).not.toBe(same);
+    expect(key({ ...payload, forwardAttachments: [] }, [report])).not.toBe(same);
+    expect(key({ ...payload, bcc: [] }, [report])).not.toBe(same);
+  });
+
+  it('forwards from the reader and the keyboard, and sends what it shows', () => {
+    const script = clientScript();
+    // In the reader's more menu beside Reply all, and on f beside r and a.
+    expect(script).toContain("item('i-forward', t('act.forward'), () => { closeSheet(menuSheet, false); startForward(key); });");
+    expect(script).toContain("else if (e.key === 'f') { e.preventDefault(); startForward(key); }");
+    expect(script).toContain("['r a', 'keys.reply'], ['f', 'keys.forward']");
+    // The original's files go by reference, read by the server; the browser never fetches them.
+    expect(script).toContain("payload.forwardAttachments = sentOriginals(state).map((a) => a.partId);");
+    expect(script).toContain("'/api/forward?key='");
+    // A draft keeps the names of what was attached, never the files.
+    expect(script).toContain('files: added.map((f) => f.name).concat(composing.lost || []),');
+    expect(script).toContain("post('/api/signature', { account: from, text })");
+  });
+
+  /** A field of the form: a value, and somewhere for the focus to go. */
+  const field = (value = ''): { value: string; focus: () => void } => ({ value, focus: () => undefined });
+  /** As much of an element as the composer's code touches. */
+  function node(): Record<string, unknown> {
+    const self: Record<string, unknown> = {
+      hidden: false, textContent: '', value: '', children: [] as unknown[], dataset: {},
+      classList: { toggle: () => undefined, add: () => undefined, remove: () => undefined },
+      appendChild: (child: unknown) => { (self['children'] as unknown[]).push(child); return child; },
+      replaceChildren: () => { self['children'] = []; },
+      setAttribute: () => undefined, focus: () => undefined, querySelector: () => null, reset: () => undefined,
+    };
+    return self;
+  }
+
+  it('keeps naming the files a restored draft is owed, however often it is saved, and holds added ones for the page', () => {
+    const stored = new Map<string, string>();
+    const context: Record<string, unknown> = {
+      composeForm: { to: field('a@b.co'), cc: field(), bcc: field(), subject: field('Re: contract'), text: field('Signed contract attached.') },
+      writeStorage: (key: string, value: string) => stored.set(key, value),
+      localStorage: { removeItem: (key: string) => stored.delete(key) },
+    };
+    const page = lifted<{ saveDraft: () => void; heldFiles: Map<string, { files: unknown[] }> }>(
+      ['homeId', 'draftId', 'heldFiles', 'saveDraft'], '({ saveDraft, heldFiles })', context,
+    );
+    const state: Record<string, unknown> = { mode: 'reply', key: 'k1', files: [], lost: ['contract-signed.pdf'] };
+    context['composing'] = state;
+    // A word typed after the restore: the file still owed is still named.
+    page.saveDraft();
+    expect(JSON.parse(stored.get('draft:k1')!)).toMatchObject({ text: 'Signed contract attached.', files: ['contract-signed.pdf'] });
+    // A file added meanwhile is named with it, and held by the page under the same letter.
+    const scan = { name: 'scan.pdf', type: 'application/pdf', size: 10, at: 1, file: {} };
+    state['files'] = [scan];
+    page.saveDraft();
+    expect(JSON.parse(stored.get('draft:k1')!).files).toEqual(['scan.pdf', 'contract-signed.pdf']);
+    expect(page.heldFiles.get('draft:k1')!.files).toEqual([scan]);
+    // Taken off again, it is no longer held.
+    state['files'] = [];
+    page.saveDraft();
+    expect(page.heldFiles.has('draft:k1')).toBe(false);
+    // A letter with nothing in it but a file to add again is still a letter worth keeping.
+    (context['composeForm'] as Record<string, { value: string }>)['text']!.value = '';
+    page.saveDraft();
+    expect(stored.has('draft:k1')).toBe(true);
+  });
+
+  it('opens a letter with the files this page holds for it, and says only which of the rest to add again', () => {
+    const lost = node();
+    const note = node();
+    const elements = new Map<string, Record<string, unknown>>();
+    const context: Record<string, unknown> = {
+      $: (selector: string) => elements.get(selector) ?? elements.set(selector, node()).get(selector),
+      composeForm: { ...node(), to: field(), cc: field(), bcc: field(), subject: field(), text: field() },
+      composeNote: note, composeLost: lost, composeSend: { disabled: false }, composeSheet: { open: true },
+      session: { assistant: false }, lastSummary: { accounts: [] },
+      readDraft: () => ({ text: 'Here they are.', files: ['report.pdf', 'notes.txt'], at: 1 }),
+      t, fill, el: () => node(), composeSay: (text: string) => { note['textContent'] = text; },
+      drawChips: () => undefined, showQuoted: () => undefined, showCopies: () => undefined, drawSignature: () => undefined,
+      drawFiles: () => undefined, openSheet: () => undefined, growText: () => undefined, setTimeout: () => undefined,
+      signatureOf: () => '', fromOf: () => 'me@qq.com', saveDraft: () => undefined,
+    };
+    const page = lifted<{ openCompose: (state: Record<string, unknown>) => void; heldFiles: Map<string, unknown> }>(
+      ['homeId', 'heldFiles', 'choosesFrom', 'drawLost', 'openCompose'], '({ openCompose, heldFiles })', context,
+    );
+    const report = { name: 'report.pdf', size: 10, file: {} };
+    page.heldFiles.set('draft:k1', { state: {}, files: [report] });
+    const state: Record<string, unknown> = { mode: 'reply', key: 'k1', account: 'me@qq.com', titleKey: 'act.reply' };
+    context['composing'] = null;
+    page.openCompose(state);
+    expect(state['files']).toEqual([report]);
+    expect(state['lost']).toEqual(['notes.txt']);
+    expect(lost['hidden']).toBe(false);
+    expect(lost['textContent']).toBe('Attachments are not kept with a draft: add notes.txt again.');
+    // Reopened after an undo, it keeps its own files, whatever this page holds under its name by then.
+    page.heldFiles.set('draft:k1', { state: {}, files: [{ name: 'other.pdf' }] });
+    state['files'] = [];
+    page.openCompose(state);
+    expect(state['files']).toEqual([]);
+  });
+
+  it('forwards the original\'s files but not the pictures in its body, unless they are asked for', () => {
+    const page = lifted<{
+      sentOriginals: (state: unknown) => Array<{ partId: string }>; attachedCount: (state: unknown) => number;
+    }>(['isOn', 'sentOriginals', 'attachedCount'], '({ sentOriginals, attachedCount })');
+    const pdf = { partId: '2', filename: 'invoice.pdf', size: 100, inline: false };
+    const logos = Array.from({ length: 24 }, (_, n) => ({ partId: `3.${n + 1}`, filename: `image${n}.png`, size: 10, inline: true }));
+    const state: Record<string, unknown> = { originals: [pdf, ...logos], files: [] };
+    // A newsletter's two dozen logos do not make a forward of one invoice too large to send.
+    expect(page.sentOriginals(state).map((a) => a.partId)).toEqual(['2']);
+    expect(page.attachedCount(state)).toBe(1);
+    // Asked for, a picture goes; taken off, the invoice does not.
+    state['choice'] = { '3.1': true, '2': false };
+    expect(page.sentOriginals(state).map((a) => a.partId)).toEqual(['3.1']);
+  });
+
+  it('keeps a saved signature from signing a letter that moved to another mailbox while it was saved', async () => {
+    const saved: Array<[string, string]> = [];
+    const closed: unknown[] = [];
+    let leavesFrom = 'me@qq.com';
+    const context: Record<string, unknown> = {
+      letterLimits: () => ({ signature: 2000 }), t, fill, announce: () => undefined, failure: () => 'failed',
+      post: async () => ({ ok: true, data: { signature: 'Ada Lovelace\nAnalytical Engines Ltd' } }),
+      savedSignatures: new Map(), rememberSignature: (address: string, text: string) => saved.push([address, text]),
+      closeSignatureEditor: (state: unknown) => closed.push(state),
+      fromOf: () => leavesFrom, choosesFrom: () => true,
+    };
+    const storeSignature = lifted<(state: unknown, from: string, area: unknown, said: unknown, buttons: unknown[]) => Promise<void>>(
+      ['storeSignature'], 'storeSignature', context,
+    );
+    const area = { value: 'Ada Lovelace\nAnalytical Engines Ltd' };
+    // Saved for work@, while the letter was moved to me@, which has no signature.
+    const letter: Record<string, unknown> = { mode: 'new', signature: '', editingSignature: false };
+    context['composing'] = letter;
+    await storeSignature(letter, 'work@qq.com', area, { textContent: '' }, []);
+    expect(letter['signature']).toBe('');
+    expect(closed).toEqual([]);
+    // Saved for every letter from work@ all the same.
+    expect(saved).toEqual([['work@qq.com', 'Ada Lovelace\nAnalytical Engines Ltd']]);
+    expect((context['savedSignatures'] as Map<string, { text: string }>).get('work@qq.com')!.text).toBe('Ada Lovelace\nAnalytical Engines Ltd');
+    // Still leaving from work@, the letter signs with it.
+    leavesFrom = 'work@qq.com';
+    await storeSignature(letter, 'work@qq.com', area, { textContent: '' }, []);
+    expect(letter['signature']).toBe('Ada Lovelace\nAnalytical Engines Ltd');
+    expect(closed).toEqual([letter]);
+  });
+
+  it('will not send while the signature is being edited, or a forward whose message could not be read', () => {
+    const said: string[] = [];
+    let focused = 0;
+    const context: Record<string, unknown> = {
+      composeSend: { disabled: false }, pendingSend: null, t, fill,
+      composeForm: { to: field('a@b.co'), cc: field(), bcc: field(), subject: field('s'), text: field('Hello') },
+      composeSay: (text: string) => said.push(text),
+      composeSig: { querySelector: () => ({ focus: () => { focused += 1; } }) },
+    };
+    const sendCompose = lifted<() => void>(['addresses', 'sendCompose'], 'sendCompose', context);
+    context['composing'] = { mode: 'new', key: '', editingSignature: true, signature: 'Old' };
+    sendCompose();
+    expect(said.at(-1)).toBe('Save or cancel the signature first.');
+    expect(focused).toBe(1);
+    // The forward's message was refused by the server: waiting will not bring it.
+    context['composing'] = { mode: 'forward', key: 'k1', quoted: '', forwardFailed: 'Not found.' };
+    sendCompose();
+    expect(said.at(-1)).toBe('The message to forward could not be read: Not found. Close this and forward it again.');
+    // Still on its way: it may yet come.
+    context['composing'] = { mode: 'forward', key: 'k1', quoted: '' };
+    sendCompose();
+    expect(said.at(-1)).toBe(t('compose.forwardMissing'));
+  });
+
+  it('says a proxy refused the size, or stopped waiting, rather than blaming the mail server', () => {
+    const sendFailure = lifted<(d: unknown, status?: number) => string>(['sendFailure'], 'sendFailure', {
+      t, fill, sizeLabel: (n: number) => `${n / (1024 * 1024)} MB`, letterLimits: () => ({ bytes: 20 * 1024 * 1024 }),
+      failure: (d: { code: string }) => `failure:${d.code}`,
+    });
+    expect(sendFailure({}, 413)).toBe(fill('compose.proxyTooLarge', { maxBytes: '20 MB' }));
+    expect(sendFailure({}, 413)).toContain('before it reached mailsift');
+    expect(sendFailure({}, 504)).toBe(t('error.send_timeout'));
+    expect(sendFailure({}, 524)).toBe(t('error.send_timeout'));
+    expect(sendFailure({}, 0)).toBe(t('error.send_connection'));
+    // mailsift's own refusals keep their own words.
+    expect(sendFailure({ code: 'send_too_large', maxBytes: 5 }, 413)).toBe('failure:send_too_large');
+    for (const key of ['compose.proxyTooLarge', 'compose.forwardUnreadable', 'compose.sigUnsaved', 'compose.picturesOff', 'compose.putBackFile'] as const) {
+      expect(STRINGS['zh-CN'][key], key).toBeTruthy();
+      expect(STRINGS['zh-CN'][key]).not.toBe(STRINGS.en[key]);
+    }
   });
 });

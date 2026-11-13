@@ -555,7 +555,7 @@ function copyNewestCode() {
 const fineKeys = matchMedia('(pointer: fine)').matches;
 const macKeys = /Mac|iPhone|iPad/.test(navigator.platform || '');
 const KEY_LIST = [
-  ['j k', 'keys.move'], ['⏎', 'keys.open'], ['e', 'keys.done'], ['r a', 'keys.reply'], ['y', 'keys.archive'],
+  ['j k', 'keys.move'], ['⏎', 'keys.open'], ['e', 'keys.done'], ['r a', 'keys.reply'], ['f', 'keys.forward'], ['y', 'keys.archive'],
   ['s', 'keys.star'], ['#', 'keys.trash'], ['n', 'keys.compose'], ['c', 'keys.code'], ['/', 'keys.search'],
   [macKeys ? '⌘K' : 'Ctrl K', 'keys.palette'], ['.', 'keys.check'], ['esc', 'keys.close'], ['?', 'keys.help'],
 ];
@@ -630,6 +630,7 @@ document.addEventListener('keydown', (e) => {
     if (e.key === 'e') { e.preventDefault(); complete(key, document.querySelector('li.row[data-key="' + CSS.escape(current) + '"]'), Boolean(row.handledAt)); }
     else if (e.key === 'r') { e.preventDefault(); startReply(key, 'reply'); }
     else if (e.key === 'a') { e.preventDefault(); startReply(key, 'replyAll'); }
+    else if (e.key === 'f') { e.preventDefault(); startForward(key); }
     else if (e.key === 'y') { e.preventDefault(); mailAction(key, 'archive'); }
     else if (e.key === 's') { e.preventDefault(); mailAction(key, (flagsByKey.get(key) || {}).flagged ? 'unstar' : 'star'); }
     else if (e.key === '#') { e.preventDefault(); mailAction(key, 'trash'); }
@@ -648,7 +649,13 @@ function languageChanged() {
   }
   if (notifySheet.open) renderNotify();
   if (keysSheet.open) { closeSheet(keysSheet, false); }
-  if (composeSheet.open && composing) { $('#compose-title').textContent = composing.title; drawChips(); }
+  if (composeSheet.open && composing) {
+    $('#compose-title').textContent = t(composing.titleKey);
+    drawChips();
+    drawSignature();
+    drawFiles();
+    drawLost();
+  }
   // The server words this device's notifications; tell it the language moved.
   if (pushPrefs.subscribed) currentPush().then((sub) => { if (sub) savePush(sub); }).catch(() => {});
 }

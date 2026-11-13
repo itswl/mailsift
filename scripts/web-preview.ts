@@ -81,6 +81,20 @@ const pdf = (filename: string, sizeBytes: number): AttachmentManifest => ({
   items: [{ partId: '2', filename, contentType: 'application/pdf', sizeBytes, inline: false }],
   truncated: false,
 });
+/**
+ * The invoice carries two files, so a forward can be tried with one of them
+ * taken off and put back, and two pictures in its body, which a forward
+ * leaves out until asked.
+ */
+const invoiceFiles: AttachmentManifest = {
+  items: [
+    { partId: '2', filename: 'invoice-4821.pdf', contentType: 'application/pdf', sizeBytes: 48_120, inline: false },
+    { partId: '3', filename: 'receipt-october.png', contentType: 'image/png', sizeBytes: 131_072, transferEncoding: 'base64', inline: false },
+    { partId: '1.2', filename: 'logo.png', contentType: 'image/png', sizeBytes: 4_096, transferEncoding: 'base64', inline: true, contentId: 'logo' },
+    { partId: '1.3', filename: 'social-x.png', contentType: 'image/png', sizeBytes: 1_024, transferEncoding: 'base64', inline: true, contentId: 'x' },
+  ],
+  truncated: false,
+};
 
 const H = 60;
 const D = 24 * H;
@@ -113,7 +127,7 @@ const FIXTURES: Fixture[] = [
     fields: { sender: 'billing@stripe.com', senderName: 'Stripe', folder: 'INBOX', category: 'Finance',
       summary: `Invoice #4821 for $240.00 is due on ${enDay(3)}. Pay from the dashboard or by bank transfer.`,
       reason: 'An unpaid invoice with a deadline this week.', deadline: ymd(3), decidedBy: 'llm',
-      attachmentManifest: pdf('invoice-4821.pdf', 48_120) } },
+      attachmentManifest: invoiceFiles } },
   { age: 2 * H + 5, ...QQ, importance: 'info', pushed: false, subject: '您的包裹正在派送',
     fields: { sender: 'tracking@parcel.example', senderName: '包裹追踪', folder: 'INBOX', category: 'Delivery',
       summary: '你的包裹正在派送，预计今天 18:00 前送达。', reason: '物流进度通知，无需操作。',
@@ -421,9 +435,25 @@ const backend: Partial<WebBackend> = {
   },
   send: async (account, mail) => {
     await sleep(700);
-    console.log(`[preview] pretended to send from ${account.username} to ${mail.to.join(', ')}: ${mail.subject}`);
+    const files = mail.attachments?.length
+      ? ` (${mail.attachments.map((file) => `${file.filename}, ${file.contentType}, ${file.content.length} bytes`).join('; ')})` : '';
+    const copies = `${mail.cc?.length ? ` cc ${mail.cc.join(', ')}` : ''}${mail.bcc?.length ? ` bcc ${mail.bcc.join(', ')}` : ''}`;
+    console.log(`[preview] pretended to send from ${account.username} to ${mail.to.join(', ')}${copies}: ${mail.subject}${files}`);
+    // The letter as it would leave, so what the composer put together can be read back.
+    console.log(mail.text.split('\n').slice(0, 40).map((line) => `  | ${line}`).join('\n'));
     const raw = Buffer.from(mail.text);
     return { messageId: `<sent-${Date.now()}@preview>`, raw, copy: raw, accepted: mail.to, rejected: [] };
+  },
+  // A forward lists the original's files and carries them: here, the list triage
+  // stored with the fixture, and made-up bytes of about the size it gives.
+  attachments: async (_account, messageId) => {
+    await sleep(250);
+    return { folder: 'INBOX', manifest: store.getMail(messageId)?.attachmentManifest ?? { items: [], truncated: false } };
+  },
+  attachment: async (_account, messageId, partId) => {
+    await sleep(400);
+    const item = store.getMail(messageId)?.attachmentManifest?.items.find((entry) => entry.partId === partId);
+    return item ? { metadata: item, content: Buffer.alloc(Math.min(item.sizeBytes ?? 1024, 1024 * 1024), 0x25) } : undefined;
   },
   appendSent: async () => 'Sent',
   savesSentCopy: () => true,

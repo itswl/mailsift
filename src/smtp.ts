@@ -22,6 +22,10 @@
  * the caller can file the same message into Sent for the providers that do
  * not keep a copy themselves (see savesSentCopy), with the one line the
  * recipients are not shown: who was blind-copied.
+ *
+ * Files travel as bytes handed in, never as a path or a URL for the builder
+ * to fetch, under a name reduced to a plain file name and a type that is a
+ * type. How many and how large is bounded here as well as by every caller.
  */
 import { createTransport } from 'nodemailer';
 import MailComposer from 'nodemailer/lib/mail-composer';
@@ -33,6 +37,15 @@ import { metrics } from './metrics.js';
 
 const log = getLogger('smtp');
 
+/** A file sent with a message: its name and type as the recipients are shown them, and its bytes. */
+export interface OutgoingAttachment {
+  filename: string;
+  content: Buffer;
+  contentType: string;
+  /** For a text file sent on as it was received: the character set its bytes are in. */
+  charset?: string;
+}
+
 export interface OutgoingMail {
   to: string[];
   cc?: string[];
@@ -42,6 +55,7 @@ export interface OutgoingMail {
   /** When replying: the original's Message-ID and its References chain. */
   inReplyTo?: string;
   references?: string[];
+  attachments?: OutgoingAttachment[];
 }
 
 export interface SentMail {
@@ -127,6 +141,19 @@ const MAX_TEXT_CHARS = 500_000;
 const MAX_QUOTED_CHARS = 50_000;
 const MAX_REFERENCES = 20;
 
+/** At most this many files on one message, whatever their size. */
+export const MAX_ATTACHMENTS = 20;
+const DEFAULT_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+/**
+ * Files grow by a third when they are encoded for mail, and providers refuse
+ * a message over a size of their own, commonly about 25 MB as it travels.
+ * 20 MiB of files is about 27 MB on the wire; past 35 MiB almost nobody
+ * would take the message, so no setting goes further.
+ */
+const CEILING_ATTACHMENT_BYTES = 35 * 1024 * 1024;
+/** Long enough for any name a person gives a file, short enough for every client to show. */
+const MAX_FILENAME_CHARS = 180;
+
 const CONNECTION_TIMEOUT_MS = 15_000;
 const SOCKET_TIMEOUT_MS = 30_000;
 
@@ -151,6 +178,94 @@ const CONTROL = /[\u0000-\u001f\u007f]/;
 
 export function isSendableAddress(value: unknown): value is string {
   return typeof value === 'string' && value.length <= 254 && !CONTROL.test(value) && ADDRESS.test(value);
+}
+
+/**
+ * How many bytes of files one message may carry, decoded: SMTP_ATTACHMENT_MAX_BYTES,
+ * 20 MiB unless set, never more than 35 MiB. A value that is not a positive
+ * number is taken as not set.
+ */
+export function attachmentLimitBytes(): number {
+  // An empty line in .env is "not set", not zero.
+  const raw = process.env.SMTP_ATTACHMENT_MAX_BYTES?.trim();
+  const value = raw ? Number(raw) : DEFAULT_ATTACHMENT_BYTES;
+  return Number.isFinite(value) && value >= 1 ? Math.min(Math.floor(value), CEILING_ATTACHMENT_BYTES) : DEFAULT_ATTACHMENT_BYTES;
+}
+
+/** A size as a person reads it in a refusal: "20 MB". */
+export function describeBytes(bytes: number): string {
+  const megabytes = bytes / (1024 * 1024);
+  if (megabytes >= 1) return `${Math.round(megabytes * 10) / 10} MB`;
+  return bytes >= 1024 ? `${Math.round(bytes / 1024)} KB` : `${bytes} bytes`;
+}
+
+/**
+ * Control characters, and the invisible ones that turn text around:
+ * "invoice" + U+202E + "fdp.exe" shows as "invoiceexe.pdf" and is a program.
+ */
+const UNSHOWABLE = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+
+/**
+ * The name a file is sent under.
+ *
+ * Whoever names it (a browser, a sender whose attachment is forwarded) may
+ * have put a path in it, or characters meant to make it look like something
+ * else. What is left is the last part of the name only, in its composed form,
+ * without either; a name that is longer than any client shows is shortened
+ * before its extension, so it still opens with the program it is for.
+ */
+export function attachmentFilename(value: unknown): string {
+  if (typeof value !== 'string') return 'attachment';
+  const base = value.split(/[/\\]/).pop() ?? '';
+  const cleaned = base.normalize('NFC').replace(UNSHOWABLE, '').trim();
+  if (!cleaned || cleaned === '.' || cleaned === '..') return 'attachment';
+  const chars = Array.from(cleaned);
+  if (chars.length <= MAX_FILENAME_CHARS) return cleaned;
+  const dot = cleaned.lastIndexOf('.');
+  const extension = dot > 0 ? Array.from(cleaned.slice(dot)) : [];
+  const kept = extension.length > 1 && extension.length <= 16 ? extension : [];
+  return chars.slice(0, MAX_FILENAME_CHARS - kept.length).join('').trimEnd() + kept.join('');
+}
+
+const MIME_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i;
+
+/**
+ * The type a file is sent as: one type/subtype and nothing else, or plain bytes.
+ *
+ * A type that says the file is itself a container is plain bytes too. Under
+ * multipart/* (a saved web page, multipart/related, or a Mac file's
+ * multipart/appledouble) the builder makes a container of the part and the
+ * file's bytes are left out of it: the letter would arrive with an empty part
+ * where the file was. Of message/*, only a whole message (message/rfc822)
+ * goes as one; the others (message/partial, message/external-body) would be
+ * sent unencoded as fragments or pointers, not as the file. As bytes, each
+ * arrives as it was, under its own name.
+ */
+export function attachmentContentType(value: unknown): string {
+  const type = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (type.length > 255 || !MIME_TYPE.test(type)) return 'application/octet-stream';
+  if (type.startsWith('multipart/') || (type.startsWith('message/') && type !== 'message/rfc822')) return 'application/octet-stream';
+  return type;
+}
+
+/**
+ * The character set a text file is labelled with: one plain token, or
+ * nothing. A text file sent on with its own bytes needs the label it came
+ * with, or a reader takes its letters for another alphabet.
+ */
+export function attachmentCharset(value: unknown): string | undefined {
+  const charset = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return /^[a-z0-9][a-z0-9_.:+-]{0,39}$/.test(charset) ? charset : undefined;
+}
+
+/**
+ * How long a message of this many bytes may fairly take to travel, on top of
+ * the time any message is given. A link to a mail server that is slow, or far
+ * away, still moves about 256 KiB a second; so 20 MiB of files are given a
+ * little over a minute and a half more, and a letter with none, no more.
+ */
+export function transferAllowanceMs(bytes: number): number {
+  return Number.isFinite(bytes) && bytes > 0 ? Math.ceil(bytes / (256 * 1024)) * 1000 : 0;
 }
 
 /**
@@ -324,6 +439,29 @@ function oneLine(value: string): string {
     return value.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
 }
 
+/**
+ * The files a message carries, each under a clean name and type, within the
+ * count and the size. The callers check the same before they get here; this
+ * is what holds when one of them did not.
+ */
+function attachmentsOf(values: unknown): OutgoingAttachment[] {
+  if (values === undefined) return [];
+  if (!Array.isArray(values)) throw invalid('attachments must be a list');
+  if (values.length > MAX_ATTACHMENTS) throw invalid(`a message may carry at most ${MAX_ATTACHMENTS} files`);
+  const limit = attachmentLimitBytes();
+  let total = 0;
+  return values.map((value) => {
+    const file = (typeof value === 'object' && value !== null ? value : {}) as Partial<OutgoingAttachment>;
+    if (!Buffer.isBuffer(file.content)) throw invalid('an attachment has no content');
+    total += file.content.length;
+    if (total > limit) throw invalid(`attachments may come to at most ${describeBytes(limit)}`);
+    const contentType = attachmentContentType(file.contentType);
+    // A character set means something only to text.
+    const charset = contentType.startsWith('text/') ? attachmentCharset(file.charset) : undefined;
+    return { filename: attachmentFilename(file.filename), content: file.content, contentType, ...(charset ? { charset } : {}) };
+  });
+}
+
 interface Prepared {
   to: string[];
   cc: string[];
@@ -332,10 +470,19 @@ interface Prepared {
   text: string;
   inReplyTo: string | undefined;
   references: string[];
+  attachments: OutgoingAttachment[];
 }
 
-/** Check a message and reduce it to what will be written. Throws SendError('invalid'). */
-function prepare(mail: OutgoingMail): Prepared {
+/**
+ * Who a message goes to, checked: each a single address, at least one of
+ * them, not too many, and each once, under the first field that names it.
+ * Throws SendError('invalid').
+ *
+ * The first half of checking a message, on its own so that a caller about
+ * to do something slow for a letter (read a forward's files from a mailbox)
+ * can find out first whether it could be sent at all, by the same checks.
+ */
+export function addressed(mail: Pick<OutgoingMail, 'to' | 'cc' | 'bcc'>): { to: string[]; cc: string[]; bcc: string[] } {
   if (typeof mail !== 'object' || mail === null) throw invalid('a message is required');
   const listed = {
     to: recipients(mail.to, 'to'),
@@ -353,9 +500,12 @@ function prepare(mail: OutgoingMail): Prepared {
     taken.add(key);
     return true;
   });
-  const to = once(listed.to);
-  const cc = once(listed.cc);
-  const bcc = once(listed.bcc);
+  return { to: once(listed.to), cc: once(listed.cc), bcc: once(listed.bcc) };
+}
+
+/** Check a message and reduce it to what will be written. Throws SendError('invalid'). */
+function prepare(mail: OutgoingMail): Prepared {
+  const { to, cc, bcc } = addressed(mail);
 
   if (typeof mail.subject !== 'string') throw invalid('subject must be text');
   const subject = oneLine(mail.subject);
@@ -368,6 +518,7 @@ function prepare(mail: OutgoingMail): Prepared {
     text: mail.text.replace(/\r\n?/g, '\n'),
     inReplyTo: messageIdOrNothing(mail.inReplyTo),
     references: referenceChain(mail.references),
+    attachments: attachmentsOf(mail.attachments),
   };
 }
 
@@ -397,6 +548,20 @@ async function compose(account: Account, mail: Prepared): Promise<{ messageId: s
     text: mail.text,
     ...(mail.inReplyTo ? { inReplyTo: mail.inReplyTo } : {}),
     ...(mail.references.length ? { references: mail.references } : {}),
+    // Bytes only, never a path or an address to fetch. Each is an attachment
+    // rather than shown in place: the text is plain and points at none of
+    // them. The builder encodes each file in base64, so what arrives is byte
+    // for byte what was attached, whatever the line ends are changed to
+    // below. A forwarded message (message/rfc822), which mail does not allow
+    // to be encoded, goes as it is, its line ends made CRLF as mail carries it.
+    // A text file passed on in its own character set says which one, as it did.
+    ...(mail.attachments.length ? {
+      attachments: mail.attachments.map((file) => ({
+        filename: file.filename, content: file.content,
+        contentType: file.charset ? `${file.contentType}; charset=${file.charset}` : file.contentType,
+        contentDisposition: 'attachment' as const,
+      })),
+    } : {}),
     disableFileAccess: true,
     disableUrlAccess: true,
   }).compile();
@@ -504,7 +669,10 @@ export async function sendMail(
     const refused = new Set(rejected.map((address) => address.toLowerCase()));
     // What the server says it took; when it does not say, everyone it did not refuse.
     const accepted = info.accepted ? addressList(info.accepted) : envelope.to.filter((address) => !refused.has(address.toLowerCase()));
-    log.info(`[${account.name}] sent a message | ${accepted.length} accepted, ${rejected.length} refused`);
+    log.info(
+      `[${account.name}] sent a message | ${accepted.length} accepted, ${rejected.length} refused`
+        + (prepared.attachments.length ? `, ${prepared.attachments.length} files` : ''),
+    );
     metrics.addCounter('mailsift.mail.sent', 1, outcome(rejected.length ? 'partial' : 'sent'));
     return { messageId, raw, copy: sentCopy(raw, prepared.bcc), accepted, rejected };
   } catch (error) {
@@ -545,20 +713,37 @@ export interface ReplyOriginal {
 /** "Re:" and what Chinese clients write for it, with either colon. */
 const REPLY_PREFIX = /^(?:re|回复|回復|答复|答覆)\s*[:：]/i;
 
-function attribution(original: ReplyOriginal, lang: 'en' | 'zh-CN'): string {
-  const from = original.from;
-  const name = from ? oneLine(from.name) : '';
-  const address = from && isSendableAddress(from.address.trim()) ? from.address.trim() : '';
-  const who = name && address ? `${name} <${address}>` : name || address || (lang === 'zh-CN' ? '发件人' : 'the sender');
-  const at = original.date ? new Date(original.date) : null;
-  let when = '';
-  if (at && !Number.isNaN(at.valueOf())) {
-    try {
-      when = new Intl.DateTimeFormat(lang === 'zh-CN' ? 'zh-CN' : 'en-GB', { dateStyle: 'medium', timeStyle: 'short' }).format(at);
-    } catch {
-      when = at.toISOString().slice(0, 16).replace('T', ' ');
-    }
+/** The original's text as lines, held to what is worth sending along, with a line that says where it stopped. */
+function clippedLines(value: string | null | undefined): string[] {
+  const text = (value ?? '').replace(/\r\n?/g, '\n').replace(/\s+$/, '');
+  const clipped = text.length > MAX_QUOTED_CHARS;
+  const lines = (clipped ? text.slice(0, MAX_QUOTED_CHARS) : text).split('\n');
+  if (clipped) lines.push('[…]');
+  return lines;
+}
+
+/** When a message was written, as the line over its quote says it; '' when it carries no usable date. */
+function dateWords(date: string | null, lang: 'en' | 'zh-CN'): string {
+  const at = date ? new Date(date) : null;
+  if (!at || Number.isNaN(at.valueOf())) return '';
+  try {
+    return new Intl.DateTimeFormat(lang === 'zh-CN' ? 'zh-CN' : 'en-GB', { dateStyle: 'medium', timeStyle: 'short' }).format(at);
+  } catch {
+    return at.toISOString().slice(0, 16).replace('T', ' ');
   }
+}
+
+/** A name and an address as one line of text: "Name <address>", or whichever of the two there is. */
+function personWords(entry: MailAddress | null | undefined, onlySendable: boolean): string {
+  const name = entry ? oneLine(String(entry.name ?? '')).slice(0, 200) : '';
+  const raw = entry ? oneLine(String(entry.address ?? '')).slice(0, 320) : '';
+  const address = !onlySendable || isSendableAddress(raw) ? raw : '';
+  return name && address ? `${name} <${address}>` : name || address;
+}
+
+function attribution(original: ReplyOriginal, lang: 'en' | 'zh-CN'): string {
+  const who = personWords(original.from, true) || (lang === 'zh-CN' ? '发件人' : 'the sender');
+  const when = dateWords(original.date, lang);
   // Both forms are the ones body.ts recognises, so when this reply is answered
   // in turn, mailsift strips its own quote before judging the new text.
   if (lang === 'zh-CN') return when ? `在 ${when}，${who} 写道：` : `${who} 写道：`;
@@ -631,10 +816,7 @@ export function replyEnvelope(
   const inReplyTo = messageIdOrNothing(original.messageId);
   const references = referenceChain([...(original.references ?? []), ...(inReplyTo ? [inReplyTo] : [])]);
 
-  const text = (original.text ?? '').replace(/\r\n?/g, '\n').replace(/\s+$/, '');
-  const clipped = text.length > MAX_QUOTED_CHARS;
-  const lines = (clipped ? text.slice(0, MAX_QUOTED_CHARS) : text).split('\n');
-  if (clipped) lines.push('[…]');
+  const lines = clippedLines(original.text);
   const quoted = [attribution(original, lang), ...lines.map((line) => (line ? `> ${line}` : '>'))].join('\n');
 
   return {
@@ -645,5 +827,67 @@ export function replyEnvelope(
     ...(inReplyTo ? { inReplyTo } : {}),
     references,
     addressedTo,
+  };
+}
+
+/** What the reader fetched of a message being forwarded. */
+export interface ForwardOriginal {
+  from: MailAddress | null;
+  to: MailAddress[];
+  cc: MailAddress[];
+  subject: string;
+  date: string | null;
+  /** Its text above any quoted history, and that history. */
+  text: string;
+  quoted: string;
+  /** Set when it went to more people, in To or in copy, than the reader lists. */
+  toCut?: boolean;
+  ccCut?: boolean;
+}
+
+/** "Fwd:", "FW:", and what Chinese clients write for it, with either colon. */
+const FORWARD_PREFIX = /^(?:fwd?|转发|轉發)\s*[:：]/i;
+
+/** A forwarded header names this many people on a line and says that there were more. */
+const MAX_FORWARD_NAMES = 50;
+
+/**
+ * Subject and forwarded block for a forward, from what the reader fetched.
+ *
+ * The block is what mail clients write over a forwarded message: a marker
+ * line, who it was from, when, its subject, who it went to (and in copy, when
+ * anyone was), then its text, unquoted. Both markers are ones body.ts
+ * recognises, so the header lines under them are read as the start of the
+ * forwarded message, not as quoted history to strip. Every name comes from
+ * the original's headers and is put on one line of text; nothing in the
+ * block is ever a header of the forward itself. A forward starts a
+ * conversation of its own, so nothing here refers to the original's thread.
+ */
+export function forwardEnvelope(original: ForwardOriginal, lang: 'en' | 'zh-CN' = 'en'): { subject: string; forwarded: string } {
+  const zh = lang === 'zh-CN';
+  const label = zh
+    ? { mark: '---------- 转发的邮件 ----------', from: '发件人：', date: '日期：', subject: '主题：', to: '收件人：', cc: '抄送：' }
+    : { mark: '---------- Forwarded message ----------', from: 'From: ', date: 'Date: ', subject: 'Subject: ', to: 'To: ', cc: 'Cc: ' };
+  // A list the reader already cut says so as well: it stops where this would.
+  const people = (list: MailAddress[] | null | undefined, cut: boolean | undefined): string => {
+    const named = (list ?? []).map((entry) => personWords(entry, false)).filter(Boolean);
+    const shown = named.slice(0, MAX_FORWARD_NAMES).join(', ');
+    return shown && (named.length > MAX_FORWARD_NAMES || cut) ? `${shown}, …` : shown;
+  };
+  const subject = oneLine(original.subject ?? '');
+  const header: string[] = [label.mark];
+  const line = (name: string, value: string): void => { if (value) header.push(name + value); };
+  line(label.from, personWords(original.from, false));
+  line(label.date, dateWords(original.date, lang));
+  line(label.subject, subject);
+  line(label.to, people(original.to, original.toCut));
+  line(label.cc, people(original.cc, original.ccCut));
+
+  const text = (original.text ?? '').replace(/\s+$/, '');
+  const quoted = (original.quoted ?? '').replace(/\s+$/, '');
+  const body = clippedLines([text, quoted].filter(Boolean).join('\n\n'));
+  return {
+    subject: FORWARD_PREFIX.test(subject) ? subject : `Fwd: ${subject}`.trim(),
+    forwarded: [...header, '', ...body].join('\n').replace(/\s+$/, ''),
   };
 }

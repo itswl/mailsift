@@ -4,7 +4,7 @@ import './setup.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { allowMcpRequest, createServer, forgetUnconfirmedSends, type InFlight } from '../src/mcp.js';
-import { MailActionError, type LiveMessage, type WebMailActionResult } from '../src/imap/client.js';
+import { AttachmentTooLargeError, MailActionError, type LiveMessage, type WebMailActionResult } from '../src/imap/client.js';
 import { StateStore } from '../src/services/state.js';
 import { SendError, type OutgoingMail } from '../src/smtp.js';
 import { forgetLive, forgetSends, type WebBackend } from '../src/web-actions.js';
@@ -32,6 +32,8 @@ const open: Array<() => Promise<void>> = [];
 interface Mailbox {
   acted: Array<{ messageId: string; action: string; destination?: string; hint?: unknown }>;
   sent: OutgoingMail[];
+  /** The parts a forward read from the mailbox. */
+  fetched: string[];
   read: unknown[];
   appended: number;
   act?: (action: string) => Partial<WebMailActionResult> | undefined;
@@ -39,7 +41,17 @@ interface Mailbox {
   backend: Partial<WebBackend>;
 }
 function mailbox(state: StateStore): Mailbox {
-  const box: Mailbox = { acted: [], sent: [], read: [], appended: 0, backend: {} };
+  const box: Mailbox = { acted: [], sent: [], fetched: [], read: [], appended: 0, backend: {} };
+  const manifest = {
+    folder: 'INBOX',
+    manifest: {
+      items: [
+        { partId: '2', filename: 'invoice.pdf', contentType: 'application/pdf', sizeBytes: 4000, transferEncoding: 'base64', inline: false },
+        { partId: '3', filename: 'logo.png', contentType: 'image/png', sizeBytes: 800, transferEncoding: 'base64', inline: true },
+      ],
+      truncated: false,
+    },
+  };
   const live: LiveMessage = {
     folder: 'INBOX', flags: { seen: false, flagged: false, answered: false }, uid: 17, uidValidity: '9',
     readable: {
@@ -67,6 +79,12 @@ function mailbox(state: StateStore): Mailbox {
       if (box.send) box.send();
       box.sent.push(mail);
       return { messageId: '<sent@x>', raw: Buffer.from('raw'), copy: Buffer.from('raw'), accepted: [...mail.to, ...(mail.cc ?? [])], rejected: [] };
+    },
+    attachments: async () => manifest,
+    attachment: async (_account, _messageId, partId) => {
+      box.fetched.push(partId);
+      const metadata = manifest.manifest.items.find((item) => item.partId === partId);
+      return metadata ? { metadata, content: Buffer.from(`bytes of ${metadata.filename}`) } : undefined;
     },
     appendSent: async () => { box.appended += 1; return 'Sent'; },
     savesSentCopy: () => false,
@@ -129,7 +147,7 @@ describe('tool surface', () => {
     expect(tools.map((t) => t.name).sort()).toEqual([
       'feedback_rules', 'get_mail', 'health', 'inspect_mail_safety', 'list_accounts', 'list_attachments', 'list_audit', 'list_dead_letters',
       'list_digest', 'list_folders', 'list_mail', 'list_threads', 'mail_summary', 'needs_you', 'observability',
-      'prepare_reply', 'read_message', 'recovery_status', 'scan_attachment', 'search_mail',
+      'prepare_forward', 'prepare_reply', 'read_message', 'recovery_status', 'scan_attachment', 'search_mail',
     ]);
     for (const tool of tools) expect(tool.description ?? '').not.toBe('');
   });
@@ -145,6 +163,7 @@ describe('tool surface', () => {
     expect(names).not.toContain('manage_mail');
     expect(names).not.toContain('mark_handled');
     expect(names).not.toContain('send_mail');
+    expect(names).not.toContain('set_signature');
 
     // Absent from the listing and also unreachable by name.
     expect(await client.callTool({ name: 'record_feedback', arguments: { messageId: '<one@x>', label: 'false_positive' } }))
@@ -155,7 +174,7 @@ describe('tool surface', () => {
     const reader = new Set((await (await connect(new StateStore(':memory:'))).listTools()).tools.map((t) => t.name));
     const writer = (await (await connect(new StateStore(':memory:'), true)).listTools()).tools.map((t) => t.name);
     expect(writer.filter((name) => !reader.has(name)).sort())
-      .toEqual(['manage_mail', 'mark_handled', 'record_feedback', 'retry_dead_letter', 'send_mail']);
+      .toEqual(['manage_mail', 'mark_handled', 'record_feedback', 'retry_dead_letter', 'send_mail', 'set_signature']);
   });
 
   it('gives the write credential what the page has, the bin and sending included, and a reader none of it', async () => {
@@ -171,9 +190,11 @@ describe('tool surface', () => {
       ['send_mail', { account: 'me@qq.com', to: ['a@b.co'], subject: 's', text: 't' }],
       ['manage_mail', { messageId: '<one@x>', action: 'trash' }],
       ['mark_handled', { messageId: '<one@x>' }],
+      ['set_signature', { account: 'me@qq.com', text: 'Signed by someone else' }],
     ] as const) {
       expect(await reader.callTool({ name, arguments: args }), name).toMatchObject({ isError: true });
     }
+    expect(state.getMeta('signature:me@qq.com')).toBeUndefined();
     expect(box.sent).toEqual([]);
     expect(box.acted).toEqual([]);
     expect(state.getMail('k1')?.handledAt).toBeNull();
@@ -649,6 +670,8 @@ describe('the review of what goes out', () => {
       ['mark_handled', { messageId: '<one@x>' }],
       ['read_message', { messageId: '<one@x>' }],
       ['prepare_reply', { messageId: '<one@x>' }],
+      ['prepare_forward', { messageId: '<one@x>' }],
+      ['send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'Which?' }],
     ] as const) {
       const refused = await errorOf(client, name, args);
       expect(refused, name).toMatchObject({ code: 'INVALID_ARGUMENT' });
@@ -940,6 +963,219 @@ describe('the review of what goes out', () => {
     const description = (await client.listTools()).tools.find((t) => t.name === 'send_mail')?.description ?? '';
     expect(description).toContain('savedCopy says whether');
     expect(description).not.toContain('A copy is kept in Sent');
+  });
+});
+
+describe('forwarding and signatures', () => {
+  beforeEach(() => { process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw'; });
+  const errorOf = async (client: Client, name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const answer = await client.callTool({ name, arguments: args });
+    expect(answer, name).toMatchObject({ isError: true });
+    return JSON.parse((answer.content as Array<{ text: string }>)[0]!.text) as Record<string, unknown>;
+  };
+
+  it('says what a forward would start from, offering the original\'s files, and sends nothing', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const reader = await connect(state, false, box.backend);
+    const draft = await call(reader, 'prepare_forward', { messageId: '<one@x>' });
+    expect(draft).toMatchObject({
+      messageId: '<one@x>', account: 'me@qq.com', subject: 'Fwd: subject k1', canSend: true,
+      attachments: [
+        { partId: '2', filename: 'invoice.pdf', contentType: 'application/pdf', size: 3000, inline: false },
+        { partId: '3', filename: 'logo.png', contentType: 'image/png', size: 600, inline: true },
+      ],
+    });
+    expect(String(draft['forwarded'])).toMatch(/^---------- Forwarded message ----------\nFrom: Vendor <billing@vendor\.com>\n/);
+    expect(String(draft['forwarded']).endsWith('\n\nPlease confirm the invoice by Friday.')).toBe(true);
+    // A signature is the business of the caller who may send under it.
+    expect(draft).not.toHaveProperty('signature');
+    expect(await call(await connect(state, true, box.backend), 'prepare_forward', { messageId: '<one@x>', language: 'zh-CN' }))
+      .toMatchObject({ signature: '', forwarded: expect.stringContaining('---------- 转发的邮件 ----------') });
+    expect(box.sent).toEqual([]);
+    expect(box.fetched).toEqual([]);
+  });
+
+  it('forwards a message in one call, with all its files and the signature, once told whom it is for', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    expect(await call(client, 'set_signature', { account: 'me@qq.com', text: 'Alex\nMailsift Ltd' }))
+      .toEqual({ account: 'me@qq.com', signature: 'Alex\nMailsift Ltd', removed: false });
+    expect(await errorOf(client, 'send_mail', { forward: '<one@x>', text: 'FYI' })).toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(box.sent).toEqual([]);
+
+    const sent = await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI, see below.' });
+    expect(sent).toMatchObject({
+      sent: true, account: 'me@qq.com', to: ['colleague@example.org'], cc: [], subject: 'Fwd: subject k1',
+      attachments: ['invoice.pdf', 'logo.png'], needsYou: 1,
+    });
+    const letter = box.sent[0]!;
+    expect(letter.text.startsWith('FYI, see below.\n\n-- \nAlex\nMailsift Ltd\n\n---------- Forwarded message ----------\n')).toBe(true);
+    expect(letter.text.endsWith('\n\nPlease confirm the invoice by Friday.')).toBe(true);
+    expect(letter).not.toHaveProperty('inReplyTo');
+    expect(letter).not.toHaveProperty('references');
+    expect(letter.attachments!.map((file) => [file.filename, file.content.toString()]))
+      .toEqual([['invoice.pdf', 'bytes of invoice.pdf'], ['logo.png', 'bytes of logo.png']]);
+    // Dealt with, and not marked answered.
+    expect(state.getMail('k1')?.handledAt).toBeTruthy();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(box.acted.map((entry) => entry.action)).not.toContain('answered');
+    // The files are part of the letter: the same forward again is a repeat; without them, another letter.
+    expect(await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI, see below.' }))
+      .toMatchObject({ repeated: true, attachments: ['invoice.pdf', 'logo.png'] });
+    expect(box.sent).toHaveLength(1);
+    const bare = await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI, see below.', includeAttachments: false });
+    expect(bare).not.toHaveProperty('repeated');
+    expect(bare['attachments']).toEqual([]);
+    expect(box.sent[1]).not.toHaveProperty('attachments');
+    // The set_signature row says which mailbox, never what the signature says.
+    const rows = state.listMcpAudit(20).filter((row) => row.action === 'set_signature');
+    expect(rows).toEqual([expect.objectContaining({ success: true, target: expect.stringContaining('me@qq.com') })]);
+    expect(JSON.stringify(state.listMcpAudit(50))).not.toContain('Mailsift Ltd');
+  });
+
+  it('forwards some of the files when told which, and refuses a part the message does not have', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    const some = await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'The invoice.', includeAttachments: ['2'] });
+    expect(some['attachments']).toEqual(['invoice.pdf']);
+    expect(box.fetched).toEqual(['2']);
+    const refused = await errorOf(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'x', includeAttachments: ['9'] });
+    expect(refused).toMatchObject({ code: 'INVALID_ARGUMENT', message: expect.stringContaining('no attachment 9') });
+    expect(String(refused['hint'])).toContain('2 (invoice.pdf)');
+    expect(await errorOf(client, 'send_mail', { forward: '<one@x>', replyTo: '<one@x>', to: ['colleague@example.org'], text: 'x' }))
+      .toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(await errorOf(client, 'send_mail', { forward: '<absent@x>', to: ['colleague@example.org'], text: 'x' })).toMatchObject({ code: 'NOT_FOUND' });
+    expect(box.sent).toHaveLength(1);
+  });
+
+  it('sends nothing when a file cannot be had or the files cannot be listed, and says how to go on', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const working = box.backend.attachment!;
+    box.backend.attachment = async () => { throw new Error('connection reset'); };
+    const client = await connect(state, true, box.backend);
+    const letter = { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI' };
+    const failed = await errorOf(client, 'send_mail', letter);
+    expect(failed).toMatchObject({ code: 'MAILBOX_UNAVAILABLE', message: expect.stringContaining('invoice.pdf') });
+    expect(String(failed['hint'])).toContain('Nothing was sent');
+    expect(box.sent).toEqual([]);
+    expect(state.getMail('k1')?.handledAt).toBeNull();
+
+    box.backend.attachments = async () => { throw new Error('mailbox down'); };
+    forgetLive();
+    const unlisted = await connect(state, true, box.backend);
+    expect(await errorOf(unlisted, 'send_mail', letter)).toMatchObject({ code: 'MAILBOX_UNAVAILABLE', hint: expect.stringContaining('includeAttachments=false') });
+    // Told to go without them, it goes.
+    expect(await call(unlisted, 'send_mail', { ...letter, includeAttachments: false })).toMatchObject({ sent: true, attachments: [] });
+
+    // More than one message may carry.
+    box.backend.attachments = mailbox(state).backend.attachments!;
+    box.backend.attachment = async () => { throw new AttachmentTooLargeError(5); };
+    const large = await connect(state, true, box.backend);
+    expect(await errorOf(large, 'send_mail', { ...letter, text: 'Big one' })).toMatchObject({ code: 'ATTACHMENT_UNSUPPORTED' });
+
+    // Once the files can be had, the same letter is a real attempt, not a repeat of one that did not leave.
+    box.backend.attachment = working;
+    const fine = await connect(state, true, box.backend);
+    expect(await call(fine, 'send_mail', letter)).toMatchObject({ sent: true, attachments: ['invoice.pdf', 'logo.png'] });
+    expect(box.sent).toHaveLength(2);
+  });
+
+  it('forwards without a list of the files when it was asked for none of them', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    box.backend.attachments = async () => { throw new Error('mailbox down'); };
+    const client = await connect(state, true, box.backend);
+    // An empty list asks for no files, as false does: the list that cannot be read is not needed.
+    expect(await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI', includeAttachments: [] }))
+      .toMatchObject({ sent: true, attachments: [] });
+    expect(box.sent[0]).not.toHaveProperty('attachments');
+    expect(box.fetched).toEqual([]);
+  });
+
+  it('forwards with no words of its own, put together as the page puts it together', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    await call(client, 'set_signature', { account: 'me@qq.com', text: 'Alex' });
+    await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: '', includeAttachments: false });
+    expect(box.sent[0]!.text).toMatch(/^-- \nAlex\n\n---------- Forwarded message ----------\nFrom: /);
+    await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: ' \n', includeAttachments: false, signature: false });
+    expect(box.sent[1]!.text).toMatch(/^---------- Forwarded message ----------\n/);
+    // Anything else needs something to say.
+    for (const args of [
+      { replyTo: '<one@x>', text: '' },
+      { account: 'me@qq.com', to: ['friend@example.org'], subject: 'Hi', text: '   ' },
+    ]) {
+      expect(await errorOf(client, 'send_mail', args), JSON.stringify(args)).toMatchObject({ code: 'INVALID_ARGUMENT' });
+    }
+    expect(box.sent).toHaveLength(2);
+  });
+
+  it('forwards from another of the owner\'s mailboxes when told which, signed as that one', async () => {
+    process.env.MAIL_ACCOUNT_2 = 'qq|work@qq.com|pw';
+    const state = seeded();
+    const box = mailbox(state);
+    const from: string[] = [];
+    const send = box.backend.send!;
+    box.backend.send = async (account, mail) => { from.push(account.username); return send(account, mail); };
+    const client = await connect(state, true, box.backend);
+    await call(client, 'set_signature', { account: 'me@qq.com', text: 'Alex, at home' });
+    await call(client, 'set_signature', { account: 'work@qq.com', text: 'Alex Lin, Mailsift Ltd' });
+    const sent = await call(client, 'send_mail', {
+      forward: '<one@x>', from: 'work@qq.com', to: ['colleague@example.org'], text: 'For the team.', includeAttachments: ['2'],
+    });
+    expect(sent).toMatchObject({ sent: true, account: 'work@qq.com', attachments: ['invoice.pdf'] });
+    expect(from).toEqual(['work@qq.com']);
+    expect(box.sent[0]!.text).toMatch(/^For the team\.\n\n-- \nAlex Lin, Mailsift Ltd\n\n---------- Forwarded/);
+    // The files still come from the mailbox the original is in.
+    expect(box.fetched).toEqual(['2']);
+    // The same forward from the mailbox it arrived in is another letter.
+    expect(await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'For the team.', includeAttachments: ['2'] }))
+      .toMatchObject({ sent: true, account: 'me@qq.com' });
+    expect(from).toEqual(['work@qq.com', 'me@qq.com']);
+    expect(box.sent[1]!.text).toContain('-- \nAlex, at home\n');
+    // Only a forward chooses; and only among the owner's mailboxes.
+    expect(await errorOf(client, 'send_mail', { replyTo: '<one@x>', from: 'work@qq.com', text: 'x' })).toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(await errorOf(client, 'send_mail', { forward: '<one@x>', from: 'stranger@qq.com', to: ['colleague@example.org'], text: 'x' }))
+      .toMatchObject({ code: 'ACCOUNT_UNKNOWN' });
+    expect(box.sent).toHaveLength(2);
+  });
+
+  it('counts forwarding among the ways mail is dealt with, where it says what those are', async () => {
+    const client = await connect(seeded(), true);
+    const description = (await client.listTools()).tools.find((t) => t.name === 'needs_you')?.description ?? '';
+    expect(description).toContain('answered or forwarded');
+  });
+
+  it('puts the signature under an answer, above the quote, unless told to leave it out', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    await call(client, 'set_signature', { account: 'me@qq.com', text: 'Alex' });
+    await call(client, 'send_mail', { replyTo: '<one@x>', text: 'Confirmed.' });
+    expect(box.sent[0]!.text).toMatch(/^Confirmed\.\n\n-- \nAlex\n\nOn .* wrote:\n> Please confirm/);
+    await call(client, 'send_mail', { replyTo: '<one@x>', text: 'Confirmed again.', signature: false });
+    expect(box.sent[1]!.text).toMatch(/^Confirmed again\.\n\nOn /);
+    await call(client, 'send_mail', { account: 'me@qq.com', to: ['friend@example.org'], subject: 'Lunch', text: 'Friday?' });
+    expect(box.sent[2]!.text).toBe('Friday?\n\n-- \nAlex');
+    expect(await call(client, 'prepare_reply', { messageId: '<one@x>' })).toMatchObject({ signature: 'Alex' });
+  });
+
+  it('shows each mailbox\'s signature to the caller who may send under it, and lets that caller change it', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const writer = await connect(state, true, box.backend);
+    await call(writer, 'set_signature', { account: 'me@qq.com', text: 'Alex' });
+    expect(((await call(writer, 'list_accounts'))['accounts'] as Array<Record<string, unknown>>)[0]).toMatchObject({ address: 'me@qq.com', signature: 'Alex' });
+    expect(((await call(await connect(state), 'list_accounts'))['accounts'] as Array<Record<string, unknown>>)[0]).not.toHaveProperty('signature');
+    expect(await call(writer, 'set_signature', { account: 'me@qq.com', text: '' })).toEqual({ account: 'me@qq.com', signature: '', removed: true });
+    expect(state.getMeta('signature:me@qq.com')).toBeUndefined();
+    expect(await errorOf(writer, 'set_signature', { account: 'nobody@qq.com', text: 'x' })).toMatchObject({ code: 'ACCOUNT_UNKNOWN' });
+    expect(await errorOf(writer, 'set_signature', { account: 'me@qq.com', text: 'x'.repeat(2001) })).toMatchObject({ code: 'INVALID_ARGUMENT' });
   });
 });
 

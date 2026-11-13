@@ -116,6 +116,27 @@ describe('what the reader gets', () => {
     expect(message.references).toEqual(['<root@team.example>', '<prev@team.example>']);
     // No Date header is not today's date: the page has the stored one.
     expect(message.date).toBeNull();
+    // Everyone is listed, so nothing says the list was cut.
+    expect(message).not.toHaveProperty('toTruncated');
+    expect(message).not.toHaveProperty('ccTruncated');
+  });
+
+  it('lists fifty of a crowd and says there were more, groups included', async () => {
+    const crowd = Array.from({ length: 60 }, (_, n) => `p${n}@list.example`);
+    const message = await parseReadable(eml(
+      'From: Mia <mia@team.example>',
+      `To: ${crowd.slice(0, 30).join(', ')}, Everyone: ${crowd.slice(30).join(', ')};`,
+      `Cc: ${crowd.slice(0, 50).join(', ')}`,
+      'Subject: All hands',
+      '',
+      'ok',
+    ));
+    expect(message.to).toHaveLength(50);
+    expect(message.to.at(-1)).toEqual({ name: '', address: 'p49@list.example' });
+    expect(message.toTruncated).toBe(true);
+    // Exactly fifty is all of them.
+    expect(message.cc).toHaveLength(50);
+    expect(message).not.toHaveProperty('ccTruncated');
   });
 });
 

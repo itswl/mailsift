@@ -1578,6 +1578,11 @@ export class StateStore {
       .run(key, value);
   }
 
+  /** Remove a meta value outright, for a setting that is gone rather than set to nothing. */
+  deleteMeta(key: string): void {
+    this.db.prepare('DELETE FROM meta WHERE key = ?').run(key);
+  }
+
   /**
    * Change a meta value only if it still holds what the caller last read.
    *

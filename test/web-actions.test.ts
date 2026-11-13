@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
 import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
-import { MailActionError, type LiveMessage } from '../src/imap/client.js';
+import { AttachmentTooLargeError, MailActionError, type LiveMessage } from '../src/imap/client.js';
 import { MailboxUnreachableError } from '../src/imap/connection.js';
 import type { ReadableMessage } from '../src/imap/readable.js';
 import { AssistantError } from '../src/services/assistant.js';
@@ -68,10 +68,25 @@ interface Calls {
   appended: number;
   asked: string[];
   drafted: Array<{ text: string; instruction?: string }>;
+  /** Each file a forward read from a mailbox: from which, and within what limit. */
+  fetched: Array<{ account: string; messageId: string; partId: string; limit?: number }>;
 }
 
+/** The original's files, as its mailbox lists them: sizes as encoded. */
+const MANIFEST = {
+  folder: 'INBOX',
+  manifest: {
+    items: [
+      { partId: '2', filename: 'report.pdf', contentType: 'application/pdf', sizeBytes: 1000, transferEncoding: 'base64', inline: false },
+      { partId: '3', filename: 'photo.png', contentType: 'image/png', sizeBytes: 400, transferEncoding: 'base64', inline: true, contentId: 'p3' },
+    ],
+    truncated: false,
+  },
+};
+const FILE_BYTES: Record<string, string> = { '2': 'pdf-bytes', '3': 'png-bytes' };
+
 function backend(overrides: Partial<WebBackend> = {}): { calls: Calls; backend: Partial<WebBackend> } {
-  const calls: Calls = { read: [], readHints: [], actHints: [], act: [], sent: [], appended: 0, asked: [], drafted: [] };
+  const calls: Calls = { read: [], readHints: [], actHints: [], act: [], sent: [], appended: 0, asked: [], drafted: [], fetched: [] };
   const live: LiveMessage = { readable: readable(), folder: 'INBOX', flags: { seen: false, flagged: false, answered: false } };
   return {
     calls,
@@ -86,6 +101,12 @@ function backend(overrides: Partial<WebBackend> = {}): { calls: Calls; backend: 
       send: async (_account, mail) => {
         calls.sent.push(mail);
         return { messageId: '<sent@x>', raw: Buffer.from('raw'), copy: Buffer.from('Bcc: kept\r\nraw'), accepted: mail.to, rejected: [] };
+      },
+      attachments: async () => MANIFEST,
+      attachment: async (account, messageId, partId, _hint, limit) => {
+        calls.fetched.push({ account: account.username, messageId, partId, ...(limit !== undefined ? { limit } : {}) });
+        const metadata = MANIFEST.manifest.items.find((item) => item.partId === partId);
+        return metadata ? { metadata, content: Buffer.from(FILE_BYTES[partId] ?? '') } : undefined;
       },
       appendSent: async () => { calls.appended += 1; return 'Sent'; },
       savesSentCopy: () => true,
@@ -833,6 +854,398 @@ describe('writing', () => {
     expect(refused.json['code']).toBe('assistant_refused');
     // A new message has nothing to answer, so it needs to be told what to say.
     expect((await post(store, '/api/draft', {}, {}, fake)).answer.status).toBe(400);
+  });
+});
+
+describe('signatures', () => {
+  it('keeps one for each mailbox, cleaned, shows it to the session that may send, and records only that it changed', async () => {
+    const store = seeded();
+    const saved = await post(store, '/api/signature', { account: 'me@qq.com', text: '\r\n-- \r\nAlex Lin\r\nMailsift Ltd\t\r\n\r\n' });
+    expect(saved.answer.status).toBe(200);
+    // The delimiter is added when a letter is put together, so it is not kept twice.
+    expect(saved.json).toEqual({ account: 'me@qq.com', signature: 'Alex Lin\nMailsift Ltd' });
+    expect(store.listMcpAudit(5).find((row) => row.action === 'web:signature')).toMatchObject({ success: true, target: 'me@qq.com' });
+    expect(JSON.stringify(store.listMcpAudit(10))).not.toContain('Alex');
+
+    const write = await call(store, '/api/summary');
+    expect(write.json['accounts']).toEqual([expect.objectContaining({ address: 'me@qq.com', signature: 'Alex Lin\nMailsift Ltd' })]);
+    expect(write.json['limits']).toEqual({ attachmentBytes: 20 * 1024 * 1024, attachmentFiles: 20, signatureChars: 2000 });
+    const read = await call(store, '/api/summary', { as: 'read' });
+    expect((read.json['accounts'] as Array<Record<string, unknown>>)[0]).not.toHaveProperty('signature');
+
+    // An answer carries the signature of the mailbox it leaves from, to the session that may send it.
+    expect((await call(store, '/api/reply?key=k1')).json['signature']).toBe('Alex Lin\nMailsift Ltd');
+    expect((await call(store, '/api/reply?key=k1', { as: 'read' })).json).not.toHaveProperty('signature');
+
+    // Empty text removes it.
+    expect((await post(store, '/api/signature', { account: 'me@qq.com', text: ' \n\t' })).json).toEqual({ account: 'me@qq.com', signature: '' });
+    expect(store.getMeta('signature:me@qq.com')).toBeUndefined();
+    expect((await call(store, '/api/summary')).json['accounts']).toEqual([expect.objectContaining({ signature: '' })]);
+  });
+
+  it('refuses a read session, an unknown mailbox, and a signature longer than a signature', async () => {
+    const store = seeded();
+    const refused = await post(store, '/api/signature', { account: 'me@qq.com', text: 'x' }, { as: 'read' });
+    expect(refused.answer.status).toBe(403);
+    expect(refused.json['code']).toBe('readOnly');
+    expect((await post(store, '/api/signature', { account: 'nobody@x.org', text: 'x' })).json['code']).toBe('unconfigured');
+    expect((await post(store, '/api/signature', { text: 'x' })).answer.status).toBe(400);
+    expect((await post(store, '/api/signature', { account: 'me@qq.com', text: 42 })).answer.status).toBe(400);
+    const long = await post(store, '/api/signature', { account: 'me@qq.com', text: 'x'.repeat(2001) });
+    expect(long.answer.status).toBe(400);
+    expect(long.json).toMatchObject({ code: 'signature_too_long', maxChars: 2000 });
+    expect(store.getMeta('signature:me@qq.com')).toBeUndefined();
+    // Characters as a person counts them: two thousand that each take two code units fit.
+    const wide = '\u{1F600}'.repeat(2000);
+    expect((await post(store, '/api/signature', { account: 'me@qq.com', text: wide })).answer.status).toBe(200);
+    expect(store.getMeta('signature:me@qq.com')).toBe(wide);
+  });
+});
+
+describe('carrying files', () => {
+  const b64 = (value: string | Buffer): string => Buffer.from(value).toString('base64');
+  const letter = { account: 'me@qq.com', to: ['a@b.co'], subject: 's', text: 't' };
+
+  it('sends what was attached, decoded, under a clean name and type, with the Bcc it was given', async () => {
+    const store = seeded();
+    const fake = backend();
+    const bytes = Buffer.from([0, 1, 2, 13, 10, 255]);
+    const { answer } = await post(store, '/api/send', {
+      ...letter, bcc: ['quiet@b.co'],
+      attachments: [
+        { name: 'C:\\Users\\me\\Q3 report.pdf', type: 'application/PDF', data: bytes.toString('base64') },
+        { name: '', type: 'text/html; charset=utf-8', data: b64('<p>hi</p>') },
+        { name: 'empty.txt', type: 'text/plain', data: '' },
+      ],
+    }, {}, fake);
+    expect(answer.status).toBe(200);
+    expect(fake.calls.sent[0]!.bcc).toEqual(['quiet@b.co']);
+    expect(fake.calls.sent[0]!.attachments).toEqual([
+      { filename: 'Q3 report.pdf', content: bytes, contentType: 'application/pdf' },
+      { filename: 'attachment', content: Buffer.from('<p>hi</p>'), contentType: 'application/octet-stream' },
+      { filename: 'empty.txt', content: Buffer.alloc(0), contentType: 'text/plain' },
+    ]);
+    // On record as any send is: that it left, never what it carried or to whom.
+    expect(JSON.stringify(store.listMailActions(5))).not.toMatch(/report|quiet|a@b\.co/);
+  });
+
+  it('refuses a file that is not cleanly encoded, or not a file at all, and sends nothing', async () => {
+    const store = seeded();
+    const fake = backend();
+    for (const data of ['abc', 'ab$=', 'YQ', 'YR==', 'YWJj\nZGVm', 'Y Q==']) {
+      const { answer, json } = await post(store, '/api/send', { ...letter, attachments: [{ name: 'n.txt', type: 'text/plain', data }] }, {}, fake);
+      expect(answer.status, data).toBe(400);
+      expect(json, data).toMatchObject({ code: 'send_attachment_invalid', file: 'n.txt' });
+    }
+    for (const attachments of ['one', [{ name: 'n.txt' }], ['YQ=='], [null]]) {
+      expect((await post(store, '/api/send', { ...letter, attachments }, {}, fake)).answer.status, JSON.stringify(attachments)).toBe(400);
+    }
+    expect(fake.calls.sent).toEqual([]);
+  });
+
+  it('holds a letter to the number of files and their size, and says the limit', async () => {
+    const store = seeded();
+    const fake = backend();
+    process.env.SMTP_ATTACHMENT_MAX_BYTES = '10';
+    const file = (bytes: number) => ({ name: 'f.bin', type: 'application/octet-stream', data: Buffer.alloc(bytes).toString('base64') });
+    const big = await post(store, '/api/send', { ...letter, attachments: [file(6), file(5)] }, {}, fake);
+    expect(big.answer.status).toBe(413);
+    expect(big.json).toMatchObject({ code: 'send_too_large', maxBytes: 10, maxFiles: 20 });
+    expect(String(big.json['error'])).toContain('10 bytes');
+    delete process.env.SMTP_ATTACHMENT_MAX_BYTES;
+    const many = await post(store, '/api/send', { ...letter, attachments: Array.from({ length: 21 }, () => file(1)) }, {}, fake);
+    expect(many.answer.status).toBe(413);
+    expect(many.json).toMatchObject({ code: 'send_too_large', maxFiles: 20 });
+    expect(String(many.json['error'])).toContain('at most 20 files');
+    expect(fake.calls.sent).toEqual([]);
+    process.env.SMTP_ATTACHMENT_MAX_BYTES = '10';
+    expect((await post(store, '/api/send', { ...letter, attachments: [file(5), file(5)] }, {}, fake)).answer.status).toBe(200);
+    expect(fake.calls.sent).toHaveLength(1);
+  });
+
+  it('waits for a letter with files as long as they take to travel, and no longer for one without', async () => {
+    vi.useFakeTimers();
+    try {
+      const store = seeded();
+      let taken: (sent: SentMail) => void = () => undefined;
+      const filed: number[] = [];
+      const fake = backend({
+        send: () => new Promise<SentMail>((resolve) => { taken = resolve; }),
+        savesSentCopy: () => false,
+        // Filing a large copy takes longer than a plain one would be given.
+        appendSent: (_account, raw) => new Promise((resolve) => {
+          filed.push(raw.length);
+          setTimeout(() => resolve('Sent'), 40_000);
+        }),
+      });
+      const file = { name: 'scan.pdf', type: 'application/pdf', data: Buffer.alloc(4 * 1024 * 1024).toString('base64') };
+      const waiting = post(store, '/api/send', { ...letter, id: 'big-letter-1', attachments: [file] }, {}, fake, 'big');
+      // Past the minute a plain letter is given, it is still waited for.
+      await vi.advanceTimersByTimeAsync(61_000);
+      let settled = false;
+      void waiting.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(false);
+      taken({ messageId: '<big@x>', raw: Buffer.alloc(10), copy: Buffer.alloc(6 * 1024 * 1024), accepted: ['a@b.co'], rejected: [] });
+      await vi.advanceTimersByTimeAsync(41_000);
+      const done = await waiting;
+      expect(done.answer.status).toBe(200);
+      // The copy took forty seconds and was still waited for, as a large one is.
+      expect(done.json).toMatchObject({ sent: true, messageId: '<big@x>', savedCopy: true });
+      expect(filed).toEqual([6 * 1024 * 1024]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('gives a forward the time its files take once it has read them', async () => {
+    vi.useFakeTimers();
+    try {
+      const store = seeded();
+      let taken: (sent: SentMail) => void = () => undefined;
+      const big = Buffer.alloc(8 * 1024 * 1024);
+      const fake = backend({
+        // Reading the files takes a while, then the server is slow to take them.
+        attachment: (_account, _messageId, partId) => new Promise((resolve) => {
+          setTimeout(() => resolve({ metadata: MANIFEST.manifest.items.find((item) => item.partId === partId)!, content: big }), 80_000);
+        }),
+        send: () => new Promise<SentMail>((resolve) => { taken = resolve; }),
+      });
+      const waiting = post(store, '/api/send', {
+        id: 'big-forward-1', forwardOf: 'k1', forwardAttachments: ['2'], to: ['colleague@example.org'], subject: 'Fwd', text: 'FYI',
+      }, {}, fake, 'forwarding');
+      // Read after eighty seconds; then a minute, and the time eight megabytes take, twice, from there.
+      await vi.advanceTimersByTimeAsync(80_000 + 120_000);
+      let settled = false;
+      void waiting.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(false);
+      taken({ messageId: '<fwd@x>', raw: Buffer.alloc(10), copy: Buffer.alloc(10), accepted: ['colleague@example.org'], rejected: [] });
+      await vi.advanceTimersByTimeAsync(10);
+      expect((await waiting).json).toMatchObject({ sent: true, messageId: '<fwd@x>' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('says the limit when the request is larger than any letter may be, rather than calling it malformed', async () => {
+    const store = seeded();
+    const fake = backend();
+    const huge = JSON.stringify({ ...letter, attachments: [{ name: 'big.bin', data: 'A'.repeat(29 * 1024 * 1024) }] });
+    const { answer, json } = await post(store, '/api/send', huge, {}, fake);
+    expect(answer.status).toBe(413);
+    expect(json).toMatchObject({ code: 'send_too_large', maxBytes: 20 * 1024 * 1024 });
+    expect(fake.calls.sent).toEqual([]);
+  });
+});
+
+describe('forwarding', () => {
+  it('starts a forward from the message as the mailbox has it, offering its files', async () => {
+    const store = seeded();
+    const fake = backend();
+    const draft = await call(store, '/api/forward?key=k1', {}, fake);
+    expect(draft.answer.status).toBe(200);
+    expect(draft.json).toMatchObject({
+      key: 'k1', account: 'me@qq.com', accountName: 'personal', subject: 'Fwd: subject k1', canSend: true, signature: '',
+      // Sizes as they will be once decoded, a little over rather than under.
+      attachments: [
+        { partId: '2', filename: 'report.pdf', contentType: 'application/pdf', size: 750, inline: false },
+        { partId: '3', filename: 'photo.png', contentType: 'image/png', size: 300, inline: true },
+      ],
+    });
+    expect(draft.json).not.toHaveProperty('attachmentsUnavailable');
+    const block = String(draft.json['forwarded']).split('\n');
+    expect(block).toEqual([
+      '---------- Forwarded message ----------',
+      'From: Vendor <billing@vendor.com>',
+      expect.stringMatching(/^Date: /),
+      'Subject: subject k1',
+      'To: me@qq.com',
+      'Cc: Ann <ann@vendor.com>',
+      '',
+      'Hello',
+    ]);
+    // A forward starts a conversation of its own.
+    expect(draft.json).not.toHaveProperty('inReplyTo');
+    expect(draft.json).not.toHaveProperty('references');
+    // Worded in the language asked for, else the page's.
+    expect(String((await call(store, '/api/forward?key=k1&language=zh-CN', {}, fake)).json['forwarded']))
+      .toContain('---------- 转发的邮件 ----------');
+    const forbidden = await call(store, '/api/forward?key=k1', { as: 'read' }, fake);
+    expect(forbidden.answer.status).toBe(403);
+    expect(forbidden.json['code']).toBe('readOnly');
+    expect((await call(store, '/api/forward?key=absent', {}, fake)).answer.status).toBe(404);
+  });
+
+  it('still offers the forward when its files cannot be listed, and says so', async () => {
+    const store = seeded();
+    for (const attachments of [async () => { throw new Error('mailbox down'); }, async () => undefined]) {
+      forgetLive();
+      const draft = await call(store, '/api/forward?key=k1', {}, backend({ attachments }));
+      expect(draft.answer.status).toBe(200);
+      expect(draft.json).toMatchObject({ subject: 'Fwd: subject k1', attachments: [], attachmentsUnavailable: true });
+    }
+  });
+
+  it('sends a forward as a new conversation, with the original\'s files read from its mailbox, and counts the original dealt with', async () => {
+    const store = seeded();
+    const fake = backend();
+    const { answer, json } = await post(store, '/api/send', {
+      forwardOf: 'k1', forwardAttachments: ['3', '2', '3'], to: ['colleague@example.org'], subject: 'Fwd: subject k1',
+      text: 'FYI', references: ['<root@x>'], attachments: [{ name: 'note.txt', type: 'text/plain', data: Buffer.from('mine').toString('base64') }],
+    }, {}, fake, 'forwarder');
+    expect(answer.status).toBe(200);
+    expect(json).toMatchObject({ sent: true, messageId: '<sent@x>', attention: 1 });
+    const sent = fake.calls.sent[0]!;
+    expect(sent).toMatchObject({ to: ['colleague@example.org'], subject: 'Fwd: subject k1', text: 'FYI' });
+    expect(sent).not.toHaveProperty('inReplyTo');
+    expect(sent).not.toHaveProperty('references');
+    expect(sent.attachments!.map((file) => [file.filename, file.contentType, file.content.toString()])).toEqual([
+      ['note.txt', 'text/plain', 'mine'], ['photo.png', 'image/png', 'png-bytes'], ['report.pdf', 'application/pdf', 'pdf-bytes'],
+    ]);
+    // Each part once, from the original's own mailbox, within what the letter may still carry.
+    const room = 20 * 1024 * 1024 - 4;
+    expect(fake.calls.fetched).toEqual([
+      { account: 'me@qq.com', messageId: '<one@x>', partId: '3', limit: room },
+      { account: 'me@qq.com', messageId: '<one@x>', partId: '2', limit: room - 'png-bytes'.length },
+    ]);
+    expect(store.getMail('k1')?.handledAt).toBeTruthy();
+    // Passed on, not answered: the mailbox is not told it was answered.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(fake.calls.act).toEqual([]);
+    const rows = store.listMailActions(5);
+    expect(rows.find((row) => row.action === 'send')).toMatchObject({ success: true, account: 'me@qq.com', client: 'forwarder' });
+    expect(JSON.stringify(rows)).not.toMatch(/report|photo|colleague/);
+  });
+
+  it('leaves from another mailbox when asked, and still reads the files from the one the original is in', async () => {
+    process.env.MAIL_ACCOUNT_2 = 'qq|work@qq.com|pw';
+    const store = seeded();
+    const fake = backend();
+    const sentFrom: string[] = [];
+    const send = fake.backend.send!;
+    fake.backend.send = async (account, mail) => { sentFrom.push(account.username); return send(account, mail); };
+    const { answer } = await post(store, '/api/send', {
+      forwardOf: 'k1', forwardAttachments: ['2'], account: 'work@qq.com', to: ['colleague@example.org'], subject: 'Fwd', text: 'FYI',
+    }, {}, fake);
+    expect(answer.status).toBe(200);
+    expect(sentFrom).toEqual(['work@qq.com']);
+    expect(fake.calls.fetched.map((entry) => entry.account)).toEqual(['me@qq.com']);
+    // Without account it leaves from where the original arrived.
+    await post(store, '/api/send', { forwardOf: 'k2', to: ['colleague@example.org'], subject: 'Fwd', text: 'FYI' }, {}, fake);
+    expect(sentFrom).toEqual(['work@qq.com', 'me@qq.com']);
+    expect(fake.calls.sent[1]).not.toHaveProperty('attachments');
+  });
+
+  it('sends nothing when one of its files cannot be had, names it, and lets the letter be tried again', async () => {
+    const store = seeded();
+    const forward = { id: 'forward-0001', forwardOf: 'k1', forwardAttachments: ['3', '2'], to: ['colleague@example.org'], subject: 'Fwd', text: 'FYI' };
+    const broken = backend({
+      attachment: async (_account, _messageId, partId) => {
+        if (partId === '2') throw new Error('connection reset');
+        return { metadata: MANIFEST.manifest.items[1]!, content: Buffer.from('png-bytes') };
+      },
+    });
+    const failed = await post(store, '/api/send', forward, {}, broken);
+    expect(failed.answer.status).toBe(502);
+    expect(failed.json).toMatchObject({ code: 'forward_attachment_unavailable', file: 'report.pdf' });
+    expect(String(failed.json['error'])).toMatch(/report\.pdf.*nothing was sent/);
+    expect(broken.calls.sent).toEqual([]);
+    expect(store.getMail('k1')?.handledAt).toBeNull();
+    expect(store.listMailActions(1)[0]).toMatchObject({ action: 'send', success: false, error: 'forward_attachment' });
+
+    const gone = await post(store, '/api/send', { ...forward, id: undefined },
+      {}, backend({ attachment: async () => undefined }));
+    expect(gone.answer.status).toBe(404);
+    expect(gone.json).toMatchObject({ code: 'forward_attachment_unavailable' });
+    const unknown = await post(store, '/api/send', { ...forward, id: undefined, forwardAttachments: ['9'] });
+    expect(unknown.answer.status).toBe(404);
+    expect(String(unknown.json['error'])).toContain('no attachment 9');
+    const unlisted = await post(store, '/api/send', { ...forward, id: undefined }, {}, backend({ attachments: async () => { throw new Error('down'); } }));
+    expect(unlisted.answer.status).toBe(502);
+    const tooBig = await post(store, '/api/send', { ...forward, id: undefined }, {}, backend({
+      attachment: async () => { throw new AttachmentTooLargeError(10); },
+    }));
+    expect(tooBig.answer.status).toBe(413);
+    expect(tooBig.json).toMatchObject({ code: 'send_too_large', file: 'photo.png' });
+
+    // Nothing left under that name, so the same letter, asked for again, is a real attempt.
+    const fine = backend();
+    expect((await post(store, '/api/send', forward, {}, fine)).json).toMatchObject({ sent: true });
+    expect(fine.calls.sent).toHaveLength(1);
+  });
+
+  it('refuses a forward to an address that is not one before reading any of its files', async () => {
+    const store = seeded();
+    const fake = backend();
+    for (const to of [['bob@example'], [], ['Ann <ann@example.org>']]) {
+      const refused = await post(store, '/api/send', {
+        forwardOf: 'k1', forwardAttachments: ['2', '3'], to, subject: 'Fwd', text: 'FYI',
+      }, {}, fake, 'typo');
+      expect(refused.answer.status, JSON.stringify(to)).toBe(400);
+      expect(refused.json['code']).toBe('send_invalid');
+    }
+    expect(fake.calls.fetched).toEqual([]);
+    expect(fake.calls.sent).toEqual([]);
+    expect(store.getMail('k1')?.handledAt).toBeNull();
+    // Refused before it was a send, it spent none of this client's: ten real ones still go.
+    for (let n = 0; n < 10; n += 1) {
+      expect((await post(store, '/api/send', { account: 'me@qq.com', to: ['a@b.co'], subject: 's', text: 't' }, {}, fake, 'typo')).answer.status)
+        .toBe(200);
+    }
+  });
+
+  it('says when the original went to more people than its forward can list', async () => {
+    const store = seeded();
+    const crowd = Array.from({ length: 50 }, (_, n) => ({ name: '', address: `p${n}@list.example` }));
+    const live: LiveMessage = {
+      readable: readable({ to: crowd, toTruncated: true, cc: [] }), folder: 'INBOX', flags: { seen: false, flagged: false, answered: false },
+    };
+    const draft = await call(store, '/api/forward?key=k1', {}, backend({ read: async () => live }));
+    const to = String(draft.json['forwarded']).split('\n').find((line) => line.startsWith('To: '))!;
+    expect(to.endsWith('p49@list.example, …')).toBe(true);
+    expect(String(draft.json['forwarded'])).not.toMatch(/^Cc:/m);
+  });
+
+  it('sends a forwarded text file in the character set its bytes are in, and no other label', async () => {
+    const store = seeded();
+    const gb = Buffer.from([0xc4, 0xe3, 0xba, 0xc3]);
+    const notes = { partId: '4', filename: 'notes.txt', contentType: 'text/plain', sizeBytes: 4, inline: false };
+    const listed = { folder: 'INBOX', manifest: { items: [...MANIFEST.manifest.items, notes], truncated: false } };
+    const fake = backend({
+      attachments: async () => listed,
+      attachment: async (_account, _messageId, partId) => {
+        if (partId === '4') return { metadata: notes, content: gb, charset: 'gb18030' };
+        // A charset on a file that is not text, or one that is not a name, is not passed on.
+        if (partId === '2') return { metadata: MANIFEST.manifest.items[0]!, content: Buffer.from('pdf'), charset: 'utf-8' };
+        return { metadata: MANIFEST.manifest.items[1]!, content: Buffer.from('png'), charset: 'utf-8\r\nX: 1' };
+      },
+    });
+    const { answer } = await post(store, '/api/send', {
+      forwardOf: 'k1', forwardAttachments: ['4', '2'], to: ['colleague@example.org'], subject: 'Fwd', text: 'FYI',
+    }, {}, fake);
+    expect(answer.status).toBe(200);
+    expect(fake.calls.sent[0]!.attachments).toEqual([
+      { filename: 'notes.txt', content: gb, contentType: 'text/plain', charset: 'gb18030' },
+      { filename: 'report.pdf', content: Buffer.from('pdf'), contentType: 'application/pdf' },
+    ]);
+  });
+
+  it('refuses what a forward cannot be', async () => {
+    const store = seeded();
+    const fake = backend();
+    const base = { to: ['colleague@example.org'], subject: 'Fwd', text: 'FYI' };
+    expect((await post(store, '/api/send', { ...base, forwardOf: 'k1', replyTo: 'k1' }, {}, fake)).answer.status).toBe(400);
+    expect((await post(store, '/api/send', { ...base, account: 'me@qq.com', forwardAttachments: ['2'] }, {}, fake)).answer.status).toBe(400);
+    expect((await post(store, '/api/send', { ...base, forwardOf: 'k1', forwardAttachments: ['../2'] }, {}, fake)).answer.status).toBe(400);
+    expect((await post(store, '/api/send', { ...base, forwardOf: 'k1', forwardAttachments: '2' }, {}, fake)).answer.status).toBe(400);
+    expect((await post(store, '/api/send', { ...base, forwardOf: 'absent' }, {}, fake)).answer.status).toBe(404);
+    const crowd = Array.from({ length: 21 }, (_, n) => `${n + 1}`);
+    const many = await post(store, '/api/send', { ...base, forwardOf: 'k1', forwardAttachments: crowd }, {}, fake);
+    expect(many.answer.status).toBe(413);
+    expect(many.json['code']).toBe('send_too_large');
+    expect(fake.calls.sent).toEqual([]);
+    expect(fake.calls.fetched).toEqual([]);
   });
 });
 

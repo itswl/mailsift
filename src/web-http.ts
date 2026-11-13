@@ -154,6 +154,14 @@ export function crossSite(req: IncomingMessage): boolean {
   }
 }
 
+/** A body over the limit it was read with. */
+export class BodyTooLargeError extends Error {
+  override name = 'BodyTooLargeError';
+  constructor(readonly limit: number) {
+    super('request body too large');
+  }
+}
+
 /** Read a bounded request body; anything larger is refused outright. */
 export async function readBody(req: IncomingMessage, limit = 4096): Promise<string> {
   let size = 0;
@@ -161,19 +169,37 @@ export async function readBody(req: IncomingMessage, limit = 4096): Promise<stri
   for await (const chunk of req) {
     const buf = chunk as Buffer;
     size += buf.length;
-    if (size > limit) throw new Error('request body too large');
+    if (size > limit) throw new BodyTooLargeError(limit);
     chunks.push(buf);
   }
   return Buffer.concat(chunks).toString('utf8');
 }
 
+const objectOf = (raw: string): Record<string, unknown> | undefined => {
+  const parsed: unknown = JSON.parse(raw);
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+};
+
 /** A JSON object body, or undefined when it is absent, oversized or not an object. */
 export async function readJson(req: IncomingMessage, limit = 16 * 1024): Promise<Record<string, unknown> | undefined> {
   try {
-    const parsed: unknown = JSON.parse(await readBody(req, limit));
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+    return objectOf(await readBody(req, limit));
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * As readJson, for a route that answers a body too large differently from
+ * one that is malformed: a letter with too much attached is told the limit.
+ */
+export async function readJsonOrSize(
+  req: IncomingMessage, limit: number,
+): Promise<{ body: Record<string, unknown> | undefined; tooLarge: boolean }> {
+  try {
+    return { body: objectOf(await readBody(req, limit)), tooLarge: false };
+  } catch (error) {
+    return { body: undefined, tooLarge: error instanceof BodyTooLargeError };
   }
 }
 

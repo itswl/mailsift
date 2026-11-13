@@ -11,7 +11,7 @@ const fake = vi.hoisted(() => {
   interface FakeMessage {
     uid: number; messageId: string; source: Buffer; flags: Set<string>; size?: number;
     /** Body parts by part id, decoded, for a message that is read part by part. */
-    parts?: Record<string, { type: string; content: Buffer; filename?: string }>;
+    parts?: Record<string, { type: string; content: Buffer; filename?: string; charset?: string }>;
   }
   const server = {
     folders: [] as FakeFolder[],
@@ -156,14 +156,23 @@ const fake = vi.hoisted(() => {
       return message ? this.shape(message, query) : false;
     }
 
-    /** One part, decoded, as a stream; the real client converts text to UTF-8 the same way. */
-    async download(uid: number, part: string, options?: { maxBytes?: number }): Promise<{ content?: AsyncIterable<Buffer> & { destroy: () => void } }> {
+    /**
+     * One part, decoded, as a stream; the real client converts text to UTF-8 the same way. Asked
+     * not to (decodeText: false), it hands over the part as stored, with the character set it is in.
+     */
+    async download(
+      uid: number, part: string, options?: { maxBytes?: number; decodeText?: boolean },
+    ): Promise<{ meta?: { contentType: string; charset?: string }; content?: AsyncIterable<Buffer> & { destroy: () => void } }> {
       const message = this.here().find((m) => m.uid === Number(uid));
       const body = message?.parts?.[part];
-      server.calls.push(`download ${part}`);
+      server.calls.push(`download ${part}${options?.decodeText === false ? ' as stored' : ''}`);
       if (!body) return {};
       const content = body.content.subarray(0, options?.maxBytes ?? body.content.length);
-      return { content: Object.assign((async function* () { yield content; })(), { destroy: () => undefined }) };
+      const stored = options?.decodeText === false && body.charset;
+      return {
+        meta: { contentType: body.type, ...(stored ? { charset: body.charset } : body.charset ? { charset: 'utf-8' } : {}) },
+        content: Object.assign((async function* () { yield content; })(), { destroy: () => undefined }),
+      };
     }
 
     async messageFlagsAdd(range: number[], flags: string[]): Promise<boolean> {
@@ -219,12 +228,13 @@ import {
   stopConnecting, warmSession, withSession,
 } from '../src/imap/connection.js';
 import {
-  appendToSent, applyWebMailAction, connect, connectAttempts, fetchAttachmentManifestByMessageId,
+  appendToSent, applyWebMailAction, connect, connectAttempts, fetchAttachmentByMessageId, fetchAttachmentManifestByMessageId,
   fetchByMessageId, fetchReadableByMessageId, imapErrorText, inspectMailSafety, isOversizedLookback, isTransientConnectError,
   MAIL_ACTIONS, MailActionError, orderLookupFolders, resolveActionDestination, retryDelayMs, selectFetchUids,
   sentFolderPath, WEB_MAIL_ACTIONS,
 } from '../src/imap/client.js';
 import { resolveFolders } from '../src/imap/folders.js';
+import { defaultBackend } from '../src/web-actions.js';
 import type { ListResponse } from 'imapflow';
 import type { Account } from '../src/config.js';
 
@@ -308,7 +318,9 @@ const source = (id: string, body = 'Hello there.'): Buffer => Buffer.from([
 
 function put(
   folder: string, id: string,
-  options: { uid?: number; flags?: string[]; size?: number; parts?: Record<string, { type: string; content: Buffer; filename?: string }> } = {},
+  options: {
+    uid?: number; flags?: string[]; size?: number; parts?: Record<string, { type: string; content: Buffer; filename?: string; charset?: string }>;
+  } = {},
 ): void {
   const list = fake.server.mail.get(folder) ?? [];
   list.push({
@@ -463,6 +475,27 @@ describe('reading one message live', () => {
     expect(fake.server.calls.filter((call) => call.startsWith('source'))).toEqual([]);
     expect(fake.server.calls.filter((call) => call.startsWith('download'))).toEqual(['download 1', 'download 2']);
     expect(fake.server.calls.filter((call) => call.startsWith('lock'))).toEqual(['lock INBOX ro']);
+  });
+
+  it('reads a file a forward sends on as the sender attached it, in the character set it is in', async () => {
+    // "你好" in GB18030, as a text file with no disposition, which a reader would turn into UTF-8.
+    const gb = Buffer.from([0xc4, 0xe3, 0xba, 0xc3, 0x0d, 0x0a]);
+    put('INBOX', '<files@x>', {
+      parts: {
+        '1': { type: 'text/plain', content: Buffer.from('See the notes.') },
+        '2': { type: 'text/plain', content: gb, filename: 'notes.txt', charset: 'gb18030' },
+      },
+    });
+    const forwarded = await defaultBackend.attachment(ME, '<files@x>', '2', undefined, 1000);
+    expect(forwarded?.content.equals(gb)).toBe(true);
+    expect(forwarded?.charset).toBe('gb18030');
+    expect(fake.server.calls).toContain('download 2 as stored');
+    // Read here rather than sent on (the page's download, MCP's resource), it is read as before.
+    fake.server.calls = [];
+    const read = await fetchAttachmentByMessageId(ME, '<files@x>', '2');
+    expect(read).not.toHaveProperty('charset');
+    expect(fake.server.calls).toContain('download 2');
+    expect(fake.server.calls).not.toContain('download 2 as stored');
   });
 
   it('reads a message of ordinary size whole, once it knows it is the right one', async () => {

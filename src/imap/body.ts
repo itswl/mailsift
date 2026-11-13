@@ -42,10 +42,11 @@ const ORIGINAL_MESSAGE =
 /**
  * A forward's header block looks exactly like a quoted Outlook block. The
  * content of a forward is usually the point of the message, so this marker
- * protects the header lines that follow it.
+ * protects the header lines that follow it. "转发的邮件" is the one mailsift
+ * writes itself (see forwardEnvelope in smtp.ts).
  */
 const FORWARDED_MESSAGE =
-  /^\s*[-_=]{2,}\s*(?:Forwarded\s+message|Weitergeleitete\s+Nachricht|Message\s+transféré|Mensaje\s+reenviado|Doorgestuurd\s+bericht|转发邮件|轉發郵件|已转发邮件|已轉發郵件)[^-_=]*[-_=]{2,}\s*$/i;
+  /^\s*[-_=]{2,}\s*(?:Forwarded\s+message|Weitergeleitete\s+Nachricht|Message\s+transféré|Mensaje\s+reenviado|Doorgestuurd\s+bericht|转发邮件|轉發郵件|转发的邮件|轉發的郵件|已转发邮件|已轉發郵件)[^-_=]*[-_=]{2,}\s*$/i;
 
 /** Outlook header lines. `\W{0,2}` allows the `*From:*` left by bold-to-text conversion. */
 const HDR_FROM = /^\W{0,2}(?:From|Von|De|Van|发件人|發件人)\s*[:：]/i;

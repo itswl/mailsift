@@ -98,7 +98,7 @@ Set `WEB_UI_ENABLED=true` and open `http://<host>:8410/` (the `MCP_PORT`). Sign 
 
 - **What needs you** comes first: mail judged important that you have not dealt with. Tick it off, swipe it away, or open it.
 - **Read** a message as it was sent. Remote images wait until you ask, tracking pixels are dropped, a link that goes somewhere other than it says is marked, and your provider's verdict on the sender is shown.
-- **Act**: done, archive, bin, star, not spam. Reply or write a new message, with a first draft from the model if you want one and five seconds to undo a send.
+- **Act**: done, archive, bin, star, not spam. Reply, forward or write a new message, with Cc and Bcc, attachments (pasted pictures too), a signature for each mailbox, a first draft from the model if you want one and five seconds to undo a send.
 - **Ask** a question across your mail and get an answer that cites the messages it came from.
 - **Codes** are set large and copy on tap. On a phone, the **Latest code** home-screen shortcut opens on the newest one and waits for one still on its way.
 - **Notifications** on your phone or desktop for codes and important mail, and a list that updates as mail is judged.
@@ -110,7 +110,7 @@ Docker publishes the port on the host's loopback address only. To reach it from 
 
 ## MCP
 
-The MCP server runs inside mailsift at `http://127.0.0.1:8410/mcp` (Streamable HTTP, `Authorization: Bearer <MCP_TOKEN>`). Add it to an MCP client and an assistant can see what needs you, list, search and read your triaged mail, preview the digest, or check mailbox health. It also ships the workflows those tools are meant to be used in, as prompts: catch up on the mailbox, or work out why something never reached you. It is read-only; a separate `MCP_WRITE_TOKEN` gives an assistant what the web view's owner has: marking mail done, filing and binning it, and sending mail, all audited. Give that token only to a client you would hand your mailbox to. An agent that supports skills can load [.agents/skills/mailsift/SKILL.md](.agents/skills/mailsift/SKILL.md). See [docs/mcp.md](docs/mcp.md).
+The MCP server runs inside mailsift at `http://127.0.0.1:8410/mcp` (Streamable HTTP, `Authorization: Bearer <MCP_TOKEN>`). Add it to an MCP client and an assistant can see what needs you, list, search and read your triaged mail, preview the digest, or check mailbox health. It also ships the workflows those tools are meant to be used in, as prompts: catch up on the mailbox, or work out why something never reached you. It is read-only; a separate `MCP_WRITE_TOKEN` gives an assistant what the web view's owner has: marking mail done, filing and binning it, and sending and forwarding mail, all audited. Give that token only to a client you would hand your mailbox to. An agent that supports skills can load [.agents/skills/mailsift/SKILL.md](.agents/skills/mailsift/SKILL.md). See [docs/mcp.md](docs/mcp.md).
 
 ## Everyday commands
 
