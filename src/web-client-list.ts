@@ -88,6 +88,18 @@ function ringButton(m) {
   b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); complete(rowKey(m), b.closest('li.row')); };
   return b;
 }
+// The check on a row that was dealt with is the way back: pressing it says
+// the message is not done after all.
+function doneButton(m) {
+  const b = el('button', 'mark done');
+  b.type = 'button';
+  b.title = t('queue.undone');
+  b.setAttribute('aria-label', t('queue.undone'));
+  b.setAttribute('aria-pressed', 'true');
+  b.appendChild(icon('i-check'));
+  b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); complete(rowKey(m), b.closest('li.row'), true); };
+  return b;
+}
 // A row of the queue is not under a day's heading, so its time says the day
 // when that is not today.
 function whenQueued(m, now) {
@@ -110,10 +122,7 @@ function rowOf(item, now, queued) {
     enableSwipe(li, rowKey(m));
   } else if (m.handledAt) {
     li.classList.add('handled');
-    const done = el('span', 'mark done');
-    done.appendChild(icon('i-check'));
-    done.title = t('row.handled');
-    li.appendChild(done);
+    li.appendChild(doneButton(m));
   } else li.appendChild(el('span', 'mark ' + level(m)));
   const who = highlightInto(el('a', 'who'), m.senderName || m.sender || t('unknownSender'));
   who.href = '#m=' + encodeURIComponent(key);
@@ -157,6 +166,7 @@ function markHandledLocal(key, at) {
   const touch = (m) => { if (m && rowKey(m) === key) m.handledAt = at; };
   for (const m of lastMail || []) touch(m);
   for (const m of attention || []) touch(m);
+  for (const m of doneRecent) touch(m);
   for (const th of lastThreads || []) { touch(th.latest); for (const m of th.messages || []) touch(m); }
   touch(extraRows.get(key));
 }
@@ -189,6 +199,7 @@ function holdPending() {
 function unfade(key) {
   nodeCache.delete('q:' + key);
   nodeCache.delete('s:' + key);
+  nodeCache.delete('d:' + key);
   for (const row of document.querySelectorAll('li.row.completing')) row.classList.remove('completing');
 }
 // Whether the reader is showing this message: by its own key, or as the
@@ -211,6 +222,18 @@ async function complete(key, li, undo) {
   if (!handled && completed.has(key) && !attentionSet.has(key)) {
     attention = [completed.get(key)].concat(attention || []);
     attentionSet.add(key);
+  }
+  // One that was dealt with before this page was opened: the server said
+  // whether it belongs in the queue, and that is where it goes back to.
+  const earlier = doneRecent.find((m) => rowKey(m) === key);
+  if (!handled && earlier && earlier.queued && !attentionSet.has(key)) {
+    attention = [earlier].concat(attention || []);
+    attentionSet.add(key);
+  }
+  // What is done now leads the list of what was dealt with lately.
+  if (handled && !earlier) {
+    const row = rowByKey(key);
+    if (row) { row.queued = attentionSet.has(key); doneRecent = [row].concat(doneRecent); }
   }
   const counted = attentionSet.has(key);
   const apply = (on) => {
@@ -245,6 +268,8 @@ async function complete(key, li, undo) {
     renderLede();
     updateBadge();
     saveSnapshot();
+    // A row put back is in the queue again only if the server says so.
+    if (!handled) loadAttention();
     return;
   }
   apply(!handled);
@@ -344,7 +369,9 @@ function patchChildren(parent, desired) {
 function rowNode(zone, item, now, arriving) {
   const id = zone + keyOf(item);
   const fresh = !nodeCache.has(id);
-  const node = cached(id, rowSignature(item, now, zone === 'q:'), () => rowOf(item, now, zone === 'q:'));
+  // Under a day's heading a row says the hour; in the queue and among what was done, the day too.
+  const dated = zone !== 's:';
+  const node = cached(id, rowSignature(item, now, dated), () => rowOf(item, now, dated));
   if (fresh && arriving) {
     node.classList.add('arrived');
     node.addEventListener('animationend', () => node.classList.remove('arrived'), { once: true });
@@ -390,21 +417,48 @@ function skeleton() {
     return box;
   });
 }
-function renderQueue(items, now, arriving) {
-  queue.hidden = !items.length;
-  if (!items.length) { queue.replaceChildren(); return; }
-  const shown = queueExpanded ? items : items.slice(0, QUEUE_SHOWN);
-  const group = cached('queue-group', 'q', () => el('ul', 'group'));
-  patchChildren(group, shown.map((m) => rowNode('q:', m, now, arriving)));
-  const desired = [dayHead('queue-head', t('queue.title'), items.length), group];
-  if (items.length > shown.length) {
-    desired.push(cached('queue-more', lang + '|' + (items.length - shown.length), () => {
-      const more = el('button', 'text-btn load-more', fill('queue.more', { count: items.length - shown.length }));
-      more.type = 'button';
-      more.dataset.focus = 'queue-more';
-      more.onclick = () => { queueExpanded = true; renderList(); };
-      return more;
+// What was dealt with lately, as the plain view shows it under the queue.
+function doneItems() {
+  if (filtersActive() || filters.view.value !== 'mail') return [];
+  return doneRecent.filter((m) => m.handledAt)
+    .map((m, index) => ({ m, index, at: Date.parse(m.handledAt) || 0 }))
+    .sort((a, b) => b.at - a.at || a.index - b.index)
+    .map((entry) => entry.m);
+}
+function renderQueue(items, done, now, arriving) {
+  queue.hidden = !items.length && !done.length;
+  if (queue.hidden) { queue.replaceChildren(); return; }
+  const desired = [];
+  if (items.length) {
+    const shown = queueExpanded ? items : items.slice(0, QUEUE_SHOWN);
+    const group = cached('queue-group', 'q', () => el('ul', 'group'));
+    patchChildren(group, shown.map((m) => rowNode('q:', m, now, arriving)));
+    desired.push(dayHead('queue-head', t('queue.title'), items.length), group);
+    if (items.length > shown.length) {
+      desired.push(cached('queue-more', lang + '|' + (items.length - shown.length), () => {
+        const more = el('button', 'text-btn load-more', fill('queue.more', { count: items.length - shown.length }));
+        more.type = 'button';
+        more.dataset.focus = 'queue-more';
+        more.onclick = () => { queueExpanded = true; renderList(); };
+        return more;
+      }));
+    }
+  }
+  if (done.length) {
+    // One quiet line where the rows went, which opens to show them.
+    desired.push(cached('done-toggle', [lang, done.length, doneExpanded].join('|'), () => {
+      const toggle = el('button', 'text-btn quiet done-toggle', fill('done.recent', { count: done.length }));
+      toggle.type = 'button';
+      toggle.dataset.focus = 'done-toggle';
+      toggle.setAttribute('aria-expanded', String(doneExpanded));
+      toggle.onclick = () => { doneExpanded = !doneExpanded; renderList(); };
+      return toggle;
     }));
+    if (doneExpanded) {
+      const group = cached('done-group', 'd', () => el('ul', 'group done-group'));
+      patchChildren(group, done.map((m) => rowNode('d:', m, now, false)));
+      desired.push(group);
+    }
   }
   patchChildren(queue, desired);
 }
@@ -420,7 +474,7 @@ function buildList() {
   if (!items) {
     lane.hidden = true;
     lane.replaceChildren();
-    renderQueue([], now, false);
+    renderQueue([], [], now, false);
     // Before the first answer: the shape of a list, not an empty page.
     patchChildren(list, loadFailed ? [] : [skeleton()]);
     forgetUnused();
@@ -428,8 +482,11 @@ function buildList() {
   }
   const laneKey = renderLane(items, now);
   const queued = queueItems(now);
-  renderQueue(queued, now, arriving);
+  const done = doneItems();
+  renderQueue(queued, done, now, arriving);
   const elsewhere = new Set(queued.map(rowKey));
+  // Opened, the list of what was done shows these rows; they are not drawn twice.
+  if (doneExpanded) for (const m of done) elsewhere.add(rowKey(m));
   if (laneKey) elsewhere.add(laneKey);
   // Newest first by the date each row shows, so a day appears once even when a
   // backfill filed old mail late. The loaded order is kept for paging.
@@ -438,7 +495,7 @@ function buildList() {
     .sort((a, b) => b.at - a.at || a.index - b.index)
     .map((entry) => entry.item);
   const desired = [];
-  if (!visible.length && !laneKey && !queued.length) {
+  if (!visible.length && !laneKey && !queued.length && !done.length) {
     const down = failingMailboxes().map((m) => m.address).join();
     const polled = lastSummary && lastSummary.lastPollAt ? hhmm(new Date(lastSummary.lastPollAt)) : '';
     desired.push(cached('empty', [lang, filtersActive(), filters.hours.value, filters.codesOnly.checked, down, polled].join('|'), emptyBlock));
@@ -539,6 +596,7 @@ function onFiltersChanged() {
   updateAsk();
   loadMoreFailed = false;
   queueExpanded = false;
+  doneExpanded = false;
   clearTimeout(timer);
   timer = setTimeout(() => { load(); chrome(); }, 250);
 }
@@ -634,8 +692,10 @@ async function refresh() {
   }
 }
 
-function setAttention(rows, count) {
+function setAttention(rows, count, done) {
   attention = Array.isArray(rows) ? rows : [];
+  // A server that does not say (an older one, during an upgrade) leaves what is known.
+  if (Array.isArray(done)) doneRecent = done;
   attentionCount = typeof count === 'number' ? count : attention.length;
   attentionSet = new Set(attention.map(rowKey));
   // The queue as the server had it before it heard of a row just completed.
@@ -653,7 +713,7 @@ async function loadAttention() {
     const r = await fetch('/api/attention');
     if (!r.ok) return;
     const d = await r.json();
-    setAttention(d.mail, d.count);
+    setAttention(d.mail, d.count, d.done);
   } catch (e) {}
 }
 
@@ -725,6 +785,7 @@ function saveSnapshot() {
         at: (lastFetchAt || new Date()).toISOString(),
         mail: lastMail.slice(0, 60).map(plain),
         attention: (attention || []).slice(0, 40).map(plain),
+        done: doneRecent.slice(0, 20).map(plain),
         attentionCount, summary: lastSummary, digest: lastDigest,
       }));
     } catch (e) {}
@@ -740,6 +801,7 @@ function restoreSnapshot() {
     lastSummary = snap.summary || null;
     lastDigest = snap.digest || null;
     attention = Array.isArray(snap.attention) ? snap.attention : [];
+    doneRecent = Array.isArray(snap.done) ? snap.done : [];
     attentionCount = Number(snap.attentionCount) || 0;
     attentionSet = new Set(attention.map(rowKey));
     lastFetchAt = new Date(snap.at);

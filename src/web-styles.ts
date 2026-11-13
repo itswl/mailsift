@@ -194,6 +194,7 @@ overflow:hidden;flex-direction:column;transition:transform .2s cubic-bezier(.2,.
 @media(hover:hover){
   .row:hover,.text-btn:hover,.token:hover,.actions a:hover,.bar-btn:hover,.menu-item:hover,.chip:hover{background:var(--fill)}
   .ring:hover{background:var(--ok-tint);border-color:var(--ok);color:var(--ok)}
+  button.mark.done:hover{color:var(--muted)}
   .bar-btn.primary:hover{background:var(--accent);filter:brightness(1.08)}
   .source:hover .source-line,.tl-open:hover .tl-sum,.link-btn:hover{color:var(--text)}
   button.digest-item:hover .gist,.health-line:hover{text-decoration:underline;text-decoration-color:var(--line-strong)}
@@ -224,6 +225,13 @@ mark{background:var(--accent-tint);color:inherit;border-radius:3px;padding:0 1px
 .ring .icon{width:12px;height:12px;stroke-width:2.6}
 .mark.done{width:20px;height:20px;margin:1px 0 0 -2px;border-radius:0;background:none;box-shadow:none;color:var(--ok);display:grid;place-items:center}
 .mark.done .icon{width:13px;height:13px;stroke-width:2.4}
+/* The check is a button: pressing it puts the message back. */
+button.mark.done{appearance:none;position:relative;z-index:1;grid-area:mark;border:0;padding:0;font:inherit;cursor:pointer;transition:color .16s}
+button.mark.done::after{content:"";position:absolute;inset:-12px}
+/* What was dealt with lately: one quiet line under the queue, which opens. */
+.done-toggle{display:block;margin:0 0 0 8px;font-weight:500}
+.done-toggle::after{content:"";display:inline-block;width:6px;height:6px;margin:0 0 2px 8px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(-45deg);transition:transform .16s}
+.done-toggle[aria-expanded=true]::after{transform:rotate(45deg)}
 .row.handled .who{font-weight:500}.row.handled .who,.row.handled .sum,.row.handled .why{color:var(--muted)}
 .row.completing .ring{background:var(--ok);border-color:var(--ok);color:#fff}
 .row.completing{animation:complete .38s ease-in forwards}

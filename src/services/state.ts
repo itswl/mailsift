@@ -252,6 +252,8 @@ export interface RowCursor {
 export const ATTENTION_SINCE_KEY = 'attention_since';
 /** A to-do nobody touched for a month has stopped being one. */
 const ATTENTION_WINDOW_DAYS = 30;
+/** How far back "dealt with lately" reaches: long enough to notice a slip, short enough to stay a short list. */
+const RECENTLY_HANDLED_DAYS = 7;
 /**
  * Bumped by the changes no aggregate over the rows can see: a message moved
  * between two folders, or one marked handled while another is put back.
@@ -1023,11 +1025,17 @@ export class StateStore {
    * out, as does anything older than the queue itself or than a month.
    */
   private attentionWhere(): { clause: string; params: string[] } {
+    const rule = this.queueRule();
+    return { clause: `handled_at IS NULL AND ${rule.clause}`, params: rule.params };
+  }
+
+  /** What belongs in the queue, whether or not it has been dealt with. */
+  private queueRule(): { clause: string; params: string[] } {
     const monthAgo = new Date(Date.now() - ATTENTION_WINDOW_DAYS * 86_400_000).toISOString();
     const since = this.attentionSince();
     return {
       clause:
-        `handled_at IS NULL AND importance IS NOT NULL
+        `importance IS NOT NULL
          AND (pushed = 1 OR importance = 'critical')
          AND (verification_code IS NULL OR verification_code = '')
          AND (summary IS NULL OR (summary NOT LIKE ? AND summary NOT LIKE ?))
@@ -1035,6 +1043,26 @@ export class StateStore {
          AND created_at >= ?`,
       params: [`${VERIFICATION_SUMMARY_PREFIX}%`, `${SIGN_IN_LINK_SUMMARY_PREFIX}%`, since > monthAgo ? since : monthAgo],
     };
+  }
+
+  /**
+   * What was dealt with lately, most recently dealt with first.
+   *
+   * This is the way back for a message marked done. It has left the queue,
+   * and the list shows a window of days that the message may be older than,
+   * so without this it is on neither. `queued` says whether putting the
+   * message back returns it to the queue.
+   */
+  recentlyHandled(limit = 20): Array<{ row: MailRow; queued: boolean }> {
+    const rule = this.queueRule();
+    const since = new Date(Date.now() - RECENTLY_HANDLED_DAYS * 86_400_000).toISOString();
+    return (
+      this.db.prepare(
+        `SELECT ${ROW_COLUMNS.join(', ')}, (CASE WHEN ${rule.clause} THEN 1 ELSE 0 END) AS would_queue
+         FROM seen WHERE handled_at IS NOT NULL AND handled_at >= ?
+         ORDER BY handled_at DESC, dedup_key DESC LIMIT ?`,
+      ).all(...rule.params, since, Math.max(1, Math.min(Math.floor(limit), 100))) as Array<Record<string, unknown>>
+    ).map((raw) => ({ row: toRow(raw), queued: Boolean(raw['would_queue']) }));
   }
 
   /** The queue, newest first. */

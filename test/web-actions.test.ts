@@ -289,6 +289,28 @@ describe('what needs the reader', () => {
     expect((json['mail'] as Array<Record<string, unknown>>)[0]).toHaveProperty('link');
   });
 
+  it('keeps the way back: what was dealt with lately is listed with the queue, and returns to it', async () => {
+    const store = seeded();
+    expect((await call(store, '/api/attention', { as: 'read' })).json['done']).toEqual([]);
+    await post(store, '/api/handled', { key: 'k1' });
+    // k2 was never in the queue (not notified, not critical): filed away, it would not come back to it.
+    await post(store, '/api/action', { key: 'k2', action: 'archive' });
+
+    const { json } = await call(store, '/api/attention', { as: 'read' });
+    expect(json['count']).toBe(1);
+    expect((json['mail'] as Array<{ dedupKey: string }>).map((m) => m.dedupKey)).toEqual(['k3']);
+    const done = json['done'] as Array<Record<string, unknown>>;
+    expect(done.map((m) => m['dedupKey']).sort()).toEqual(['k1', 'k2']);
+    expect(done.find((m) => m['dedupKey'] === 'k1')).toMatchObject({ queued: true, handledAt: expect.any(String) });
+    expect(done.find((m) => m['dedupKey'] === 'k2')).toMatchObject({ queued: false, folder: 'Archive' });
+    expect(done[0]).toHaveProperty('link');
+
+    await post(store, '/api/handled', { key: 'k1', handled: false });
+    const after = (await call(store, '/api/attention', { as: 'read' })).json;
+    expect((after['mail'] as Array<{ dedupKey: string }>).map((m) => m.dedupKey).sort()).toEqual(['k1', 'k3']);
+    expect((after['done'] as Array<{ dedupKey: string }>).map((m) => m.dedupKey)).toEqual(['k2']);
+  });
+
   it('marks a message dealt with, and back again', async () => {
     const store = seeded();
     const done = await post(store, '/api/handled', { key: 'k1' });

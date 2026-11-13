@@ -592,6 +592,9 @@ const extraRows = new Map();
 // What needs the reader: the rows of the queue, how many there are in all,
 // and their keys, so any row anywhere knows whether it is one of them.
 let attention = null, attentionCount = 0, attentionSet = new Set();
+// What was dealt with lately, most recently first: the way back for a row
+// that has left the queue. Each says whether it would return to the queue.
+let doneRecent = [], doneExpanded = false;
 // What this session may do; the summary carries it.
 let session = { writable: false, writeConfigured: false, assistant: false, push: true, auth: false };
 // Whether the page is on the server's live line, and so hears of mail as it is judged.
@@ -615,6 +618,7 @@ function findItem(key) {
   for (const item of lastMail || []) if (keyOf(item) === key) return item;
   for (const item of lastThreads || []) if (keyOf(item) === key) return item;
   for (const item of attention || []) if (keyOf(item) === key) return item;
+  for (const item of doneRecent) if (keyOf(item) === key) return item;
   return extraRows.get(key) || null;
 }
 function mergeMail(existing, incoming) {

@@ -50,6 +50,8 @@ The page opens on a queue: the mail that was judged to matter (critical, or push
 
 Each row has a ring. Pressing it, swiping the row to the right on a phone, or `e` on a desk marks the message done: it leaves the queue at once, and a toast offers Undo. With a write session the message is also marked read in its mailbox, so "done" here is done there. Archiving, binning and answering a message count as dealing with it too.
 
+Done moves nothing and deletes nothing, and there is a way back after the toast is gone. Under the queue a line reads "Done · 3": it opens what was dealt with in the last seven days, most recent first, including mail older than the list below is showing. A done row carries a check where its ring was, here and in the list, and pressing the check (or `e`, or "Not done" under the open message) puts the message back; one that was judged to matter returns to the queue.
+
 Verification codes and sign-in links never enter the queue, since they expire in minutes, and neither do mailsift's own health alerts or digests. The queue starts on the day this version is first run, so an upgrade does not present a month of old mail as unfinished, and it looks back at most thirty days.
 
 ## The list

@@ -277,7 +277,14 @@ export async function handleApi(
     // What was judged to matter and has not been dealt with, whatever the
     // window the list is showing: a deadline does not expire with the day.
     const rows = store.attention(intParam(params, 'limit', 50, 100));
-    return json(200, { count: store.attentionCount(), mail: rows.map(decorate) });
+    // And what was dealt with lately, so a message marked done can be found
+    // again and put back even when it is older than the list's window.
+    const done = store.recentlyHandled(intParam(params, 'done', 20, 50));
+    return json(200, {
+      count: store.attentionCount(),
+      mail: rows.map(decorate),
+      done: done.map(({ row, queued }) => ({ ...decorate(row), queued })),
+    });
   }
 
   if (path === '/api/summary') {
