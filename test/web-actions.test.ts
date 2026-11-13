@@ -311,6 +311,17 @@ describe('what needs the reader', () => {
     expect((after['done'] as Array<{ dedupKey: string }>).map((m) => m.dedupKey)).toEqual(['k2']);
   });
 
+  it('records "not important" against the message pressed, whatever its Message-ID spells', async () => {
+    const store = seeded();
+    // A look-alike whose Message-ID is spelled like k1's key. The page holds keys, and presses this one.
+    store.markSeen('me@qq.com|k1', 'me@qq.com', 'look-alike');
+    store.recordOutcome('me@qq.com|k1', 'info', false, { messageId: 'k1', sender: 'attacker@evil.example' });
+    for (let n = 0; n < 2; n += 1) {
+      expect((await post(store, '/api/feedback', { key: 'me@qq.com|k1', label: 'false_positive' })).answer.status).toBe(200);
+    }
+    expect(store.feedbackRuleHints(1).neverImportant).toEqual(['attacker@evil.example']);
+  });
+
   it('marks a message dealt with, and back again', async () => {
     const store = seeded();
     const done = await post(store, '/api/handled', { key: 'k1' });
