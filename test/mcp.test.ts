@@ -179,7 +179,7 @@ describe('tool surface', () => {
     const reader = new Set((await (await connect(new StateStore(':memory:'))).listTools()).tools.map((t) => t.name));
     const writer = (await (await connect(new StateStore(':memory:'), true)).listTools()).tools.map((t) => t.name);
     expect(writer.filter((name) => !reader.has(name)).sort())
-      .toEqual(['manage_mail', 'mark_handled', 'record_feedback', 'retry_dead_letter', 'send_mail', 'set_signature']);
+      .toEqual(['manage_mail', 'mark_handled', 'record_feedback', 'retry_dead_letter', 'send_mail', 'set_signature', 'snooze']);
   });
 
   it('gives the write credential what the page has, the bin and sending included, and a reader none of it', async () => {
@@ -195,6 +195,7 @@ describe('tool surface', () => {
       ['send_mail', { account: 'me@qq.com', to: ['a@b.co'], subject: 's', text: 't' }],
       ['manage_mail', { messageId: '<one@x>', action: 'trash' }],
       ['mark_handled', { messageId: '<one@x>' }],
+      ['snooze', { messageId: '<one@x>', until: new Date(Date.now() + 3_600_000).toISOString() }],
       ['set_signature', { account: 'me@qq.com', text: 'Signed by someone else' }],
     ] as const) {
       expect(await reader.callTool({ name, arguments: args }), name).toMatchObject({ isError: true });
@@ -203,6 +204,7 @@ describe('tool surface', () => {
     expect(box.sent).toEqual([]);
     expect(box.acted).toEqual([]);
     expect(state.getMail('k1')?.handledAt).toBeNull();
+    expect(state.getMail('k1')?.snoozedUntil).toBeNull();
   });
 
   it('warns a client that message fields are untrusted data', async () => {
@@ -377,6 +379,90 @@ describe('what needs the mailbox owner', () => {
     // Putting one back changes nothing in the mailbox.
     expect(box.acted).toHaveLength(1);
     expect(await client.callTool({ name: 'mark_handled', arguments: { messageId: '<absent@x>' } })).toMatchObject({ isError: true });
+  });
+
+  it('lets a writer put a message off until a time, as the page does, and lists what is put off', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    // Monday 09:00 where the owner is, written as they would write it.
+    const when = new Date(Date.now() + 2 * 86_400_000);
+    when.setUTCSeconds(0, 0);
+    const local = new Date(when.getTime() + 8 * 3_600_000).toISOString().replace(/\.000Z$/, '+08:00');
+    const put = await call(client, 'snooze', { messageId: '<one@x>', until: local });
+    expect(put).toMatchObject({ messageId: '<one@x>', account: 'me@qq.com', snoozedUntil: when.toISOString(), handledAt: null, needsYou: 1 });
+
+    const queue = await call(client, 'needs_you', { includeSnoozed: true });
+    expect((queue['mail'] as Array<{ messageId: string }>).map((m) => m.messageId)).toEqual(['<two@x>']);
+    expect(queue['snoozed']).toEqual([expect.objectContaining({ messageId: '<one@x>', snoozedUntil: when.toISOString() })]);
+    expect(await call(client, 'needs_you')).not.toHaveProperty('snoozed');
+
+    // Cancelled, it is back where it was judged to belong; nothing in the mailbox moved either way.
+    expect(await call(client, 'snooze', { messageId: '<one@x>', until: null })).toMatchObject({ snoozedUntil: null, needsYou: 2 });
+    expect(box.acted).toEqual([]);
+    // Done, then put off: a reminder is for what is not done, so it comes back as not done.
+    state.setHandled('k2', true);
+    expect(await call(client, 'snooze', { messageId: '<two@x>', until: when.toISOString() })).toMatchObject({ handledAt: null });
+    expect(state.listMcpAudit(10).map((event) => event.action)).toEqual(expect.arrayContaining(['snooze']));
+  });
+
+  it('brings a message back now as the page\'s "Back now" does, and says where a cancelled one went', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    state.setMeta('attention_since', '2025-01-01T00:00:00.000Z');
+    // Critical and notified, but 35 days old; and k3, never judged to matter.
+    (state as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db
+      .prepare('UPDATE seen SET created_at = ? WHERE dedup_key = ?').run(new Date(Date.now() - 35 * 86_400_000).toISOString(), 'k1');
+    const later = new Date(Date.now() + 4 * 86_400_000).toISOString();
+    for (const messageId of ['<one@x>', '<three@x>']) {
+      expect(await call(client, 'snooze', { messageId, until: later }), messageId).toMatchObject({ inNeedsYou: false });
+      expect(await call(client, 'snooze', { messageId, until: 'now' }), messageId).toMatchObject({ inNeedsYou: true });
+    }
+    const queue = await call(client, 'needs_you', { includeSnoozed: true });
+    expect((queue['mail'] as Array<{ messageId: string }>).map((m) => m.messageId).sort()).toEqual(['<one@x>', '<three@x>', '<two@x>']);
+    expect(queue['snoozed']).toEqual([]);
+    // Cancelled instead, each is left to its judgement, and the answer says it is not in the queue.
+    expect(await call(client, 'snooze', { messageId: '<one@x>', until: null })).toMatchObject({ snoozedUntil: null, inNeedsYou: false });
+    expect(await call(client, 'snooze', { messageId: '<three@x>', until: null })).toMatchObject({ inNeedsYou: false });
+    expect(box.acted).toEqual([]);
+  });
+
+  it('describes what a reminder does to the queue as it does it', async () => {
+    const tools = (await (await connect(seeded(), true)).listTools()).tools;
+    const said = (name: string): string => tools.find((tool) => tool.name === name)?.description ?? '';
+    // A code put off comes back like anything else.
+    expect(said('needs_you')).not.toContain('are never in it');
+    expect(said('needs_you')).toContain('unless the owner put one off and its time has come');
+    // Cancelling is not bringing back: only what was judged to matter and is within the month returns.
+    expect(said('snooze')).not.toContain('in needs_you again at once if it was judged to matter');
+    expect(said('snooze')).toContain('arrived within the last 30 days');
+    expect(said('snooze')).toContain('until="now"');
+    expect(said('snooze')).toContain('list_mail with hours');
+  });
+
+  it('refuses a reminder in the past, more than a year ahead, without an offset, or for an id that names two copies', async () => {
+    const state = seeded();
+    state.markSeen('k1-work', 'me@work.com', 'subject k1');
+    state.recordOutcome('k1-work', 'critical', true, { messageId: '<one@x>', folder: 'INBOX' });
+    const client = await connect(state, true, mailbox(state).backend);
+    const refused = async (args: Record<string, unknown>, code: string): Promise<void> => {
+      const result = await client.callTool({ name: 'snooze', arguments: args });
+      expect(result, JSON.stringify(args)).toMatchObject({ isError: true });
+      expect(JSON.stringify(result.content), JSON.stringify(args)).toContain(code);
+    };
+    const hour = new Date(Date.now() + 3_600_000).toISOString();
+    await refused({ messageId: '<two@x>', until: new Date(Date.now() - 3_600_000).toISOString() }, 'snoozePast');
+    await refused({ messageId: '<two@x>', until: new Date(Date.now() + 400 * 86_400_000).toISOString() }, 'snoozeFar');
+    // Refused by the published schema before the call runs, naming the argument.
+    await refused({ messageId: '<two@x>', until: '2030-01-01T09:00:00' }, 'until');
+    await refused({ messageId: '<two@x>' }, 'until');
+    await refused({ messageId: '<one@x>', until: hour }, 'more than one mailbox');
+    await refused({ messageId: '<absent@x>', until: hour }, 'NOT_FOUND');
+    expect(state.snoozed()).toEqual([]);
+    // Named, the copy meant is put off and the other is not.
+    expect(await call(client, 'snooze', { messageId: '<one@x>', until: hour, account: 'me@work.com' })).toMatchObject({ account: 'me@work.com' });
+    expect(state.snoozed().map((row) => row.dedupKey)).toEqual(['k1-work']);
   });
 });
 

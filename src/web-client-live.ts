@@ -556,7 +556,7 @@ const fineKeys = matchMedia('(pointer: fine)').matches;
 const macKeys = /Mac|iPhone|iPad/.test(navigator.platform || '');
 const KEY_LIST = [
   ['j k', 'keys.move'], ['⏎', 'keys.open'], ['e', 'keys.done'], ['r a', 'keys.reply'], ['f', 'keys.forward'], ['y', 'keys.archive'],
-  ['s', 'keys.star'], ['#', 'keys.trash'], ['n', 'keys.compose'], ['c', 'keys.code'], ['/', 'keys.search'],
+  ['s', 'keys.star'], ['#', 'keys.trash'], ['b', 'keys.snooze'], ['n', 'keys.compose'], ['c', 'keys.code'], ['/', 'keys.search'],
   [macKeys ? '⌘K' : 'Ctrl K', 'keys.palette'], ['.', 'keys.check'], ['esc', 'keys.close'], ['?', 'keys.help'],
 ];
 function openKeys() {
@@ -634,6 +634,13 @@ document.addEventListener('keydown', (e) => {
     else if (e.key === 'y') { e.preventDefault(); mailAction(key, 'archive'); }
     else if (e.key === 's') { e.preventDefault(); mailAction(key, (flagsByKey.get(key) || {}).flagged ? 'unstar' : 'star'); }
     else if (e.key === '#') { e.preventDefault(); mailAction(key, 'trash'); }
+    else if (e.key === 'b' && !row.handledAt) {
+      // Under the reader's clock on a desk, under the row itself in a narrow window.
+      e.preventDefault();
+      const anchor = (isWide() && document.querySelector('#pane-bar [data-act="snooze"]'))
+        || document.querySelector('li.row[data-key="' + CSS.escape(current) + '"]');
+      if (anchor) openSnooze(key, anchor);
+    }
   }
 });
 
@@ -648,6 +655,7 @@ function languageChanged() {
     if (item) showInSheet(item, openKey);
   }
   if (notifySheet.open) renderNotify();
+  if (snoozeSheet.open && snoozeKey && rowByKey(snoozeKey)) { drawSnooze(rowByKey(snoozeKey)); placePopover(snoozeSheet); }
   if (keysSheet.open) { closeSheet(keysSheet, false); }
   if (composeSheet.open && composing) {
     $('#compose-title').textContent = t(composing.titleKey);
@@ -680,10 +688,13 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('pagehide', rememberSeen);
 // The minute timer is the fallback: with the live line up it only keeps the
-// relative times honest, and without one it is how new mail is found.
+// relative times honest, and without one it is how new mail is found. A
+// message put off whose time has come on this clock is asked for again
+// either way, so it is back in the queue even before the server says so.
 setInterval(() => {
   if (document.hidden) return;
-  if (live) renderList(); else { refresh(); chrome(); }
+  const woke = snoozedRows.some((m) => m.snoozedUntil && !m.handledAt && !isSnoozed(m));
+  if (live) { renderList(); if (woke) loadAttention(); } else { refresh(); chrome(); }
 }, 60000);
 setInterval(renderStatus, 30000);
 

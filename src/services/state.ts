@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS seen (
   importance TEXT, category TEXT, summary TEXT, reason TEXT, deadline TEXT,
   decided_by TEXT, pushed INTEGER NOT NULL DEFAULT 0,
   mail_date TEXT, snippet TEXT, attachments_json TEXT, verification_code TEXT, handled_at TEXT,
-  uid INTEGER, uid_validity TEXT,
+  uid INTEGER, uid_validity TEXT, snoozed_until TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS digest_queue (
@@ -132,6 +132,12 @@ export interface MailRow {
   createdAt: string;
   /** When the reader marked it dealt with, in the page or through feedback; null while it still needs them. */
   handledAt: string | null;
+  /**
+   * When the owner asked to be reminded of it (ISO 8601, UTC). Until then it
+   * is out of the queue; from then on it is back in it, whatever it was
+   * judged. Null when no reminder was asked for, or it was cancelled.
+   */
+  snoozedUntil: string | null;
   snippet?: string | null;
   /** Extracted one-time code, kept locally so the web view can show it. */
   verificationCode?: string;
@@ -256,7 +262,8 @@ const ATTENTION_WINDOW_DAYS = 30;
 const RECENTLY_HANDLED_DAYS = 7;
 /**
  * Bumped by the changes no aggregate over the rows can see: a message moved
- * between two folders, or one marked handled while another is put back.
+ * between two folders, one marked handled while another is put back, one put
+ * off until later, and one whose reminder has come.
  */
 const MAIL_REVISION_KEY = 'mail_revision';
 /**
@@ -267,6 +274,12 @@ const MAIL_REVISION_KEY = 'mail_revision';
  * leaves its key here; the dispatcher takes the list each pass.
  */
 export const REJUDGED_KEY = 'web_push_rejudged';
+/**
+ * Up to when the push dispatcher has looked for reminders that came, as an
+ * ISO 8601 time. It is the dispatcher's mark, kept here because bringing a
+ * message back by hand reads it too (see wakeNow).
+ */
+export const SNOOZE_CHECKED_KEY = 'snooze_checked_at';
 /** Nobody may be reading the list (notifications off); it must not grow without end. */
 const MAX_REJUDGED = 200;
 /** How far back the change signature looks; a little past the widest window the page offers. */
@@ -302,7 +315,7 @@ export function notificationRetryDelayMs(attempt: number): number {
 const ROW_COLUMNS = [
   'dedup_key', 'message_id', 'thread_key', 'account', 'account_label', 'subject', 'sender', 'sender_name',
   'folder', 'in_spam', 'importance', 'category', 'summary', 'reason', 'deadline',
-  'decided_by', 'pushed', 'mail_date', 'attachments_json', 'verification_code', 'handled_at', 'created_at',
+  'decided_by', 'pushed', 'mail_date', 'attachments_json', 'verification_code', 'handled_at', 'snoozed_until', 'created_at',
 ] as const;
 
 function parseAttachmentManifest(value: unknown): AttachmentManifest | null {
@@ -359,6 +372,7 @@ function toRow(raw: Record<string, unknown>): MailRow {
     mailDate: (raw['mail_date'] as string) ?? null,
     createdAt: String(raw['created_at'] ?? ''),
     handledAt: (raw['handled_at'] as string) ?? null,
+    snoozedUntil: (raw['snoozed_until'] as string) ?? null,
     ...(raw['snippet'] !== undefined ? { snippet: raw['snippet'] as string } : {}),
     ...(raw['verification_code'] ? { verificationCode: String(raw['verification_code']) } : {}),
     attachmentManifest: parseAttachmentManifest(raw['attachments_json']),
@@ -404,7 +418,7 @@ export class StateStore {
     const seenColumns = this.db.prepare('PRAGMA table_info(seen)').all() as Array<Record<string, unknown>>;
     for (const [name, definition] of [
       ['attachments_json', 'TEXT'], ['thread_key', 'TEXT'], ['verification_code', 'TEXT'], ['handled_at', 'TEXT'],
-      ['uid', 'INTEGER'], ['uid_validity', 'TEXT'],
+      ['uid', 'INTEGER'], ['uid_validity', 'TEXT'], ['snoozed_until', 'TEXT'],
     ] as const) {
       if (seenColumns.some((column) => column['name'] === name)) continue;
       try {
@@ -439,6 +453,9 @@ export class StateStore {
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_outbox_retry ON notification_outbox (delivered_at, next_attempt_at, created_at)');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_seen_thread ON seen (thread_key, created_at)');
+    // Only the few rows with a reminder are in it, which is what the waker
+    // and the list of what is put off look for.
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_seen_snoozed ON seen (snoozed_until) WHERE snoozed_until IS NOT NULL');
     // Before 0.1.98, code mail mailsift handled itself was labelled
     // 'fallback', which reads as a failed model and made it a candidate for
     // re-triage after an LLM outage, where its stored code was lost. It was
@@ -624,7 +641,13 @@ export class StateStore {
 
   prune(keepDays = 90): number {
     const cutoff = new Date(Date.now() - keepDays * 86_400_000).toISOString();
-    const seen = Number(this.db.prepare('DELETE FROM seen WHERE created_at < ?').run(cutoff).changes);
+    // A reminder may be asked for up to a year ahead, further than the rows
+    // are kept. Its row stays until the reminder has come and its time in the
+    // queue is over, or the owner would be promised a reminder that never comes.
+    const reminded = new Date(Date.now() - ATTENTION_WINDOW_DAYS * 86_400_000).toISOString();
+    const seen = Number(this.db.prepare(
+      'DELETE FROM seen WHERE created_at < ? AND (snoozed_until IS NULL OR snoozed_until < ?)',
+    ).run(cutoff, reminded).changes);
     const dead = Number(this.db.prepare('DELETE FROM dead_letter WHERE created_at < ?').run(cutoff).changes);
     const outbox = Number(this.db.prepare(
       'DELETE FROM notification_outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?',
@@ -1073,27 +1096,51 @@ export class StateStore {
    *
    * A verification code or a sign-in link is not a to-do, it is gone in
    * minutes; mailsift's own health alerts and digests are not mail. Both stay
-   * out, as does anything older than the queue itself or than a month.
+   * out, as does anything older than the queue itself or than a month. A
+   * message the owner asked to be reminded of is out until that time, and
+   * in from then on (see queueRule).
    */
   private attentionWhere(): { clause: string; params: string[] } {
     const rule = this.queueRule();
     return { clause: `handled_at IS NULL AND ${rule.clause}`, params: rule.params };
   }
 
-  /** What belongs in the queue, whether or not it has been dealt with. */
+  /**
+   * What belongs in the queue, whether or not it has been dealt with.
+   *
+   * A row with a reminder goes by the reminder alone. Before its time it is
+   * out, however it was judged. From its time on it is in, however it was
+   * judged too, because the owner asked to be reminded of it, and the
+   * queue's month is counted from the reminder rather than from the day the
+   * message came, which may be long before.
+   *
+   * The two cases are written as two halves of an OR, each bounded by a
+   * column of its own, rather than as one CASE: SQLite then reads the first
+   * half through the created_at index and the second through the index of
+   * reminders, where a CASE would make it read every row kept.
+   */
   private queueRule(): { clause: string; params: string[] } {
-    const monthAgo = new Date(Date.now() - ATTENTION_WINDOW_DAYS * 86_400_000).toISOString();
-    const since = this.attentionSince();
+    const at = now();
+    const start = this.queueStart(at);
     return {
       clause:
-        `importance IS NOT NULL
-         AND (pushed = 1 OR importance = 'critical')
-         AND (verification_code IS NULL OR verification_code = '')
-         AND (summary IS NULL OR (summary NOT LIKE ? AND summary NOT LIKE ?))
-         AND (decided_by IS NULL OR decided_by NOT IN ('health', 'digest'))
-         AND created_at >= ?`,
-      params: [`${VERIFICATION_SUMMARY_PREFIX}%`, `${SIGN_IN_LINK_SUMMARY_PREFIX}%`, since > monthAgo ? since : monthAgo],
+        `((snoozed_until IS NULL
+           AND importance IS NOT NULL
+           AND (pushed = 1 OR importance = 'critical')
+           AND (verification_code IS NULL OR verification_code = '')
+           AND (summary IS NULL OR (summary NOT LIKE ? AND summary NOT LIKE ?))
+           AND (decided_by IS NULL OR decided_by NOT IN ('health', 'digest'))
+           AND created_at >= ?)
+         OR (snoozed_until <= ? AND snoozed_until >= ?))`,
+      params: [`${VERIFICATION_SUMMARY_PREFIX}%`, `${SIGN_IN_LINK_SUMMARY_PREFIX}%`, start, at, start],
     };
+  }
+
+  /** The earliest moment a row can count from and still be in the queue: its first day, or a month ago. */
+  private queueStart(at: string): string {
+    const monthAgo = new Date(Date.parse(at) - ATTENTION_WINDOW_DAYS * 86_400_000).toISOString();
+    const since = this.attentionSince();
+    return since > monthAgo ? since : monthAgo;
   }
 
   /**
@@ -1116,13 +1163,16 @@ export class StateStore {
     ).map((raw) => ({ row: toRow(raw), queued: Boolean(raw['would_queue']) }));
   }
 
-  /** The queue, newest first. */
+  /**
+   * The queue, newest first: by when each row came into it, which for a
+   * message that was put off is when its reminder came, not when it arrived.
+   */
   attention(limit = 50): MailRow[] {
     const { clause, params } = this.attentionWhere();
     return (
       this.db.prepare(
         `SELECT ${ROW_COLUMNS.join(', ')} FROM seen WHERE ${clause}
-         ORDER BY created_at DESC, dedup_key DESC LIMIT ?`,
+         ORDER BY COALESCE(snoozed_until, created_at) DESC, dedup_key DESC LIMIT ?`,
       ).all(...params, Math.max(1, Math.min(Math.floor(limit), 200))) as Array<Record<string, unknown>>
     ).map(toRow);
   }
@@ -1132,6 +1182,106 @@ export class StateStore {
     const { clause, params } = this.attentionWhere();
     const row = this.db.prepare(`SELECT COUNT(*) AS n FROM seen WHERE ${clause}`).get(...params) as Record<string, unknown>;
     return Number(row['n'] ?? 0);
+  }
+
+  /** Whether one message is in the queue now. */
+  inAttention(idOrKey: string): boolean {
+    const key = this.keyOf(idOrKey);
+    if (key === undefined) return false;
+    const { clause, params } = this.attentionWhere();
+    return this.db.prepare(`SELECT 1 FROM seen WHERE dedup_key = ? AND ${clause}`).get(key, ...params) !== undefined;
+  }
+
+  // ---- Reminders: "not now, remind me then" ----
+
+  /**
+   * Put a message off until a time, or with null cancel that.
+   *
+   * Like handled, this is mailsift's own note and changes nothing at the
+   * provider. Asking to be reminded of a message says it is not done, so a
+   * message marked done is put back by it; cancelling leaves done alone.
+   * `until` is stored as given, which the caller has made an ISO 8601 UTC
+   * time; the queue compares it with the clock as text.
+   */
+  setSnoozed(idOrKey: string, until: string | null): MailRow | undefined {
+    const key = this.keyOf(idOrKey);
+    if (key === undefined) return undefined;
+    const result = until
+      ? this.db.prepare(
+        `UPDATE seen SET snoozed_until = ?, handled_at = NULL
+         WHERE dedup_key = ? AND (snoozed_until IS NOT ? OR handled_at IS NOT NULL)`,
+      ).run(until, key, until)
+      : this.db.prepare('UPDATE seen SET snoozed_until = NULL WHERE dedup_key = ? AND snoozed_until IS NOT NULL').run(key);
+    // Open pages move the row out of the queue, or back into it.
+    if (Number(result.changes) > 0) this.bumpMailRevision();
+    return this.getMail(key);
+  }
+
+  /**
+   * Bring a message back now: its reminder counts as having come.
+   *
+   * This is "Back now", and the way back to a reminder that had come and was
+   * then put off again. Cancelling the reminder instead would hand the row
+   * back to its judgement, which leaves out a message that was not judged to
+   * matter or that arrived more than a month ago; the owner asked for it
+   * back, so like any reminder that came it is in the queue whatever it was
+   * judged, for a month from now.
+   *
+   * The time stored is the dispatcher's last look for reminders, which while
+   * the page is served is less than a minute ago, rather than this moment.
+   * The dispatcher announces only what came after its last look, so a message
+   * brought back by hand is not announced again a minute later: the owner is
+   * the one who asked. When nobody has been keeping the time (the page was
+   * not served for a while) that look is older, and the message counts as
+   * having come then, which keeps the same promise at the cost of a shorter
+   * month in the queue. It is this moment only when there is no look to use:
+   * none yet (a dispatcher that starts later begins from its own start), one
+   * ahead of the clock (the dispatcher waits for the clock to pass it), or
+   * one so old that a reminder counted from it would be out of the queue.
+   */
+  wakeNow(idOrKey: string): MailRow | undefined {
+    const at = now();
+    const raw = this.getMeta(SNOOZE_CHECKED_KEY);
+    const mark = raw && Number.isFinite(Date.parse(raw)) ? new Date(Date.parse(raw)).toISOString() : undefined;
+    const usable = mark !== undefined && mark <= at && mark >= this.queueStart(at);
+    return this.setSnoozed(idOrKey, usable ? mark : at);
+  }
+
+  /**
+   * What is put off and still to come, soonest first.
+   *
+   * A message marked done after it was put off keeps its time but is not
+   * listed: it will not come back, so saying when it would is not true.
+   */
+  snoozed(limit = 50): MailRow[] {
+    return (
+      this.db.prepare(
+        `SELECT ${ROW_COLUMNS.join(', ')} FROM seen
+         WHERE snoozed_until > ? AND handled_at IS NULL
+         ORDER BY snoozed_until ASC, dedup_key ASC LIMIT ?`,
+      ).all(now(), Math.max(1, Math.min(Math.floor(limit), 200))) as Array<Record<string, unknown>>
+    ).map(toRow);
+  }
+
+  /**
+   * The rows whose reminder came after `after` and no later than `upTo`,
+   * soonest first, and tell open pages that the queue changed if there are any.
+   *
+   * Nothing is written to a row: the queue reads the clock, so a reminder is
+   * in it from its minute on whoever looks. What waking adds is the
+   * announcement, since a page is otherwise told only of commits, and the
+   * list of whom to remind.
+   */
+  wakeSnoozed(after: string, upTo: string): MailRow[] {
+    const rows = (
+      this.db.prepare(
+        `SELECT ${ROW_COLUMNS.join(', ')} FROM seen
+         WHERE snoozed_until > ? AND snoozed_until <= ?
+         ORDER BY snoozed_until ASC, dedup_key ASC LIMIT 500`,
+      ).all(after, upTo) as Array<Record<string, unknown>>
+    ).map(toRow);
+    if (rows.length) this.bumpMailRevision();
+    return rows;
   }
 
   /** Where a message lives now, after an action moved it at the provider. */
@@ -1199,7 +1349,8 @@ export class StateStore {
    * Two short strings that change when the page would draw something else.
    *
    * `mail` covers the list, the queue and the digest: a row added, judged,
-   * notified, handled or moved, a digest queued or sent. `poll` covers the
+   * notified, handled, moved, put off or come back from being put off (those
+   * last three through the revision), a digest queued or sent. `poll` covers the
    * status line: the heartbeat, a mailbox starting or ceasing to fail, the
    * outbox. A commit that touches neither (an audit entry, a cursor) leaves
    * both alone, so the page is not told to redraw for nothing.

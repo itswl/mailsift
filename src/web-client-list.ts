@@ -45,6 +45,62 @@ function dueInfo(deadline, now) {
   return { text, days, late: days <= 0 };
 }
 
+// ---- Later: when a message that is put off comes back ----
+// Put off and still to come. One marked done after it was put off will not
+// come back, so it does not count, and neither does one whose time is here.
+function isSnoozed(m) {
+  return Boolean(m && m.snoozedUntil && !m.handledAt && Date.parse(m.snoozedUntil) > Date.now());
+}
+// A reminder's time as the reader says it: the clock alone today, then
+// tomorrow, then a weekday within the week, then the date. Within a sentence
+// or a row's details English lowers "Tomorrow".
+function whenLabel(d, now, inSentence) {
+  const time = hhmm(d);
+  if (dayKey(d) === dayKey(now)) return fill('when.today', { time });
+  const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  if (dayKey(d) === dayKey(tomorrow)) return fill(inSentence ? 'when.tomorrowIn' : 'when.tomorrow', { time });
+  const days = Math.round((new Date(d.getFullYear(), d.getMonth(), d.getDate()) - tomorrow) / 86400000) + 1;
+  const near = days > 0 && days < 7;
+  const options = near ? { weekday: 'short' } : { day: 'numeric', month: 'short' };
+  // A weekday within the coming six days is plain without a year, even across
+  // New Year ("2027 Mon" reads as a puzzle); a date in another year needs one.
+  if (!near && d.getFullYear() !== now.getFullYear()) options.year = 'numeric';
+  let day = dayKey(d);
+  try { day = new Intl.DateTimeFormat(lang, options).format(d); } catch (e) {}
+  return fill('when.day', { day, time });
+}
+// The times a message can be put off until, from this moment on this
+// device's clock, soonest first: three hours on to the next quarter hour,
+// while the evening is still ahead and unless that is still night; seven in
+// the evening, until five; nine in the morning; and nine on Monday, unless
+// that is the morning already offered.
+// Until five the night is not over, and the morning anyone means is the one
+// to come: nine today, called this morning, rather than a day and a half on.
+// A reminder before seven would wake the owner for something they put off.
+function snoozeChoices(now) {
+  const at = (days, hours) => new Date(now.getFullYear(), now.getMonth(), now.getDate() + days, hours, 0, 0, 0);
+  const quarter = 15 * 60000;
+  const later = new Date(Math.ceil((now.getTime() + 3 * 3600000) / quarter) * quarter);
+  const evening = at(0, 19);
+  const out = [];
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  const offerEvening = minutes < 17 * 60;
+  const smallHours = now.getHours() < 5;
+  // Three hours on would be no sooner than the evening that is also offered.
+  if (minutes < 20 * 60 && later.getHours() >= 7 && !(offerEvening && later >= evening)) out.push({ key: 'snooze.laterToday', at: later });
+  if (offerEvening) out.push({ key: 'snooze.evening', at: evening });
+  const morning = at(smallHours ? 0 : 1, 9);
+  out.push({ key: smallHours ? 'snooze.morning' : 'snooze.tomorrow', at: morning });
+  const toMonday = ((8 - now.getDay()) % 7) || 7;
+  const monday = at(toMonday, 9);
+  if (monday.getTime() !== morning.getTime()) out.push({ key: 'snooze.nextWeek', at: monday });
+  return out.sort((a, b) => a.at - b.at);
+}
+// A moment as a datetime-local field holds it: this device's own time, to the minute.
+function localInput(d) {
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
 // ---- Rows ----
 // What the reader searched for, marked where it occurs.
 function highlightInto(node, value) {
@@ -61,7 +117,7 @@ function highlightInto(node, value) {
   if (at < s.length) node.appendChild(textNode(s.slice(at)));
   return node;
 }
-const needsYou = (m) => attentionSet.has(rowKey(m)) && !m.handledAt;
+const needsYou = (m) => attentionSet.has(rowKey(m)) && !m.handledAt && !isSnoozed(m);
 function metaLine(m, thread, now) {
   const meta = el('div', 'meta');
   const add = (value, cls) => {
@@ -77,6 +133,10 @@ function metaLine(m, thread, now) {
   const due = dueInfo(m.deadline, now);
   // A deadline on something already dealt with is a fact, not a call to act.
   if (due) add(due.text, m.handledAt ? null : (due.late ? 'due late' : 'due'));
+  // When it comes back, wherever a message that is put off is shown; and in
+  // the queue, why a message that was not judged to matter is there.
+  if (isSnoozed(m)) add(fill('snooze.meta', { when: whenLabel(new Date(m.snoozedUntil), now, true) }));
+  else if (m.snoozedUntil && needsYou(m)) add(t('snooze.woke'));
   return meta;
 }
 function ringButton(m) {
@@ -98,6 +158,20 @@ function doneButton(m) {
   b.setAttribute('aria-pressed', 'true');
   b.appendChild(icon('i-check'));
   b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); complete(rowKey(m), b.closest('li.row'), true); };
+  return b;
+}
+// A message that is put off carries a clock where its ring was, here and in
+// the list. Pressing it opens the times again, with a way to bring it back now.
+function laterButton(m) {
+  const b = el('button', 'mark later');
+  b.type = 'button';
+  b.dataset.act = 'snooze';
+  b.title = t('act.snooze');
+  b.setAttribute('aria-label', t('act.snooze'));
+  b.setAttribute('aria-haspopup', 'dialog');
+  b.setAttribute('aria-expanded', 'false');
+  b.appendChild(icon('i-clock'));
+  b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openSnooze(rowKey(m), b); };
   return b;
 }
 // A row of the queue is not under a day's heading, so its time says the day
@@ -123,6 +197,9 @@ function rowOf(item, now, queued) {
   } else if (m.handledAt) {
     li.classList.add('handled');
     li.appendChild(doneButton(m));
+  } else if (isSnoozed(m)) {
+    li.classList.add('later');
+    li.appendChild(laterButton(m));
   } else li.appendChild(el('span', 'mark ' + level(m)));
   const who = highlightInto(el('a', 'who'), m.senderName || m.sender || t('unknownSender'));
   who.href = '#m=' + encodeURIComponent(key);
@@ -150,6 +227,7 @@ function rowSignature(item, now, queued) {
     m.importance, m.pushed ? 1 : 0, m.inSpam ? 1 : 0, m.summary, m.subject, m.senderName, m.sender, m.category,
     m.reason, m.verificationCode || '', m.verificationCode && now - dateOf(m) > STALE_CODE_MS ? 1 : 0,
     m.deadline || '', m.deadline ? dayKey(now) : '', isThread(item) ? item.messageCount : 0, filters.q.value.trim(),
+    m.snoozedUntil || '', isSnoozed(m) ? dayKey(now) : '',
   ].join('\u0001');
 }
 function markSelected() {
@@ -162,13 +240,18 @@ function markSelected() {
 }
 
 // ---- Dealing with a message: the ring, the swipe, and the way back ----
+// Every copy of a row the page holds, wherever it is listed.
+function eachCopy(key, touch) {
+  const one = (m) => { if (m && rowKey(m) === key) touch(m); };
+  for (const m of lastMail || []) one(m);
+  for (const m of attention || []) one(m);
+  for (const m of doneRecent) one(m);
+  for (const m of snoozedRows) one(m);
+  for (const th of lastThreads || []) { one(th.latest); for (const m of th.messages || []) one(m); }
+  one(extraRows.get(key));
+}
 function markHandledLocal(key, at) {
-  const touch = (m) => { if (m && rowKey(m) === key) m.handledAt = at; };
-  for (const m of lastMail || []) touch(m);
-  for (const m of attention || []) touch(m);
-  for (const m of doneRecent) touch(m);
-  for (const th of lastThreads || []) { touch(th.latest); for (const m of th.messages || []) touch(m); }
-  touch(extraRows.get(key));
+  eachCopy(key, (m) => { m.handledAt = at; });
 }
 async function post(path, body, options) {
   try {
@@ -197,10 +280,8 @@ function holdPending() {
 // A row that is put back must not keep the look of one that is leaving: its
 // fade ends at nothing, and the same element would be reused as it is.
 function unfade(key) {
-  nodeCache.delete('q:' + key);
-  nodeCache.delete('s:' + key);
-  nodeCache.delete('d:' + key);
-  for (const row of document.querySelectorAll('li.row.completing')) row.classList.remove('completing');
+  for (const zone of ['q:', 's:', 'd:', 'z:']) nodeCache.delete(zone + key);
+  for (const row of document.querySelectorAll('li.row.completing, li.row.leaving')) row.classList.remove('completing', 'leaving');
 }
 // Whether the reader is showing this message: by its own key, or as the
 // latest message of the thread that is open.
@@ -235,13 +316,18 @@ async function complete(key, li, undo) {
     const row = rowByKey(key);
     if (row) { row.queued = attentionSet.has(key); doneRecent = [row].concat(doneRecent); }
   }
-  const counted = attentionSet.has(key);
+  // Counted by what it does to the queue, which a row that is put off is not in either way.
+  const inQueue = () => {
+    const m = rowByKey(key) || completed.get(key);
+    return Boolean(m && attentionSet.has(key) && !m.handledAt && !isSnoozed(m));
+  };
   const apply = (on) => {
     const at = on ? new Date().toISOString() : null;
+    const was = inQueue();
     markHandledLocal(key, at);
     const kept = completed.get(key);
     if (kept) kept.handledAt = at;
-    if (counted) attentionCount = Math.max(0, attentionCount + (on ? -1 : 1));
+    attentionCount = Math.max(0, attentionCount + (inQueue() ? 1 : 0) - (was ? 1 : 0));
     if (!on) unfade(key);
     return at;
   };
@@ -320,22 +406,196 @@ function enableSwipe(li, key) {
   li.addEventListener('pointercancel', end);
 }
 
+// ---- Putting a message off: the times, and the way back ----
+// The keys being put off or brought back that the server has not answered
+// yet, each with what was asked of it, the time the page shows meanwhile,
+// and whether it was brought back now. A list fetched before the answer
+// still has the old time, and must not undo what was asked.
+const pendingSnooze = new Map();
+// Every copy of the row takes the new time. One brought back now is a
+// reminder that has come, and is in the queue whatever it was judged, so it
+// joins the queue here even before the server's list says so.
+function snoozeLocal(key, until, woken) {
+  eachCopy(key, (m) => { m.snoozedUntil = until; });
+  const row = rowByKey(key);
+  snoozedRows = snoozedRows.filter((m) => rowKey(m) !== key);
+  if (!row) return;
+  if (isSnoozed(row)) snoozedRows = snoozedRows.concat([row]);
+  if (woken && attention && !attentionSet.has(key)) {
+    attention = [row].concat(attention);
+    attentionSet.add(key);
+  }
+}
+function holdSnoozes() {
+  for (const [key, asked] of pendingSnooze) snoozeLocal(key, asked.local, asked.woken);
+}
+// The panel of times, under the control that asked for it. It opens where
+// that control is: inside the reader on a phone, whose sheet is modal and
+// would leave anything outside it unreachable, and in the page elsewhere.
+let snoozeKey = null;
+function openSnooze(key, anchor) {
+  if (session.canMark === false) { requireWrite(); return; }
+  const row = rowByKey(key) || (findItem(key) && rowOfItem(findItem(key)));
+  if (!row || !anchor) return;
+  if (snoozeSheet.open) {
+    const again = snoozeKey === key && popovers.has(snoozeSheet) && anchorOf(popovers.get(snoozeSheet)) === anchor;
+    closePopover(snoozeSheet, false);
+    if (again) return;
+  }
+  snoozeKey = rowKey(row);
+  drawSnooze(row);
+  const host = anchor.closest('dialog.sheet:not(.popover)') || document.body;
+  if (snoozeSheet.parentNode !== host) host.appendChild(snoozeSheet);
+  const r = anchor.getBoundingClientRect();
+  openPopover(snoozeSheet, anchor, {
+    width: 320, flip: true, history: !isWide(),
+    fixed: Boolean(anchor.closest('#sheet, #pane, .app-header')),
+    align: r.left + r.width / 2 < document.documentElement.clientWidth / 2 ? 'start' : 'end',
+  });
+}
+function drawSnooze(row) {
+  const body = snoozeSheet.querySelector('.sheet-body');
+  const key = rowKey(row);
+  const now = new Date();
+  body.replaceChildren();
+  // Put off already: when, and a way to have it back now.
+  if (isSnoozed(row)) body.appendChild(el('p', 'sheet-text quiet snooze-now', fill('snooze.toast', { when: whenLabel(new Date(row.snoozedUntil), now, true) })));
+  const choices = el('div', 'choices');
+  const choice = (label, at, run) => {
+    const b = el('button', 'choice');
+    b.type = 'button';
+    b.appendChild(el('span', null, label));
+    if (at) b.appendChild(el('span', 'choice-when', whenLabel(at, now)));
+    b.onclick = run;
+    choices.appendChild(b);
+    return b;
+  };
+  if (isSnoozed(row)) choice(t('snooze.now'), null, () => snooze(key, 'now'));
+  for (const c of snoozeChoices(now)) choice(t(c.key), c.at, () => snooze(key, c.at));
+  // Any other moment, on this device's own clock, still to come and within a year.
+  const form = el('form', 'snooze-pick');
+  form.hidden = true;
+  form.noValidate = true;
+  const input = el('input');
+  input.type = 'datetime-local';
+  input.required = true;
+  input.setAttribute('aria-label', t('snooze.pick'));
+  const latest = new Date(now.getTime() + 365 * 86400000);
+  input.min = localInput(new Date(now.getTime() + 60000));
+  input.max = localInput(latest);
+  input.value = localInput(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 9, 0, 0, 0));
+  const set = el('button', 'text-btn strong', t('snooze.set'));
+  set.type = 'submit';
+  const note = el('p', 'snooze-note');
+  note.setAttribute('role', 'status');
+  form.appendChild(input);
+  form.appendChild(set);
+  form.appendChild(note);
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    const at = new Date(input.value);
+    note.textContent = isNaN(at) || at <= new Date() ? t('snooze.past') : at > latest ? t('snooze.far') : '';
+    if (!note.textContent) snooze(key, at);
+  };
+  const pick = choice(t('snooze.pick'), null, () => {
+    pick.hidden = true;
+    form.hidden = false;
+    input.focus();
+    placePopover(snoozeSheet);
+  });
+  body.appendChild(choices);
+  body.appendChild(form);
+}
+// Where Undo takes a message whose reminder was just changed, from the time
+// it had before: back to that time while it is still to come, and to no
+// reminder if it had none. A time that has come, before or since, was a
+// reminder that came (or would be one by now), and the way back to that is
+// to bring the message back now: taking the reminder away instead would
+// leave out of the queue a message that was there only because of it.
+function snoozeUndoTo(before) {
+  if (!before) return null;
+  return Date.parse(before) > Date.now() + 1000 ? new Date(before) : 'now';
+}
+// The way a message is put off, from the panel, the key and the list alike.
+// Optimistic, as marking done is: it leaves the queue at once, and comes
+// back if the server refuses. 'at' is a time; 'now', to bring the message
+// back now as a reminder that has come; or null, to take the reminder away,
+// which only Undo asks for, of a message that had none. Undoing is quiet.
+async function snooze(key, at, undoing) {
+  if (session.canMark === false) { requireWrite(); return; }
+  if (popovers.has(snoozeSheet)) closePopover(snoozeSheet, false);
+  const row = rowByKey(key) || (findItem(key) && rowOfItem(findItem(key)));
+  if (!row) return;
+  const before = row.snoozedUntil || null;
+  const woken = at === 'now';
+  const until = woken ? 'now' : at ? at.toISOString() : null;
+  const asked = { until, local: woken ? new Date().toISOString() : until, woken };
+  const queued = () => attentionSet.has(key) && needsYou(rowByKey(key) || row);
+  const was = queued();
+  const apply = (value, wake) => {
+    const inQueue = queued();
+    snoozeLocal(key, value, wake);
+    attentionCount = Math.max(0, attentionCount + (queued() ? 1 : 0) - (inQueue ? 1 : 0));
+    // Back in the queue, or no longer put off: it must not keep the look of a row leaving.
+    if (!(value && Date.parse(value) > Date.now())) unfade(key);
+  };
+  apply(asked.local, woken);
+  pendingSnooze.set(key, asked);
+  const li = was && at && !woken ? document.querySelector('#queue li.row[data-key="' + CSS.escape(key) + '"]') : null;
+  if (li && !reduceMotion()) {
+    // It lets go the way a row marked done does, without the ring filling.
+    li.classList.add('leaving');
+    setTimeout(renderList, 380);
+  } else renderList();
+  renderLede();
+  renderBars();
+  updateBadge();
+  // Undoing says nothing more, as for Done: the row moving back is the answer.
+  const undo = { label: t('undo'), run: () => snooze(key, snoozeUndoTo(before), true) };
+  if (!undoing && woken) toast(t('snooze.back'), false, isSnoozed({ snoozedUntil: before }) ? undo : null);
+  else if (!undoing && at) {
+    toast(fill('snooze.toast', { when: whenLabel(at, new Date(), true) }), false, undo);
+    if (sheet.open && isOpenRow(key)) closeSheet(sheet, false);
+  }
+  const r = await post('/api/snooze', { key, until });
+  if (pendingSnooze.get(key) === asked) pendingSnooze.delete(key);
+  if (r.ok) {
+    if (typeof r.data.attention === 'number') attentionCount = r.data.attention;
+    if (r.data.row) applyRow(r.data.row);
+    renderLede();
+    updateBadge();
+    saveSnapshot();
+    // Back, or with no reminder, where it stands in the queue is the server's to say.
+    if (!at || woken) loadAttention();
+    return;
+  }
+  apply(before, false);
+  renderList();
+  renderLede();
+  renderBars();
+  updateBadge();
+  toast(r.data && r.data.code ? failure(r.data) : t('act.failed'), true);
+}
+
 // ---- The queue: what needs the reader, most pressing first ----
 const QUEUE_SHOWN = 6;
 let queueExpanded = false;
 function queueItems(now) {
   if (!attention || filtersActive() || filters.view.value !== 'mail') return [];
-  // Soonest deadline first when one is close; then what was judged critical;
-  // then other deadlines this week; then the rest, newest first.
+  // Soonest deadline first when one is close; then a reminder that came in
+  // the last day, at the moment the owner chose for it; then what was judged
+  // critical; then other deadlines this week; then the rest, newest first.
   const urgency = (m) => {
     const due = dueInfo(m.deadline, now);
     const days = due && due.days !== null ? due.days : null;
     if (days !== null && days <= 3) return days;
+    const woke = m.snoozedUntil ? now - Date.parse(m.snoozedUntil) : NaN;
+    if (woke >= 0 && woke < 86400000) return 5;
     if (level(m) === 'critical') return 10;
     if (days !== null && days <= 7) return 20 + days;
     return 100;
   };
-  return attention.filter((m) => !m.handledAt)
+  return attention.filter((m) => !m.handledAt && !isSnoozed(m))
     .map((m, index) => ({ m, index, u: urgency(m) }))
     .sort((a, b) => a.u - b.u || a.index - b.index)
     .map((entry) => entry.m);
@@ -425,8 +685,26 @@ function doneItems() {
     .sort((a, b) => b.at - a.at || a.index - b.index)
     .map((entry) => entry.m);
 }
-function renderQueue(items, done, now, arriving) {
-  queue.hidden = !items.length && !done.length;
+// What is put off and still to come, soonest first, beside it.
+function laterItems() {
+  if (filtersActive() || filters.view.value !== 'mail') return [];
+  return snoozedRows.filter(isSnoozed)
+    .sort((a, b) => (Date.parse(a.snoozedUntil) || 0) - (Date.parse(b.snoozedUntil) || 0));
+}
+// One quiet line where the rows went, which opens to show them. Only one of
+// the two opens at a time, so what is shown under it is never in doubt.
+function footToggle(id, label, open, toggle) {
+  return cached(id, [lang, label, open].join('|'), () => {
+    const b = el('button', 'text-btn quiet foot-toggle ' + id, label);
+    b.type = 'button';
+    b.dataset.focus = id;
+    b.setAttribute('aria-expanded', String(open));
+    b.onclick = toggle;
+    return b;
+  });
+}
+function renderQueue(items, done, later, now, arriving) {
+  queue.hidden = !items.length && !done.length && !later.length;
   if (queue.hidden) { queue.replaceChildren(); return; }
   const desired = [];
   if (items.length) {
@@ -444,17 +722,31 @@ function renderQueue(items, done, now, arriving) {
       }));
     }
   }
-  if (done.length) {
-    // One quiet line where the rows went, which opens to show them.
-    desired.push(cached('done-toggle', [lang, done.length, doneExpanded].join('|'), () => {
-      const toggle = el('button', 'text-btn quiet done-toggle', fill('done.recent', { count: done.length }));
-      toggle.type = 'button';
-      toggle.dataset.focus = 'done-toggle';
-      toggle.setAttribute('aria-expanded', String(doneExpanded));
-      toggle.onclick = () => { doneExpanded = !doneExpanded; renderList(); };
-      return toggle;
-    }));
-    if (doneExpanded) {
+  if (later.length || done.length) {
+    const foot = cached('queue-foot', 'f', () => el('div', 'queue-foot'));
+    const toggles = [];
+    if (later.length) {
+      toggles.push(footToggle('later-toggle', fill('snooze.later', { count: later.length }), laterExpanded, () => {
+        laterExpanded = !laterExpanded;
+        if (laterExpanded) doneExpanded = false;
+        renderList();
+      }));
+    }
+    if (done.length) {
+      toggles.push(footToggle('done-toggle', fill('done.recent', { count: done.length }), doneExpanded, () => {
+        doneExpanded = !doneExpanded;
+        if (doneExpanded) laterExpanded = false;
+        renderList();
+      }));
+    }
+    patchChildren(foot, toggles);
+    desired.push(foot);
+    if (laterExpanded && later.length) {
+      const group = cached('later-group', 'z', () => el('ul', 'group later-group'));
+      patchChildren(group, later.map((m) => rowNode('z:', m, now, false)));
+      desired.push(group);
+    }
+    if (doneExpanded && done.length) {
       const group = cached('done-group', 'd', () => el('ul', 'group done-group'));
       patchChildren(group, done.map((m) => rowNode('d:', m, now, false)));
       desired.push(group);
@@ -474,7 +766,7 @@ function buildList() {
   if (!items) {
     lane.hidden = true;
     lane.replaceChildren();
-    renderQueue([], [], now, false);
+    renderQueue([], [], [], now, false);
     // Before the first answer: the shape of a list, not an empty page.
     patchChildren(list, loadFailed ? [] : [skeleton()]);
     forgetUnused();
@@ -483,10 +775,12 @@ function buildList() {
   const laneKey = renderLane(items, now);
   const queued = queueItems(now);
   const done = doneItems();
-  renderQueue(queued, done, now, arriving);
+  const later = laterItems();
+  renderQueue(queued, done, later, now, arriving);
   const elsewhere = new Set(queued.map(rowKey));
-  // Opened, the list of what was done shows these rows; they are not drawn twice.
+  // Opened, the list of what was done or put off shows these rows; they are not drawn twice.
   if (doneExpanded) for (const m of done) elsewhere.add(rowKey(m));
+  if (laterExpanded) for (const m of later) elsewhere.add(rowKey(m));
   if (laneKey) elsewhere.add(laneKey);
   // Newest first by the date each row shows, so a day appears once even when a
   // backfill filed old mail late. The loaded order is kept for paging.
@@ -495,7 +789,7 @@ function buildList() {
     .sort((a, b) => b.at - a.at || a.index - b.index)
     .map((entry) => entry.item);
   const desired = [];
-  if (!visible.length && !laneKey && !queued.length && !done.length) {
+  if (!visible.length && !laneKey && !queued.length && !done.length && !later.length) {
     const down = failingMailboxes().map((m) => m.address).join();
     const polled = lastSummary && lastSummary.lastPollAt ? hhmm(new Date(lastSummary.lastPollAt)) : '';
     desired.push(cached('empty', [lang, filtersActive(), filters.hours.value, filters.codesOnly.checked, down, polled].join('|'), emptyBlock));
@@ -597,6 +891,7 @@ function onFiltersChanged() {
   loadMoreFailed = false;
   queueExpanded = false;
   doneExpanded = false;
+  laterExpanded = false;
   clearTimeout(timer);
   timer = setTimeout(() => { load(); chrome(); }, 250);
 }
@@ -629,6 +924,7 @@ async function load(reset = true) {
       nextCursor = data.nextCursor || null;
     }
     holdPending();
+    holdSnoozes();
     lastFetchAt = new Date();
     fromSnapshot = false;
     loadFailed = false;
@@ -675,6 +971,7 @@ async function refresh() {
     const oldest = Date.now() - Number(filters.hours.value || 24) * 3600 * 1000;
     lastMail = mergeMail(lastMail || [], page).filter((m) => !(Date.parse(m.createdAt) < oldest));
     holdPending();
+    holdSnoozes();
     nextCursor = previousCursor;
     lastFetchAt = new Date();
     setNetworkIssue(false);
@@ -692,17 +989,26 @@ async function refresh() {
   }
 }
 
-function setAttention(rows, count, done) {
+function setAttention(rows, count, done, later) {
   attention = Array.isArray(rows) ? rows : [];
   // A server that does not say (an older one, during an upgrade) leaves what is known.
   if (Array.isArray(done)) doneRecent = done;
+  if (Array.isArray(later)) snoozedRows = later;
   attentionCount = typeof count === 'number' ? count : attention.length;
   attentionSet = new Set(attention.map(rowKey));
-  // The queue as the server had it before it heard of a row just completed.
+  // The queue as the server had it before it heard of a row just completed,
+  // put off, or brought back.
   for (const [key, at] of pendingHandled) {
     if (at && attention.some((m) => rowKey(m) === key && !m.handledAt)) attentionCount = Math.max(0, attentionCount - 1);
   }
+  for (const [key, asked] of pendingSnooze) {
+    if (pendingHandled.get(key)) continue;
+    const listed = attention.some((m) => rowKey(m) === key && !m.handledAt && !isSnoozed(m));
+    if (asked.until && !asked.woken && listed) attentionCount = Math.max(0, attentionCount - 1);
+    else if (asked.woken && !listed) attentionCount += 1;
+  }
   holdPending();
+  holdSnoozes();
   renderLede();
   if (lastMail || lastThreads) renderList();
   renderBars();
@@ -713,7 +1019,7 @@ async function loadAttention() {
     const r = await fetch('/api/attention');
     if (!r.ok) return;
     const d = await r.json();
-    setAttention(d.mail, d.count, d.done);
+    setAttention(d.mail, d.count, d.done, d.snoozed);
   } catch (e) {}
 }
 
@@ -786,6 +1092,7 @@ function saveSnapshot() {
         mail: lastMail.slice(0, 60).map(plain),
         attention: (attention || []).slice(0, 40).map(plain),
         done: doneRecent.slice(0, 20).map(plain),
+        later: snoozedRows.slice(0, 20).map(plain),
         attentionCount, summary: lastSummary, digest: lastDigest,
       }));
     } catch (e) {}
@@ -802,6 +1109,7 @@ function restoreSnapshot() {
     lastDigest = snap.digest || null;
     attention = Array.isArray(snap.attention) ? snap.attention : [];
     doneRecent = Array.isArray(snap.done) ? snap.done : [];
+    snoozedRows = Array.isArray(snap.later) ? snap.later : [];
     attentionCount = Number(snap.attentionCount) || 0;
     attentionSet = new Set(attention.map(rowKey));
     lastFetchAt = new Date(snap.at);

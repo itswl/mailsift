@@ -42,18 +42,13 @@ function rowByKey(key) {
     for (const m of th.messages || []) if (rowKey(m) === key) return m;
   }
   for (const m of doneRecent) if (rowKey(m) === key) return m;
+  for (const m of snoozedRows) if (rowKey(m) === key) return m;
   return extraRows.get(key) || null;
 }
 // A row the server sent back after an action replaces every copy of it.
 function applyRow(row) {
   if (!row) return;
-  const key = rowKey(row);
-  const swap = (m) => { if (m && rowKey(m) === key) Object.assign(m, row); };
-  for (const m of lastMail || []) swap(m);
-  for (const m of attention || []) swap(m);
-  for (const m of doneRecent) swap(m);
-  for (const th of lastThreads || []) { swap(th.latest); for (const m of th.messages || []) swap(m); }
-  swap(extraRows.get(key));
+  eachCopy(rowKey(row), (m) => { Object.assign(m, row); });
 }
 
 // ---- Cleaning a message's HTML: an allowlist, rebuilt element by element ----
@@ -721,7 +716,26 @@ async function mailAction(key, action) {
   if ((action === 'archive' || action === 'trash') && sheet.open && isOpenRow(key)) closeSheet(sheet, false);
   else if (action === 'inbox') renderPane(true);
 }
-function openMenu(key) {
+// Run once a sheet just closed has gone: the history has stepped back from
+// its entry, and it has finished closing. A popover that takes an entry of
+// its own must not push it before the step back, which would land on it and
+// close it again; nor open while the sheet is still on its way out, whose
+// end hands the focus back to whatever opened it.
+function afterBack(run) {
+  let stepped = !backsOwed, ran = false;
+  const onPop = () => { stepped = true; };
+  if (!stepped) window.addEventListener('popstate', onPop, { once: true });
+  // Within about half a second whatever happens, so the panel is never lost.
+  const settle = (tries) => {
+    if (ran) return;
+    if (tries > 0 && (!stepped || document.querySelector('dialog.closing'))) { setTimeout(() => settle(tries - 1), 40); return; }
+    ran = true;
+    window.removeEventListener('popstate', onPop);
+    run();
+  };
+  settle(15);
+}
+function openMenu(key, anchor) {
   const row = rowByKey(key);
   if (!row) return;
   $('#menu-title').textContent = t('menu.title');
@@ -738,6 +752,14 @@ function openMenu(key) {
   };
   item('i-reply-all', t('act.replyAll'), () => { closeSheet(menuSheet, false); startReply(key, 'replyAll'); });
   item('i-forward', t('act.forward'), () => { closeSheet(menuSheet, false); startForward(key); });
+  // A reminder is for what is not done; one marked done is put back first.
+  if (!row.handledAt && anchor) {
+    item('i-clock', t('act.snooze'), () => {
+      closeSheet(menuSheet, false);
+      // Under the "more" that opened the menu, or its successor if the bar was drawn again meanwhile.
+      afterBack(() => openSnooze(key, anchor.isConnected ? anchor : document.querySelector((isWide() ? '#pane-bar' : '#sheet-bar') + ' [data-act="more"]')));
+    });
+  }
   item('i-star', t(flags.flagged ? 'act.unstar' : 'act.star'), () => mailAction(key, flags.flagged ? 'unstar' : 'star'));
   item('i-read', t(flags.seen === false ? 'act.markRead' : 'act.markUnread'), () => mailAction(key, flags.seen === false ? 'mark_read' : 'mark_unread'));
   if (row.inSpam) item('i-inbox', t('act.notSpam'), () => mailAction(key, 'inbox'));
@@ -764,7 +786,17 @@ function fillBar(bar, row, wide) {
   if (wide) bar.appendChild(barButton('i-reply-all', t('act.replyAll'), () => startReply(key, 'replyAll'), 'icon-only'));
   bar.appendChild(barButton('i-archive', t('act.archive'), () => mailAction(key, 'archive'), wide ? 'icon-only' : ''));
   if (wide) bar.appendChild(barButton('i-star', t(flags.flagged ? 'act.unstar' : 'act.star'), () => mailAction(key, flags.flagged ? 'unstar' : 'star'), 'icon-only' + (flags.flagged ? ' lit' : '')));
-  bar.appendChild(barButton('i-more', t('act.more'), () => openMenu(key), 'icon-only'));
+  // On a desk there is room for it beside the star; on a phone it is under "more".
+  if (wide && !row.handledAt) {
+    const later = barButton('i-clock', t('act.snooze'), () => openSnooze(key, later), 'icon-only snooze-btn' + (isSnoozed(row) ? ' lit' : ''));
+    later.dataset.act = 'snooze';
+    later.setAttribute('aria-haspopup', 'dialog');
+    later.setAttribute('aria-expanded', 'false');
+    bar.appendChild(later);
+  }
+  const more = barButton('i-more', t('act.more'), () => openMenu(key, more), 'icon-only');
+  more.dataset.act = 'more';
+  bar.appendChild(more);
   if (!wide) return;
   bar.appendChild(el('span', 'bar-space'));
   bar.appendChild(barButton('i-up', t('nav.prev'), () => stepMessage(-1), 'icon-only quiet'));
@@ -776,6 +808,8 @@ function renderBars() {
   fillBar($('#sheet-bar'), phone, false);
   const item = isWide() && selectedKey ? findItem(selectedKey) : null;
   fillBar($('#pane-bar'), item ? rowOfItem(item) : null, true);
+  // A popover opened from a button just replaced follows the one in its place.
+  for (const p of popovers.values()) anchorOf(p);
 }
 
 // ---- Opening a message: a sheet on a phone, the pane on a desk ----
@@ -870,6 +904,8 @@ function clearSelection() {
 // Called by the sheet controller when any sheet has finished closing.
 function sheetClosed(dialog) {
   if (dialog !== sheet) return;
+  // The times for a message are no use once it is put away.
+  if (popovers.has(snoozeSheet) && sheet.contains(snoozeSheet)) closePopover(snoozeSheet, true);
   openKey = null;
   sheet.querySelector('.sheet-body').replaceChildren();
   renderBars();

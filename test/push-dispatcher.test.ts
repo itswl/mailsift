@@ -5,8 +5,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { afterEach, describe, expect, it } from 'vitest';
 import './setup.js';
 import {
-  fitNotice, noticeFor, PUSH_CURSOR_KEY, PushDispatcher, pushSubject, sendTestPush, vapidKeys, wants,
-  type PushNotice,
+  fitNotice, noticeFor, PUSH_CURSOR_KEY, PushDispatcher, pushSubject, reminderFor, sendTestPush, SNOOZE_CHECKED_KEY,
+  vapidKeys, wants, type PushDispatcherOptions, type PushNotice,
 } from '../src/services/push-dispatcher.js';
 import { StateStore, type MailRow, type PushSubscriptionRow } from '../src/services/state.js';
 import { MAX_PAYLOAD_BYTES, type PushSendResult, type sendPush } from '../src/services/webpush.js';
@@ -52,7 +52,8 @@ function world() {
     });
     return outcomes.get(target.endpoint) ?? 'sent';
   }) as typeof sendPush;
-  const dispatcher = (): PushDispatcher => new PushDispatcher({ openStore: () => new StateStore(path), send });
+  const dispatcher = (options: Partial<PushDispatcherOptions> = {}): PushDispatcher =>
+    new PushDispatcher({ openStore: () => new StateStore(path), send, ...options });
 
   /** Past the bootstrap: the cursor already exists, a minute back. */
   const started = (): void => {
@@ -81,7 +82,7 @@ const row = (over: Partial<MailRow> = {}): MailRow => ({
   subject: 'Invoice 42', sender: 'billing@example.com', senderName: 'Billing', folder: 'INBOX', inSpam: false,
   importance: 'warning', category: 'Finance', summary: 'Invoice 42 is due on the 30th.', reason: 'a date',
   deadline: null, decidedBy: 'llm', pushed: true, mailDate: new Date().toISOString(),
-  createdAt: new Date().toISOString(), handledAt: null, ...over,
+  createdAt: new Date().toISOString(), handledAt: null, snoozedUntil: null, ...over,
 });
 
 const device = (over: Partial<PushSubscriptionRow> = {}): PushSubscriptionRow => ({
@@ -384,6 +385,240 @@ describe('a dry run', () => {
     expect(await pass(dispatcher)).toBe(1);
     expect(w.sent.map((s) => s.notice.key)).toEqual(['after']);
     dispatcher.stop();
+  });
+});
+
+describe('reminders', () => {
+  /** A dispatcher that looks for reminders on every pass rather than once a minute. */
+  const eager = (w: ReturnType<typeof world>, options: Partial<PushDispatcherOptions> = {}): PushDispatcher =>
+    w.dispatcher({ wakeEveryMs: 1, ...options });
+  /** Put a message off until a moment a few milliseconds away, and wait for it to come. */
+  async function remind(w: ReturnType<typeof world>, key: string): Promise<void> {
+    w.writer.setSnoozed(key, new Date(Date.now() + 5).toISOString());
+    await sleep(10);
+  }
+
+  it('reminds every device of a message whose time has come, whatever it chose to hear, once', async () => {
+    const w = world();
+    w.started();
+    // One wants only critical mail and no codes; the reminder is the owner's own, and goes to it all the same.
+    w.subscribe('phone', { level: 'critical', codes: false });
+    w.subscribe('tablet', { lang: 'zh-CN' });
+    w.file('quiet', 'info');
+    const dispatcher = eager(w);
+    // The first look marks where it starts.
+    expect(await pass(dispatcher)).toBe(0);
+    expect(w.writer.getMeta(SNOOZE_CHECKED_KEY)).toEqual(expect.any(String));
+
+    const before = w.writer.changeSignature().mail;
+    await remind(w, 'quiet');
+    expect(await pass(dispatcher)).toBe(2);
+    const phone = w.sent.find((s) => s.endpoint === endpoint('phone'))!;
+    expect(phone.notice).toMatchObject({
+      kind: 'reminder', title: 'Reminder: Sender', body: 'summary of quiet', url: '/#m=quiet', key: 'quiet', tag: 'quiet',
+    });
+    expect(phone.ttl).toBe(86_400);
+    // It is back in the queue, so the badge counts it, and open pages are told.
+    expect(phone.notice.badge).toBe(1);
+    expect(w.writer.changeSignature().mail).not.toBe(before);
+    expect(w.sent.find((s) => s.endpoint === endpoint('tablet'))!.notice.title).toBe('提醒：Sender');
+
+    w.writer.setMeta('nudge', '1');
+    expect(await pass(dispatcher)).toBe(0);
+    expect(w.sent).toHaveLength(2);
+    dispatcher.stop();
+  });
+
+  it('looks once a minute, not on every pass', async () => {
+    const w = world();
+    w.started();
+    w.subscribe('phone');
+    w.file('quiet', 'info');
+    // A minute that will not end during the test.
+    const dispatcher = w.dispatcher({ wakeEveryMs: 1e12 });
+    await pass(dispatcher);
+    await remind(w, 'quiet');
+    w.writer.setMeta('nudge', '1');
+    expect(await pass(dispatcher)).toBe(0);
+    // The next minute's look finds it, in whichever process looks.
+    expect(await pass(eager(w))).toBe(1);
+    dispatcher.stop();
+  });
+
+  it('says nothing of one marked done before its time, or of one a day late, and still moves on', async () => {
+    const w = world();
+    w.started();
+    w.subscribe('phone');
+    w.file('done', 'critical');
+    w.file('stale', 'critical');
+    const dispatcher = eager(w);
+    await pass(dispatcher);
+    // Those were news when they came; what follows is about their reminders.
+    w.sent.length = 0;
+    w.writer.setSnoozed('done', new Date(Date.now() + 5).toISOString());
+    w.writer.setHandled('done', true);
+    // The service was down for two days, and the mark is from before then.
+    w.writer.setMeta('attention_since', new Date(Date.now() - 7 * 86_400_000).toISOString());
+    w.writer.setMeta(SNOOZE_CHECKED_KEY, new Date(Date.now() - 3 * 86_400_000).toISOString());
+    w.writer.setSnoozed('stale', new Date(Date.now() - 2 * 86_400_000).toISOString());
+    await sleep(10);
+    expect(await pass(dispatcher)).toBe(0);
+    expect(w.sent).toEqual([]);
+    // Back in the queue all the same, and the mark has moved past it.
+    expect(w.writer.attention().map((row) => row.dedupKey)).toEqual(['stale']);
+    expect(Date.parse(w.writer.getMeta(SNOOZE_CHECKED_KEY) ?? '')).toBeGreaterThan(Date.now() - 1_000);
+    dispatcher.stop();
+  });
+
+  it('neither misses nor repeats a reminder across a restart, and two processes send it once', async () => {
+    const w = world();
+    w.started();
+    w.subscribe('phone');
+    w.file('a', 'info');
+    w.file('b', 'info');
+    const first = eager(w);
+    await pass(first);
+    first.stop();
+    // Down while its time came.
+    await remind(w, 'a');
+    const one = eager(w);
+    const two = eager(w);
+    const counts = await Promise.all([one.tick(), two.tick()]);
+    expect(counts.reduce((x, y) => x + y, 0)).toBe(1);
+    expect(w.sent.map((s) => s.notice.key)).toEqual(['a']);
+    await remind(w, 'b');
+    await Promise.all([two.tick(), one.tick()]);
+    expect(w.sent.map((s) => s.notice.key)).toEqual(['a', 'b']);
+    one.stop();
+    two.stop();
+  });
+
+  it('comes first, and is not told twice beside the same message\'s own notice, within the cap', async () => {
+    const w = world();
+    w.started();
+    w.subscribe('phone');
+    const dispatcher = eager(w);
+    await pass(dispatcher);
+    for (let n = 1; n <= 4; n += 1) w.file(`m${n}`, 'critical');
+    // News and a reminder in the same pass: it is told once, as the reminder.
+    w.file('both', 'critical');
+    await remind(w, 'both');
+    expect(await pass(dispatcher)).toBe(5);
+    expect(w.sent.map((s) => s.notice.kind)).toEqual(['reminder', 'mail', 'mail', 'mail', 'more']);
+    expect(w.sent.filter((s) => s.notice.key === 'both')).toHaveLength(1);
+    expect(w.sent[4]!.notice.body).toBe('1 more message needs you');
+    dispatcher.stop();
+  });
+
+  it('reminds nobody in a dry run, or with notifications off, and wakes the message all the same', async () => {
+    const w = world();
+    w.started();
+    w.subscribe('phone');
+    w.file('a', 'info');
+    w.file('b', 'info');
+    const quiet = eager(w, { notify: false });
+    await pass(quiet);
+    const cursor = w.writer.getMeta(PUSH_CURSOR_KEY);
+    w.file('new', 'critical');
+    await remind(w, 'a');
+    const before = w.writer.changeSignature().mail;
+    expect(await pass(quiet)).toBe(0);
+    // Open pages are told it is back; new mail is left for whoever does notify.
+    expect(w.writer.changeSignature().mail).not.toBe(before);
+    expect(w.writer.getMeta(PUSH_CURSOR_KEY)).toBe(cursor);
+    quiet.stop();
+
+    process.env.DRY_RUN = 'true';
+    const dry = eager(w);
+    await pass(dry);
+    await remind(w, 'b');
+    expect(await pass(dry)).toBe(0);
+    delete process.env.DRY_RUN;
+    w.writer.setMeta('nudge', '1');
+    expect(await pass(dry)).toBe(0);
+    expect(w.sent).toEqual([]);
+    dry.stop();
+  });
+
+  it('forgets a device its push service says is gone', async () => {
+    const w = world();
+    w.started();
+    const gone = w.subscribe('gone');
+    w.outcomes.set(gone, 'gone');
+    w.file('a', 'info');
+    const dispatcher = eager(w);
+    await pass(dispatcher);
+    await remind(w, 'a');
+    await pass(dispatcher);
+    expect(w.writer.getPushSubscription(gone)).toBeUndefined();
+    dispatcher.stop();
+  });
+
+  it('says nothing of a message put off before its time, even when it is judged again meanwhile', async () => {
+    const w = world();
+    w.started();
+    w.subscribe('phone');
+    // Filed quietly while the model was down, and put off until tomorrow.
+    w.file('outage', 'info', { decidedBy: 'fallback' });
+    const dispatcher = eager(w);
+    await pass(dispatcher);
+    w.writer.setSnoozed('outage', new Date(Date.now() + 86_400_000).toISOString());
+    // The model is back and finds it critical: the owner said "not now", and the reminder will say it then.
+    w.writer.recordOutcome('outage', 'critical', true, {
+      messageId: '<outage@x>', senderName: 'Vendor', summary: 'Card blocked', decidedBy: 'llm', mailDate: new Date().toISOString(),
+    });
+    expect(await pass(dispatcher)).toBe(0);
+    expect(w.sent).toEqual([]);
+    expect(wants(device(), row({ importance: 'critical', snoozedUntil: new Date(Date.now() + 60_000).toISOString() }))).toBe(false);
+    // Once its time has come, mail about it is news like any other.
+    expect(wants(device(), row({ importance: 'critical', snoozedUntil: new Date(Date.now() - 60_000).toISOString() }))).toBe(true);
+    dispatcher.stop();
+  });
+
+  it('puts a fresh code before reminders that came together, so it is never folded into "more"', async () => {
+    const w = world();
+    w.started();
+    w.subscribe('phone');
+    for (let n = 1; n <= 4; n += 1) w.file(`r${n}`, 'info');
+    const dispatcher = eager(w);
+    await pass(dispatcher);
+    // Four put off to the same choice, and a code that arrives in the minute they come.
+    const nine = new Date(Date.now() + 5).toISOString();
+    for (let n = 1; n <= 4; n += 1) w.writer.setSnoozed(`r${n}`, nine);
+    w.file('code', 'warning', { verificationCode: '123456', summary: 'Verification code from Example.' });
+    await sleep(10);
+    expect(await pass(dispatcher)).toBe(5);
+    expect(w.sent.map((s) => s.notice.kind)).toEqual(['code', 'reminder', 'reminder', 'reminder', 'more']);
+    expect(w.sent[0]!.notice.title).toBe('123 456');
+    dispatcher.stop();
+  });
+
+  it('says nothing of a message brought back by hand, which is in the queue at once', async () => {
+    const w = world();
+    w.started();
+    w.subscribe('phone');
+    w.file('quiet', 'info');
+    const dispatcher = eager(w);
+    await pass(dispatcher);
+    w.writer.setSnoozed('quiet', new Date(Date.now() + 3_600_000).toISOString());
+    await pass(dispatcher);
+    // "Back now", between two looks.
+    await sleep(5);
+    w.writer.wakeNow('quiet');
+    await sleep(5);
+    expect(await pass(dispatcher)).toBe(0);
+    expect(w.sent).toEqual([]);
+    expect(w.writer.attention().map((m) => m.dedupKey)).toEqual(['quiet']);
+    dispatcher.stop();
+  });
+
+  it('words a reminder from the message, never with a code, and inside one push message', () => {
+    expect(reminderFor(row({ verificationCode: '123456', summary: 'A sign-in code from Example.' }), 'en'))
+      .toMatchObject({ kind: 'reminder', title: 'Reminder: Billing', body: 'A sign-in code from Example.' });
+    expect(reminderFor(row({ senderName: null, sender: null, summary: null }), 'zh-CN'))
+      .toMatchObject({ title: '提醒：未知发件人', body: 'Invoice 42' });
+    const long = fitNotice(reminderFor(row({ summary: '提醒'.repeat(2_000) }), 'zh-CN'));
+    expect(Buffer.byteLength(JSON.stringify(long), 'utf8')).toBeLessThanOrEqual(3_000);
   });
 });
 

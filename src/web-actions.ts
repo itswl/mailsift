@@ -2,21 +2,22 @@
  * The part of the web view that does things.
  *
  * Reading what triage stored is the rest of the view. This file is where the
- * page stops being a window: marking a message dealt with, moving it in the
- * mailbox, correcting a judgement, sending a reply or a forward with what it
- * carries, keeping each mailbox's signature, asking the model a question, and
- * telling this server which devices want notifications.
+ * page stops being a window: marking a message dealt with or putting it off
+ * until later, moving it in the mailbox, correcting a judgement, sending a
+ * reply or a forward with what it carries, keeping each mailbox's signature,
+ * asking the model a question, and telling this server which devices want
+ * notifications.
  *
  * Three rules hold for every route here.
  *
  * 1. Who may: anything that touches a mailbox, sends mail or changes how
  *    future mail is judged needs a `write` session, which a browser gets only
- *    by signing in with MCP_WRITE_TOKEN. Marking something dealt with changes
- *    what every reader sees, so once a deployment has set that token, the
- *    read token cannot do it either; with no write token configured the one
- *    credential is the owner's and may keep the page's own books. Asking a
- *    question and this device's notifications are reading, and work for a
- *    `read` session.
+ *    by signing in with MCP_WRITE_TOKEN. Marking something dealt with, or
+ *    putting it off, changes what every reader sees, so once a deployment has
+ *    set that token, the read token cannot do it either; with no write token
+ *    configured the one credential is the owner's and may keep the page's own
+ *    books. Asking a question and this device's notifications are reading,
+ *    and work for a `read` session.
  * 2. From where: every route is a POST (or a GET that changes nothing) and
  *    the router refuses a POST another site started before it gets here.
  * 3. On record: each mailbox action and each sent message is written to the
@@ -382,8 +383,8 @@ const PAGE_ACTIONS = new Set<WebMailAction>(MAIL_ACTIONS);
  *
  * The MCP server gives a caller holding the write credential what a write
  * session of the page has, and it does so by running the page's own code:
- * markHandled, actOnMail, sendMessage, replyDraft, forwardDraft and
- * saveSignature below are what the routes call. There is one implementation
+ * markHandled, snoozeMail, actOnMail, sendMessage, replyDraft, forwardDraft
+ * and saveSignature below are what the routes call. There is one implementation
  * of each action and of every check around it, so the two cannot drift
  * apart. Work one of them starts may
  * outlast the call; `life` is ended when the call returns, as it is for a
@@ -451,6 +452,79 @@ export async function markHandled(
     }
   }
   return json(200, { key: row.dedupKey, handled, handledAt: row.handledAt, attention: store.attentionCount() });
+}
+
+// ---- Later: put off until a time ----
+
+/** A reminder further off than this is a note for a calendar, not a to-do put off. */
+const SNOOZE_MAX_DAYS = 366;
+
+/**
+ * The moment a reminder is asked for, as an ISO 8601 UTC time, or a reason it
+ * cannot be one. Only a time that says its offset is taken: a bare "09:00"
+ * means a different moment on the server than where it was meant.
+ */
+export function snoozeTime(value: unknown, now = Date.now()): { at: string } | { refused: string; code: string } {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/i.test(value.trim())) {
+    return { refused: 'until must be an ISO 8601 time with its offset, \'now\' or null', code: 'badRequest' };
+  }
+  const at = Date.parse(value.trim());
+  if (!Number.isFinite(at)) return { refused: 'until is not a time', code: 'badRequest' };
+  if (at <= now) return { refused: 'until is in the past; a reminder needs a time still to come', code: 'snoozePast' };
+  if (at > now + SNOOZE_MAX_DAYS * 86_400_000) return { refused: 'until is more than a year ahead', code: 'snoozeFar' };
+  return { at: new Date(at).toISOString() };
+}
+
+async function handleSnooze(req: IncomingMessage, store: StateStore, ctx: ActionContext, life: Life): Promise<WebResponse> {
+  if (!ctx.mayMark) return readOnly();
+  return snoozeMail(await readJson(req), store, ctx, life);
+}
+
+/**
+ * Put a message off until a time, bring it back now, or cancel its reminder.
+ * `body`: key, and until: an ISO 8601 time with its offset; 'now'; or null.
+ *
+ * 'now' is "Back now": the reminder counts as having come, so the message is
+ * in the queue whatever it was judged, as it would have been at its time
+ * (see StateStore.wakeNow), and nobody is notified, since the one who asked
+ * is the owner. It is also how the page undoes putting off again a reminder
+ * that had already come. null takes the reminder away and leaves the message
+ * to its judgement, which is the way back from putting off a message that
+ * had none.
+ *
+ * The queue's own bookkeeping, like marking done, so it is open to the same
+ * sessions and changes nothing in the mailbox. Who may mark mail done may
+ * say when to be reminded of it. `inQueue` says where the message is now.
+ */
+export async function snoozeMail(
+  body: Record<string, unknown> | undefined, store: StateStore, ctx: ActionContext, _life: Life,
+): Promise<WebResponse> {
+  if (!ctx.mayMark) return readOnly();
+  const key = text(body?.['key'], 1200);
+  if (!key) return badRequest('key is required');
+  if (!body || !('until' in body)) {
+    return badRequest('until is required: a time, \'now\' to bring the message back now, or null to cancel the reminder');
+  }
+  let row: MailRow | undefined;
+  let audit: string;
+  if (body['until'] === 'now') {
+    row = store.wakeNow(key);
+    audit = 'web:wake';
+  } else if (body['until'] === null) {
+    row = store.setSnoozed(key, null);
+    audit = 'web:unsnooze';
+  } else {
+    const parsed = snoozeTime(body['until']);
+    if ('refused' in parsed) return json(400, { error: parsed.refused, code: parsed.code });
+    row = store.setSnoozed(key, parsed.at);
+    audit = 'web:snooze';
+  }
+  if (!row) return json(404, { error: 'not found', code: 'notFound' });
+  if (ctx.origin !== 'mcp') store.recordMcpAudit(audit, ctx.client, true, row.dedupKey);
+  return json(200, {
+    key: row.dedupKey, snoozedUntil: row.snoozedUntil, handledAt: row.handledAt,
+    inQueue: store.inAttention(row.dedupKey), row: ctx.decorate(row), attention: store.attentionCount(),
+  });
 }
 
 async function handleAction(req: IncomingMessage, store: StateStore, ctx: ActionContext, life: Life): Promise<WebResponse> {
@@ -1466,6 +1540,7 @@ export async function routeActions(
       if (path === '/api/forward' && req.method === 'GET') return handleForward(url.searchParams, store, ctx);
       if (req.method !== 'POST') return undefined;
       if (path === '/api/handled') return handleHandled(req, store, ctx, life);
+      if (path === '/api/snooze') return handleSnooze(req, store, ctx, life);
       if (path === '/api/action') return handleAction(req, store, ctx, life);
       if (path === '/api/feedback') return handleFeedback(req, store, ctx);
       if (path === '/api/send') return handleSend(req, store, ctx, life);

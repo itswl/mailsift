@@ -721,29 +721,29 @@ describe('refresh', () => {
   });
 });
 
+/**
+ * Declarations of the page script, run on their own. The script is written
+ * with each top-level function closing on a line of its own, and each
+ * top-level table on a "};" line, which is what lets one be lifted out.
+ */
+function lifted<T>(names: string[], expose: string, context: Record<string, unknown> = {}): T {
+  const script = clientScript();
+  const parts = names.map((name) => {
+    const plain = script.indexOf(`\nfunction ${name}(`);
+    const fn = plain !== -1 ? plain : script.indexOf(`\nasync function ${name}(`);
+    if (fn !== -1) return script.slice(fn, script.indexOf('\n}\n', fn) + 3);
+    const constant = script.indexOf(`\nconst ${name} = `);
+    expect(constant, name).toBeGreaterThan(-1);
+    const table = script.slice(constant).match(/^\nconst \w+ = \{\n/);
+    const end = table ? script.indexOf('\n};\n', constant) + 4 : script.indexOf(';\n', constant) + 2;
+    return script.slice(constant, end);
+  });
+  return new Script(`${parts.join('\n')}\n(${expose})`).runInNewContext(context) as T;
+}
 describe('the composer', () => {
   const shell = async (headers: Record<string, string> = {}): Promise<string> =>
     String((await routeWeb(request({ headers }), url('/'), '', seeded())).body);
 
-  /**
-   * Declarations of the page script, run on their own. The script is written
-   * with each top-level function closing on a line of its own, and each
-   * top-level table on a "};" line, which is what lets one be lifted out.
-   */
-  function lifted<T>(names: string[], expose: string, context: Record<string, unknown> = {}): T {
-    const script = clientScript();
-    const parts = names.map((name) => {
-      const plain = script.indexOf(`\nfunction ${name}(`);
-      const fn = plain !== -1 ? plain : script.indexOf(`\nasync function ${name}(`);
-      if (fn !== -1) return script.slice(fn, script.indexOf('\n}\n', fn) + 3);
-      const constant = script.indexOf(`\nconst ${name} = `);
-      expect(constant, name).toBeGreaterThan(-1);
-      const table = script.slice(constant).match(/^\nconst \w+ = \{\n/);
-      const end = table ? script.indexOf('\n};\n', constant) + 4 : script.indexOf(';\n', constant) + 2;
-      return script.slice(constant, end);
-    });
-    return new Script(`${parts.join('\n')}\n(${expose})`).runInNewContext(context) as T;
-  }
   /** The page's words by key, filled in, in English, as the page shows them. */
   const t = (key: string): string => STRINGS.en[key as StringKey] ?? key;
   const fill = (key: string, vars: Record<string, unknown> = {}): string =>
@@ -1229,5 +1229,208 @@ describe('the composer', () => {
       expect(STRINGS['zh-CN'][key], key).toBeTruthy();
       expect(STRINGS['zh-CN'][key]).not.toBe(STRINGS.en[key]);
     }
+  });
+});
+
+describe('putting a message off until later', () => {
+  /** The page's words in one language, filled in as the page fills them. */
+  const words = (lang: 'en' | 'zh-CN') => {
+    const t = (key: string): string => STRINGS[lang][key as StringKey] ?? key;
+    const fill = (key: string, vars: Record<string, unknown> = {}): string =>
+      Object.entries(vars).reduce((text, [name, value]) => text.split(`{${name}}`).join(String(value)), t(key));
+    return { t, fill, lang };
+  };
+  type Choice = { key: string; at: Date };
+  const choicesAt = (now: Date): Array<[string, string]> => lifted<(now: Date) => Choice[]>(['snoozeChoices'], 'snoozeChoices')(now)
+    .map((c) => [c.key.replace('snooze.', ''), `${c.at.getDate()} ${String(c.at.getHours()).padStart(2, '0')}:${String(c.at.getMinutes()).padStart(2, '0')}`]);
+
+  it('offers the times that make sense from where the day is, on the device\'s own clock', () => {
+    // Saturday 14 November 2026, early: three hours on to the next quarter hour, the evening, tomorrow, Monday.
+    expect(choicesAt(new Date(2026, 10, 14, 5, 40))).toEqual([
+      ['laterToday', '14 08:45'], ['evening', '14 19:00'], ['tomorrow', '15 09:00'], ['nextWeek', '16 09:00'],
+    ]);
+    // On a quarter hour, it stays on it.
+    expect(choicesAt(new Date(2026, 10, 14, 9, 15))[0]).toEqual(['laterToday', '14 12:15']);
+    // Three hours on would be no sooner than the evening that is also offered: only the evening.
+    expect(choicesAt(new Date(2026, 10, 14, 16, 10)).map(([key]) => key)).toEqual(['evening', 'tomorrow', 'nextWeek']);
+    // After five the evening is no longer offered; after eight, nothing more today.
+    expect(choicesAt(new Date(2026, 10, 14, 17, 30)).slice(0, 2)).toEqual([['laterToday', '14 20:30'], ['tomorrow', '15 09:00']]);
+    expect(choicesAt(new Date(2026, 10, 14, 20, 0)).map(([key]) => key)).toEqual(['tomorrow', 'nextWeek']);
+    // On a Sunday, Monday morning is tomorrow morning, offered once.
+    expect(choicesAt(new Date(2026, 10, 15, 10, 0)).map(([key]) => key)).toEqual(['laterToday', 'evening', 'tomorrow']);
+    // On a Monday, next week is a week on.
+    expect(choicesAt(new Date(2026, 10, 16, 10, 0)).at(-1)).toEqual(['nextWeek', '23 09:00']);
+  });
+
+  it('says each time as the reader would, in both languages', () => {
+    const now = new Date(2026, 10, 14, 5, 40);
+    for (const [lang, today, tomorrow, inSentence, weekday, far] of [
+      ['en', '08:45', 'Tomorrow 09:00', 'tomorrow 09:00', 'Mon 09:00', /^Nov 30 09:00$/],
+      ['zh-CN', '今天 08:45', '明天 09:00', '明天 09:00', '周一 09:00', /^11月30日 09:00$/],
+    ] as const) {
+      const say = lifted<(d: Date, now: Date, inSentence?: boolean) => string>(
+        ['pad', 'hhmm', 'dayKey', 'whenLabel'], 'whenLabel', words(lang),
+      );
+      expect(say(new Date(2026, 10, 14, 8, 45), now)).toBe(today);
+      expect(say(new Date(2026, 10, 15, 9, 0), now)).toBe(tomorrow);
+      expect(say(new Date(2026, 10, 15, 9, 0), now, true)).toBe(inSentence);
+      expect(say(new Date(2026, 10, 16, 9, 0), now)).toBe(weekday);
+      expect(say(new Date(2026, 10, 30, 9, 0), now)).toMatch(far);
+    }
+    expect(words('en').fill('snooze.toast', { when: 'tomorrow 09:00' })).toBe('Reminder set for tomorrow 09:00');
+    expect(words('zh-CN').fill('snooze.toast', { when: '明天 09:00' })).toBe('将于明天 09:00 提醒你');
+    expect(words('en').fill('snooze.later', { count: 2 })).toBe('Later · 2');
+    expect(words('zh-CN').fill('snooze.later', { count: 2 })).toBe('稍后 · 2');
+  });
+
+  it('offers the morning to come in the small hours, and no reminder in the night', () => {
+    // Sunday 15 November 2026, ten past midnight: nothing at three in the morning, and the
+    // morning meant is this one; Monday is then a choice of its own. Soonest first.
+    expect(choicesAt(new Date(2026, 10, 15, 0, 10))).toEqual([
+      ['morning', '15 09:00'], ['evening', '15 19:00'], ['nextWeek', '16 09:00'],
+    ]);
+    // A minute before five, three hours on is already morning.
+    expect(choicesAt(new Date(2026, 10, 15, 4, 59))).toEqual([
+      ['laterToday', '15 08:00'], ['morning', '15 09:00'], ['evening', '15 19:00'], ['nextWeek', '16 09:00'],
+    ]);
+    // From five, tomorrow morning is tomorrow's again.
+    expect(choicesAt(new Date(2026, 10, 15, 5, 0)).map(([key]) => key)).toEqual(['laterToday', 'evening', 'tomorrow']);
+    expect(words('en').t('snooze.morning')).toBe('This morning');
+    expect(words('zh-CN').t('snooze.morning')).toBe('今天上午');
+  });
+
+  it('names a weekday across New Year without the year, and a date in another year with it', () => {
+    const now = new Date(2026, 11, 30, 10, 0);
+    for (const [lang, monday, far] of [
+      ['en', 'Mon 09:00', /^Jan 20, 2027 09:00$/],
+      ['zh-CN', '周一 09:00', /^2027年1月20日 09:00$/],
+    ] as const) {
+      const say = lifted<(d: Date, now: Date, inSentence?: boolean) => string>(
+        ['pad', 'hhmm', 'dayKey', 'whenLabel'], 'whenLabel', words(lang),
+      );
+      expect(say(new Date(2027, 0, 4, 9, 0), now)).toBe(monday);
+      expect(say(new Date(2027, 0, 20, 9, 0), now)).toMatch(far);
+    }
+    // "Next week" from the 30th of December is that Monday, said the same way.
+    expect(choicesAt(now).at(-1)).toEqual(['nextWeek', '4 09:00']);
+  });
+
+  it('undoes to the time a message had while it is to come, to none if it had none, and back now if it came', () => {
+    const undoTo = lifted<(before: string | null) => Date | string | null>(['snoozeUndoTo'], 'snoozeUndoTo');
+    const ahead = new Date(Date.now() + 3_600_000);
+    expect(undoTo(null)).toBeNull();
+    expect((undoTo(ahead.toISOString()) as Date).getTime()).toBe(ahead.getTime());
+    // A reminder that had come: putting it back means bringing it back, never taking the reminder away.
+    expect(undoTo(new Date(Date.now() - 20 * 60_000).toISOString())).toBe('now');
+    const script = clientScript();
+    expect(script).toContain("choice(t('snooze.now'), null, () => snooze(key, 'now'))");
+    expect(script).toContain('run: () => snooze(key, snoozeUndoTo(before), true)');
+    expect(words('en').t('snooze.back')).toBe('Back in Needs you');
+    expect(words('zh-CN').t('snooze.back')).toBe('已放回待你处理');
+  });
+
+  it('says in Chinese that a reminder can be at most a year ahead, not at least', () => {
+    expect(words('zh-CN').t('error.snoozeFar')).toBe('提醒最多只能设在一年以内。');
+    expect(words('zh-CN').t('error.snoozeFar')).not.toContain('以后');
+  });
+
+  it('keeps a popover on its control when the control is drawn again, and in place when it is gone', () => {
+    type Box = { left: number; right: number; top: number; bottom: number; width: number; height: number };
+    const box = (left: number, top: number): Box => ({ left, right: left + 32, top, bottom: top + 32, width: 32, height: 32 });
+    const control = (rect: Box, connected = true) => {
+      const attrs: Record<string, string> = {};
+      return {
+        isConnected: connected, id: '', dataset: { act: 'snooze' } as Record<string, string>, attrs,
+        getBoundingClientRect: () => rect,
+        setAttribute: (name: string, value: string) => { attrs[name] = value; },
+        closest: () => null, parentElement: null,
+      };
+    };
+    const popovers = new Map<unknown, Record<string, unknown>>();
+    const props: Record<string, string> = {};
+    const dialog = {
+      open: true, scrollHeight: 200,
+      classList: { toggle: () => undefined },
+      style: { setProperty: (name: string, value: string) => { props[name] = value; } },
+    };
+    let successor: ReturnType<typeof control> | null = null;
+    const place = lifted<(d: unknown) => void>(['anchorOf', 'placePopover'], 'placePopover', {
+      popovers, window: { innerHeight: 800, scrollX: 0, scrollY: 0 },
+      document: { documentElement: { clientWidth: 1200 } },
+    });
+    const first = control(box(500, 100));
+    popovers.set(dialog, { anchor: first, width: 320, align: 'end', fixed: true, flip: false, find: () => successor });
+    place(dialog);
+    const where = { ...props };
+    expect(where['--pop-top']).toBe('142px');
+
+    // The bar was drawn again: the old control is gone and nothing stands in its place yet.
+    first.isConnected = false;
+    for (const name of Object.keys(props)) delete props[name];
+    place(dialog);
+    expect(props).toEqual({});
+    // Its successor, where the bar now puts it: the popover follows it, and it is marked open.
+    successor = control(box(520, 100));
+    place(dialog);
+    expect(popovers.get(dialog)!['anchor']).toBe(successor);
+    expect(successor.attrs['aria-expanded']).toBe('true');
+    expect(props['--pop-top']).toBe(where['--pop-top']);
+    expect(Number.parseFloat(props['--pop-left']!)).toBeGreaterThan(Number.parseFloat(where['--pop-left']!));
+
+    // Where its successor is looked for: the same act in the same bar, or in the same row.
+    const asked: string[] = [];
+    const finder = lifted<(anchor: unknown) => (() => unknown) | null>(['anchorFinder'], 'anchorFinder', {
+      CSS: { escape: (value: string) => value },
+      document: { querySelector: (selector: string) => { asked.push(selector); return null; }, getElementById: (id: string) => { asked.push(`id:${id}`); return null; } },
+    });
+    const inBar = { id: '', dataset: { act: 'snooze' }, parentElement: { closest: () => ({ id: 'pane-bar' }) }, closest: () => null };
+    const inRow = { id: '', dataset: { act: 'snooze' }, parentElement: { closest: () => ({ id: 'queue' }) }, closest: () => ({ dataset: { key: 'k1' } }) };
+    finder(inBar)!();
+    finder(inRow)!();
+    finder({ id: 'bell', dataset: {} })!();
+    expect(asked).toEqual(['#pane-bar [data-act="snooze"]', '#queue li.row[data-key="k1"] [data-act="snooze"]', 'id:bell']);
+    expect(finder({ id: '', dataset: {}, parentElement: { closest: () => ({ id: 'x' }) }, closest: () => null })).toBeNull();
+  });
+
+  it('holds a datetime field to this device\'s own time, to the minute', () => {
+    const local = lifted<(d: Date) => string>(['pad', 'localInput'], 'localInput');
+    expect(local(new Date(2026, 0, 5, 7, 3, 59))).toBe('2026-01-05T07:03');
+  });
+
+  it('counts a message put off as still to come only while it is, and not once it is done', () => {
+    const isSnoozed = lifted<(m: Record<string, unknown> | null) => boolean>(['isSnoozed'], 'isSnoozed');
+    const later = new Date(Date.now() + 60_000).toISOString();
+    expect(isSnoozed({ snoozedUntil: later, handledAt: null })).toBe(true);
+    expect(isSnoozed({ snoozedUntil: new Date(Date.now() - 60_000).toISOString(), handledAt: null })).toBe(false);
+    expect(isSnoozed({ snoozedUntil: later, handledAt: new Date().toISOString() })).toBe(false);
+    expect(isSnoozed({ snoozedUntil: null, handledAt: null })).toBe(false);
+    expect(isSnoozed(null)).toBe(false);
+  });
+
+  it('offers it in the reader, on b, and in the list of keys, and opens it as a panel under its control', async () => {
+    const script = clientScript();
+    const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
+    expect(page).toContain('<dialog id="snooze-sheet" class="sheet bare" aria-labelledby="snooze-title" tabindex="-1">');
+    expect(page).toContain('<symbol id="i-clock" viewBox="0 0 24 24">');
+    expect(script).toContain("item('i-clock', t('act.snooze'), () => {");
+    expect(script).toContain("['b', 'keys.snooze']");
+    expect(script).toContain("else if (e.key === 'b' && !row.handledAt) {");
+    expect(script).toContain('openPopover(snoozeSheet, anchor, {');
+    // The queue's own line for it, beside what was done, and the server told by the route for it.
+    expect(script).toContain("fill('snooze.later', { count: later.length })");
+    expect(script).toContain("post('/api/snooze', { key, until })");
+  });
+
+  it('lists what is put off with the queue, soonest first, and shows it nowhere in the queue', async () => {
+    const store = seeded();
+    store.setSnoozed('k3', new Date(Date.now() + 2 * 3_600_000).toISOString());
+    store.setSnoozed('k1', new Date(Date.now() + 3_600_000).toISOString());
+    const queue = await body('/api/attention', store);
+    expect(queue['count']).toBe(0);
+    expect((queue['snoozed'] as Array<{ dedupKey: string }>).map((m) => m.dedupKey)).toEqual(['k1', 'k3']);
+    expect((queue['snoozed'] as Array<Record<string, unknown>>)[0]).toHaveProperty('provider');
+    // The list itself still has them, each carrying when it comes back.
+    const mail = (await body('/api/mail', store))['mail'] as Array<{ dedupKey: string; snoozedUntil: string | null }>;
+    expect(mail.find((m) => m.dedupKey === 'k1')?.snoozedUntil).toEqual(expect.any(String));
   });
 });

@@ -35,7 +35,7 @@ Which token you sign in with decides what the page may do, the same split MCP ma
 |---|---|---|
 | Read the list, a message, attachments | yes | yes |
 | Search, ask a question, get notifications | yes | yes |
-| Mark done | only when no write token is configured | yes |
+| Mark done, put off until later | only when no write token is configured | yes |
 | Archive, bin, star, mark read, move out of spam | no | yes |
 | Reply, forward and send; change a signature | no | yes |
 | Correct a judgement, draft with the model | no | yes |
@@ -46,13 +46,31 @@ Pressing an action a session may not take explains this instead of failing.
 
 ## What needs you
 
-The page opens on a queue: the mail that was judged to matter (critical, or pushed) and that nobody has dealt with yet, most pressing first. A deadline that has passed or falls within three days comes first, then what was judged critical, then other deadlines this week, then the rest, newest first. The first sentence of the page counts it, and the number is also the badge on the installed app's icon.
+The page opens on a queue: the mail that was judged to matter (critical, or pushed) and that nobody has dealt with yet, most pressing first. A deadline that has passed or falls within three days comes first, then a reminder that came back in the last day (see [Later](#later)), then what was judged critical, then other deadlines this week, then the rest, newest first. The first sentence of the page counts it, and the number is also the badge on the installed app's icon.
 
 Each row has a ring. Pressing it, swiping the row to the right on a phone, or `e` on a desk marks the message done: it leaves the queue at once, and a toast offers Undo. With a write session the message is also marked read in its mailbox, so "done" here is done there. Archiving, binning, answering and forwarding a message count as dealing with it too.
 
 Done moves nothing and deletes nothing, and there is a way back after the toast is gone. Under the queue a line reads "Done · 3": it opens what was dealt with in the last seven days, most recent first, including mail older than the list below is showing. A done row carries a check where its ring was, here and in the list, and pressing the check (or `e`, or "Not done" under the open message) puts the message back; one that was judged to matter returns to the queue.
 
-Verification codes and sign-in links never enter the queue, since they expire in minutes, and neither do mailsift's own health alerts or digests. The queue starts on the day this version is first run, so an upgrade does not present a month of old mail as unfinished, and it looks back at most thirty days.
+Verification codes and sign-in links never enter the queue by themselves, since they expire in minutes, and neither do mailsift's own health alerts or digests; one you put off comes back like anything else (see [Later](#later)). The queue starts on the day this version is first run, so an upgrade does not present a month of old mail as unfinished, and it looks back at most thirty days.
+
+### Later
+
+A message that needs you, but not now, can be put off. "Remind me" under the open message (beside the star on a desk, under "more" on a phone), `b` on a desk, or the clock on a row that is already put off, opens a small panel of times under it, in this device's own time, each with the time it means:
+
+| Choice | When | Offered |
+|---|---|---|
+| Later today | three hours on, rounded up to the next quarter hour | until 20:00, not when it would be before 07:00, and not when it would be no sooner than this evening |
+| This evening | 19:00 | until 17:00 |
+| Tomorrow morning | 09:00 tomorrow; before 05:00, 09:00 today, called "This morning" | always |
+| Next week | 09:00 on Monday | unless that is the morning already offered |
+| Pick a date and time | any minute still to come, within a year | always |
+
+The message leaves the queue at once, the reader closes on a phone as it does for Done, and a toast says when it comes back ("Reminder set for tomorrow 09:00") and offers Undo. Under the queue, beside "Done · 3", a line reads "Later · 2": it opens what is put off, soonest first. A message that is put off carries a clock where its ring was, and its line of details says when it comes back ("reminder tomorrow 09:00"), here and anywhere else in the list. Pressing the clock opens the times again, with "Back now" first. The times are listed soonest first, and a time within the coming week is named by its weekday, a later one by its date (with the year when it is in another).
+
+At its time the message comes back to the queue, whatever it was judged, since you asked to be reminded of it; its line of details says "reminder". The queue's thirty days are counted from the reminder, not from the day the message came. Every device with notifications on is told, whatever it chose to hear (see [Notifications](#notifications)). Open pages bring it back on its minute, and one without the live line within the minute after.
+
+Putting off is the queue's own note, like Done: nothing changes in the mailbox. A reminder is for what is not done, so the page offers it for a message that is not done, and MCP's `snooze` puts back a message marked done when asked to remind of it; one marked done after it was put off keeps its time but is no longer listed under Later, and nobody is reminded of it. "Back now" brings the message back as if its time had come: it is in the queue whatever it was judged and however long ago it arrived, with "reminder" in its details, and no device is notified, since you are the one who asked; a toast offers Undo while the old time is still to come. Undo after putting off a message puts back what it had: no reminder for one that had none, the earlier time while that is still to come, and for a reminder that had already come, the message back in the queue. Putting off is open to the sessions that may mark mail done, and recorded in the audit as `web:snooze`, `web:wake` (Back now) and `web:unsnooze` (a reminder taken away by Undo).
 
 ## The list
 
@@ -93,7 +111,7 @@ Attachments are listed with download and a bounded local scan, images open in a 
 
 ## Acting on a message
 
-With a write session the bar under a message offers Done, Reply, Archive, and under "more": Reply all, Forward, Star, Mark unread, Not spam (for a message in the spam folder) and Bin.
+With a write session the bar under a message offers Done, Reply, Archive, and under "more": Reply all, Forward, Remind me (see [Later](#later)), Star, Mark unread, Not spam (for a message in the spam folder) and Bin. On a desk, Reply all, Star and Remind me sit in the bar itself.
 
 Each action is applied in the mailbox itself, to the message found by its Message-ID, and recorded in the same audit table the MCP write tools use. Archive and Bin go to the folder the server marks for that purpose (the special-use flag, then the well-known names); a mailbox that has no such folder is told so rather than given a new one. On Gmail, archiving removes the message from the inbox and leaves it in All Mail. The page follows a message to its new folder, so it can still be opened, answered, or brought back afterwards.
 
@@ -151,6 +169,7 @@ The bell turns on Web Push for the device you are holding: a verification code o
 - Notifications are encrypted from this server to the device (RFC 8291); the push service relays them and cannot read them. The server's signing key is generated on first use and kept in the state database.
 - Delivery is at most once. A code that could not be delivered is not sent late; the page still lists it.
 - A notification is about mail that still needs you and has only just arrived: nothing is sent for a message already marked done, for a code fetched more than fifteen minutes ago or sent more than an hour before it was fetched, or for other mail more than a day old, so catching up after downtime does not bury a phone. Mail that was filed quietly while the LLM was down is notified when it is judged properly. A dry run notifies nobody.
+- A reminder you asked for ([Later](#later)) is sent to every device with notifications on, whatever level it chose and whether or not it wants codes: "Reminder: Vendor", with the summary or the subject under it. Nothing is sent for one marked done before its time, for one brought back with "Back now", or for one that came more than a day before the service was running to send it; it is back in the queue all the same. A message put off is not notified as mail before its time, even when it is judged again meanwhile. Reminders that come together, as every "Tomorrow morning" does at 09:00, go after a fresh code, never instead of it. The time reminders were last looked for is kept in the database, so a restart neither skips a reminder nor sends one twice.
 - Tapping one opens that message, or the code.
 - On iPhone and iPad, notifications work only from the app installed to the Home Screen.
 - The panel under the bell lists the other devices that have notifications on, and the owner can remove one, which is how a lost phone is cut off. A subscription is also tied to the token it was made under: replace `MCP_TOKEN` or `MCP_WRITE_TOKEN` and restart, and every device that subscribed under the old one stops being told.
@@ -170,6 +189,7 @@ The bell turns on Web Push for the device you are holding: a verification code o
 | `y` | archive |
 | `s` | star |
 | `#` | bin |
+| `b` | remind me later |
 | `n` | new message |
 | `c` | copy the newest code |
 | `/` | search |

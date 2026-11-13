@@ -20,7 +20,9 @@
  * on the console, and the assistant answers from a script. --write-token is
  * the token that signs in with the right to act (default "write"); with
  * --token set, signing in with that one gives the read-only page. --arrive N
- * files a new message every N seconds, to watch the live line work.
+ * files a new message every N seconds, to watch the live line work. Two
+ * messages are put off, one until tomorrow and one whose time has come, and
+ * a reminder set from the page comes back on its minute, as in the service.
  */
 import { mkdtempSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -33,6 +35,7 @@ import type { LiveMessage } from '../src/imap/client.js';
 import type { AttachmentManifest } from '../src/imap/message.js';
 import type { ReadableMessage } from '../src/imap/readable.js';
 import { markDigestSent, type DigestItem } from '../src/services/digest.js';
+import { PushDispatcher, type PushNotice } from '../src/services/push-dispatcher.js';
 import { StateStore, type MailRecord } from '../src/services/state.js';
 import { HEARTBEAT_KEY, type PollStats } from '../src/services/watcher.js';
 import { routeWeb, type WebBackend } from '../src/web.js';
@@ -295,11 +298,33 @@ function seed(): void {
   const dealtWith = db.prepare('UPDATE seen SET handled_at = ? WHERE dedup_key = ?');
   dealtWith.run(new Date(Date.now() - 2 * H * 60_000).toISOString(), 'preview-13');
   dealtWith.run(new Date(Date.now() - 1 * D * 60_000).toISOString(), 'preview-25');
+  // Two were put off: the signature request until nine tomorrow morning, so
+  // it is under "Later" and not in the queue, and the dinner invitation,
+  // which was never judged to matter, until a while ago, so it is back in the
+  // queue as the reminder the owner asked for.
+  const putOff = db.prepare('UPDATE seen SET snoozed_until = ? WHERE dedup_key = ?');
+  const tomorrowMorning = new Date();
+  tomorrowMorning.setDate(tomorrowMorning.getDate() + 1);
+  tomorrowMorning.setHours(9, 0, 0, 0);
+  putOff.run(tomorrowMorning.toISOString(), 'preview-16');
+  putOff.run(new Date(Date.now() - 25 * 60_000).toISOString(), 'preview-07');
   db.close();
 }
 
 seed();
 const store = new StateStore(dbPath);
+
+// The minute on which what was put off comes back, as the service keeps it.
+// No notification leaves: a device that subscribes here is told on the
+// console instead, in the words its phone would show.
+const dispatcher = new PushDispatcher({
+  send: async (target, notice) => {
+    const said = notice as PushNotice;
+    console.log(`[push] would tell ${target.endpoint.slice(0, 48)}…: ${said.title} — ${said.body}`);
+    return 'sent';
+  },
+});
+dispatcher.start();
 
 let refreshes = 0;
 /** The pretend poll: one new verification code each time, after a believable pause. */

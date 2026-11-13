@@ -18,12 +18,21 @@
  * queued for later: a verification code an hour late is worse than none, and
  * the page still lists everything.
  *
+ * It is also the clock for reminders. Once a minute it looks for messages the
+ * owner put off whose time has come, tells open pages (through the revision
+ * the live line watches) and reminds every device. The time it last looked is
+ * kept in the database and moved with the same compare-and-swap, so a
+ * restart neither skips a reminder nor sends one twice, and two processes do
+ * not both send it.
+ *
  * Nothing here logs a sender, a subject, a summary or a code.
  */
 import { createHash } from 'node:crypto';
 import { getLogger } from '../logger.js';
 import { VERIFICATION_SUMMARY_PREFIX } from '../imap/message.js';
-import { REJUDGED_KEY, StateStore, type MailRow, type PushSubscriptionRow, type RowCursor } from './state.js';
+import {
+  REJUDGED_KEY, SNOOZE_CHECKED_KEY, StateStore, type MailRow, type PushSubscriptionRow, type RowCursor,
+} from './state.js';
 import {
   generateVapidKeys, MAX_PAYLOAD_BYTES, sendPush, type PushSendResult, type VapidKeys,
 } from './webpush.js';
@@ -32,9 +41,13 @@ const log = getLogger('push');
 
 /** Where the dispatcher has read up to, as JSON `{ createdAt, dedupKey }`. */
 export const PUSH_CURSOR_KEY = 'web_push_cursor';
+/** Up to when reminders have been looked for, as an ISO 8601 time; the store reads it too. */
+export { SNOOZE_CHECKED_KEY };
 const VAPID_META_KEY = 'web_push_vapid';
 
 const DEFAULT_INTERVAL_MS = 1_500;
+/** Reminders are asked for to the minute, so they are looked for once in each. */
+const WAKE_EVERY_MS = 60_000;
 /** A code is only worth a notification while it can still be typed in. */
 const CODE_FRESH_MS = 15 * 60_000;
 /** Other mail is still news for a day; past that it is a backfill, not an arrival. */
@@ -57,7 +70,7 @@ const PAYLOAD_BUDGET = Math.min(MAX_PAYLOAD_BYTES, 3_000);
 
 /** What the service worker receives and turns into a notification. */
 export interface PushNotice {
-  kind: 'code' | 'mail' | 'more' | 'test';
+  kind: 'code' | 'mail' | 'reminder' | 'more' | 'test';
   title: string;
   body: string;
   /** Notifications with the same tag replace one another on the device. */
@@ -71,7 +84,7 @@ export interface PushNotice {
 }
 
 type Words = Record<
-  'code' | 'codeUnread' | 'critical' | 'unknown' | 'more' | 'more1' | 'test', string
+  'code' | 'codeUnread' | 'critical' | 'reminder' | 'unknown' | 'more' | 'more1' | 'test', string
 >;
 
 // The dispatcher's own few words. The page's table is the browser's; these
@@ -81,6 +94,7 @@ const WORDS: Record<'en' | 'zh', Words> = {
     code: '{sender} · verification code',
     codeUnread: 'Verification email · open it for the code',
     critical: 'Critical · {sender}',
+    reminder: 'Reminder: {sender}',
     unknown: 'unknown sender',
     more: '{count} more messages need you',
     more1: '1 more message needs you',
@@ -90,6 +104,7 @@ const WORDS: Record<'en' | 'zh', Words> = {
     code: '{sender} · 验证码',
     codeUnread: '验证码邮件 · 打开查看验证码',
     critical: '紧急 · {sender}',
+    reminder: '提醒：{sender}',
     unknown: '未知发件人',
     more: '还有 {count} 封邮件待你处理',
     more1: '还有 1 封邮件待你处理',
@@ -202,9 +217,14 @@ function stillNews(row: MailRow, now: number, window: number, maxLag: number): b
  * Everything else goes by level: critical always, warnings when the device
  * chose the wider setting. A digest is a summary of mail already offered, a
  * handled message needs nobody, and mail older than a day is a backfill.
+ * Nor is a message the owner put off told of before its time, even when it
+ * is judged again meanwhile (a verdict that came late, after an outage of
+ * the model): they said "not now", and the reminder tells them at the time
+ * they chose.
  */
 export function wants(sub: PushSubscriptionRow, row: MailRow, now = Date.now()): boolean {
   if (row.handledAt || !row.importance) return false;
+  if (row.snoozedUntil && Date.parse(row.snoozedUntil) > now) return false;
   if (isCodeRow(row)) return sub.codes && stillNews(row, now, CODE_FRESH_MS, CODE_MAX_LAG_MS);
   if (row.decidedBy === 'digest') return false;
   const level = row.importance;
@@ -250,6 +270,26 @@ export function noticeFor(row: MailRow, lang: string): PushNotice {
   return {
     kind: 'mail',
     title: row.importance === 'critical' ? words.critical.replace('{sender}', sender) : sender,
+    body: cut(row.summary || row.subject || '', BODY_CHARS),
+    tag: tagFor(row.dedupKey),
+    url: `/#m=${encodeURIComponent(row.dedupKey)}`,
+    key: row.dedupKey,
+  };
+}
+
+/**
+ * The reminder the owner asked for, worded for one device.
+ *
+ * Led by the sender, as other mail is, and saying what the summary says. A
+ * verification message keeps its code out of it: by the time anyone asked to
+ * be reminded of one, the code is long dead.
+ */
+export function reminderFor(row: MailRow, lang: string): PushNotice {
+  const words = wordsFor(lang);
+  const sender = cut(row.senderName || row.sender || words.unknown, TITLE_CHARS);
+  return {
+    kind: 'reminder',
+    title: words.reminder.replace('{sender}', sender),
     body: cut(row.summary || row.subject || '', BODY_CHARS),
     tag: tagFor(row.dedupKey),
     url: `/#m=${encodeURIComponent(row.dedupKey)}`,
@@ -303,6 +343,14 @@ export interface PushDispatcherOptions {
   openStore?: () => StateStore;
   send?: typeof sendPush;
   intervalMs?: number;
+  /**
+   * Whether notifications are sent at all (WEB_PUSH_ENABLED). Without them
+   * the dispatcher still wakes what was put off, so that open pages hear of
+   * it, and leaves every row of mail alone.
+   */
+  notify?: boolean;
+  /** How often reminders are looked for; a whole minute, on the minute, unless a test says otherwise. */
+  wakeEveryMs?: number;
 }
 
 export class PushDispatcher {
@@ -312,6 +360,8 @@ export class PushDispatcher {
   private running = false;
   /** Set by a pass that left the current millisecond's rows unclaimed. */
   private unsettled = false;
+  /** The minute reminders were last looked for in, counted from the epoch; none yet. */
+  private wokeIn: number | undefined;
 
   constructor(private readonly options: PushDispatcherOptions = {}) {}
 
@@ -351,17 +401,28 @@ export class PushDispatcher {
     this.running = true;
     try {
       const store = this.store ??= (this.options.openStore ?? (() => new StateStore()))();
+      // Reminders come with the clock, not with a commit, so they are looked
+      // for in each new minute whatever else has happened.
+      const minute = Math.floor(Date.now() / (this.options.wakeEveryMs ?? WAKE_EVERY_MS));
+      const reminders = minute !== this.wokeIn ? this.wake(store) : [];
+      this.wokeIn = minute;
+      const notify = this.options.notify ?? true;
       const version = store.dataVersion();
-      if (!force && this.version !== undefined && version === this.version) return 0;
-      this.version = version;
-      this.unsettled = false;
-      const rows = this.claim(store);
-      // Something was left for later: look again next pass even if nothing else commits.
-      if (this.unsettled) this.version = undefined;
-      // A dry run tells nobody anything: the rows are claimed, so that the
-      // run after it does not announce them, and nothing is sent.
-      if ((process.env.DRY_RUN ?? '').trim().toLowerCase() === 'true') return 0;
-      return rows.length ? await this.deliver(store, rows) : 0;
+      const changed = force || this.version === undefined || version !== this.version;
+      if (!changed && !reminders.length) return 0;
+      let rows: MailRow[] = [];
+      if (changed && notify) {
+        this.version = version;
+        this.unsettled = false;
+        rows = this.claim(store);
+        // Something was left for later: look again next pass even if nothing else commits.
+        if (this.unsettled) this.version = undefined;
+      } else if (changed) this.version = version;
+      // With notifications off nobody is told anything. Nor in a dry run, but
+      // there the rows and the reminders are claimed, so that the run after
+      // it does not announce them.
+      if (!notify || (process.env.DRY_RUN ?? '').trim().toLowerCase() === 'true') return 0;
+      return rows.length || reminders.length ? await this.deliver(store, rows, reminders) : 0;
     } catch (error) {
       log.warn(`Push pass failed: ${String(error).slice(0, 200)}`);
       // The handle may be the thing that broke; the next pass opens a new one.
@@ -427,6 +488,29 @@ export class PushDispatcher {
     return claimed;
   }
 
+  /**
+   * Take the reminders that came since the last look, moving the mark first.
+   *
+   * Like the cursor, the mark is what makes a reminder one process's to send:
+   * only the swap that went in returns the rows. A mark that does not exist
+   * yet starts at this moment, so a first look reminds of nothing that came
+   * before anyone was looking. Returns only what still needs the owner.
+   */
+  private wake(store: StateStore): MailRow[] {
+    const raw = store.getMeta(SNOOZE_CHECKED_KEY);
+    const at = new Date().toISOString();
+    const last = raw && Number.isFinite(Date.parse(raw)) ? new Date(Date.parse(raw)).toISOString() : undefined;
+    if (!last) {
+      store.casMeta(SNOOZE_CHECKED_KEY, raw, at);
+      return [];
+    }
+    // A clock set back: wait for it to pass the mark rather than look twice.
+    if (at <= last) return [];
+    if (!store.casMeta(SNOOZE_CHECKED_KEY, raw, at)) return [];
+    // Marked done meanwhile: back in the queue it is not, and nobody is told.
+    return store.wakeSnoozed(last, at).filter((row) => !row.handledAt);
+  }
+
   /** Take the list of re-judged rows, leaving it empty for whoever looks next. */
   private claimRejudged(store: StateStore): MailRow[] {
     const raw = store.getMeta(REJUDGED_KEY);
@@ -447,20 +531,31 @@ export class PushDispatcher {
     return rows;
   }
 
-  private async deliver(store: StateStore, rows: MailRow[]): Promise<number> {
+  private async deliver(store: StateStore, rows: MailRow[], reminders: MailRow[] = []): Promise<number> {
     const subscriptions = store.listPushSubscriptions();
     if (subscriptions.length === 0) return 0;
     const keys = vapidKeys(store);
     const send = this.options.send ?? sendPush;
     const now = Date.now();
     const badge = store.attentionCount();
+    // A reminder a day late, after the service was down, is history rather
+    // than a reminder; the message is back in the queue all the same.
+    const due = reminders.filter((row) => now - Date.parse(row.snoozedUntil ?? '') <= MAIL_FRESH_MS);
+    const reminded = new Set(due.map((row) => row.dedupKey));
 
     const counts = await Promise.all(subscriptions.map(async (sub) => {
-      const wanted = rows.filter((row) => wants(sub, row, now)).sort(byUrgency);
+      // Reminders go whatever the device chose to hear: the owner asked for
+      // them. Mail about the same message is not told twice. They come before
+      // other mail, but after a fresh code: a code is worth something for
+      // minutes, and reminders all set for the same choice ("tomorrow
+      // morning" is 09:00 for every one) would otherwise fill the pass and
+      // fold the code into "1 more message needs you" while it could still be typed.
+      const news = rows.filter((row) => !reminded.has(row.dedupKey) && wants(sub, row, now)).sort(byUrgency);
+      const wanted = [...news.filter(isCodeRow), ...due, ...news.filter((row) => !isCodeRow(row))];
       if (wanted.length === 0) return 0;
       const words = wordsFor(sub.lang);
       const notices: Array<{ notice: PushNotice; ttl: number }> = wanted.slice(0, MAX_NOTICES_PER_TICK).map((row) => {
-        const notice = noticeFor(row, sub.lang);
+        const notice = reminded.has(row.dedupKey) ? reminderFor(row, sub.lang) : noticeFor(row, sub.lang);
         return { notice, ttl: notice.kind === 'code' ? CODE_TTL_SECONDS : MAIL_TTL_SECONDS };
       });
       const rest = wanted.length - notices.length;

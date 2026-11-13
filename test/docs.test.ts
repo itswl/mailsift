@@ -62,3 +62,25 @@ describe('docs/web-view.md', () => {
     expect(text).toContain('a larger letter, or one with files added from this device, goes back to being a draft');
   });
 });
+
+describe('putting off until later', () => {
+  it('says "Back now" brings a message back, and that only a cancelled reminder leaves it to its judgement', () => {
+    const web = prose(read('docs/web-view.md'));
+    const mcp = prose(read('docs/mcp.md'));
+    const skill = prose(read('.agents/skills/mailsift/SKILL.md'));
+    expect(web).not.toContain('"Back now" cancels the reminder');
+    expect(web).toContain('"Back now" brings the message back as if its time had come');
+    expect(mcp).not.toContain('the message is in `needs_you` again if it was judged to matter (critical or notified), and otherwise only in `list_mail`');
+    expect(mcp).toContain('arrived within the last 30 days');
+    expect(mcp).toContain('`until: "now"`');
+    expect(skill).not.toContain('The message is back in `needs_you` at once if it was judged to matter');
+    expect(skill).toContain('`until: "now"`');
+  });
+
+  it('does not say codes and sign-in links are never in the queue, when one put off comes back', () => {
+    const skill = prose(read('.agents/skills/mailsift/SKILL.md'));
+    expect(skill).not.toContain('Verification codes, sign-in links and mailsift\'s own alerts and digests are never in it');
+    expect(skill).toContain('unless the owner put one off and its time has come');
+    expect(prose(read('docs/web-view.md'))).toContain('one you put off comes back like anything else');
+  });
+});

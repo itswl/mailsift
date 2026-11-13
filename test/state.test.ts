@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import './setup.js';
-import { REJUDGED_KEY, StateStore } from '../src/services/state.js';
+import { REJUDGED_KEY, SNOOZE_CHECKED_KEY, StateStore } from '../src/services/state.js';
 import { makeMessage, makeResult } from './helpers.js';
 
 function store(): StateStore {
@@ -441,6 +441,218 @@ describe('the needs-you queue', () => {
     seed(s, 'k1', 'critical', true, { folder: 'Junk', inSpam: true });
     s.updateMailLocation('k1', 'INBOX', false);
     expect(s.getMail('k1')).toMatchObject({ folder: 'INBOX', inSpam: false });
+  });
+});
+
+describe('putting a message off until later', () => {
+  function seed(s: StateStore, key: string, importance: string, pushed: boolean, fields: Record<string, unknown> = {}): void {
+    s.markSeen(key, 'me@qq.com', key);
+    s.recordOutcome(key, importance, pushed, { messageId: `<${key}@x>`, summary: `summary of ${key}`, decidedBy: 'llm', ...fields });
+    // The queue started a while ago, so a reminder backdated here falls inside it.
+    s.setMeta('attention_since', new Date(Date.now() - 7 * 86_400_000).toISOString());
+  }
+  const at = (minutes: number): string => new Date(Date.now() + minutes * 60_000).toISOString();
+  const keys = (rows: Array<{ dedupKey: string }>): string[] => rows.map((row) => row.dedupKey);
+
+  it('takes a message out of the queue until its time, and puts it back then whatever it was judged', () => {
+    const s = store();
+    seed(s, 'critical', 'critical', true);
+    seed(s, 'quiet', 'info', false);
+    seed(s, 'other', 'warning', true);
+    expect(keys(s.attention()).sort()).toEqual(['critical', 'other']);
+    expect(s.getMail('critical')).toMatchObject({ snoozedUntil: null });
+
+    const tomorrow = at(24 * 60);
+    expect(s.setSnoozed('<critical@x>', tomorrow)).toMatchObject({ dedupKey: 'critical', snoozedUntil: tomorrow, handledAt: null });
+    s.setSnoozed('quiet', at(60));
+    expect(keys(s.attention())).toEqual(['other']);
+    expect(s.attentionCount()).toBe(1);
+    // Waiting, soonest first; the list carries the time each comes back.
+    expect(keys(s.snoozed())).toEqual(['quiet', 'critical']);
+    expect(s.snoozed()[1]?.snoozedUntil).toBe(tomorrow);
+    expect(s.queryMail().find((row) => row.dedupKey === 'critical')?.snoozedUntil).toBe(tomorrow);
+
+    // Its time comes: back in the queue, and ahead of what arrived before its
+    // reminder came, though the message itself arrived days before that.
+    rawRun(s, 'UPDATE seen SET snoozed_until = ? WHERE dedup_key = ?', at(-1), 'critical');
+    rawRun(s, 'UPDATE seen SET snoozed_until = ? WHERE dedup_key = ?', at(-2), 'quiet');
+    rawRun(s, 'UPDATE seen SET created_at = ? WHERE dedup_key IN (?, ?)', at(-3 * 24 * 60), 'critical', 'quiet');
+    rawRun(s, 'UPDATE seen SET created_at = ? WHERE dedup_key = ?', at(-10), 'other');
+    // The owner asked to be reminded of the quiet one too, so it is a to-do now.
+    expect(keys(s.attention())).toEqual(['critical', 'quiet', 'other']);
+    expect(s.attentionCount()).toBe(3);
+    expect(s.snoozed()).toEqual([]);
+  });
+
+  it('counts the queue\'s month from the reminder, not from the day the message came', () => {
+    const s = store();
+    s.setMeta('attention_since', '2025-01-01T00:00:00.000Z');
+    seed(s, 'old', 'info', false);
+    rawRun(s, 'UPDATE seen SET created_at = ? WHERE dedup_key = ?', at(-60 * 24 * 60), 'old');
+    rawRun(s, 'UPDATE seen SET snoozed_until = ? WHERE dedup_key = ?', at(-60), 'old');
+    expect(keys(s.attention())).toEqual(['old']);
+    // A reminder that came and was left for more than a month has stopped being one.
+    rawRun(s, 'UPDATE seen SET snoozed_until = ? WHERE dedup_key = ?', at(-31 * 24 * 60), 'old');
+    expect(s.attention()).toEqual([]);
+  });
+
+  it('cancelled, leaves a message where it would be without the reminder', () => {
+    const s = store();
+    seed(s, 'critical', 'critical', false);
+    seed(s, 'quiet', 'info', false);
+    s.setSnoozed('critical', at(60));
+    s.setSnoozed('quiet', at(60));
+    expect(s.setSnoozed('critical', null)).toMatchObject({ snoozedUntil: null });
+    s.setSnoozed('quiet', null);
+    expect(keys(s.attention())).toEqual(['critical']);
+    expect(s.snoozed()).toEqual([]);
+    expect(s.setSnoozed('<absent@x>', at(60))).toBeUndefined();
+  });
+
+  it('puts back a message marked done when asked to be reminded of it, and keeps the time when one is marked done after', () => {
+    const s = store();
+    seed(s, 'k1', 'critical', true);
+    s.setHandled('k1', true);
+    const later = at(90);
+    expect(s.setSnoozed('k1', later)).toMatchObject({ handledAt: null, snoozedUntil: later });
+    expect(keys(s.snoozed())).toEqual(['k1']);
+
+    // Done before the reminder came: it keeps its time, but will not come back, so it is not listed as coming.
+    expect(s.setHandled('k1', true)).toMatchObject({ snoozedUntil: later });
+    expect(s.snoozed()).toEqual([]);
+    rawRun(s, 'UPDATE seen SET snoozed_until = ? WHERE dedup_key = ?', at(-1), 'k1');
+    expect(s.attentionCount()).toBe(0);
+    // Put back, it is in the queue again, and among what was done it says it would be.
+    expect(s.recentlyHandled()[0]).toMatchObject({ queued: true });
+    s.setHandled('k1', false);
+    expect(keys(s.attention())).toEqual(['k1']);
+  });
+
+  it('wakes what came between two looks, once, and tells open pages', () => {
+    const s = store();
+    seed(s, 'a', 'critical', true);
+    seed(s, 'b', 'info', false);
+    seed(s, 'c', 'info', false);
+    s.setSnoozed('a', at(1));
+    s.setSnoozed('b', at(2));
+    s.setSnoozed('c', at(10));
+    const before = s.changeSignature().mail;
+    expect(keys(s.wakeSnoozed(at(0), at(3)))).toEqual(['a', 'b']);
+    expect(s.changeSignature().mail).not.toBe(before);
+    // The next look starts where this one ended: nothing twice, and nothing to announce.
+    const quiet = s.changeSignature().mail;
+    expect(s.wakeSnoozed(at(3), at(5))).toEqual([]);
+    expect(s.changeSignature().mail).toBe(quiet);
+    expect(keys(s.wakeSnoozed(at(5), at(10)))).toEqual(['c']);
+  });
+
+  it('changes the mail signature when a message is put off and when that is cancelled', () => {
+    const s = store();
+    seed(s, 'k1', 'critical', true);
+    const seen = new Set([s.changeSignature().mail]);
+    for (const [what, run] of [
+      ['put off', () => s.setSnoozed('k1', at(60))],
+      ['put off to another time', () => s.setSnoozed('k1', at(120))],
+      ['cancelled', () => s.setSnoozed('k1', null)],
+    ] as const) {
+      run();
+      const sig = s.changeSignature().mail;
+      expect(seen.has(sig), what).toBe(false);
+      seen.add(sig);
+    }
+    // Asked for again with nothing different, nothing changed.
+    const same = s.changeSignature().mail;
+    s.setSnoozed('k1', null);
+    expect(s.changeSignature().mail).toBe(same);
+  });
+
+  it('keeps a row whose reminder is still to come, however old the message is', () => {
+    const s = store();
+    seed(s, 'waiting', 'info', false);
+    seed(s, 'reminded-long-ago', 'info', false);
+    seed(s, 'plain', 'info', false);
+    rawRun(s, 'UPDATE seen SET created_at = ?', at(-200 * 24 * 60));
+    rawRun(s, 'UPDATE seen SET snoozed_until = ? WHERE dedup_key = ?', at(30 * 24 * 60), 'waiting');
+    rawRun(s, 'UPDATE seen SET snoozed_until = ? WHERE dedup_key = ?', at(-40 * 24 * 60), 'reminded-long-ago');
+    s.prune(90);
+    expect(s.queryMail().map((row) => row.dedupKey)).toEqual(['waiting']);
+  });
+
+  it('brought back now, is in the queue whatever it was judged and however old, and is not announced again', () => {
+    const s = store();
+    s.setMeta('attention_since', '2025-01-01T00:00:00.000Z');
+    // From the stream, not judged to matter; and critical and notified, but 35 days old, put off for four more.
+    seed(s, 'newsletter', 'info', false);
+    seed(s, 'crit', 'critical', true);
+    rawRun(s, 'UPDATE seen SET created_at = ? WHERE dedup_key = ?', at(-35 * 24 * 60), 'crit');
+    s.setSnoozed('newsletter', at(60));
+    s.setSnoozed('crit', at(4 * 24 * 60));
+    expect(keys(s.snoozed())).toEqual(['newsletter', 'crit']);
+    expect(s.attention()).toEqual([]);
+    // The dispatcher looked for reminders half a minute ago.
+    const mark = at(-0.5);
+    s.setMeta(SNOOZE_CHECKED_KEY, mark);
+
+    expect(s.wakeNow('newsletter')).toMatchObject({ snoozedUntil: mark, handledAt: null });
+    s.wakeNow('<crit@x>');
+    expect(keys(s.attention()).sort()).toEqual(['crit', 'newsletter']);
+    expect(s.inAttention('newsletter')).toBe(true);
+    expect(s.snoozed()).toEqual([]);
+    // Its time is the last look, so the next look, which starts there, does not remind of it.
+    expect(s.wakeSnoozed(mark, at(1))).toEqual([]);
+    // Cancelling, by contrast, leaves each to its judgement: neither is in the queue then.
+    s.setSnoozed('newsletter', null);
+    s.setSnoozed('crit', null);
+    expect(s.attention()).toEqual([]);
+    expect(s.inAttention('crit')).toBe(false);
+  });
+
+  it('brings back now at this moment when there is no recent look to stand on', () => {
+    const s = store();
+    seed(s, 'k1', 'info', false);
+    for (const mark of [undefined, at(10), at(-40 * 24 * 60), 'not a time']) {
+      if (mark === undefined) rawRun(s, 'DELETE FROM meta WHERE key = ?', SNOOZE_CHECKED_KEY);
+      else s.setMeta(SNOOZE_CHECKED_KEY, mark);
+      s.setSnoozed('k1', at(60));
+      const before = Date.now();
+      const until = Date.parse(s.wakeNow('k1')?.snoozedUntil ?? '');
+      expect(until, String(mark)).toBeGreaterThanOrEqual(before);
+      expect(until, String(mark)).toBeLessThanOrEqual(Date.now());
+      expect(s.inAttention('k1'), String(mark)).toBe(true);
+    }
+  });
+
+  it('reads the queue through its indexes rather than every row kept', () => {
+    const s = store();
+    const plan = (sql: string, params: unknown[]): string =>
+      ((s as unknown as { db: { prepare(sql: string): { all(...a: unknown[]): Array<{ detail: string }> } } }).db
+        .prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params)).map((step) => step.detail).join(' | ');
+    const { clause, params } = (s as unknown as { attentionWhere(): { clause: string; params: string[] } }).attentionWhere();
+    for (const sql of [`SELECT COUNT(*) FROM seen WHERE ${clause}`, `SELECT dedup_key FROM seen WHERE ${clause} ORDER BY COALESCE(snoozed_until, created_at) DESC LIMIT 50`]) {
+      const steps = plan(sql, params);
+      expect(steps, sql).not.toMatch(/SCAN seen(?! USING)/);
+      expect(steps, sql).toContain('idx_seen_created');
+      expect(steps, sql).toContain('idx_seen_snoozed');
+    }
+  });
+
+  it('adds the column to a database an older release created', async () => {
+    const { DatabaseSync } = await import('node:sqlite');
+    const path = await tempDb('mailsift-snooze-');
+    const first = new StateStore(path);
+    seed(first, 'old', 'critical', true);
+    first.close();
+    const raw = new DatabaseSync(path);
+    raw.exec('DROP INDEX idx_seen_snoozed');
+    raw.exec('ALTER TABLE seen DROP COLUMN snoozed_until');
+    raw.close();
+
+    const upgraded = new StateStore(path);
+    expect(upgraded.getMail('old')).toMatchObject({ snoozedUntil: null });
+    expect(upgraded.attentionCount()).toBe(1);
+    upgraded.setSnoozed('old', at(60));
+    expect(upgraded.attentionCount()).toBe(0);
+    upgraded.close();
   });
 });
 
