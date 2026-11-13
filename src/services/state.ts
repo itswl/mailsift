@@ -21,7 +21,7 @@ const nodeRequire = createRequire(import.meta.url);
 const { DatabaseSync } = nodeRequire('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSync = import('node:sqlite').DatabaseSync;
 import { getLogger } from '../logger.js';
-import { attachmentSafetyWarnings, VERIFICATION_SUMMARY_PREFIX } from '../imap/message.js';
+import { attachmentSafetyWarnings, SIGN_IN_LINK_SUMMARY, VERIFICATION_SUMMARY_PREFIX } from '../imap/message.js';
 import type { AttachmentInfo, AttachmentManifest, MailMessage } from '../imap/message.js';
 import type { TriageResult } from './triage.js';
 
@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS seen (
   folder TEXT, in_spam INTEGER NOT NULL DEFAULT 0,
   importance TEXT, category TEXT, summary TEXT, reason TEXT, deadline TEXT,
   decided_by TEXT, pushed INTEGER NOT NULL DEFAULT 0,
-  mail_date TEXT, snippet TEXT, attachments_json TEXT, verification_code TEXT, created_at TEXT NOT NULL
+  mail_date TEXT, snippet TEXT, attachments_json TEXT, verification_code TEXT, handled_at TEXT,
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS digest_queue (
   dedup_key TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
@@ -69,6 +70,12 @@ CREATE TABLE IF NOT EXISTS mail_actions (
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS digest_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, sent_at TEXT NOT NULL, items TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  endpoint TEXT PRIMARY KEY, p256dh TEXT NOT NULL, auth TEXT NOT NULL,
+  level TEXT NOT NULL DEFAULT 'warning', codes INTEGER NOT NULL DEFAULT 1, lang TEXT NOT NULL DEFAULT 'en',
+  label TEXT, origin TEXT, created_at TEXT NOT NULL, last_ok_at TEXT, failures INTEGER NOT NULL DEFAULT 0,
+  credential TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_seen_created ON seen (created_at);
 CREATE INDEX IF NOT EXISTS idx_seen_importance ON seen (importance);
@@ -114,6 +121,8 @@ export interface MailRow {
   pushed: boolean;
   mailDate: string | null;
   createdAt: string;
+  /** When the reader marked it dealt with, in the page or through feedback; null while it still needs them. */
+  handledAt: string | null;
   snippet?: string | null;
   /** Extracted one-time code, kept locally so the web view can show it. */
   verificationCode?: string;
@@ -196,6 +205,66 @@ export interface NotificationOutboxRow {
 
 export type FeedbackLabel = 'false_positive' | 'missed' | 'handled' | 'correct';
 
+/** One browser that asked to be notified, and what it asked to be told. */
+export interface PushSubscriptionRow {
+  endpoint: string;
+  /** base64url, as PushSubscription.toJSON() gives them. */
+  p256dh: string;
+  auth: string;
+  /** `critical` is critical mail only; `warning` adds warnings. */
+  level: 'critical' | 'warning';
+  /** Whether a verification code is sent, with the code in it. */
+  codes: boolean;
+  lang: string;
+  label: string | null;
+  /** The origin the page was on when it subscribed, for the push service's contact claim. */
+  origin: string | null;
+  createdAt: string;
+  lastOkAt: string | null;
+  /** Deliveries that failed in a row since the last one that worked. */
+  failures: number;
+  /** A mark of the token the subscribing session held, never the token; '' when none was required. */
+  credential: string;
+}
+
+/** A place in the judged mail, ordered by when a row was filed and then by its key. */
+export interface RowCursor {
+  createdAt: string;
+  dedupKey: string;
+}
+
+/**
+ * The moment the "needs you" queue starts from.
+ *
+ * Mail judged before the queue existed was never offered to anyone as a
+ * to-do, so on an upgrade it would arrive as weeks of backlog nobody asked
+ * for. The queue therefore only holds what was filed after this instant.
+ */
+export const ATTENTION_SINCE_KEY = 'attention_since';
+/** A to-do nobody touched for a month has stopped being one. */
+const ATTENTION_WINDOW_DAYS = 30;
+/**
+ * Bumped by the changes no aggregate over the rows can see: a message moved
+ * between two folders, or one marked handled while another is put back.
+ */
+const MAIL_REVISION_KEY = 'mail_revision';
+/**
+ * Keys of rows whose verdict changed after they were first judged, as a JSON
+ * list. The web push dispatcher reads rows in the order they were filed and
+ * never looks back, so a message that was `info` during an LLM outage and
+ * `critical` once it was judged properly would never be notified. The poller
+ * leaves its key here; the dispatcher takes the list each pass.
+ */
+export const REJUDGED_KEY = 'web_push_rejudged';
+/** Nobody may be reading the list (notifications off); it must not grow without end. */
+const MAX_REJUDGED = 200;
+/** How far back the change signature looks; a little past the widest window the page offers. */
+const SIGNATURE_WINDOW_DAYS = 35;
+/** More than anyone has browsers; the oldest gives way to the newest. */
+const MAX_PUSH_SUBSCRIPTIONS = 50;
+/** What a sign-in link summary starts with, whichever of its two wordings was stored. */
+const SIGN_IN_LINK_SUMMARY_PREFIX = SIGN_IN_LINK_SUMMARY.replace(/[。.]$/, '');
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -222,7 +291,7 @@ export function notificationRetryDelayMs(attempt: number): number {
 const ROW_COLUMNS = [
   'dedup_key', 'message_id', 'thread_key', 'account', 'account_label', 'subject', 'sender', 'sender_name',
   'folder', 'in_spam', 'importance', 'category', 'summary', 'reason', 'deadline',
-  'decided_by', 'pushed', 'mail_date', 'attachments_json', 'verification_code', 'created_at',
+  'decided_by', 'pushed', 'mail_date', 'attachments_json', 'verification_code', 'handled_at', 'created_at',
 ] as const;
 
 function parseAttachmentManifest(value: unknown): AttachmentManifest | null {
@@ -278,9 +347,28 @@ function toRow(raw: Record<string, unknown>): MailRow {
     pushed: Boolean(raw['pushed']),
     mailDate: (raw['mail_date'] as string) ?? null,
     createdAt: String(raw['created_at'] ?? ''),
+    handledAt: (raw['handled_at'] as string) ?? null,
     ...(raw['snippet'] !== undefined ? { snippet: raw['snippet'] as string } : {}),
     ...(raw['verification_code'] ? { verificationCode: String(raw['verification_code']) } : {}),
     attachmentManifest: parseAttachmentManifest(raw['attachments_json']),
+  };
+}
+
+function toPushSubscription(raw: Record<string, unknown>): PushSubscriptionRow {
+  return {
+    endpoint: String(raw['endpoint'] ?? ''),
+    p256dh: String(raw['p256dh'] ?? ''),
+    auth: String(raw['auth'] ?? ''),
+    // Anything but the narrower choice reads as the default one.
+    level: raw['level'] === 'critical' ? 'critical' : 'warning',
+    codes: Boolean(raw['codes']),
+    lang: String(raw['lang'] ?? 'en'),
+    label: (raw['label'] as string) ?? null,
+    origin: (raw['origin'] as string) ?? null,
+    createdAt: String(raw['created_at'] ?? ''),
+    lastOkAt: (raw['last_ok_at'] as string) ?? null,
+    failures: Number(raw['failures'] ?? 0),
+    credential: String(raw['credential'] ?? ''),
   };
 }
 
@@ -304,7 +392,7 @@ export class StateStore {
     // exposed. Multiple service processes may open the same DB concurrently.
     const seenColumns = this.db.prepare('PRAGMA table_info(seen)').all() as Array<Record<string, unknown>>;
     for (const [name, definition] of [
-      ['attachments_json', 'TEXT'], ['thread_key', 'TEXT'], ['verification_code', 'TEXT'],
+      ['attachments_json', 'TEXT'], ['thread_key', 'TEXT'], ['verification_code', 'TEXT'], ['handled_at', 'TEXT'],
     ] as const) {
       if (seenColumns.some((column) => column['name'] === name)) continue;
       try {
@@ -347,6 +435,13 @@ export class StateStore {
       this.db.prepare(`UPDATE seen SET decided_by = 'local' WHERE decided_by = 'fallback' AND summary LIKE ?`)
         .run(`${VERIFICATION_SUMMARY_PREFIX}%`);
       this.setMeta(LOCAL_LABEL_MIGRATION_KEY, new Date().toISOString());
+    }
+    // Stamped the first time a release with the queue opens the database, so
+    // the queue starts at the upgrade rather than at the first visit after it.
+    // Read first: this constructor runs for every web request, and a write
+    // that changes nothing would still queue behind the poller's lock.
+    if (this.getMeta(ATTENTION_SINCE_KEY) === undefined) {
+      this.db.prepare('INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)').run(ATTENTION_SINCE_KEY, now());
     }
   }
 
@@ -458,6 +553,9 @@ export class StateStore {
   }
 
   recordOutcome(dedupKey: string, importance: string, pushed: boolean, fields: MailRecord = {}): void {
+    const before = this.db.prepare('SELECT importance, pushed FROM seen WHERE dedup_key = ?').get(dedupKey) as
+      | Record<string, unknown>
+      | undefined;
     this.db
       .prepare(
         `UPDATE seen SET importance = ?, pushed = ?, message_id = ?, thread_key = ?, account_label = ?,
@@ -477,6 +575,24 @@ export class StateStore {
         fields.verificationCode ?? null,
         dedupKey,
       );
+    // A second verdict for a row that already had one. Its counts may be the
+    // same as before, so the page is told through the revision, and a verdict
+    // that now matters more is left for the notification dispatcher.
+    if (before?.['importance']) {
+      this.bumpMailRevision();
+      if (before['importance'] !== importance || Boolean(before['pushed']) !== pushed) this.noteRejudged(dedupKey);
+    }
+  }
+
+  /** Append one key to the re-judged list, in one statement so no reader can interleave. */
+  private noteRejudged(dedupKey: string): void {
+    this.db.prepare(
+      `INSERT INTO meta (key, value) VALUES (?, json_array(?))
+       ON CONFLICT(key) DO UPDATE SET value = CASE
+         WHEN NOT json_valid(value) THEN json_array(?)
+         WHEN json_array_length(value) >= ? THEN value
+         ELSE json_insert(value, '$[#]', ?) END`,
+    ).run(REJUDGED_KEY, dedupKey, dedupKey, MAX_REJUDGED, dedupKey);
   }
 
   /** Count records marked without a triage result; normally zero. */
@@ -674,6 +790,9 @@ export class StateStore {
     this.db.prepare(
       'INSERT INTO feedback (message_id, dedup_key, label, note, created_at) VALUES (?, ?, ?, ?, ?)',
     ).run(messageId, row ? String(row['dedup_key']) : null, label, note.slice(0, 1000), now());
+    // "Handled" said through MCP takes the message off the page's queue too,
+    // so an agent and the reader never disagree about what is still open.
+    if (label === 'handled' && row) this.setHandled(String(row['dedup_key']), true);
   }
 
   feedbackSummary(): Record<string, number> {
@@ -843,6 +962,257 @@ export class StateStore {
       )
       .get(messageId, messageId) as Record<string, unknown> | undefined;
     return row ? toRow(row) : undefined;
+  }
+
+  // ---- The "needs you" queue ----
+
+  /** The dedup key a message id or a dedup key names; the exact key wins when both could match. */
+  private keyOf(idOrKey: string): string | undefined {
+    const row = this.db.prepare(
+      `SELECT dedup_key FROM seen WHERE message_id = ? OR dedup_key = ?
+       ORDER BY (dedup_key = ?) DESC LIMIT 1`,
+    ).get(idOrKey, idOrKey, idOrKey) as Record<string, unknown> | undefined;
+    return row ? String(row['dedup_key']) : undefined;
+  }
+
+  /**
+   * Mark a message dealt with, or put it back.
+   *
+   * This is mailsift's own note about the message, not a mailbox flag: it
+   * takes the row out of the queue on every device and changes nothing at the
+   * provider. Marking twice keeps the first time.
+   */
+  setHandled(idOrKey: string, handled: boolean): MailRow | undefined {
+    const key = this.keyOf(idOrKey);
+    if (key === undefined) return undefined;
+    const result = handled
+      ? this.db.prepare('UPDATE seen SET handled_at = ? WHERE dedup_key = ? AND handled_at IS NULL').run(now(), key)
+      : this.db.prepare('UPDATE seen SET handled_at = NULL WHERE dedup_key = ? AND handled_at IS NOT NULL').run(key);
+    if (Number(result.changes) > 0) this.bumpMailRevision();
+    return this.getMail(key);
+  }
+
+  /** When the queue starts; see ATTENTION_SINCE_KEY. Set on first use if an older file lacks it. */
+  attentionSince(): string {
+    const stored = this.getMeta(ATTENTION_SINCE_KEY);
+    if (stored) return stored;
+    const at = now();
+    this.casMeta(ATTENTION_SINCE_KEY, undefined, at);
+    return this.getMeta(ATTENTION_SINCE_KEY) || at;
+  }
+
+  /**
+   * What belongs in the queue: mail that was notified or judged critical and
+   * that nobody has marked handled.
+   *
+   * A verification code or a sign-in link is not a to-do, it is gone in
+   * minutes; mailsift's own health alerts and digests are not mail. Both stay
+   * out, as does anything older than the queue itself or than a month.
+   */
+  private attentionWhere(): { clause: string; params: string[] } {
+    const monthAgo = new Date(Date.now() - ATTENTION_WINDOW_DAYS * 86_400_000).toISOString();
+    const since = this.attentionSince();
+    return {
+      clause:
+        `handled_at IS NULL AND importance IS NOT NULL
+         AND (pushed = 1 OR importance = 'critical')
+         AND (verification_code IS NULL OR verification_code = '')
+         AND (summary IS NULL OR (summary NOT LIKE ? AND summary NOT LIKE ?))
+         AND (decided_by IS NULL OR decided_by NOT IN ('health', 'digest'))
+         AND created_at >= ?`,
+      params: [`${VERIFICATION_SUMMARY_PREFIX}%`, `${SIGN_IN_LINK_SUMMARY_PREFIX}%`, since > monthAgo ? since : monthAgo],
+    };
+  }
+
+  /** The queue, newest first. */
+  attention(limit = 50): MailRow[] {
+    const { clause, params } = this.attentionWhere();
+    return (
+      this.db.prepare(
+        `SELECT ${ROW_COLUMNS.join(', ')} FROM seen WHERE ${clause}
+         ORDER BY created_at DESC, dedup_key DESC LIMIT ?`,
+      ).all(...params, Math.max(1, Math.min(Math.floor(limit), 200))) as Array<Record<string, unknown>>
+    ).map(toRow);
+  }
+
+  /** How long the queue is, which is also the number on the app's badge. */
+  attentionCount(): number {
+    const { clause, params } = this.attentionWhere();
+    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM seen WHERE ${clause}`).get(...params) as Record<string, unknown>;
+    return Number(row['n'] ?? 0);
+  }
+
+  /** Where a message lives now, after an action moved it at the provider. */
+  updateMailLocation(dedupKey: string, folder: string, inSpam: boolean): void {
+    const result = this.db.prepare('UPDATE seen SET folder = ?, in_spam = ? WHERE dedup_key = ?')
+      .run(folder.slice(0, 500), inSpam ? 1 : 0, dedupKey);
+    if (Number(result.changes) > 0) this.bumpMailRevision();
+  }
+
+  private bumpMailRevision(): void {
+    this.db.prepare(
+      `INSERT INTO meta (key, value) VALUES (?, '1')
+       ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)`,
+    ).run(MAIL_REVISION_KEY);
+  }
+
+  // ---- Change tracking, for the live page and the push dispatcher ----
+
+  /**
+   * A counter SQLite moves whenever another connection commits.
+   *
+   * Reading it costs nothing, so a watcher can ask once a second and do real
+   * work only when the number moved. Writes made through this same handle do
+   * not move it, which is why each watcher keeps a handle of its own.
+   */
+  dataVersion(): number {
+    const row = this.db.prepare('PRAGMA data_version').get() as Record<string, unknown> | undefined;
+    return Number(row?.['data_version'] ?? 0);
+  }
+
+  /**
+   * Two short strings that change when the page would draw something else.
+   *
+   * `mail` covers the list, the queue and the digest: a row added, judged,
+   * notified, handled or moved, a digest queued or sent. `poll` covers the
+   * status line: the heartbeat, a mailbox starting or ceasing to fail, the
+   * outbox. A commit that touches neither (an audit entry, a cursor) leaves
+   * both alone, so the page is not told to redraw for nothing.
+   *
+   * The scan is bounded to recent rows, on a cutoff that only moves at
+   * midnight, so it stays cheap on a large table and a row ageing out does not
+   * read as a change more than once a day.
+   */
+  changeSignature(): { mail: string; poll: string } {
+    const cutoff = new Date(Date.now() - SIGNATURE_WINDOW_DAYS * 86_400_000);
+    cutoff.setUTCHours(0, 0, 0, 0);
+    const rows = this.db.prepare(
+      `SELECT COUNT(*) AS n, MAX(created_at) AS latest, COUNT(importance) AS judged,
+              COALESCE(SUM(CASE importance WHEN 'critical' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END), 0) AS weight,
+              COALESCE(SUM(pushed), 0) AS pushed, COALESCE(SUM(in_spam), 0) AS spam,
+              COUNT(handled_at) AS handled, MAX(handled_at) AS handled_latest
+       FROM seen WHERE created_at >= ?`,
+    ).get(cutoff.toISOString()) as Record<string, unknown>;
+    const queue = this.db.prepare(
+      'SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(payload)), 0) AS size FROM digest_queue',
+    ).get() as Record<string, unknown>;
+    const sent = this.db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM digest_log').get() as Record<string, unknown>;
+    const mail = [
+      rows['n'], rows['latest'] ?? '', rows['judged'], rows['weight'], rows['pushed'], rows['spam'],
+      rows['handled'], rows['handled_latest'] ?? '', this.getMeta(MAIL_REVISION_KEY) ?? '0',
+      queue['n'], queue['size'], sent['id'],
+    ].join('|');
+
+    const failing = this.listMeta('account_fail_count:').map((entry) => `${entry.key}=${entry.value}`).join(',');
+    const poll = [this.getMeta('last_poll_at') ?? '', failing, this.notificationOutboxPending()].join('|');
+    return { mail, poll };
+  }
+
+  /**
+   * Judged rows strictly after a cursor, oldest first.
+   *
+   * A row is filed before it is judged, so the newest one may still be
+   * waiting for its outcome; it is left out here and picked up on the next
+   * read, because the cursor only ever moves to a row that was returned.
+   */
+  rowsAfter(cursor: RowCursor, limit = 50): MailRow[] {
+    return (
+      this.db.prepare(
+        // The first condition is implied by the third; it is there so the
+        // created_at index bounds the scan, which the OR alone would not let it do.
+        `SELECT ${ROW_COLUMNS.join(', ')} FROM seen
+         WHERE created_at >= ? AND importance IS NOT NULL
+           AND (created_at > ? OR (created_at = ? AND dedup_key > ?))
+         ORDER BY created_at ASC, dedup_key ASC LIMIT ?`,
+      ).all(
+        cursor.createdAt, cursor.createdAt, cursor.createdAt, cursor.dedupKey,
+        Math.max(1, Math.min(Math.floor(limit), 200)),
+      ) as
+        Array<Record<string, unknown>>
+    ).map(toRow);
+  }
+
+  // ---- Push subscriptions ----
+
+  /**
+   * Remember a browser that asked to be notified.
+   *
+   * Saving the same endpoint again updates what it wants and clears its
+   * failure count, keeping the day it first subscribed. At the cap a new
+   * endpoint is refused and false is returned: dropping the oldest instead
+   * would let anyone who can subscribe push every real device out.
+   */
+  savePushSubscription(input: {
+    endpoint: string; p256dh: string; auth: string; level: 'critical' | 'warning'; codes: boolean; lang: string;
+    label?: string; origin?: string; credential?: string;
+  }): boolean {
+    const endpoint = input.endpoint.slice(0, 2048);
+    const known = this.db.prepare('SELECT 1 FROM push_subscriptions WHERE endpoint = ?').get(endpoint) !== undefined;
+    if (!known) {
+      const held = this.db.prepare('SELECT COUNT(*) AS n FROM push_subscriptions').get() as Record<string, unknown>;
+      if (Number(held['n'] ?? 0) >= MAX_PUSH_SUBSCRIPTIONS) return false;
+    }
+    this.db.prepare(
+      `INSERT INTO push_subscriptions (endpoint, p256dh, auth, level, codes, lang, label, origin, created_at, failures, credential)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+       ON CONFLICT(endpoint) DO UPDATE SET
+         p256dh = excluded.p256dh, auth = excluded.auth, level = excluded.level, codes = excluded.codes,
+         lang = excluded.lang, label = excluded.label, origin = excluded.origin, failures = 0,
+         credential = excluded.credential`,
+    ).run(
+      endpoint, input.p256dh.slice(0, 200), input.auth.slice(0, 100),
+      input.level === 'critical' ? 'critical' : 'warning', input.codes ? 1 : 0, input.lang.slice(0, 16),
+      input.label?.slice(0, 80) ?? null, input.origin?.slice(0, 200) ?? null, now(),
+      (input.credential ?? '').slice(0, 64),
+    );
+    return true;
+  }
+
+  /**
+   * End every subscription made under a credential that is no longer one of
+   * this server's. Returns how many were ended.
+   */
+  prunePushSubscriptions(validCredentials: string[]): number {
+    const valid = validCredentials.length ? validCredentials : [''];
+    const marks = valid.map(() => '?').join(', ');
+    return Number(
+      this.db.prepare(`DELETE FROM push_subscriptions WHERE credential NOT IN (${marks})`).run(...valid).changes,
+    );
+  }
+
+  getPushSubscription(endpoint: string): PushSubscriptionRow | undefined {
+    const row = this.db.prepare('SELECT * FROM push_subscriptions WHERE endpoint = ?').get(endpoint) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? toPushSubscription(row) : undefined;
+  }
+
+  listPushSubscriptions(): PushSubscriptionRow[] {
+    return (
+      this.db.prepare('SELECT * FROM push_subscriptions ORDER BY created_at, rowid').all() as Array<Record<string, unknown>>
+    ).map(toPushSubscription);
+  }
+
+  deletePushSubscription(endpoint: string): boolean {
+    return Number(this.db.prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').run(endpoint).changes) > 0;
+  }
+
+  /**
+   * Note how a delivery went, and say how many have now failed in a row.
+   *
+   * A success clears the count. The caller decides when the count means the
+   * subscription is dead; an endpoint that is not stored reports zero.
+   */
+  recordPushResult(endpoint: string, ok: boolean): number {
+    if (ok) {
+      this.db.prepare('UPDATE push_subscriptions SET last_ok_at = ?, failures = 0 WHERE endpoint = ?').run(now(), endpoint);
+      return 0;
+    }
+    this.db.prepare('UPDATE push_subscriptions SET failures = failures + 1 WHERE endpoint = ?').run(endpoint);
+    const row = this.db.prepare('SELECT failures FROM push_subscriptions WHERE endpoint = ?').get(endpoint) as
+      | Record<string, unknown>
+      | undefined;
+    return Number(row?.['failures'] ?? 0);
   }
 
   /** Recent, already-processed messages from one mailbox thread. */
@@ -1081,6 +1451,25 @@ export class StateStore {
     this.db
       .prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
       .run(key, value);
+  }
+
+  /**
+   * Change a meta value only if it still holds what the caller last read.
+   *
+   * `expected` undefined means "only if the key is absent". True is returned
+   * to the one caller whose write went in, so two processes racing for the
+   * same step (minting a key pair, claiming a batch of rows) cannot both
+   * believe they won. Swapping a value for itself changes nothing and wins
+   * nothing.
+   */
+  casMeta(key: string, expected: string | undefined, next: string): boolean {
+    if (expected === undefined) {
+      return Number(this.db.prepare('INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)').run(key, next).changes) > 0;
+    }
+    if (expected === next) return false;
+    return Number(
+      this.db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value = ?').run(next, key, expected).changes,
+    ) > 0;
   }
 
   /** Several keys in one statement, so they are written together or not at all. */
