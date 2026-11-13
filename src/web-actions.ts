@@ -576,7 +576,9 @@ export async function replyDraft(
   // the reader's safety clues warn about, said here where the answer is addressed.
   const domain = (address: string): string => address.slice(address.lastIndexOf('@') + 1).trim().toLowerCase();
   const sender = r.from?.address ?? '';
-  const replyToElsewhere = Boolean(sender && r.replyTo.length && envelope.to.some((address) => domain(address) !== domain(sender)));
+  // A sender with no address to compare is no reassurance: answers are still asked for somewhere of the message's choosing.
+  const replyToElsewhere = r.replyTo.length > 0
+    && envelope.to.some((address) => !sender || domain(address) !== domain(sender));
   return json(200, {
     key: row.dedupKey, account: account.username, accountName: account.name,
     ...envelope,

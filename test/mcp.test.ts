@@ -558,6 +558,34 @@ describe('reading a message and answering it', () => {
     expect(box.sent).toHaveLength(1);
   });
 
+  it('answers with what really happened once a send that was slow to confirm has gone through', async () => {
+    vi.useFakeTimers();
+    try {
+      const state = seeded();
+      const box = mailbox(state);
+      let release: () => void = () => undefined;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const send = box.backend.send!;
+      box.backend.send = async (account, mail) => { await held; return send(account, mail); };
+      const client = await connect(state, true, box.backend);
+      const letter = { account: 'me@qq.com', to: ['friend@example.org'], subject: 'Slow', text: 'Takes its time.' };
+      // A client that is patient enough to hear the server's own answer; most give up at a minute themselves.
+      const first = client.callTool({ name: 'send_mail', arguments: letter }, undefined, { timeout: 120_000 });
+      // The mail server takes longer than a caller is made to wait.
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(JSON.parse(((await first).content as Array<{ text: string }>)[0]!.text)).toMatchObject({ code: 'PROVIDER_ERROR' });
+      // ...and then takes the message after all.
+      release();
+      await vi.advanceTimersByTimeAsync(10);
+      // Asked again, the answer is what became of it, not a warning that it may or may not have left.
+      expect(await call(client, 'send_mail', letter)).toMatchObject({ sent: true, repeated: true, messageId: '<sent@x>' });
+      expect(box.sent).toHaveLength(1);
+      expect(state.listMailActions(5).find((row) => row.action === 'send' && row.success)).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('fills in to and cc each on its own, and says when an answer went to another domain than the sender\'s', async () => {
     const state = seeded();
     const box = mailbox(state);
@@ -585,6 +613,13 @@ describe('reading a message and answering it', () => {
     expect(sent['note']).toContain('another domain than its sender (billing@vendor.com)');
     // Addressed by the caller, there is nothing to point out.
     expect(await call(wary, 'send_mail', { replyTo: '<one@x>', to: ['billing@vendor.com'], text: 'Paid, to you directly.' })).not.toHaveProperty('note');
+
+    // A sender with no address at all is no reassurance about where the answer is going.
+    const nameless = { ...elsewhere, readable: { ...elsewhere.readable, from: null } };
+    box.backend.read = async () => nameless;
+    forgetLive();
+    expect(await call(await connect(state, false, box.backend), 'prepare_reply', { messageId: '<one@x>' }))
+      .toMatchObject({ sender: '', to: ['payments@other-domain.example'], replyToElsewhere: true });
   });
 });
 
