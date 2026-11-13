@@ -142,6 +142,22 @@ overflow:hidden;flex-direction:column;transition:transform .2s cubic-bezier(.2,.
 .handle{position:absolute;left:50%;top:8px;width:36px;height:4px;margin-left:-18px;border-radius:2px;background:var(--line-strong)}
 .sheet-body{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:0 16px calc(24px + env(safe-area-inset-bottom))}
 #filter-sheet .sheet-body,#health-sheet .sheet-body{padding-bottom:calc(16px + env(safe-area-inset-bottom))}
+/* A popover: a small panel under the control that opened it, with a notch pointing at that control. */
+.sheet.popover{position:absolute;inset:auto;left:var(--pop-left,auto);top:var(--pop-top,auto);width:var(--pop-width,320px);max-width:none;margin:0;max-height:min(var(--pop-max,70vh),640px);border-radius:14px;border:1px solid var(--line);box-shadow:var(--shadow-pop);background:var(--surface);overflow:visible;transform-origin:var(--pop-arrow,50%) 0}
+.sheet.popover.fixed{position:fixed}
+.sheet.popover::before{content:"";position:absolute;top:-7px;left:calc(var(--pop-arrow,50%) - 6px);width:12px;height:12px;background:var(--surface);border-left:1px solid var(--line);border-top:1px solid var(--line);border-top-left-radius:3px;transform:rotate(45deg)}
+.sheet.popover::backdrop{background:transparent}
+.sheet.popover .handle{display:none}
+.sheet.popover .sheet-head{padding-top:4px;min-height:44px;touch-action:auto}
+.sheet.popover .sheet-body{padding-bottom:14px;border-radius:0 0 14px 14px}
+.sheet.popover.opening{animation:pop-in .16s cubic-bezier(.2,.7,.2,1)}
+@keyframes pop-in{from{opacity:0;transform:translateY(-4px) scale(.97)}}
+/* Nothing to confirm in these: the title alone, and the control that opened them closes them. */
+.sheet.bare.popover .sheet-head{justify-content:flex-start;padding:14px 16px 4px;min-height:0}
+.sheet.bare.popover .sheet-head h2{text-align:left}
+.sheet.bare.popover .sheet-head>span:not(.handle),.sheet.bare.popover .sheet-head .text-btn{display:none}
+#health-sheet.popover .sheet-body,#notify-sheet.popover .sheet-body{padding-bottom:14px}
+dialog.sheet:focus{outline:none}
 .mailbox{padding:12px 0;border-top:1px solid var(--line)}
 .mailbox:first-child{border-top:0}
 .mailbox-head{display:flex;align-items:baseline;gap:4px 8px;flex-wrap:wrap}
@@ -508,12 +524,6 @@ a.primary-action{display:inline-flex;align-items:center;justify-content:center;t
   .pane-empty .keys{font-size:12px;color:var(--muted)}
   .pane-empty p{margin:0}
   .detail h3{font-size:20px}
-  .sheet.popover{position:absolute;inset:auto;left:var(--pop-left,auto);top:var(--pop-top,auto);width:320px;max-height:min(70vh,560px);border-radius:12px;border:1px solid var(--line);box-shadow:var(--shadow-pop);background:var(--surface)}
-  .sheet.popover .handle{display:none}
-  .sheet.popover .sheet-head{padding-top:4px;min-height:44px}
-  .sheet.popover .sheet-body{padding-bottom:12px}
-  .sheet.popover.opening,.sheet.popover.closing{animation:fade .12s}
-  .sheet.popover::backdrop{background:transparent}
   #compose{max-width:680px;height:min(720px,calc(100vh - 72px))}
 }
 
