@@ -383,8 +383,8 @@ export function createServer(
     if (records.some((record) => record.by === 'key') && records.some((record) => record.by === 'messageId')) {
       throw new McpToolError('INVALID_ARGUMENT',
         'this is one record\'s key and also the Message-ID of another message',
-        'Pass the messageId that list_mail shows for the message you mean. The record whose dedupKey this is can be ' +
-        'reached by its own messageId.');
+        'The message whose Message-ID this is can be reached by its own dedupKey (list_mail shows it); the record ' +
+        'whose dedupKey this is, by its own messageId. Use the one that belongs to the message the user means.');
     }
     return records;
   }
@@ -646,10 +646,11 @@ export function createServer(
         'replyToElsewhere=true means the answer would go to a Reply-To address on another domain than its ' +
         'sender\'s, or the message names no sender address to compare it with: say so before anything is sent. ' +
         'language is the language of the line that introduces the quote ("On ..., ... wrote:"). ' +
-        'addressedTo says where to came from: replyTo, sender, ownRecipients (a message the owner sent, continued ' +
-        'to the people it went to), or recipients (the message named nobody to answer, so it would go to the ' +
-        'people it was sent to). send_mail fills in to only from replyTo or sender; for the other two it needs ' +
-        'an explicit to, since a From line can be forged to look like the owner\'s. ' +
+        'addressedTo says where to came from: replyTo, sender, ownRecipients (a message from the owner\'s own ' +
+        'address, continued to the people it went to), or recipients (the message names nobody to answer: a plain ' +
+        'reply is left unaddressed, and replyAll goes to everyone it was sent to). send_mail fills in to only from ' +
+        'replyTo or sender; for the other two it needs an explicit to, since a From line can be forged to look like ' +
+        'the owner\'s. ' +
         'account (an address from list_accounts) says which copy is meant when one message is stored for more than one mailbox.',
       inputSchema: {
         messageId: z.string().min(1).max(1000),
@@ -765,9 +766,15 @@ export function createServer(
     },
     async (uri, variables) => {
       const messageId = decodeVariable(variables['messageId']);
-      // By Message-ID, as get_mail finds it: a key is taken only when no message carries the string as its id.
-      const first = messageId ? unambiguous(messageId)[0] : undefined;
-      const found = first ? store.getMail(first.dedupKey) : undefined;
+      // Found as get_mail finds it; a string that names two records at once is refused, and that is audited too.
+      let found: ReturnType<typeof store.getMail>;
+      try {
+        const first = messageId ? unambiguous(messageId)[0] : undefined;
+        found = first ? store.getMail(first.dedupKey) : undefined;
+      } catch (error) {
+        store.recordMcpAudit('resource:mail-record', client, false, messageId);
+        throw error;
+      }
       store.recordMcpAudit('resource:mail-record', client, Boolean(found), messageId);
       if (!found) throw new McpToolError('NOT_FOUND', 'mail record not found');
       return {
@@ -1063,9 +1070,10 @@ export function createServer(
           'To answer a stored message give replyTo (its Message-ID): the answer leaves from the mailbox that ' +
           'received it and continues its thread. Where to is left out it goes to whoever the original asks ' +
           'answers to, or else its sender; a message that names neither, or that is from the owner\'s own address, ' +
-          'needs an explicit to (see prepare_reply\'s addressedTo). replyAll=true adds the other recipients in copy; give cc to set the ' +
-          'copies yourself, [] for none), with "Re:" its subject and the original quoted under your text unless ' +
-          'quote=false (language is the language of the line that introduces the quote). If one message is stored ' +
+          'needs an explicit to (see prepare_reply\'s addressedTo). replyAll=true adds the other recipients in ' +
+          'copy; give cc to set the copies yourself, [] for none. The subject is "Re:" the original\'s, and the ' +
+          'original is quoted under your text unless quote=false (language is the language of the line that ' +
+          'introduces the quote). If one message is stored ' +
           'for more than one mailbox, account says which copy is being answered. If the original can no longer be ' +
           'read from its mailbox, an answer is still sent when you give to and quote=false. ' +
           'For a new message give account (an address from list_accounts), to and subject. text is plain text. ' +
@@ -1194,8 +1202,8 @@ export function createServer(
               if (toEveryone) {
                 throw new McpToolError('INVALID_ARGUMENT',
                   draft['addressedTo'] === 'recipients'
-                    ? 'the message names no sender or reply address to answer, so an answer would go to everyone it was sent to'
-                    : 'the message is from the owner\'s own address, so an answer would go on to everyone it was sent to',
+                    ? 'the message names no sender or reply address to answer'
+                    : 'the message is from the owner\'s own address, which a sender can forge; an answer would go on to everyone it was sent to',
                   'Ask the user who the answer is for, and give to. read_message shows who the message went to (to and cc).');
               }
               to = list(draft['to']);

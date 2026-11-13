@@ -977,19 +977,36 @@ export class StateStore {
    * message can be stored once per mailbox (a forwarded copy, or a message
    * addressed to two of them), and getMail returns only one of those.
    */
+  /**
+   * Whether a string has the shape of a record key: a mailbox this store
+   * holds mail for, a bar, and the rest. A real Message-ID ("<...>", or a
+   * bare one with no bar) never does; a look-alike's does.
+   */
+  keyShaped(value: string): boolean {
+    const text = value.trim();
+    if (text.startsWith('<')) return false;
+    const bar = text.indexOf('|');
+    if (bar <= 0) return false;
+    return Boolean(this.db.prepare('SELECT 1 FROM seen WHERE account = ? LIMIT 1').get(text.slice(0, bar)));
+  }
+
   recordsFor(messageId: string): Array<{ dedupKey: string; account: string; by: 'messageId' | 'key' }> {
     // Every record the string names: as a Message-ID (one per mailbox it was
     // stored for), and as a record's own key. A sender can write a Message-ID
     // that spells another record's key, so a string can name both; the caller
     // decides what to do with that rather than this picking one.
+    const byKeyAll = (this.db.prepare('SELECT dedup_key, account FROM seen WHERE dedup_key = ?')
+      .all(messageId) as Array<Record<string, unknown>>)
+      .map((row) => ({ dedupKey: String(row['dedup_key']), account: String(row['account'] ?? ''), by: 'key' as const }));
+    // A string shaped like a key is matched as a Message-ID only to show that
+    // it is also one, beside the record whose key it is. On its own it names
+    // nothing: that record is gone, and the look-alike is not it.
+    if (this.keyShaped(messageId) && !byKeyAll.length) return [];
     const byId = (this.db.prepare(
       'SELECT dedup_key, account FROM seen WHERE message_id = ? ORDER BY created_at, dedup_key',
     ).all(messageId) as Array<Record<string, unknown>>)
       .map((row) => ({ dedupKey: String(row['dedup_key']), account: String(row['account'] ?? ''), by: 'messageId' as const }));
-    const byKey = (this.db.prepare('SELECT dedup_key, account FROM seen WHERE dedup_key = ?')
-      .all(messageId) as Array<Record<string, unknown>>)
-      .map((row) => ({ dedupKey: String(row['dedup_key']), account: String(row['account'] ?? ''), by: 'key' as const }))
-      .filter((row) => !byId.some((other) => other.dedupKey === row.dedupKey));
+    const byKey = byKeyAll.filter((row) => !byId.some((other) => other.dedupKey === row.dedupKey));
     return [...byId, ...byKey];
   }
 
@@ -1003,20 +1020,19 @@ export class StateStore {
 
   // ---- The "needs you" queue ----
 
-  /** The dedup key a message id or a dedup key names; the exact key wins when both could match. */
   /**
    * The record a page link, a key or a Message-ID names.
    *
    * A record's key is its own name and is tried first. Failing that, a
-   * Message-ID, the first stored copy of it; but only one that looks like a
-   * Message-ID ("<...>"). A key starts with a mailbox address, and a sender
-   * can write a Message-ID that spells one; such a string never falls through
-   * to a look-alike when the record it names is gone.
+   * Message-ID, the first stored copy of it; but never a string shaped like a
+   * key (see keyShaped). A sender can write a Message-ID that spells a key,
+   * and such a string must not fall through to that look-alike when the
+   * record it names is gone.
    */
   private keyOf(idOrKey: string): string | undefined {
     const exact = this.db.prepare('SELECT dedup_key FROM seen WHERE dedup_key = ?').get(idOrKey) as Record<string, unknown> | undefined;
     if (exact) return String(exact['dedup_key']);
-    if (!idOrKey.trimStart().startsWith('<')) return undefined;
+    if (this.keyShaped(idOrKey)) return undefined;
     const byId = this.db.prepare(
       'SELECT dedup_key FROM seen WHERE message_id = ? ORDER BY created_at, dedup_key LIMIT 1',
     ).get(idOrKey) as Record<string, unknown> | undefined;

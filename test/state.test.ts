@@ -478,10 +478,21 @@ describe('finding a stored message by its key or its Message-ID', () => {
     s.recordOutcome('me@qq.com|me@qq.com|<gone@x>', 'info', false, { messageId: 'me@qq.com|<gone@x>' });
     expect(s.getMail('me@qq.com|<gone@x>')).toBeUndefined();
     expect(s.setHandled('me@qq.com|<gone@x>', true)).toBeUndefined();
-    // A real Message-ID is still found by itself, as a shared link may carry one.
+    // The same for a caller holding Message-IDs: a key-shaped string whose record is gone names nothing.
+    expect(s.keyShaped('me@qq.com|<gone@x>')).toBe(true);
+    expect(s.recordsFor('me@qq.com|<gone@x>')).toEqual([]);
+    // A real Message-ID is still found by itself, as a shared link may carry one, bracketed or bare.
     s.markSeen('me@qq.com|<here@x>', 'me@qq.com', 'here');
     s.recordOutcome('me@qq.com|<here@x>', 'info', false, { messageId: '<here@x>' });
     expect(s.getMail('<here@x>')).toMatchObject({ dedupKey: 'me@qq.com|<here@x>' });
+    s.markSeen('me@qq.com|bare@x', 'me@qq.com', 'bare');
+    s.recordOutcome('me@qq.com|bare@x', 'info', false, { messageId: 'bare@x' });
+    expect(s.keyShaped('bare@x')).toBe(false);
+    expect(s.getMail('bare@x')).toMatchObject({ dedupKey: 'me@qq.com|bare@x' });
+    expect(s.recordsFor('bare@x')).toEqual([{ dedupKey: 'me@qq.com|bare@x', account: 'me@qq.com', by: 'messageId' }]);
+    // A bar in a Message-ID is not a key unless what comes before it is a mailbox held here.
+    expect(s.keyShaped('<a|b@x>')).toBe(false);
+    expect(s.keyShaped('someone@else.example|<x>')).toBe(false);
   });
 });
 
