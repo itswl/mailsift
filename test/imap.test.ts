@@ -20,6 +20,12 @@ const fake = vi.hoisted(() => {
     calls: [] as string[],
     appended: [] as Array<{ path: string; raw: Buffer; flags: string[] }>,
     refuseAppend: false,
+    /** What the next connections do, in order: connect, hang until hung up on, or fail. */
+    connectPlan: [] as Array<'ok' | 'hang' | Error>,
+    /** Connections hung up on without a goodbye. */
+    closed: 0,
+    /** Every connection made, so a test can cut one from the server's side. */
+    clients: [] as Array<{ usable: boolean }>,
     reset(): void {
       this.folders = [];
       this.mail = new Map();
@@ -27,6 +33,9 @@ const fake = vi.hoisted(() => {
       this.calls = [];
       this.appended = [];
       this.refuseAppend = false;
+      this.connectPlan = [];
+      this.closed = 0;
+      this.clients = [];
     },
   };
 
@@ -34,10 +43,25 @@ const fake = vi.hoisted(() => {
     private current = '';
     mailbox: { uidValidity: bigint } | false = false;
 
+    usable = false;
+    private pending: ((error: Error) => void) | undefined;
+
     on(): this { return this; }
-    async connect(): Promise<void> { server.calls.push('connect'); }
-    close(): void { /* nothing to close */ }
-    async logout(): Promise<void> { server.calls.push('logout'); }
+    async connect(): Promise<void> {
+      server.calls.push('connect');
+      server.clients.push(this);
+      const plan = server.connectPlan.shift() ?? 'ok';
+      if (plan === 'hang') await new Promise<void>((_, reject) => { this.pending = reject; });
+      else if (plan !== 'ok') throw plan;
+      this.usable = true;
+    }
+    close(): void {
+      this.usable = false;
+      server.closed += 1;
+      this.pending?.(new Error('Connection closed | ECONNRESET'));
+      this.pending = undefined;
+    }
+    async logout(): Promise<void> { this.usable = false; server.calls.push('logout'); }
 
     async list(): Promise<unknown[]> {
       server.calls.push('list');
@@ -147,7 +171,10 @@ const fake = vi.hoisted(() => {
 vi.mock('imapflow', () => ({ ImapFlow: fake.ImapFlow }));
 
 import {
-  appendToSent, applyMessageAction, applyWebMailAction, connectAttempts, fetchAttachmentManifestByMessageId,
+  closeSessions, connectInteractive, openSessions, resumeConnecting, stopConnecting, withSession,
+} from '../src/imap/connection.js';
+import {
+  appendToSent, applyMessageAction, applyWebMailAction, connect, connectAttempts, fetchAttachmentManifestByMessageId,
   fetchByMessageId, fetchReadableByMessageId, imapErrorText, isOversizedLookback, isTransientConnectError,
   MAIL_ACTIONS, MailActionError, orderLookupFolders, resolveActionDestination, retryDelayMs, selectFetchUids,
   sentFolderPath, WEB_MAIL_ACTIONS,
@@ -245,11 +272,17 @@ function put(
   fake.server.mail.set(folder, list);
 }
 
+/** The reader's connection is kept between requests; closing it is when the goodbye is said. */
+const hungUp = (): string | undefined => { closeSessions(); return fake.server.calls.at(-1); };
+
 const flagsOf = (folder: string, id: string): string[] =>
   [...(fake.server.mail.get(folder)?.find((m) => m.messageId === id)?.flags ?? [])].sort();
 const idsIn = (folder: string): string[] => (fake.server.mail.get(folder) ?? []).map((m) => m.messageId);
 
 beforeEach(() => {
+  // No connection is carried from one test into the next.
+  closeSessions();
+  resumeConnecting();
   fake.server.reset();
   fake.server.folders = [
     { path: 'INBOX' },
@@ -310,7 +343,7 @@ describe('reading one message live', () => {
     // Read-only locks only: opening a message here does not mark it read.
     expect(fake.server.calls.filter((call) => call.startsWith('lock'))).toEqual(['lock INBOX ro']);
     expect(fake.server.calls).not.toContain('+flags \\Seen');
-    expect(fake.server.calls.at(-1)).toBe('logout');
+    expect(hungUp()).toBe('logout');
     expect(flagsOf('INBOX', '<one@x>')).toEqual(['\\Answered', '\\Seen']);
   });
 
@@ -343,7 +376,7 @@ describe('reading one message live', () => {
   it('still fails loudly when a configured folder cannot be opened', async () => {
     fake.server.unopenable.add('INBOX');
     await expect(fetchReadableByMessageId(ME, '<one@x>')).rejects.toThrow(/Unknown Mailbox/);
-    expect(fake.server.calls.at(-1)).toBe('logout');
+    expect(hungUp()).toBe('logout');
   });
 
   it('opens a message with a large attachment by reading its headers and its text, and nothing else', async () => {
@@ -519,7 +552,7 @@ describe('acting on a message from the web view', () => {
     await expect(applyWebMailAction(ME, '<one@x>', 'archive')).rejects.toMatchObject({
       code: 'invalid_destination', message: 'this mailbox has no archive folder',
     });
-    expect(fake.server.calls.at(-1)).toBe('logout');
+    expect(hungUp()).toBe('logout');
   });
 
   it('archives on Gmail into All Mail', async () => {
@@ -533,7 +566,7 @@ describe('acting on a message from the web view', () => {
 
   it('reports a message that is in none of the folders searched', async () => {
     expect(await applyWebMailAction(ME, '<absent@x>', 'mark_read')).toBeUndefined();
-    expect(fake.server.calls.at(-1)).toBe('logout');
+    expect(hungUp()).toBe('logout');
   });
 });
 
@@ -568,7 +601,7 @@ describe('keeping a copy of what was sent', () => {
   it('files the message in the Sent folder, already read', async () => {
     expect(await appendToSent(ME, raw)).toBe('Sent Messages');
     expect(fake.server.appended).toEqual([{ path: 'Sent Messages', raw, flags: ['\\Seen'] }]);
-    expect(fake.server.calls.at(-1)).toBe('logout');
+    expect(hungUp()).toBe('logout');
   });
 
   it('finds the folder by name when the server flags nothing', () => {
@@ -587,6 +620,175 @@ describe('keeping a copy of what was sent', () => {
   it('reports a copy the server would not take', async () => {
     fake.server.refuseAppend = true;
     await expect(appendToSent(ME, raw)).rejects.toThrow(/rejected the append to Sent Messages/);
+    expect(hungUp()).toBe('logout');
+  });
+});
+
+describe('the reader\'s kept connection', () => {
+  const connects = (): number => fake.server.calls.filter((call) => call === 'connect').length;
+  const lists = (): number => fake.server.calls.filter((call) => call === 'list').length;
+
+  it('pays for one handshake when a message, its attachments and another message are read in a row', async () => {
+    put('INBOX', '<one@x>');
+    put('INBOX', '<two@x>');
+    await fetchReadableByMessageId(ME, '<one@x>', 'INBOX');
+    await fetchAttachmentManifestByMessageId(ME, '<one@x>', 'INBOX');
+    await fetchReadableByMessageId(ME, '<two@x>', 'INBOX');
+    expect(connects()).toBe(1);
+    // The folder list is asked for once, too.
+    expect(lists()).toBe(1);
+    expect(fake.server.calls).not.toContain('logout');
+    expect(openSessions()).toBe(1);
+    closeSessions();
+    expect(fake.server.calls.at(-1)).toBe('logout');
+    expect(openSessions()).toBe(0);
+  });
+
+  it('keeps one connection per mailbox, and they do not wait for each other', async () => {
+    put('INBOX', '<one@x>');
+    await Promise.all([fetchReadableByMessageId(ME, '<one@x>'), fetchReadableByMessageId(GMAIL, '<one@x>')]);
+    expect(connects()).toBe(2);
+    expect(openSessions()).toBe(2);
+  });
+
+  it('answers requests for one mailbox one at a time, in the order they were made', async () => {
+    const order: string[] = [];
+    const slow = withSession(ME, async () => { order.push('first starts'); await new Promise((r) => setTimeout(r, 20)); order.push('first ends'); });
+    const quick = withSession(ME, async () => { order.push('second'); });
+    await Promise.all([slow, quick]);
+    expect(order).toEqual(['first starts', 'first ends', 'second']);
+    expect(connects()).toBe(1);
+    // One that failed does not hold up the next.
+    await expect(withSession(ME, async () => { throw new Error('boom'); })).rejects.toThrow('boom');
+    await expect(withSession(ME, async () => 'still here')).resolves.toBe('still here');
+    expect(connects()).toBe(1);
+  });
+
+  it('reads again on a new connection when the kept one died while it sat idle', async () => {
+    put('INBOX', '<one@x>');
+    await fetchReadableByMessageId(ME, '<one@x>', 'INBOX');
+    // The server dropped it without a word; the first use finds out.
+    let first = true;
+    const live = await withSession(ME, async (client) => {
+      if (first) { first = false; client.close(); throw new Error('read ECONNRESET'); }
+      return 'read on the second connection';
+    });
+    expect(live).toBe('read on the second connection');
+    expect(connects()).toBe(2);
+  });
+
+  it('does not do a change to the mailbox twice on the strength of a dropped line', async () => {
+    put('INBOX', '<one@x>');
+    await fetchReadableByMessageId(ME, '<one@x>', 'INBOX');
+    let attempts = 0;
+    await expect(withSession(ME, async (client) => {
+      attempts += 1;
+      client.close();
+      throw new Error('read ECONNRESET');
+    }, { repeatable: false })).rejects.toThrow('ECONNRESET');
+    expect(attempts).toBe(1);
+    // The dead connection is not kept; the next request makes its own.
+    expect(openSessions()).toBe(0);
+    await withSession(ME, async () => undefined);
+    expect(connects()).toBe(2);
+  });
+
+  it('gives up on a request that outlasts its time, and frees the mailbox for the next', async () => {
+    const stuck = withSession(ME, () => new Promise<never>(() => undefined), { timeoutMs: 30 });
+    const next = withSession(ME, async () => 'answered');
+    await expect(stuck).rejects.toThrow(/did not answer in time/);
+    await expect(next).resolves.toBe('answered');
+    // The connection the stuck request was on was closed under it, not reused.
+    expect(fake.server.closed).toBeGreaterThanOrEqual(1);
+    expect(connects()).toBe(2);
+  });
+});
+
+describe('connecting for someone who is waiting', () => {
+  const quick = { attemptMs: 400, hedgeAfterMs: 20, attempts: 3 };
+
+  it('starts a second attempt beside one that is not answering, and uses whichever connects', async () => {
+    fake.server.connectPlan = ['hang', 'ok'];
+    const started = Date.now();
+    const client = await connectInteractive(ME, quick);
+    expect(client.usable).toBe(true);
+    expect(Date.now() - started).toBeLessThan(300);
+    expect(fake.server.calls.filter((call) => call === 'connect')).toHaveLength(2);
+    // The one that never answered is hung up on at once, not left to run out its time.
+    expect(fake.server.closed).toBe(1);
+    expect(fake.server.clients.filter((c) => c.usable)).toHaveLength(1);
+    client.close();
+  });
+
+  it('does not open a second connection when the first answers at once', async () => {
+    const client = await connectInteractive(ME, quick);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(fake.server.calls.filter((call) => call === 'connect')).toHaveLength(1);
+    client.close();
+  });
+
+  it('replaces an attempt that failed outright, and reports the last failure when none got through', async () => {
+    fake.server.connectPlan = [new Error('read ECONNRESET'), 'ok'];
+    const client = await connectInteractive(ME, quick);
+    expect(client.usable).toBe(true);
+    client.close();
+
+    fake.server.connectPlan = [new Error('read ECONNRESET'), new Error('Connection timed out'), new Error('read ECONNRESET')];
+    await expect(connectInteractive(ME, quick)).rejects.toThrow(/ECONNRESET/);
+  });
+
+  it('stops at once on a refusal another try would not change', async () => {
+    fake.server.connectPlan = [Object.assign(new Error('Command failed'), { responseText: 'AUTHENTICATE failed.' }), 'ok'];
+    const before = fake.server.calls.length;
+    await expect(connectInteractive(ME, quick)).rejects.toThrow(/AUTHENTICATE failed/);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(fake.server.calls.slice(before).filter((call) => call === 'connect')).toHaveLength(1);
+  });
+
+  it('a slower twin that connects after the winner says goodbye instead of lingering', async () => {
+    let release: () => void = () => undefined;
+    const original = fake.ImapFlow.prototype.connect;
+    let n = 0;
+    fake.ImapFlow.prototype.connect = async function patched(this: InstanceType<typeof fake.ImapFlow>): Promise<void> {
+      n += 1;
+      fake.server.calls.push('connect');
+      if (n === 1) await new Promise<void>((resolve) => { release = resolve; });
+      this.usable = true;
+    };
+    try {
+      const client = await connectInteractive(ME, quick);
+      expect(n).toBe(2);
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(fake.server.calls).toContain('logout');
+      expect(client.usable).toBe(true);
+      client.close();
+    } finally {
+      fake.ImapFlow.prototype.connect = original;
+    }
+  });
+});
+
+describe('being told to stop', () => {
+  it('hangs up on connections still being made, and makes no more', async () => {
+    // A poll stuck on a server that is not answering: each attempt would wait a minute and a half.
+    fake.server.connectPlan = ['hang', 'hang', 'hang', 'hang'];
+    const stuck = connect(ME);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    stopConnecting();
+    await expect(stuck).rejects.toThrow(/Connection closed/);
+    // No second attempt, no two-second pause before it.
+    expect(fake.server.calls.filter((call) => call === 'connect')).toHaveLength(1);
+    await expect(connect(ME)).rejects.toThrow(/shutting down/);
+    await expect(connectInteractive(ME)).rejects.toThrow(/shutting down/);
+  });
+
+  it('closes the reader\'s kept connections too', async () => {
+    put('INBOX', '<one@x>');
+    await fetchReadableByMessageId(ME, '<one@x>', 'INBOX');
+    expect(openSessions()).toBe(1);
+    stopConnecting();
+    expect(openSessions()).toBe(0);
     expect(fake.server.calls.at(-1)).toBe('logout');
   });
 });

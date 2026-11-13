@@ -23,6 +23,7 @@ import { recordStartupFailure } from './services/health.js';
 import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
 import { PollCoordinator } from './services/poll-scheduler.js';
 import { IdleSupervisor, idleEnabled, idleFolderTokens } from './imap/idle.js';
+import { stopConnecting } from './imap/connection.js';
 import { webUiEnabled } from './web.js';
 import { flushHeartbeats, heartbeatProblem, heartbeatUrl } from './services/heartbeat.js';
 import { getLogger } from './logger.js';
@@ -315,6 +316,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       stopping = true;
       coordinator.wake();
       if (mcpServer) mcpServer.close();
+      // Hang up on connections still being made and make no more: a poll
+      // stuck on a provider that is not answering would otherwise outlast
+      // the time a stop is given, and be killed.
+      stopConnecting();
       // Log the IDLE sessions out now so the server keeps no zombie connections.
       void idle?.stop().catch((error) => log.warn(`Failed to stop IDLE listeners: ${error}`));
       void metrics.shutdown().catch((error) => log.warn(`Failed to flush OTel metrics: ${error}`));
