@@ -69,7 +69,8 @@ body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset
 .icon-btn svg{display:block;width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round}
 .icon-btn .icon{vertical-align:0}
 .theme-icon{transition:transform .45s cubic-bezier(.2,.7,.2,1)}:root[data-theme=dark] .theme-icon{transform:rotate(180deg)}
-#bell{position:relative}#bell.on{color:var(--text)}#bell.on::after{content:"";position:absolute;top:11px;right:10px;width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 2px var(--bg)}
+/* On: a shade darker, nothing more. A dot means something new to look at, and a setting that is on is not that. */
+#bell{position:relative}#bell.on{color:var(--text)}
 .icon-btn:disabled{opacity:.3;cursor:default}.icon-btn.small{min-width:32px;min-height:32px;margin:-6px -6px -6px 0}.icon-btn.small svg,.icon-btn.small .icon{width:16px;height:16px}
 #refresh:disabled{cursor:wait;color:var(--accent);opacity:1}#refresh.running .refresh-icon{animation:spin .9s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 
