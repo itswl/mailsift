@@ -825,6 +825,16 @@ describe('the review of what goes out', () => {
     expect(state.getMail('me@qq.com|me@qq.com|<real@x>')?.handledAt).toBeTruthy();
     await call(client, 'record_feedback', { messageId: 'me@qq.com|me@qq.com|<real@x>', label: 'false_positive' });
     expect(state.feedbackRuleHints(1).neverImportant).toEqual(['attacker@evil.example']);
+
+    // The refusal names both ways out.
+    expect(await errorOf('get_mail', { messageId: both })).toMatchObject({ hint: expect.stringContaining('its own dedupKey') });
+    // Once the real record is gone, its key names nothing, rather than the look-alike spelling it.
+    (state as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db
+      .prepare('DELETE FROM seen WHERE dedup_key = ?').run('me@qq.com|<real@x>');
+    const sentBefore = box.sent.length;
+    expect(await errorOf('send_mail', { replyTo: both, text: 'To whom?' })).toMatchObject({ code: 'NOT_FOUND' });
+    expect(await call(client, 'get_mail', { messageId: both })).toMatchObject({ found: false });
+    expect(box.sent).toHaveLength(sentBefore);
   });
 
   it('does not answer everyone a message went to because its From line names the owner', async () => {

@@ -167,6 +167,11 @@ function fillCompose(d) {
   composing.quoted = d.quoted || '';
   composing.canSend = d.canSend !== false;
   if (!composeForm.to.value) composeForm.to.value = (d.to || []).join(', ');
+  // A message that names nobody to answer: the person chooses, and is told why the line is empty.
+  if (!composeForm.to.value && d.addressedTo === 'recipients') {
+    composeSay(t('compose.noAddressee'));
+    setTimeout(() => { if (composeSheet.open && !composeForm.to.value) composeForm.to.focus(); }, 120);
+  }
   if (!composeForm.cc.value && d.cc && d.cc.length) {
     composeForm.cc.value = d.cc.join(', ');
     $('#compose-cc-row').hidden = false;
