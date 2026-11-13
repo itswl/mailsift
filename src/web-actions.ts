@@ -29,7 +29,7 @@ import type { IncomingMessage } from 'node:http';
 import { loadConfig, type Account } from './config.js';
 import { MailboxUnreachableError } from './imap/connection.js';
 import {
-  appendToSent, applyWebMailAction, fetchReadableByMessageId, MailActionError,
+  appendToSent, applyWebMailAction, fetchReadableByMessageId, MAIL_ACTIONS, MailActionError,
   type LiveMessage, type LookupHint, type MessageHint, type WebMailAction, type WebMailActionResult,
 } from './imap/client.js';
 import {
@@ -233,6 +233,8 @@ export interface ActionContext {
   mayMark: boolean;
   /** A mark of the token this session holds (see credentialMark); '' when none is required. */
   credential: string;
+  /** Set for a caller that is not the page. Its calls are audited under the tool's own name by whoever made them. */
+  origin?: 'mcp';
 }
 
 const LIVE_TIMEOUT_MS = 25_000;
@@ -281,7 +283,7 @@ function assistantBudget(client: string, now = new Date()): WebResponse | undefi
   return undefined;
 }
 /** Mail leaves under the owner's name; ten a minute is more than a person types. */
-const allowSend = rateWindow(10);
+let allowSend = rateWindow(10);
 
 /**
  * Whether the request a piece of work belongs to has been answered.
@@ -356,18 +358,52 @@ function assistantFailure(error: unknown): WebResponse {
 
 // ---- Dealt with ----
 
-/** The actions the page offers. `move` to a folder of the caller's choosing stays with MCP. */
-const PAGE_ACTIONS = new Set<WebMailAction>(['mark_read', 'mark_unread', 'star', 'unstar', 'archive', 'trash', 'inbox']);
+/** What may be asked for a message: by the page, and by an MCP caller holding the write credential. */
+const PAGE_ACTIONS = new Set<WebMailAction>(MAIL_ACTIONS);
+
+/**
+ * The page's actions for a caller that is not a browser.
+ *
+ * The MCP server gives a caller holding the write credential what a write
+ * session of the page has, and it does so by running the page's own code:
+ * markHandled, actOnMail, sendMessage and replyDraft below are what the
+ * routes call. There is one implementation of each action and of every check
+ * around it, so the two cannot drift apart. Work one of them starts may
+ * outlast the call; `life` is ended when the call returns, as it is for a
+ * request, so such work finishes on a database handle of its own.
+ */
+export async function asWriteSession<T>(
+  client: string, backend: Partial<WebBackend> | undefined, run: (ctx: ActionContext, life: Life) => Promise<T>,
+  lang: Language = 'en',
+): Promise<T> {
+  const life: Life = { over: false };
+  const ctx: ActionContext = {
+    session: 'write', backend: { ...defaultBackend, ...(backend ?? {}) }, lang, client,
+    decorate: (row) => ({ ...row }), mayMark: true, credential: '', origin: 'mcp',
+  };
+  try {
+    return await run(ctx, life);
+  } finally {
+    life.over = true;
+  }
+}
 
 async function handleHandled(req: IncomingMessage, store: StateStore, ctx: ActionContext, life: Life): Promise<WebResponse> {
   if (!ctx.mayMark) return readOnly();
-  const body = await readJson(req);
+  return markHandled(await readJson(req), store, ctx, life);
+}
+
+/** Say a message is dealt with, or put it back. `body`: key, and handled (false to put it back). */
+export async function markHandled(
+  body: Record<string, unknown> | undefined, store: StateStore, ctx: ActionContext, life: Life,
+): Promise<WebResponse> {
+  if (!ctx.mayMark) return readOnly();
   const key = text(body?.['key'], 1200);
   if (!key) return badRequest('key is required');
   const handled = body?.['handled'] !== false;
   const row = store.setHandled(key, handled);
   if (!row) return json(404, { error: 'not found', code: 'notFound' });
-  store.recordMcpAudit(handled ? 'web:handled' : 'web:unhandled', ctx.client, true, row.dedupKey);
+  if (ctx.origin !== 'mcp') store.recordMcpAudit(handled ? 'web:handled' : 'web:unhandled', ctx.client, true, row.dedupKey);
   // "Done" here should mean done there too: where the session may write, the
   // message is marked read in its mailbox. Not awaited, because the queue has
   // already moved on, and not fatal, because the page's own state is what
@@ -402,10 +438,19 @@ async function handleHandled(req: IncomingMessage, store: StateStore, ctx: Actio
 
 async function handleAction(req: IncomingMessage, store: StateStore, ctx: ActionContext, life: Life): Promise<WebResponse> {
   if (ctx.session !== 'write') return readOnly();
-  const body = await readJson(req);
+  return actOnMail(await readJson(req), store, ctx, life);
+}
+
+/** Do one thing to a message in its mailbox. `body`: key, action, and for a move its destination folder. */
+export async function actOnMail(
+  body: Record<string, unknown> | undefined, store: StateStore, ctx: ActionContext, life: Life,
+): Promise<WebResponse> {
+  if (ctx.session !== 'write') return readOnly();
   const key = text(body?.['key'], 1200);
   const action = text(body?.['action'], 40) as WebMailAction;
   if (!key || !PAGE_ACTIONS.has(action)) return badRequest('key and a supported action are required');
+  const destination = action === 'move' ? text(body?.['destination'], 500) : '';
+  if (action === 'move' && !destination) return badRequest('a move needs a destination folder');
   const row = store.getMail(key);
   if (!row?.messageId) return json(404, { error: 'not found', code: 'notFound' });
   const account = accountOf(row);
@@ -444,7 +489,9 @@ async function handleAction(req: IncomingMessage, store: StateStore, ctx: Action
     if (error instanceof MailActionError) return json(409, { error: error.message, code: `action_${error.code}` });
     return json(502, { error: 'the mailbox action failed', code: 'actionFailed', detail: String(error).slice(0, 200) });
   };
-  const work: Promise<WebResponse> = ctx.backend.act(account, row.messageId, action, actHint(store, row)).then(
+  const work: Promise<WebResponse> = ctx.backend.act(
+    account, row.messageId, action, { ...actHint(store, row), ...(destination ? { destination } : {}) },
+  ).then(
     (result) => record(ctx, store, life, (db) => settle(db, result)),
     (error: unknown) => {
       quietly('A failed mailbox action', () => record(ctx, store, life, (db) => db.recordMailAction(
@@ -491,7 +538,14 @@ async function handleFeedback(req: IncomingMessage, store: StateStore, ctx: Acti
 // ---- Writing ----
 
 async function handleReply(params: URLSearchParams, store: StateStore, ctx: ActionContext): Promise<WebResponse> {
-  const key = params.get('key')?.trim() ?? '';
+  return replyDraft({ key: params.get('key')?.trim() ?? '', mode: params.get('mode') ?? '' }, store, ctx);
+}
+
+/** What an answer to a message starts from: who it goes to, its subject, the thread it continues, the original quoted. */
+export async function replyDraft(
+  asked: { key: string; mode?: string }, store: StateStore, ctx: ActionContext,
+): Promise<WebResponse> {
+  const key = asked.key;
   const row = key ? store.getMail(key) : undefined;
   if (!row) return json(404, { error: 'not found', code: 'notFound' });
   const account = accountOf(row);
@@ -514,13 +568,19 @@ async function handleReply(params: URLSearchParams, store: StateStore, ctx: Acti
       date: r.date ?? row.mailDate, messageId: r.messageId ?? row.messageId, references: r.references, text: r.text,
     },
     self,
-    params.get('mode') === 'replyAll' ? 'replyAll' : 'reply',
+    asked.mode === 'replyAll' ? 'replyAll' : 'reply',
     ctx.lang,
   );
   const sending = ctx.backend.sending(account);
+  // An answer that would go to another domain than the message came from: what
+  // the reader's safety clues warn about, said here where the answer is addressed.
+  const domain = (address: string): string => address.slice(address.lastIndexOf('@') + 1).trim().toLowerCase();
+  const sender = r.from?.address ?? '';
+  const replyToElsewhere = Boolean(sender && r.replyTo.length && envelope.to.some((address) => domain(address) !== domain(sender)));
   return json(200, {
     key: row.dedupKey, account: account.username, accountName: account.name,
     ...envelope,
+    sender, replyToElsewhere,
     canSend: sending.available, ...(sending.reason ? { reason: sending.reason } : {}),
   });
 }
@@ -550,8 +610,16 @@ const SEND_MEMORY_MS = 15 * 60_000;
 const SEND_MEMORY_MAX = 200;
 const sendJobs = new Map<string, { at: number; outcome: Promise<WebResponse> }>();
 
+/** For tests: no memory of letters sent, and nobody's count of them. */
 export function forgetSends(): void {
   sendJobs.clear();
+  allowSend = rateWindow(10);
+}
+
+/** What became, or is becoming, of a letter already asked for under this name; undefined when there was none. */
+export function earlierSend(id: string, now = Date.now()): Promise<WebResponse> | undefined {
+  const job = sendJobs.get(id);
+  return job && now - job.at <= SEND_MEMORY_MS ? job.outcome : undefined;
 }
 
 function rememberSend(id: string, outcome: Promise<WebResponse>, now = Date.now()): void {
@@ -568,7 +636,19 @@ const SEND_UNCERTAIN = (): WebResponse =>
 async function handleSend(req: IncomingMessage, store: StateStore, ctx: ActionContext, life: Life): Promise<WebResponse> {
   if (ctx.session !== 'write') return readOnly();
   // Sized for a long letter with its quoted history, and nothing like an upload.
-  const body = await readJson(req, 700 * 1024);
+  return sendMessage(await readJson(req, 700 * 1024), store, ctx, life);
+}
+
+/**
+ * Send one message from a mailbox. `body`: to, cc, bcc, subject, text; for
+ * an answer replyTo (the stored message's key or Message-ID) and references,
+ * for a new message account; and id, a name for this letter, under which
+ * asking again does not send it twice.
+ */
+export async function sendMessage(
+  body: Record<string, unknown> | undefined, store: StateStore, ctx: ActionContext, life: Life,
+): Promise<WebResponse> {
+  if (ctx.session !== 'write') return readOnly();
   if (!body) return badRequest('a JSON body is required');
 
   // The same letter again: answer with what became of it the first time.

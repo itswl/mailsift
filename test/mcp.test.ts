@@ -1,31 +1,13 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
 
-/**
- * The mailbox is stood in for here: these tests are about what the server
- * does around an action (who may ask, what is recorded, where the record
- * goes), and test/imap.test.ts is where the action itself is run.
- */
-const mailbox = vi.hoisted(() => ({
-  calls: [] as Array<{ messageId: string; action: string; destination?: string; hint: unknown }>,
-  answer: undefined as undefined | ((action: string) => Record<string, unknown> | undefined),
-}));
-vi.mock('../src/imap/client.js', async (original) => {
-  const real = await original<typeof import('../src/imap/client.js')>();
-  return {
-    ...real,
-    applyMessageAction: async (account: { username: string }, messageId: string, action: string, destination?: string, hint?: unknown) => {
-      if (!mailbox.answer) return real.applyMessageAction(account as never, messageId, action as never, destination, hint as never);
-      mailbox.calls.push({ messageId, action, ...(destination ? { destination } : {}), hint });
-      const answer = mailbox.answer(action);
-      return answer ? { action, account: account.username, messageId, sourceFolder: 'INBOX', ...answer } : undefined;
-    },
-  };
-});
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { allowMcpRequest, createServer } from '../src/mcp.js';
+import { allowMcpRequest, createServer, forgetUnconfirmedSends, type InFlight } from '../src/mcp.js';
+import { MailActionError, type LiveMessage, type WebMailActionResult } from '../src/imap/client.js';
 import { StateStore } from '../src/services/state.js';
+import { SendError, type OutgoingMail } from '../src/smtp.js';
+import { forgetLive, forgetSends, type WebBackend } from '../src/web-actions.js';
 import { IMPORTANCE } from '../src/config.js';
 import { CATEGORIES } from '../src/services/triage.js';
 import { makeMessage, makeResult } from './helpers.js';
@@ -40,9 +22,70 @@ import { makeMessage, makeResult } from './helpers.js';
  */
 const open: Array<() => Promise<void>> = [];
 
-async function connect(state: StateStore, writable = false): Promise<Client> {
+/**
+ * The mailbox, stood in for. These tests are about what the server does
+ * around an action (who may ask, what is recorded, where the record goes);
+ * test/imap.test.ts is where the actions themselves are run, and
+ * test/web-actions.test.ts where the page's handlers, which the write tools
+ * call, are gone through case by case.
+ */
+interface Mailbox {
+  acted: Array<{ messageId: string; action: string; destination?: string; hint?: unknown }>;
+  sent: OutgoingMail[];
+  read: unknown[];
+  appended: number;
+  act?: (action: string) => Partial<WebMailActionResult> | undefined;
+  send?: () => never;
+  backend: Partial<WebBackend>;
+}
+function mailbox(state: StateStore): Mailbox {
+  const box: Mailbox = { acted: [], sent: [], read: [], appended: 0, backend: {} };
+  const live: LiveMessage = {
+    folder: 'INBOX', flags: { seen: false, flagged: false, answered: false }, uid: 17, uidValidity: '9',
+    readable: {
+      html: '<p>Hello</p>', htmlOmitted: false, text: 'Please confirm the invoice by Friday.', quoted: '', truncated: false,
+      from: { name: 'Vendor', address: 'billing@vendor.com' }, to: [{ name: '', address: 'me@qq.com' }],
+      cc: [{ name: 'Ann', address: 'ann@vendor.com' }], replyTo: [], subject: 'subject k1', date: '2026-11-10T08:00:00.000Z',
+      messageId: '<one@x>', inReplyTo: null, references: ['<root@x>'],
+      auth: { result: 'pass', dkim: 'pass', spf: 'pass', dmarc: 'pass', signedBy: 'vendor.com' },
+      unsubscribe: null, inlineImages: 0,
+    },
+  };
+  box.backend = {
+    read: async (_account, _messageId, hint) => { box.read.push(hint); return live; },
+    act: async (account, messageId, action, options) => {
+      box.acted.push({ messageId, action, ...(options?.destination ? { destination: options.destination } : {}), hint: options?.hint });
+      const moved = action === 'archive' ? 'Archive' : action === 'trash' ? 'Trash' : action === 'inbox' ? 'INBOX' : options?.destination;
+      const answer = box.act ? box.act(action) : {};
+      if (!answer) return undefined;
+      return {
+        action, account: account.username, messageId, sourceFolder: 'INBOX',
+        ...(moved ? { destinationFolder: moved, destinationIsSpam: false } : {}), ...answer,
+      };
+    },
+    send: async (_account, mail) => {
+      if (box.send) box.send();
+      box.sent.push(mail);
+      return { messageId: '<sent@x>', raw: Buffer.from('raw'), copy: Buffer.from('raw'), accepted: [...mail.to, ...(mail.cc ?? [])], rejected: [] };
+    },
+    appendSent: async () => { box.appended += 1; return 'Sent'; },
+    savesSentCopy: () => false,
+    sending: () => ({ available: true }),
+    // Work that outlasts a call opens a handle of its own: here the same database, behind a close() that closes nothing.
+    openStore: () => Object.create(state, { close: { value: () => undefined } }) as StateStore,
+  };
+  return box;
+}
+
+beforeEach(() => {
+  forgetLive();
+  forgetSends();
+  forgetUnconfirmedSends();
+});
+
+async function connect(state: StateStore, writable = false, backend?: Partial<WebBackend>, inFlight?: InFlight): Promise<Client> {
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  const server = createServer({ state, client: 'test', writable });
+  const server = createServer({ state, client: 'test', writable, ...(backend ? { backend } : {}), ...(inFlight ? { inFlight } : {}) });
   const client = new Client({ name: 'mcp-test', version: '0.0.0' });
   await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
   open.push(async () => {
@@ -86,7 +129,7 @@ describe('tool surface', () => {
     expect(tools.map((t) => t.name).sort()).toEqual([
       'feedback_rules', 'get_mail', 'health', 'inspect_mail_safety', 'list_accounts', 'list_attachments', 'list_audit', 'list_dead_letters',
       'list_digest', 'list_folders', 'list_mail', 'list_threads', 'mail_summary', 'needs_you', 'observability',
-      'recovery_status', 'scan_attachment', 'search_mail',
+      'prepare_reply', 'read_message', 'recovery_status', 'scan_attachment', 'search_mail',
     ]);
     for (const tool of tools) expect(tool.description ?? '').not.toBe('');
   });
@@ -101,6 +144,7 @@ describe('tool surface', () => {
     expect(names).not.toContain('retry_dead_letter');
     expect(names).not.toContain('manage_mail');
     expect(names).not.toContain('mark_handled');
+    expect(names).not.toContain('send_mail');
 
     // Absent from the listing and also unreachable by name.
     expect(await client.callTool({ name: 'record_feedback', arguments: { messageId: '<one@x>', label: 'false_positive' } }))
@@ -110,14 +154,29 @@ describe('tool surface', () => {
   it('adds exactly the tools that change something for a caller holding the write credential', async () => {
     const reader = new Set((await (await connect(new StateStore(':memory:'))).listTools()).tools.map((t) => t.name));
     const writer = (await (await connect(new StateStore(':memory:'), true)).listTools()).tools.map((t) => t.name);
-    expect(writer.filter((name) => !reader.has(name)).sort()).toEqual(['manage_mail', 'mark_handled', 'record_feedback', 'retry_dead_letter']);
+    expect(writer.filter((name) => !reader.has(name)).sort())
+      .toEqual(['manage_mail', 'mark_handled', 'record_feedback', 'retry_dead_letter', 'send_mail']);
   });
 
-  it('offers no way to send mail or to delete it, to anyone', async () => {
+  it('gives the write credential what the page has, the bin and sending included, and a reader none of it', async () => {
     const writer = (await (await connect(new StateStore(':memory:'), true)).listTools()).tools;
-    expect(writer.map((t) => t.name).filter((name) => /send|reply|delete|trash|bin/i.test(name))).toEqual([]);
     const actions = (writer.find((t) => t.name === 'manage_mail')?.inputSchema.properties as Record<string, { enum?: string[] }>)['action']?.enum;
-    expect(actions).toEqual(['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox']);
+    expect(actions).toEqual(['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox', 'trash']);
+    expect(writer.find((t) => t.name === 'send_mail')?.description).toContain('really sends mail');
+
+    const state = seeded();
+    const box = mailbox(state);
+    const reader = await connect(state, false, box.backend);
+    for (const [name, args] of [
+      ['send_mail', { account: 'me@qq.com', to: ['a@b.co'], subject: 's', text: 't' }],
+      ['manage_mail', { messageId: '<one@x>', action: 'trash' }],
+      ['mark_handled', { messageId: '<one@x>' }],
+    ] as const) {
+      expect(await reader.callTool({ name, arguments: args }), name).toMatchObject({ isError: true });
+    }
+    expect(box.sent).toEqual([]);
+    expect(box.acted).toEqual([]);
+    expect(state.getMail('k1')?.handledAt).toBeNull();
   });
 
   it('warns a client that message fields are untrusted data', async () => {
@@ -273,86 +332,319 @@ describe('what needs the mailbox owner', () => {
     expect(done[0]?.handledAt).toEqual(expect.any(String));
   });
 
-  it('lets a writer say a message is done, and put it back', async () => {
-    const state = seeded();
-    const client = await connect(state, true);
-    // No mailbox is configured here: the message is done all the same, and the answer says the mailbox was not told.
-    const done = await call(client, 'mark_handled', { messageId: '<one@x>' });
-    expect(done).toMatchObject({ messageId: '<one@x>', handled: true, markedRead: false, needsYou: 1 });
-    expect(done['handledAt']).toEqual(expect.any(String));
-    expect(state.getMail('k1')?.handledAt).toBeTruthy();
-    expect(state.listMailActions(5)[0]).toMatchObject({ action: 'mark_read', success: false, client: 'test' });
-
-    const back = await call(client, 'mark_handled', { messageId: '<one@x>', handled: false });
-    expect(back).toMatchObject({ handled: false, handledAt: null, needsYou: 2 });
-    expect(back).not.toHaveProperty('markedRead');
-    expect(await client.callTool({ name: 'mark_handled', arguments: { messageId: '<absent@x>' } })).toMatchObject({ isError: true });
-  });
-
-  it('marks a done message read in its mailbox, at the place the record remembers', async () => {
+  it('lets a writer say a message is done, and put it back, as the ring does', async () => {
     process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw';
     const state = seeded();
     state.rememberUid('k1', 'INBOX', 17, '9');
-    mailbox.calls = [];
-    mailbox.answer = () => ({});
-    try {
-      const done = await call(await connect(state, true), 'mark_handled', { messageId: '<one@x>' });
-      expect(done).toMatchObject({ handled: true, markedRead: true, needsYou: 1 });
-      expect(mailbox.calls).toEqual([{ messageId: '<one@x>', action: 'mark_read', hint: { folder: 'INBOX', uid: 17, uidValidity: '9' } }]);
-      expect(state.listMailActions(5)[0]).toMatchObject({ action: 'mark_read', success: true, sourceFolder: 'INBOX' });
-    } finally {
-      mailbox.answer = undefined;
-    }
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    const done = await call(client, 'mark_handled', { messageId: '<one@x>' });
+    expect(done).toMatchObject({ messageId: '<one@x>', handled: true, needsYou: 1 });
+    expect(done['handledAt']).toEqual(expect.any(String));
+    expect(state.getMail('k1')?.handledAt).toBeTruthy();
+    // Done here is done there: the mailbox is told, at the place the record remembers, and that goes on record.
+    await vi.waitFor(() => expect(state.listMailActions(5)[0]).toMatchObject({ action: 'mark_read', success: true, client: 'mcp:test' }));
+    expect(box.acted).toEqual([{ messageId: '<one@x>', action: 'mark_read', hint: { folder: 'INBOX', uid: 17, uidValidity: '9' } }]);
+
+    const back = await call(client, 'mark_handled', { messageId: '<one@x>', handled: false });
+    expect(back).toMatchObject({ handled: false, handledAt: null, needsYou: 2 });
+    // Putting one back changes nothing in the mailbox.
+    expect(box.acted).toHaveLength(1);
+    expect(await client.callTool({ name: 'mark_handled', arguments: { messageId: '<absent@x>' } })).toMatchObject({ isError: true });
   });
 });
 
 describe('acting on a mailbox', () => {
+  beforeEach(() => { process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw'; });
+
   it('keeps the record with the message when it is archived, and counts it dealt with', async () => {
-    process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw';
     const state = seeded();
     state.rememberUid('k1', 'INBOX', 17, '9');
-    mailbox.calls = [];
-    mailbox.answer = (action) => (action === 'archive'
-      ? { destinationFolder: 'Archive', destinationIsSpam: false, destinationUid: 101, destinationUidValidity: '4' }
-      : action === 'inbox' ? { sourceFolder: 'Archive', destinationFolder: 'INBOX', destinationIsSpam: false } : {});
-    try {
-      const client = await connect(state, true);
-      const archived = await call(client, 'manage_mail', { messageId: '<one@x>', action: 'archive' });
-      // What a caller is told is the action and the folders, not where in the folder.
-      expect(archived).toEqual({
-        success: true, action: 'archive', account: 'me@qq.com', messageId: '<one@x>', sourceFolder: 'INBOX', destinationFolder: 'Archive',
-      });
-      expect(mailbox.calls[0]).toMatchObject({ action: 'archive', hint: { folder: 'INBOX', uid: 17, uidValidity: '9' } });
-      expect(state.getMail('k1')).toMatchObject({ folder: 'Archive', inSpam: false });
-      expect(state.getMail('k1')?.handledAt).toBeTruthy();
-      expect(state.placeOf('k1')).toEqual({ uid: 101, uidValidity: '4' });
-      expect(state.listMailActions(5)[0]).toMatchObject({ action: 'archive', success: true, destinationFolder: 'Archive' });
-      expect((await call(client, 'needs_you'))['count']).toBe(1);
+    const box = mailbox(state);
+    box.act = (action) => (action === 'archive' ? { destinationUid: 101, destinationUidValidity: '4' } : action === 'inbox' ? { sourceFolder: 'Archive' } : {});
+    const client = await connect(state, true, box.backend);
+    const archived = await call(client, 'manage_mail', { messageId: '<one@x>', action: 'archive' });
+    // What a caller is told is the action and where the message now is, not where in the folder.
+    expect(archived).toEqual({
+      success: true, action: 'archive', messageId: '<one@x>', account: 'me@qq.com', folder: 'Archive', inSpam: false,
+      handledAt: expect.any(String), needsYou: 1,
+    });
+    expect(box.acted[0]).toMatchObject({ action: 'archive', hint: { folder: 'INBOX', uid: 17, uidValidity: '9' } });
+    expect(state.getMail('k1')).toMatchObject({ folder: 'Archive', inSpam: false });
+    expect(state.placeOf('k1')).toEqual({ uid: 101, uidValidity: '4' });
+    expect(state.listMailActions(5)[0]).toMatchObject({ action: 'archive', success: true, destinationFolder: 'Archive', client: 'mcp:test' });
+    expect((await call(client, 'needs_you'))['count']).toBe(1);
 
-      // Brought back, it is looked for where the record now says it is; the server did not say where it landed.
-      await call(client, 'manage_mail', { messageId: '<one@x>', action: 'inbox' });
-      expect(mailbox.calls[1]).toMatchObject({ action: 'inbox', hint: { folder: 'Archive', uid: 101, uidValidity: '4' } });
-      expect(state.getMail('k1')).toMatchObject({ folder: 'INBOX' });
-      expect(state.placeOf('k1')).toBeUndefined();
-      // Starring moves nothing, and leaves the record alone.
-      await call(client, 'manage_mail', { messageId: '<two@x>', action: 'star' });
-      expect(state.getMail('k2')).toMatchObject({ folder: 'INBOX', handledAt: null });
+    // Brought back, it is looked for where the record now says it is; the server did not say where it landed.
+    await call(client, 'manage_mail', { messageId: '<one@x>', action: 'inbox' });
+    expect(box.acted[1]).toMatchObject({ action: 'inbox', hint: { folder: 'Archive', uid: 101, uidValidity: '4' } });
+    expect(state.getMail('k1')).toMatchObject({ folder: 'INBOX' });
+    expect(state.placeOf('k1')).toBeUndefined();
+    // Starring moves nothing, and leaves the record alone.
+    expect(await call(client, 'manage_mail', { messageId: '<two@x>', action: 'star' })).toMatchObject({ success: true, folder: 'INBOX', handledAt: null });
+  });
+
+  it('bins a message and moves one to a named folder, as the page\'s owner can', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    expect(await call(client, 'manage_mail', { messageId: '<one@x>', action: 'trash' }))
+      .toMatchObject({ success: true, action: 'trash', folder: 'Trash', handledAt: expect.any(String) });
+    expect(state.listMailActions(5)[0]).toMatchObject({ action: 'trash', success: true, destinationFolder: 'Trash' });
+
+    expect(await call(client, 'manage_mail', { messageId: '<two@x>', action: 'move', destination: 'Projects/2026' }))
+      .toMatchObject({ success: true, folder: 'Projects/2026', handledAt: null });
+    expect(box.acted[1]).toMatchObject({ action: 'move', destination: 'Projects/2026' });
+    // A move with nowhere to go is a bad argument, and nothing is asked of the mailbox.
+    expect(await client.callTool({ name: 'manage_mail', arguments: { messageId: '<three@x>', action: 'move' } })).toMatchObject({ isError: true });
+    expect(box.acted).toHaveLength(2);
+  });
+
+  it('records a message that could not be found or an action the mailbox refused, and changes nothing', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    box.act = () => undefined;
+    const client = await connect(state, true, box.backend);
+    const missing = await client.callTool({ name: 'manage_mail', arguments: { messageId: '<one@x>', action: 'archive' } });
+    expect(missing).toMatchObject({ isError: true });
+    expect(JSON.parse((missing.content as Array<{ text: string }>)[0]!.text)).toMatchObject({ code: 'NOT_FOUND' });
+    expect(state.getMail('k1')).toMatchObject({ folder: 'INBOX', handledAt: null });
+    expect(state.listMailActions(5)[0]).toMatchObject({ action: 'archive', success: false });
+
+    box.backend.act = async () => { throw new MailActionError('invalid_destination', 'this mailbox has no archive folder'); };
+    const refused = await (await connect(state, true, box.backend)).callTool({ name: 'manage_mail', arguments: { messageId: '<one@x>', action: 'archive' } });
+    expect(JSON.parse((refused.content as Array<{ text: string }>)[0]!.text)).toMatchObject({ code: 'ACTION_REFUSED', message: expect.stringContaining('no archive folder') });
+  });
+});
+
+describe('reading a message and answering it', () => {
+  beforeEach(() => { process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw'; });
+
+  it('reads a message as the page shows it, to anyone who may read, and remembers where it was', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const message = await call(await connect(state, false, box.backend), 'read_message', { messageId: '<one@x>' });
+    expect(message).toMatchObject({
+      messageId: '<one@x>', account: 'me@qq.com', folder: 'INBOX', flags: { seen: false },
+      from: { address: 'billing@vendor.com' }, subject: 'subject k1', text: 'Please confirm the invoice by Friday.',
+      hasHtml: true, senderAuthentication: { result: 'pass', signedBy: 'vendor.com' }, importance: 'critical',
+    });
+    // The markup is the page's to draw; a model is given the text.
+    expect(message).not.toHaveProperty('html');
+    expect(box.read).toEqual([{ folder: 'INBOX' }]);
+    expect(state.placeOf('k1')).toEqual({ uid: 17, uidValidity: '9' });
+    expect(await (await connect(state)).callTool({ name: 'read_message', arguments: { messageId: '<absent@x>' } })).toMatchObject({ isError: true });
+  });
+
+  it('says what an answer would start from, and sends nothing', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, false, box.backend);
+    expect(await call(client, 'prepare_reply', { messageId: '<one@x>' })).toMatchObject({
+      account: 'me@qq.com', to: ['billing@vendor.com'], cc: [], subject: 'Re: subject k1', canSend: true,
+      references: ['<root@x>', '<one@x>'], quoted: expect.stringContaining('> Please confirm the invoice by Friday.'),
+    });
+    // The line over the quote follows the language the answer is written in.
+    expect((await call(client, 'prepare_reply', { messageId: '<one@x>', language: 'zh-CN' }))['quoted']).toContain('写道：');
+    // Everyone the original went to, and never the owner's own address.
+    expect(await call(client, 'prepare_reply', { messageId: '<one@x>', mode: 'replyAll' })).toMatchObject({ to: ['billing@vendor.com'], cc: ['ann@vendor.com'] });
+    expect(box.sent).toEqual([]);
+  });
+
+  it('answers a message in one call: to its sender, in its thread, quoted, and counts it dealt with', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    const sent = await call(client, 'send_mail', { replyTo: '<one@x>', text: 'Confirmed, thank you.' });
+    expect(sent).toMatchObject({
+      sent: true, messageId: '<sent@x>', to: ['billing@vendor.com'], cc: [], bccCount: 0, subject: 'Re: subject k1',
+      accepted: 1, savedCopy: true, needsYou: 1,
+    });
+    expect(box.sent).toHaveLength(1);
+    expect(box.sent[0]).toMatchObject({ to: ['billing@vendor.com'], subject: 'Re: subject k1', inReplyTo: '<one@x>' });
+    // The thread it continues: what the original referred to, and the original. (The sender removes a repeat.)
+    expect(box.sent[0]!.references).toEqual(expect.arrayContaining(['<root@x>', '<one@x>']));
+    expect(box.sent[0]!.text.startsWith('Confirmed, thank you.\n\n')).toBe(true);
+    expect(box.sent[0]!.text).toContain('> Please confirm the invoice by Friday.');
+    // What the page does after a send: a copy in Sent, the original answered and done, all of it on record.
+    expect(box.appended).toBe(1);
+    expect(state.getMail('k1')?.handledAt).toBeTruthy();
+    await vi.waitFor(() => expect(box.acted).toContainEqual(expect.objectContaining({ messageId: '<one@x>', action: 'answered' })));
+    expect(state.listMailActions(10).map((row) => row.action)).toEqual(expect.arrayContaining(['send', 'answered']));
+    expect(state.listMailActions(10).find((row) => row.action === 'send')).toMatchObject({ success: true, client: 'mcp:test' });
+  });
+
+  it('sends to whom it is told, without a quote when asked, and a new message from a named mailbox', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    await call(client, 'send_mail', {
+      replyTo: '<one@x>', replyAll: true, quote: false, to: ['ann@vendor.com'], cc: ['boss@example.org'], subject: 'About the invoice', text: 'See below.',
+    });
+    expect(box.sent[0]).toMatchObject({ to: ['ann@vendor.com'], cc: ['boss@example.org'], subject: 'About the invoice', text: 'See below.', inReplyTo: '<one@x>' });
+
+    const fresh = await call(client, 'send_mail', { account: 'me@qq.com', to: ['friend@example.org'], subject: 'Lunch', text: 'Friday?' });
+    expect(fresh).toMatchObject({ sent: true, to: ['friend@example.org'], subject: 'Lunch' });
+    expect(fresh).not.toHaveProperty('needsYou', 0);
+    expect(box.sent[1]).toMatchObject({ to: ['friend@example.org'], subject: 'Lunch', text: 'Friday?' });
+    expect(box.sent[1]).not.toHaveProperty('inReplyTo');
+  });
+
+  it('refuses a letter with no sender or nobody to go to, before anything is sent', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    const errorOf = async (args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      const answer = await client.callTool({ name: 'send_mail', arguments: args });
+      expect(answer).toMatchObject({ isError: true });
+      return JSON.parse((answer.content as Array<{ text: string }>)[0]!.text) as Record<string, unknown>;
+    };
+    expect(await errorOf({ text: 'hello' })).toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(await errorOf({ account: 'me@qq.com', subject: 's', text: 'hello' })).toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(await errorOf({ account: 'nobody@example.org', to: ['a@b.co'], subject: 's', text: 'hello' })).toMatchObject({ code: 'ACCOUNT_UNKNOWN' });
+    expect(await errorOf({ replyTo: '<absent@x>', text: 'hello' })).toMatchObject({ code: 'NOT_FOUND' });
+    expect(box.sent).toEqual([]);
+  });
+
+  it('sends one letter once: the same request again is answered with what became of the first', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    const letter = { account: 'me@qq.com', to: ['friend@example.org'], subject: 'Once', text: 'Only once.' };
+    expect(await call(client, 'send_mail', letter)).toMatchObject({ sent: true, messageId: '<sent@x>' });
+    // No name was given: the letter is its own name, which is what protects a caller that timed out and asked again.
+    const again = await call(client, 'send_mail', letter);
+    expect(again).toMatchObject({ sent: true, repeated: true, messageId: '<sent@x>' });
+    expect(again['note']).toContain('not sent again');
+    expect(box.sent).toHaveLength(1);
+
+    // On purpose, under a name of its own, the same words do go out again...
+    expect(await call(client, 'send_mail', { ...letter, id: 'second-copy' })).not.toHaveProperty('repeated');
+    expect(box.sent).toHaveLength(2);
+    // ...and a name stands for one letter only: reused for another, it does not answer for the first.
+    const other = await call(client, 'send_mail', { ...letter, id: 'second-copy', text: 'A different letter.' });
+    expect(other).toMatchObject({ sent: true });
+    expect(other).not.toHaveProperty('repeated');
+    expect(box.sent).toHaveLength(3);
+    expect(box.sent[2]).toMatchObject({ text: 'A different letter.' });
+  });
+
+  it('says when a send may or may not have left, and does not try it again on the same request', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    const letter = { account: 'me@qq.com', to: ['friend@example.org'], subject: 'Maybe', text: 'Did this leave?' };
+    const errorOf = async (args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      const answer = await client.callTool({ name: 'send_mail', arguments: args });
+      expect(answer).toMatchObject({ isError: true });
+      return JSON.parse((answer.content as Array<{ text: string }>)[0]!.text) as Record<string, unknown>;
+    };
+
+    box.send = () => { throw new SendError('rejected', 'the server refused the recipient', { detail: '550 no such user' }); };
+    expect(await errorOf(letter)).toMatchObject({ code: 'ACTION_REFUSED', message: expect.stringContaining('550 no such user') });
+    box.send = () => { throw new SendError('connection', 'could not reach the mail server'); };
+    // Nothing left, and the answer says that trying again is safe.
+    expect(await errorOf(letter)).toMatchObject({ code: 'MAILBOX_UNAVAILABLE', hint: expect.stringContaining('Nothing was sent') });
+
+    let attempts = 0;
+    box.send = () => { attempts += 1; throw new SendError('unknown', 'the connection ended after the message was handed over'); };
+    expect(await errorOf(letter)).toMatchObject({ code: 'PROVIDER_ERROR', hint: expect.stringContaining('Do not send it again') });
+    // The same request again is told the same, and the mail server is not handed the letter a second time.
+    expect(await errorOf(letter)).toMatchObject({ code: 'PROVIDER_ERROR', message: expect.stringContaining('send_timeout') });
+    expect(attempts).toBe(1);
+    // Once the owner has looked in Sent and wants it sent after all, a new name sends it.
+    delete box.send;
+    expect(await call(client, 'send_mail', { ...letter, id: 'after-looking' })).toMatchObject({ sent: true });
+    expect(box.sent).toHaveLength(1);
+  });
+
+  it('fills in to and cc each on its own, and says when an answer went to another domain than the sender\'s', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    // Told who to answer, and asked to reply to all: the others still get their copy, and nobody gets two.
+    await call(client, 'send_mail', { replyTo: '<one@x>', replyAll: true, to: ['ann@vendor.com'], text: 'To Ann, with the rest in copy.' });
+    expect(box.sent[0]).toMatchObject({ to: ['ann@vendor.com'], cc: [] });
+    await call(client, 'send_mail', { replyTo: '<one@x>', replyAll: true, to: ['boss@example.org'], text: 'Copying the thread.' });
+    expect(box.sent[1]).toMatchObject({ to: ['boss@example.org'], cc: ['ann@vendor.com'] });
+    // An empty cc is a decision, not an omission.
+    await call(client, 'send_mail', { replyTo: '<one@x>', replyAll: true, cc: [], text: 'Only to the sender.' });
+    expect(box.sent[2]).toMatchObject({ to: ['billing@vendor.com'], cc: [] });
+
+    // A message that asks for answers somewhere else than it came from.
+    const elsewhere = { ...(await box.backend.read!({} as never, '<one@x>'))! };
+    elsewhere.readable = { ...elsewhere.readable, replyTo: [{ name: '', address: 'payments@other-domain.example' }] };
+    box.backend.read = async () => elsewhere;
+    forgetLive();
+    // A server is given its mailbox when it is made, so this one is made anew.
+    const wary = await connect(state, true, box.backend);
+    expect(await call(wary, 'prepare_reply', { messageId: '<one@x>' }))
+      .toMatchObject({ sender: 'billing@vendor.com', to: ['payments@other-domain.example'], replyToElsewhere: true });
+    const sent = await call(wary, 'send_mail', { replyTo: '<one@x>', text: 'Paid.' });
+    expect(sent).toMatchObject({ to: ['payments@other-domain.example'] });
+    expect(sent['note']).toContain('another domain than its sender (billing@vendor.com)');
+    // Addressed by the caller, there is nothing to point out.
+    expect(await call(wary, 'send_mail', { replyTo: '<one@x>', to: ['billing@vendor.com'], text: 'Paid, to you directly.' })).not.toHaveProperty('note');
+  });
+});
+
+describe('a call that outlasts its caller', () => {
+  beforeEach(() => { process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw'; });
+
+  it('is counted until it has finished and written its audit row, so its database handle is not closed under it', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const send = box.backend.send!;
+    box.backend.send = async (account, mail) => { await held; return send(account, mail); };
+    const inFlight: InFlight = { count: 0 };
+    let idle = 0;
+    inFlight.idle = () => { idle += 1; };
+    const client = await connect(state, true, box.backend, inFlight);
+
+    const sending = call(client, 'send_mail', { account: 'me@qq.com', to: ['friend@example.org'], subject: 'Slow', text: 'Still leaving.' });
+    await vi.waitFor(() => expect(inFlight.count).toBe(1));
+    expect(idle).toBe(0);
+    release();
+    expect(await sending).toMatchObject({ sent: true });
+    expect(inFlight.count).toBe(0);
+    expect(idle).toBe(1);
+    // What it did is on record: the message that left, and the call that sent it.
+    expect(state.listMailActions(5).find((row) => row.action === 'send')).toMatchObject({ success: true });
+    expect(state.listMcpAudit(5).find((row) => row.action === 'send_mail')).toMatchObject({ success: true, client: 'test' });
+  });
+
+  it('does not turn a message that left into an error because the audit row could not be written', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    const audit = vi.spyOn(state, 'recordMcpAudit').mockImplementation(() => { throw new Error('database is locked'); });
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(await call(client, 'send_mail', { account: 'me@qq.com', to: ['friend@example.org'], subject: 'Sent', text: 'It left.' }))
+        .toMatchObject({ sent: true });
+      expect(box.sent).toHaveLength(1);
     } finally {
-      mailbox.answer = undefined;
+      audit.mockRestore();
+      quiet.mockRestore();
     }
   });
 
-  it('records a message that could not be found, and changes nothing', async () => {
-    process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw';
+  it('gives a reader no more of a message than the operator allowed MCP reads', async () => {
     const state = seeded();
-    mailbox.answer = () => undefined;
+    const box = mailbox(state);
+    process.env.MCP_LIVE_BODY_CHARS = '1000';
     try {
-      const client = await connect(state, true);
-      expect(await client.callTool({ name: 'manage_mail', arguments: { messageId: '<one@x>', action: 'archive' } })).toMatchObject({ isError: true });
-      expect(state.getMail('k1')).toMatchObject({ folder: 'INBOX', handledAt: null });
-      expect(state.listMailActions(5)[0]).toMatchObject({ action: 'archive', success: false });
+      const long = { ...(await box.backend.read!({} as never, '<one@x>'))! };
+      long.readable = { ...long.readable, text: 'a'.repeat(900), quoted: 'b'.repeat(900) };
+      box.backend.read = async () => long;
+      const message = await call(await connect(state, false, box.backend), 'read_message', { messageId: '<one@x>' });
+      expect(String(message['text'])).toHaveLength(900);
+      expect(String(message['quoted'])).toHaveLength(100);
+      expect(message['truncated']).toBe(true);
     } finally {
-      mailbox.answer = undefined;
+      delete process.env.MCP_LIVE_BODY_CHARS;
     }
   });
 });

@@ -219,7 +219,7 @@ import {
   stopConnecting, warmSession, withSession,
 } from '../src/imap/connection.js';
 import {
-  appendToSent, applyMessageAction, applyWebMailAction, connect, connectAttempts, fetchAttachmentManifestByMessageId,
+  appendToSent, applyWebMailAction, connect, connectAttempts, fetchAttachmentManifestByMessageId,
   fetchByMessageId, fetchReadableByMessageId, imapErrorText, inspectMailSafety, isOversizedLookback, isTransientConnectError,
   MAIL_ACTIONS, MailActionError, orderLookupFolders, resolveActionDestination, retryDelayMs, selectFetchUids,
   sentFolderPath, WEB_MAIL_ACTIONS,
@@ -675,10 +675,10 @@ describe('where a moving action puts a message', () => {
 });
 
 describe('acting on a message from the web view', () => {
-  it('gives a person what a model is not given: the bin, and marking a message answered', () => {
-    expect([...MAIL_ACTIONS]).toEqual(['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox']);
-    expect([...WEB_MAIL_ACTIONS]).toEqual([...MAIL_ACTIONS, 'trash', 'answered']);
-    expect(MAIL_ACTIONS as readonly string[]).not.toContain('trash');
+  it('has one list of what may be asked for a message, and one thing nobody asks for', () => {
+    expect([...MAIL_ACTIONS]).toEqual(['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox', 'trash']);
+    // Marking a message answered is what a reply leaving does, not a request.
+    expect([...WEB_MAIL_ACTIONS]).toEqual([...MAIL_ACTIONS, 'answered']);
   });
 
   it('marks, stars and records an answer under a writable lock', async () => {
@@ -779,79 +779,6 @@ describe('acting on a message from the web view', () => {
   it('reports a message that is in none of the folders searched', async () => {
     expect(await applyWebMailAction(ME, '<absent@x>', 'mark_read')).toBeUndefined();
     expect(hungUp()).toBe('logout');
-  });
-});
-
-describe('the MCP action path', () => {
-  it('still refuses to move anything to a trash folder', async () => {
-    put('INBOX', '<one@x>');
-    await expect(applyMessageAction(ME, '<one@x>', 'move', 'Trash')).rejects.toMatchObject({ code: 'invalid_destination' });
-    await expect(applyMessageAction(ME, '<one@x>', 'move', '已删除')).rejects.toThrow(/delete\/trash folder is disabled/);
-    // Refused before any connection: nothing reached the server.
-    expect(fake.server.calls).toEqual([]);
-    await expect(applyMessageAction(ME, '<one@x>', 'trash' as never)).rejects.toMatchObject({ code: 'invalid_action' });
-  });
-
-  it('keeps its actions, its result shape and its configured folders', async () => {
-    put('INBOX', '<one@x>');
-    put('Archive', '<moved@x>');
-    expect(await applyMessageAction(ME, '<one@x>', 'star')).toEqual({
-      action: 'star', account: 'me@qq.com', messageId: '<one@x>', sourceFolder: 'INBOX',
-    });
-    expect(await applyMessageAction(ME, '<one@x>', 'move', 'Archive')).toEqual({
-      action: 'move', account: 'me@qq.com', messageId: '<one@x>', sourceFolder: 'INBOX',
-      destinationFolder: 'Archive', destinationIsSpam: false,
-    });
-    // Without a hint a message outside the configured folders stays out of reach.
-    expect(await applyMessageAction(ME, '<moved@x>', 'mark_read')).toBeUndefined();
-    await expect(applyMessageAction(ME, '<one@x>', 'move', 'Projects')).rejects.toThrow(/not found or not selectable/);
-    // Its own connection each time, with a goodbye: nothing is kept open for a tool call.
-    expect(openSessions()).toBe(0);
-  });
-
-  it('archives and brings back by what the mailbox calls those folders, not by a name the caller has to know', async () => {
-    put('INBOX', '<one@x>');
-    put('Junk', '<rescued@x>');
-    expect(await applyMessageAction(ME, '<one@x>', 'archive')).toMatchObject({
-      action: 'archive', sourceFolder: 'INBOX', destinationFolder: 'Archive', destinationIsSpam: false,
-    });
-    expect(idsIn('Archive')).toEqual(['<one@x>']);
-    expect(await applyMessageAction(ME, '<rescued@x>', 'inbox')).toMatchObject({ sourceFolder: 'Junk', destinationFolder: 'INBOX' });
-    expect(idsIn('INBOX')).toEqual(['<rescued@x>']);
-    // A mailbox without an archive is not given one.
-    fake.server.folders = fake.server.folders.filter((folder) => folder.path !== 'Archive');
-    await expect(applyMessageAction(ME, '<rescued@x>', 'archive')).rejects.toThrow(/no archive folder/);
-  });
-
-  it('reaches a message that was filed away when it is told where, and still checks it is that message', async () => {
-    fake.server.saysWhereMoved = true;
-    put('INBOX', '<one@x>');
-    const archived = await applyMessageAction(ME, '<one@x>', 'archive');
-    expect(archived).toMatchObject({ destinationFolder: 'Archive', destinationUid: 101, destinationUidValidity: '1' });
-    const place = { folder: 'Archive', uid: 101, uidValidity: '1' };
-    fake.server.calls = [];
-    expect(await applyMessageAction(ME, '<one@x>', 'star', undefined, place)).toMatchObject({ sourceFolder: 'Archive' });
-    expect(flagsOf('Archive', '<one@x>')).toEqual(['\\Flagged']);
-    expect(fake.server.calls.filter((call) => call.startsWith('search'))).toEqual([]);
-    // The same place, said of another message, changes nothing.
-    put('Archive', '<other@x>', { uid: 7 });
-    expect(await applyMessageAction(ME, '<absent@x>', 'star', undefined, { folder: 'Archive', uid: 7, uidValidity: '1' })).toBeUndefined();
-    expect(flagsOf('Archive', '<other@x>')).toEqual([]);
-    expect(await applyMessageAction(ME, '<one@x>', 'inbox', undefined, place)).toMatchObject({ destinationFolder: 'INBOX' });
-  });
-
-  it('refuses a bin whatever it is called: by the server\'s own flag, and by the names bins go by', async () => {
-    put('INBOX', '<one@x>');
-    fake.server.folders.push(
-      { path: 'Old stuff', specialUse: '\\Trash' }, { path: '[Gmail]/Bin' }, { path: '废纸篓' },
-      // A folder inside a bin goes when the bin is emptied.
-      { path: 'Old stuff/2024' }, { path: 'Deleted Messages/kept' }, { path: 'INBOX.Trash.sub', delimiter: '.' },
-    );
-    for (const bin of ['Old stuff', '[Gmail]/Bin', '废纸篓', 'Deleted Messages', 'Old stuff/2024', 'Deleted Messages/kept', 'INBOX.Trash.sub']) {
-      await expect(applyMessageAction(ME, '<one@x>', 'move', bin), bin).rejects.toThrow(/delete\/trash folder is disabled/);
-    }
-    expect(idsIn('INBOX')).toEqual(['<one@x>']);
-    expect(fake.server.calls.filter((call) => call.startsWith('move'))).toEqual([]);
   });
 });
 

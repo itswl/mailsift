@@ -1,6 +1,6 @@
 # MCP
 
-mailsift includes an MCP server, so an AI assistant can see what needs you, list, search and read your triaged mail, preview the digest, look at attachments and at what your provider said about a sender, and check whether mailsift is healthy. With a second, write token it can also mark mail done and file it. It can never send mail or delete it.
+mailsift includes an MCP server, so an AI assistant can see what needs you, list, search and read your triaged mail, preview the digest, look at attachments and at what your provider said about a sender, and check whether mailsift is healthy. With a second, write token it is given what the web view's owner has: it can mark mail done, file it, bin it, and send mail.
 
 An agent that supports skills can load [`.agents/skills/mailsift/SKILL.md`](../.agents/skills/mailsift/SKILL.md), which says how these tools are meant to be used and where the limits are.
 
@@ -47,6 +47,8 @@ For local stdio clients, point the command at `dist/src/mcp.js` (or `npm run mcp
 | `list_digest` | The messages waiting for the next daily digest. |
 | `list_accounts` | The monitored mailboxes, their providers and the folders being watched. |
 | `list_folders` | One mailbox's IMAP folders. |
+| `read_message` | One message as the web view shows it, read live: its text with the quoted history apart, who it is from and to, the provider's verdict on the sender, its flags and folder. |
+| `prepare_reply` | What an answer to a message would start from: recipients, subject, thread references, the original quoted. Sends nothing. |
 | `list_attachments` | A message's attachments, each with a resource URI to fetch the file. |
 | `scan_attachment` | A bounded local check of one attachment. |
 | `inspect_mail_safety` | Spam and safety clues for one message, with what the mailbox's provider reported about the sender. |
@@ -56,8 +58,9 @@ For local stdio clients, point the command at `dist/src/mcp.js` (or `npm run mcp
 | `observability` | Totals for processing, delivery, dead letters, feedback and mailbox actions, plus access audit by tool. |
 | `list_audit` | Recent tool and resource calls and audited mailbox actions. |
 | `feedback_rules` | Sender rules inferred from feedback. |
-| `manage_mail` | Write: mark read or unread, star or unstar, archive, bring back to the inbox, move. |
+| `manage_mail` | Write: mark read or unread, star or unstar, archive, bring back to the inbox, bin, move. |
 | `mark_handled` | Write: say a message is dealt with, which takes it out of `needs_you`, or put it back. |
+| `send_mail` | Write: answer a stored message, or send a new one, from a monitored mailbox. |
 | `record_feedback` | Write: label a message `false_positive`, `missed`, `handled` or `correct`. |
 | `retry_dead_letter` | Write: rewind one folder cursor so the next poll retries a dead letter. |
 
@@ -96,24 +99,30 @@ Every failure carries a `code` a caller can branch on, a message, and a `hint` n
 | `INVALID_ARGUMENT` | An argument does not match the schema, or a resource URI is malformed. |
 | `MAILBOX_UNAVAILABLE` | The mailbox itself could not be read just now. Stored records stay available. |
 | `ATTACHMENT_UNSUPPORTED` | Skipped by the size or type limit. |
-| `ACTION_REFUSED` | `manage_mail` was asked for an action or destination that is not allowed. |
+| `ACTION_REFUSED` | The mailbox or the mail server refused: a folder that does not exist, a recipient the server would not take, too many messages in a minute. |
 | `WRITE_DISABLED` | No write credential is configured. |
 | `SERVER_MISCONFIGURED` | mailsift cannot read its own settings. This needs a person, not another call. |
-| `PROVIDER_ERROR` | Anything else. The underlying message is never passed through, because it can carry a credential. |
+| `PROVIDER_ERROR` | Anything else. The underlying message is never passed through, because it can carry a credential. `send_mail` answers with this code and `send_timeout` in its message when the mail server did not confirm a message: it may have left, so look in Sent before sending again. |
 
 A Message-ID that was never seen is not an error: `get_mail` answers `found: false`, because absence is a result.
 
 ## Write tools and the write token
 
-`manage_mail`, `mark_handled`, `record_feedback`, and `retry_dead_letter` are write tools, and they are not registered at all unless `MCP_WRITE_TOKEN` is set. The separate token keeps a leaked read credential from changing either mailbox contents or future triage policy.
+`manage_mail`, `mark_handled`, `send_mail`, `record_feedback`, and `retry_dead_letter` are write tools, and they are not registered at all unless `MCP_WRITE_TOKEN` is set. The separate token keeps a leaked read credential from changing mailbox contents, sending mail or changing future triage policy.
 
-`manage_mail` supports `mark_read`, `mark_unread`, `star`, `unstar`, `archive`, `inbox` and `move`. `archive` files a message in the mailbox's own archive folder (All Mail on Gmail; refused where there is none) and counts it as dealt with; `inbox` brings one back from spam or from the archive; `move` takes a folder path from `list_folders`. It never sends mail, and it refuses a move to a bin whatever the folder is called: by the usual names and by the server's own `\Trash` flag. Every operation looks the message up again in the mailbox, starting where mailsift last saw it, and checks its Message-ID inside a writable IMAP lock before changing anything; then it records an audit row. After a move the stored record follows the message, so the web view and the next call look where it now is.
+**The write token is the owner's key.** A caller that presents it is given what a browser signed in with it has in the [web view](web-view.md#signing-in-and-what-a-session-may-do), and the tools run the page's own code, so the two cannot differ: the same checks, the same limits (ten messages a minute per client), the same audit. That includes the two things that act for you in the world, binning a message and sending one. An MCP client is a model, and the mail it reads is written by strangers who can address it directly, so give this token only to a client you would hand your mailbox to, and prefer one that asks before it sends. The server's instructions, each tool's description and the [skill](../.agents/skills/mailsift/SKILL.md) all tell a model to act only on your request and never on a message's; that is guidance, not a lock. `SMTP_ENABLED=false` switches sending off for the page and for MCP alike.
 
-`mark_handled` is the ring in the web view: it takes a message out of the queue, or with `handled: false` puts it back. Marking one done also marks it read in its mailbox, and the answer's `markedRead` says whether the mailbox could be told; a mailbox that cannot be reached does not undo the mark.
+`manage_mail` supports `mark_read`, `mark_unread`, `star`, `unstar`, `archive`, `inbox`, `trash` and `move`. `archive` files a message in the mailbox's own archive folder (All Mail on Gmail; refused where there is none); `inbox` brings one back from spam, the archive or the bin; `trash` moves it to the mailbox's bin, which the provider empties on its own schedule; `move` takes a folder path from `list_folders`. Archiving and binning count the message as dealt with. Every operation looks the message up again in the mailbox, starting where mailsift last saw it, and checks its Message-ID inside a writable IMAP lock before changing anything; then it records an audit row. After a move the stored record follows the message, so the web view and the next call look where it now is.
+
+`mark_handled` is the ring in the web view: it takes a message out of the queue, or with `handled: false` puts it back. Marking one done also marks it read in its mailbox, in the background, and that is audited too; a mailbox that cannot be reached does not undo the mark.
+
+`send_mail` is the composer. With `replyTo` (a stored Message-ID) the answer leaves from the mailbox that received the original and continues its thread; where `to` is left out it goes to whoever the original asks answers to, and where `cc` is left out `replyAll: true` puts the other recipients in copy (never your own addresses, and nobody twice), under "Re:" its subject, with the original quoted below the text unless `quote: false`. With `account` instead it sends a new message from that mailbox. Text is plain text. Afterwards, as in the page, a copy is in Sent, the original is marked answered and counted as dealt with, and the audit has a row saying that a message left, from where and when, without its recipients or its text. When an answer was addressed for the caller to a Reply-To on another domain than the sender's, the result says so in `note`; `prepare_reply` shows the same as `replyToElsewhere` before anything is sent.
+
+One letter is sent once. A letter's name is what the caller called it (`id`, optional) bound to what it says and who it goes to, as the page names its own, so the same request repeated within fifteen minutes is answered with `repeated: true` and what became of the first attempt instead of a second copy, and a name reused for a different letter does not answer for the first. When the mail server did not confirm a message, the answer is `PROVIDER_ERROR` with `send_timeout`, the message may have left, and the same request again gets the same answer without another attempt; a different `id` sends it after all, once the owner has looked in Sent. That memory is the running process's: a restart forgets it. A call the client walks away from still runs to its end, and what it did is still recorded.
 
 Set `MCP_WRITE_TOKEN` to a second secret that differs from `MCP_TOKEN`; reusing one value for both is refused at startup. Present it as the bearer token to get the full surface. `MCP_TOKEN` then stays a read-only credential, which is what any shared client should hold. Over stdio the caller can already read the env file, so setting `MCP_WRITE_TOKEN` alone enables the write tools there without a second presentation.
 
-The [web view](web-view.md#signing-in-and-what-a-session-may-do) makes the same split: a browser that signs in with `MCP_WRITE_TOKEN` can act on mail, and one that signs in with `MCP_TOKEN` reads. The page can do two things the MCP tools deliberately cannot, move a message to the bin and send a reply, because there a person presses the button. An MCP client is a model following instructions that may have come from the mail it is reading, so what it is given is what can be undone from the same place: flags flip back, and a message that was archived or moved can be brought back. Both write to the same audit tables.
+What stays with the page: its own assistant (asking a question across your mail, drafting a reply), since an MCP client is itself the model that would do that, and notifications to installed copies of the page, which belong to a browser.
 
 `record_feedback` records `false_positive`, `missed`, `handled`, and `correct` labels for later rule and triage evaluation. Two `missed` or two `false_positive` records for one sender become a rule; see [Configuration](configuration.md#your-own-rules). The `handled` label also takes the message out of the queue, but it cannot put one back: `mark_handled` is the tool for the queue.
 

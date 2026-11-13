@@ -356,15 +356,16 @@ interface DownloadedPrefix {
 }
 
 /**
- * What the MCP tool may do to a message: mark it, star it, and move it within
- * the mailbox, by a folder's name or to the mailbox's own archive or inbox.
- * Nothing in this list destroys mail or sends any.
+ * What may be asked for a message: by the page, and by an MCP caller holding
+ * the write credential, which is given what the page has. Marking, starring,
+ * and moving: to a folder by name, or to the mailbox's own archive, inbox or
+ * bin.
  */
-export const MAIL_ACTIONS = ['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox'] as const;
+export const MAIL_ACTIONS = ['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox', 'trash'] as const;
 export type MailAction = (typeof MAIL_ACTIONS)[number];
 
 export interface MailActionResult {
-  action: MailAction;
+  action: WebMailAction;
   account: string;
   messageId: string;
   sourceFolder: string;
@@ -381,16 +382,6 @@ export class MailActionError extends Error {
     super(message);
     this.name = 'MailActionError';
   }
-}
-
-/**
- * A destination that names a bin outright, told before any connection is
- * made. The server's own list is checked again once it is at hand (inTrash).
- */
-function isUnsafeMoveDestination(path: string): boolean {
-  const normalized = path.trim().toLowerCase();
-  const leaf = normalized.split('/').at(-1) ?? normalized;
-  return new Set(['trash', 'deleted', 'deleted items', 'deleted messages', '回收站', '已删除', '已刪除']).has(leaf);
 }
 
 async function extractLargeMessageBody(
@@ -1214,79 +1205,13 @@ async function actOnMessage(
 }
 
 /**
- * Apply one narrowly-scoped mailbox action after the caller has presented the
- * separate write credential. This is the MCP tool's path.
- *
- * Message IDs are resolved again inside the selected mailbox, so a stale
- * local row cannot turn into an arbitrary UID: `hint` only says where to
- * look first, and what is found there is checked before anything changes.
- * Without a hint the configured folders are searched, as before.
- *
- * `archive` and `inbox` are moves to a folder the mailbox itself names, so a
- * caller need not know what a provider calls it. Nothing here deletes: a
- * move to the bin is refused whatever the folder is called.
+ * Everything that is done to a message: what may be asked for, and
+ * `answered`, which nobody asks for. It is set when a reply has left.
  */
-export async function applyMessageAction(
-  account: Account,
-  messageId: string,
-  action: MailAction,
-  destination?: string,
-  hint: MessageHint = {},
-): Promise<MailActionResult | undefined> {
-  if (!MAIL_ACTIONS.includes(action)) {
-    throw new MailActionError('invalid_action', `unsupported mail action: ${action}`);
-  }
-  const target = destination?.trim();
-  if (action === 'move' && !target) {
-    throw new MailActionError('invalid_destination', 'move requires a destination folder');
-  }
-  if (action === 'move' && target && isUnsafeMoveDestination(target)) {
-    throw new MailActionError('invalid_destination', 'moving to a delete/trash folder is disabled');
-  }
-
-  const client = await connect(account);
-  try {
-    const listed = await listFolders(client);
-    let to: { path: string; isSpam: boolean } | undefined;
-    if (action === 'move' || action === 'archive' || action === 'inbox') {
-      to = resolveActionDestination(listed, action, account.provider, target);
-      // The name was checked above, before connecting. Here the server's own
-      // list is at hand: its flag for the bin, and the folders inside one.
-      if (inTrash(listed, to.path)) {
-        throw new MailActionError('invalid_destination', 'moving to a delete/trash folder is disabled');
-      }
-    }
-
-    const folders = orderLookupFolders(listed, resolveFolders(listed, account.folders), hint.folder);
-    const acted = await actOnMessage(client, messageId, folders, action, to?.path, hint);
-    if (acted === undefined) return undefined;
-    return {
-      action,
-      account: account.username,
-      messageId,
-      sourceFolder: acted.sourceFolder,
-      ...(to ? { destinationFolder: to.path, destinationIsSpam: to.isSpam } : {}),
-      ...(acted.destinationUid && acted.destinationUidValidity
-        ? { destinationUid: acted.destinationUid, destinationUidValidity: acted.destinationUidValidity } : {}),
-    };
-  } finally {
-    await client.logout().catch(() => undefined);
-  }
-}
-
-/**
- * What the web view may do to a message.
- *
- * A person looking at one message and pressing one button, not an agent with a
- * tool: so this set adds, to what the MCP tool has, the two things only a
- * person is given: binning a message, and marking it answered once a reply
- * has left. MAIL_ACTIONS stays without them. The MCP tool builds its schema
- * from that list and promises there that nothing can be sent to the trash.
- */
-export const WEB_MAIL_ACTIONS = [...MAIL_ACTIONS, 'trash', 'answered'] as const;
+export const WEB_MAIL_ACTIONS = [...MAIL_ACTIONS, 'answered'] as const;
 export type WebMailAction = (typeof WEB_MAIL_ACTIONS)[number];
 
-export type WebMailActionResult = Omit<MailActionResult, 'action'> & { action: WebMailAction };
+export type WebMailActionResult = MailActionResult;
 
 type MovingAction = 'move' | 'archive' | 'trash' | 'inbox';
 const MOVING_ACTIONS = new Set<WebMailAction>(['move', 'archive', 'trash', 'inbox']);
@@ -1312,23 +1237,6 @@ function entrySelectable(entry: ListResponse): boolean {
 /** RFC 6154 special use, whether the server sent it as an attribute or ImapFlow resolved it. */
 function entryHasUse(entry: ListResponse, use: string): boolean {
   return (entry.specialUse ?? '').trim().toLowerCase() === use || entryFlags(entry).has(use);
-}
-
-/**
- * Whether a folder is a bin or lies inside one: by the server's special-use
- * flag or by the names bins go by, at any level of its path. A provider
- * empties what is under its bin along with it.
- */
-function inTrash(entries: readonly ListResponse[], path: string): boolean {
-  const delimiter = entries.find((entry) => entry.path === path)?.delimiter || '/';
-  const parts = path.split(delimiter);
-  for (let depth = 1; depth <= parts.length; depth += 1) {
-    const ancestor = parts.slice(0, depth).join(delimiter);
-    const listed = entries.find((entry) => entry.path === ancestor);
-    if (listed && entryHasUse(listed, '\\trash')) return true;
-    if (TRASH_NAMES.has(ancestor.trim().toLowerCase()) || TRASH_NAMES.has((parts[depth - 1] ?? '').trim().toLowerCase())) return true;
-  }
-  return false;
 }
 
 function entryByName(entries: readonly ListResponse[], names: ReadonlySet<string>): ListResponse | undefined {

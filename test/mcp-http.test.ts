@@ -61,8 +61,10 @@ async function listTools(url: string, token: string): Promise<{ status: number; 
   return { status: res.status, names: (body.result?.tools ?? []).map((t) => t.name) };
 }
 
+const WRITE_TOOLS = ['record_feedback', 'retry_dead_letter', 'manage_mail', 'mark_handled', 'send_mail'];
+
 describe('bearer credentials decide the tool set', () => {
-  it('gives a read token everything except the two state-changing tools', async () => {
+  it('gives a read token everything except the tools that change something', async () => {
     process.env.MCP_TOKEN = READ;
     process.env.MCP_WRITE_TOKEN = WRITE;
     const url = await start();
@@ -70,18 +72,18 @@ describe('bearer credentials decide the tool set', () => {
     const { status, names } = await listTools(url, READ);
     expect(status).toBe(200);
     expect(names).toContain('list_mail');
-    expect(names).not.toContain('record_feedback');
-    expect(names).not.toContain('retry_dead_letter');
+    expect(names).toContain('read_message');
+    // Nothing that changes a mailbox, sends mail, or changes how mail is judged.
+    for (const name of WRITE_TOOLS) expect(names, name).not.toContain(name);
   });
 
-  it('gives the write token the full surface', async () => {
+  it('gives the write token the full surface, sending included', async () => {
     process.env.MCP_TOKEN = READ;
     process.env.MCP_WRITE_TOKEN = WRITE;
     const url = await start();
 
     const { names } = await listTools(url, WRITE);
-    expect(names).toContain('record_feedback');
-    expect(names).toContain('retry_dead_letter');
+    for (const name of WRITE_TOOLS) expect(names, name).toContain(name);
     expect(names).toContain('list_mail');
   });
 
@@ -92,8 +94,7 @@ describe('bearer credentials decide the tool set', () => {
     const url = await start();
 
     const { names } = await listTools(url, READ);
-    expect(names).not.toContain('record_feedback');
-    expect(names).not.toContain('retry_dead_letter');
+    for (const name of WRITE_TOOLS) expect(names, name).not.toContain(name);
   });
 
   it('rejects a token that is neither', async () => {
