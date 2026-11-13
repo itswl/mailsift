@@ -7,9 +7,8 @@
  * 2. IMAP `UID n:*` returns at least one message, even when its UID is below n.
  *    Filter the search result client-side or the last message repeats every poll.
  */
-import { setTimeout as sleep } from 'node:timers/promises';
-import { ImapFlow, type FetchMessageObject, type ListResponse } from 'imapflow';
-import { getAccessToken } from './auth.js';
+import type { FetchMessageObject, ImapFlow, ListResponse } from 'imapflow';
+import { connect, imapErrorText, withSession } from './connection.js';
 import { resolveFolders, toFolder, type Folder } from './folders.js';
 import {
   extractAttachmentManifest, extractBody, fallbackMessageId, findBodyParts, findTextBodyPart, htmlToText, normalizeDate,
@@ -22,8 +21,13 @@ import {
   type AttachmentScanReport,
   type LinkRiskReport,
 } from '../security.js';
-import { needsOAuth, type Account } from '../config.js';
+import type { Account } from '../config.js';
 import { getLogger } from '../logger.js';
+
+// Getting a connection lives in connection.ts; these names are still offered from here.
+export {
+  connect, connectAttempts, imapErrorText, isTransientConnectError, retryDelayMs, type ConnectOptions,
+} from './connection.js';
 
 const log = getLogger('imap');
 
@@ -51,44 +55,6 @@ function intEnv(name: string, fallback: number): number {
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
 }
 
-const TRANSIENT_CONNECT_MARKERS = [
-  'user is authenticated but not connected',
-  'connection reset', 'connection refused', 'socket hang up',
-  'timed out', 'timeout', 'econnreset', 'econnrefused', 'etimedout',
-  'temporarily unavailable', 'try again',
-];
-
-export function imapErrorText(error: unknown): string {
-  if (!error || typeof error !== 'object') return String(error);
-  const value = error as {
-    message?: unknown;
-    response?: unknown;
-    responseText?: unknown;
-    responseStatus?: unknown;
-    code?: unknown;
-  };
-  return [value.message, value.responseText, value.response, value.responseStatus, value.code]
-    .filter((part) => part !== undefined && part !== null && String(part))
-    .map(String)
-    .filter((part, index, all) => all.indexOf(part) === index)
-    .join(' | ');
-}
-
-export function isTransientConnectError(error: unknown): boolean {
-  const text = imapErrorText(error).toLowerCase();
-  return TRANSIENT_CONNECT_MARKERS.some((marker) => text.includes(marker));
-}
-
-export function connectAttempts(account: Account): number {
-  void account;
-  return 4;
-}
-
-export function retryDelayMs(account: Account, attempt: number): number {
-  void account;
-  return 2_000 * 2 ** Math.max(0, attempt - 1);
-}
-
 export function selectFetchUids(found: readonly number[], floor: number, limit: number): number[] {
   return [...found]
     .filter((uid) => uid > floor)
@@ -100,78 +66,20 @@ export function isOversizedLookback(found: readonly number[], limit: number): bo
   return found.length > limit;
 }
 
-export interface ConnectOptions {
-  /** Tune the connection for a long-lived IDLE listener instead of a short poll. */
-  idle?: boolean;
-}
-
-export async function connect(account: Account, options: ConnectOptions = {}): Promise<ImapFlow> {
-  const auth = needsOAuth(account)
-    ? { user: account.username, accessToken: await getAccessToken(account.username, account.auth) }
-    : { user: account.username, pass: account.password ?? '' };
-
-  const maxAttempts = connectAttempts(account);
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    log.info(
-      `Connecting ${account.name} (${account.host}:${account.port}, auth=${account.auth}, attempt ${attempt}/${maxAttempts})`,
-    );
-    const client = new ImapFlow({
-      host: account.host,
-      port: account.port,
-      secure: account.useSsl,
-      auth,
-      logger: false,
-      // Observe only; do not modify mailbox state.
-      emitLogs: false,
-      ...(options.idle
-        ? {
-            // Re-enter IDLE soon after a wake-up fetch so the listening gap stays
-            // short; this connection issues few commands, so the extra round
-            // trips do not matter. RFC 2177 lets servers drop an IDLE after 29
-            // minutes, so restart it well before that.
-            autoIdleDelay: 1_000,
-            maxIdleTime: 20 * 60_000,
-            missingIdleCommand: 'NOOP' as const,
-          }
-        : {}),
-    });
-    // ImapFlow can emit a later socket error after connect() has rejected. Node
-    // treats an EventEmitter "error" without a listener as process-fatal, which
-    // used to turn one provider reset into a container restart loop.
-    client.on('error', (error: unknown) => {
-      log.warn(`[${account.name}] asynchronous IMAP error: ${imapErrorText(error)}`);
-    });
-    try {
-      await client.connect();
-      return client;
-    } catch (error) {
-      // A failed handshake can leave a half-open TLS socket behind. Close it
-      // before retrying or handing the connection failure back to the watcher.
-      try {
-        client.close();
-      } catch {
-        // Cleanup is best effort; preserve the original connection error.
-      }
-
-      const detail = imapErrorText(error);
-      if (attempt === maxAttempts || !isTransientConnectError(error)) {
-        throw new Error(detail, { cause: error });
-      }
-
-      const delayMs = retryDelayMs(account, attempt);
-      log.warn(
-        `[${account.name}] transient IMAP connection failure (${attempt}/${maxAttempts}); ` +
-          `retrying in ${delayMs}ms: ${detail}`,
-      );
-      await sleep(delayMs);
-    }
-  }
-
-  throw new Error(`Unable to connect to ${account.name}`);
-}
+/**
+ * A mailbox's folders. Asked once per connection and remembered for a minute:
+ * the reader's kept connection would otherwise ask again before every
+ * message, and folders do not come and go at that rate.
+ */
+const LIST_TTL_MS = 60_000;
+const listed = new WeakMap<ImapFlow, { at: number; entries: ListResponse[] }>();
 
 export async function listFolders(client: ImapFlow): Promise<ListResponse[]> {
-  return client.list();
+  const known = listed.get(client);
+  if (known && Date.now() - known.at < LIST_TTL_MS) return known.entries;
+  const entries = await client.list();
+  listed.set(client, { at: Date.now(), entries });
+  return entries;
 }
 
 export interface MailboxFolderInfo {
@@ -765,14 +673,10 @@ export async function fetchReadableByMessageId(
   messageId: string,
   folderHint?: string,
 ): Promise<LiveMessage | undefined> {
-  const client = await connect(account);
-  let found: Awaited<ReturnType<typeof findLiveSource>>;
-  try {
+  const found = await withSession(account, async (client) => {
     const folders = await lookupFolders(client, account, folderHint);
-    found = await findLiveSource(client, account, messageId, folders, { withFlags: true, parseBody: false, oversize: 'slim' });
-  } finally {
-    await client.logout().catch(() => undefined);
-  }
+    return findLiveSource(client, account, messageId, folders, { withFlags: true, parseBody: false, oversize: 'slim' });
+  });
   if (!found) return undefined;
   // Parsed after the connection is closed: it needs no server, and a large
   // message should not hold a mailbox session open while it is read.
@@ -796,8 +700,7 @@ export async function fetchAttachmentManifestByMessageId(
   messageId: string,
   folderHint?: string,
 ): Promise<AttachmentManifestLookup | undefined> {
-  const client = await connect(account);
-  try {
+  return withSession(account, async (client) => {
     const folders = await lookupFolders(client, account, folderHint);
     for (const folder of folders) {
       const lock = await lockFolder(client, folder, true);
@@ -818,9 +721,7 @@ export async function fetchAttachmentManifestByMessageId(
       }
     }
     return undefined;
-  } finally {
-    await client.logout().catch(() => undefined);
-  }
+  });
 }
 
 /** Read at most maxBytes from a decoded MIME part, retaining no suffix. */
@@ -863,8 +764,7 @@ export async function scanAttachmentByMessageId(
 ): Promise<AttachmentScanReport | undefined> {
   if (!/^\d+(?:\.\d+)*$/.test(partId)) throw new AttachmentNotFoundError(partId);
   const maxBytes = attachmentScanMaxBytes();
-  const client = await connect(account);
-  try {
+  return withSession(account, async (client) => {
     const folders = await lookupFolders(client, account, folderHint);
     for (const folder of folders) {
       const lock = await lockFolder(client, folder, true);
@@ -889,9 +789,7 @@ export async function scanAttachmentByMessageId(
       }
     }
     return undefined;
-  } finally {
-    await client.logout().catch(() => undefined);
-  }
+  });
 }
 
 /**
@@ -904,8 +802,7 @@ export async function inspectMailSafety(
   messageId: string,
   folderHint?: string,
 ): Promise<MailSafetyReport | undefined> {
-  const client = await connect(account);
-  try {
+  return withSession(account, async (client) => {
     const folders = await lookupFolders(client, account, folderHint);
     for (const folder of folders) {
       const lock = await lockFolder(client, folder, true);
@@ -1055,9 +952,7 @@ export async function inspectMailSafety(
       }
     }
     return undefined;
-  } finally {
-    await client.logout().catch(() => undefined);
-  }
+  });
 }
 
 /**
@@ -1073,8 +968,7 @@ export async function fetchAttachmentByMessageId(
 ): Promise<DownloadedAttachment | undefined> {
   if (!/^\d+(?:\.\d+)*$/.test(partId)) throw new AttachmentNotFoundError(partId);
   const maxBytes = attachmentMaxBytes();
-  const client = await connect(account);
-  try {
+  return withSession(account, async (client) => {
     const folders = await lookupFolders(client, account, folderHint);
     for (const folder of folders) {
       const lock = await lockFolder(client, folder, true);
@@ -1111,9 +1005,7 @@ export async function fetchAttachmentByMessageId(
       }
     }
     return undefined;
-  } finally {
-    await client.logout().catch(() => undefined);
-  }
+  }, { timeoutMs: 90_000 });
 }
 
 /** What each flag action does, and the word its refusal is reported with. */
@@ -1339,8 +1231,7 @@ export async function applyWebMailAction(
     throw new MailActionError('invalid_destination', 'move requires a destination folder');
   }
 
-  const client = await connect(account);
-  try {
+  return withSession(account, async (client) => {
     const entries = await listFolders(client);
     const destination = MOVING_ACTIONS.has(action)
       ? resolveActionDestination(entries, action as MovingAction, account.provider, options.destination)
@@ -1355,9 +1246,7 @@ export async function applyWebMailAction(
       sourceFolder,
       ...(destination ? { destinationFolder: destination.path, destinationIsSpam: destination.isSpam } : {}),
     };
-  } finally {
-    await client.logout().catch(() => undefined);
-  }
+  }, { repeatable: false });
 }
 
 /** The folder sent mail is kept in, from the folder list alone. */
@@ -1376,8 +1265,7 @@ export function sentFolderPath(entries: readonly ListResponse[]): string | undef
  * mailbox has no Sent folder to put it in, which is not an error.
  */
 export async function appendToSent(account: Account, raw: Buffer): Promise<string | undefined> {
-  const client = await connect(account);
-  try {
+  return withSession(account, async (client) => {
     const path = sentFolderPath(await listFolders(client));
     if (!path) return undefined;
     // Marked read: it is the owner's own message.
@@ -1385,7 +1273,5 @@ export async function appendToSent(account: Account, raw: Buffer): Promise<strin
       throw new Error(`IMAP server rejected the append to ${path}`);
     }
     return path;
-  } finally {
-    await client.logout().catch(() => undefined);
-  }
+  }, { repeatable: false, timeoutMs: 60_000 });
 }
