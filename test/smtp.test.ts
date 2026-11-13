@@ -619,9 +619,12 @@ describe('replying', () => {
       messageId: '<original@example.org>\r\nX-Injected: 1',
       references: ['<first@example.org>', 'two words'],
     }), self, 'replyAll');
-    // No usable sender, so it falls to the people the message went to, and says so.
+    // No usable sender: reply all falls to the people the message went to, and says so...
     expect(reply.to).toEqual(['lee@example.org']);
     expect(reply.addressedTo).toBe('recipients');
+    // ...and a plain reply is left for the person to address.
+    expect(replyEnvelope(original({ from: { name: '', address: 'not an address' }, replyTo: [] }), self, 'reply'))
+      .toMatchObject({ to: [], addressedTo: 'recipients' });
     expect(reply.cc).toEqual([]);
     expect(reply.inReplyTo).toBeUndefined();
     expect(reply.references).toEqual(['<first@example.org>']);

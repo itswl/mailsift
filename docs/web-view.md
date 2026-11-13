@@ -107,7 +107,7 @@ Under every judgement is a line that asks whether it was right. "Right" records 
 
 Reply, Reply all and a new message (the pencil in the header, or `n`) open the composer. It is plain text on purpose: a reply does not need markup, and composing HTML would mean sanitising it on the way out.
 
-- A reply leaves from the mailbox that received the original, addressed the way a mail client would address it: to the Reply-To address when there is one (to the sender when it names only you), never to yourself, with Cc kept for Reply all. It is threaded under the original, which is quoted below what you write.
+- A reply leaves from the mailbox that received the original, addressed the way a mail client would address it: to the Reply-To address when there is one (to the sender when it names only you), never to yourself, and to nobody when the message names neither a usable sender nor a Reply-To, so that you choose, with Cc kept for Reply all. It is threaded under the original, which is quoted below what you write.
 - A new message leaves from whichever of your mailboxes you pick.
 - **Draft with AI** writes a first version from the message being answered and, optionally, a line from you about what to say. It never sends; it fills the box, and you edit.
 - What you type is kept in the browser as a draft per message until it is sent or discarded.

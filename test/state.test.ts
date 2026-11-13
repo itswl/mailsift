@@ -455,16 +455,33 @@ describe('finding a stored message by its key or its Message-ID', () => {
 
     // The page holds keys: a key names its own record.
     expect(s.getMail('me@qq.com|<real@x>')).toMatchObject({ dedupKey: 'me@qq.com|<real@x>', sender: 'boss@corp.example' });
-    // An MCP caller holds Message-IDs: the look-alike's own id names the look-alike, not the message it imitates.
-    expect(s.recordsFor('me@qq.com|<real@x>')).toEqual([{ dedupKey: 'me@qq.com|me@qq.com|<real@x>', account: 'me@qq.com' }]);
-    // A key with no message carrying it as an id is still found.
-    expect(s.recordsFor('me@qq.com|me@qq.com|<real@x>')).toEqual([{ dedupKey: 'me@qq.com|me@qq.com|<real@x>', account: 'me@qq.com' }]);
+    expect(s.getMail('me@qq.com|me@qq.com|<real@x>')).toMatchObject({ sender: 'attacker@evil.example' });
+    // A string that is one record's key and another's Message-ID is said to be both, for the caller to refuse.
+    expect(s.recordsFor('me@qq.com|<real@x>')).toEqual([
+      { dedupKey: 'me@qq.com|me@qq.com|<real@x>', account: 'me@qq.com', by: 'messageId' },
+      { dedupKey: 'me@qq.com|<real@x>', account: 'me@qq.com', by: 'key' },
+    ]);
+    // A key no message carries as its id is found as a key only.
+    expect(s.recordsFor('me@qq.com|me@qq.com|<real@x>')).toEqual([{ dedupKey: 'me@qq.com|me@qq.com|<real@x>', account: 'me@qq.com', by: 'key' }]);
     expect(s.setHandled('me@qq.com|<real@x>', true)?.sender).toBe('boss@corp.example');
     // Feedback given with the record's own key lands on that record.
     s.recordFeedback('me@qq.com|<real@x>', 'false_positive', '', 'me@qq.com|me@qq.com|<real@x>');
     expect(s.feedbackRuleHints(1).neverImportant).toEqual(['attacker@evil.example']);
     // By its Message-ID it is found as well, and lists every mailbox it is stored for.
-    expect(s.recordsFor('<real@x>')).toEqual([{ dedupKey: 'me@qq.com|<real@x>', account: 'me@qq.com' }]);
+    expect(s.recordsFor('<real@x>')).toEqual([{ dedupKey: 'me@qq.com|<real@x>', account: 'me@qq.com', by: 'messageId' }]);
+  });
+
+  it('does not let a page link to a record that is gone open a look-alike instead', () => {
+    const s = store();
+    // The look-alike spells the key of a record that retention has since removed.
+    s.markSeen('me@qq.com|me@qq.com|<gone@x>', 'me@qq.com', 'look-alike');
+    s.recordOutcome('me@qq.com|me@qq.com|<gone@x>', 'info', false, { messageId: 'me@qq.com|<gone@x>' });
+    expect(s.getMail('me@qq.com|<gone@x>')).toBeUndefined();
+    expect(s.setHandled('me@qq.com|<gone@x>', true)).toBeUndefined();
+    // A real Message-ID is still found by itself, as a shared link may carry one.
+    s.markSeen('me@qq.com|<here@x>', 'me@qq.com', 'here');
+    s.recordOutcome('me@qq.com|<here@x>', 'info', false, { messageId: '<here@x>' });
+    expect(s.getMail('<here@x>')).toMatchObject({ dedupKey: 'me@qq.com|<here@x>' });
   });
 });
 

@@ -800,12 +800,11 @@ export class StateStore {
 
   recordFeedback(messageId: string, label: FeedbackLabel, note = '', dedupKey?: string): void {
     // The caller may already know which stored copy it means; otherwise the id is looked up.
-    const row = (dedupKey
-      ? this.db.prepare('SELECT dedup_key FROM seen WHERE dedup_key = ?').get(dedupKey)
-      : this.db.prepare(
-        `SELECT dedup_key FROM seen WHERE message_id = ? OR dedup_key = ?
-         ORDER BY (dedup_key = ?) DESC, created_at, dedup_key LIMIT 1`,
-      ).get(messageId, messageId, messageId)) as Record<string, unknown> | undefined;
+    const found = dedupKey
+      ? (this.db.prepare('SELECT dedup_key FROM seen WHERE dedup_key = ?').get(dedupKey) as Record<string, unknown> | undefined)
+      : undefined;
+    const key = dedupKey ? (found ? String(found['dedup_key']) : undefined) : this.keyOf(messageId);
+    const row = key === undefined ? undefined : { dedup_key: key };
     this.db.prepare(
       'INSERT INTO feedback (message_id, dedup_key, label, note, created_at) VALUES (?, ?, ?, ?, ?)',
     ).run(messageId, row ? String(row['dedup_key']) : null, label, note.slice(0, 1000), now());
@@ -978,44 +977,50 @@ export class StateStore {
    * message can be stored once per mailbox (a forwarded copy, or a message
    * addressed to two of them), and getMail returns only one of those.
    */
-  recordsFor(messageId: string): Array<{ dedupKey: string; account: string }> {
-    // A Message-ID first: that is what a caller of this is given and told to
-    // pass. A record's own key is accepted only when no message carries the
-    // string as its Message-ID, since a sender can write a Message-ID that
-    // spells another record's key; the page, which only ever holds keys,
-    // finds records with getMail instead.
+  recordsFor(messageId: string): Array<{ dedupKey: string; account: string; by: 'messageId' | 'key' }> {
+    // Every record the string names: as a Message-ID (one per mailbox it was
+    // stored for), and as a record's own key. A sender can write a Message-ID
+    // that spells another record's key, so a string can name both; the caller
+    // decides what to do with that rather than this picking one.
     const byId = (this.db.prepare(
       'SELECT dedup_key, account FROM seen WHERE message_id = ? ORDER BY created_at, dedup_key',
-    ).all(messageId) as Array<Record<string, unknown>>);
-    const rows = byId.length ? byId : (this.db.prepare(
-      'SELECT dedup_key, account FROM seen WHERE dedup_key = ?',
-    ).all(messageId) as Array<Record<string, unknown>>);
-    return rows.map((row) => ({ dedupKey: String(row['dedup_key']), account: String(row['account'] ?? '') }));
+    ).all(messageId) as Array<Record<string, unknown>>)
+      .map((row) => ({ dedupKey: String(row['dedup_key']), account: String(row['account'] ?? ''), by: 'messageId' as const }));
+    const byKey = (this.db.prepare('SELECT dedup_key, account FROM seen WHERE dedup_key = ?')
+      .all(messageId) as Array<Record<string, unknown>>)
+      .map((row) => ({ dedupKey: String(row['dedup_key']), account: String(row['account'] ?? ''), by: 'key' as const }))
+      .filter((row) => !byId.some((other) => other.dedupKey === row.dedupKey));
+    return [...byId, ...byKey];
   }
 
   getMail(messageId: string): MailRow | undefined {
-    // A key names its own row first. A Message-ID is the sender's to write, so
-    // one shaped like another message's key ("<mailbox>|<id>") must not be able
-    // to stand in for that message; among Message-IDs, the first stored wins.
-    const row = this.db
-      .prepare(
-        `SELECT ${ROW_COLUMNS.join(', ')}, snippet FROM seen
-         WHERE message_id = ? OR dedup_key = ?
-         ORDER BY (dedup_key = ?) DESC, created_at, dedup_key LIMIT 1`,
-      )
-      .get(messageId, messageId, messageId) as Record<string, unknown> | undefined;
+    const key = this.keyOf(messageId);
+    if (key === undefined) return undefined;
+    const row = this.db.prepare(`SELECT ${ROW_COLUMNS.join(', ')}, snippet FROM seen WHERE dedup_key = ?`)
+      .get(key) as Record<string, unknown> | undefined;
     return row ? toRow(row) : undefined;
   }
 
   // ---- The "needs you" queue ----
 
   /** The dedup key a message id or a dedup key names; the exact key wins when both could match. */
+  /**
+   * The record a page link, a key or a Message-ID names.
+   *
+   * A record's key is its own name and is tried first. Failing that, a
+   * Message-ID, the first stored copy of it; but only one that looks like a
+   * Message-ID ("<...>"). A key starts with a mailbox address, and a sender
+   * can write a Message-ID that spells one; such a string never falls through
+   * to a look-alike when the record it names is gone.
+   */
   private keyOf(idOrKey: string): string | undefined {
-    const row = this.db.prepare(
-      `SELECT dedup_key FROM seen WHERE message_id = ? OR dedup_key = ?
-       ORDER BY (dedup_key = ?) DESC, created_at, dedup_key LIMIT 1`,
-    ).get(idOrKey, idOrKey, idOrKey) as Record<string, unknown> | undefined;
-    return row ? String(row['dedup_key']) : undefined;
+    const exact = this.db.prepare('SELECT dedup_key FROM seen WHERE dedup_key = ?').get(idOrKey) as Record<string, unknown> | undefined;
+    if (exact) return String(exact['dedup_key']);
+    if (!idOrKey.trimStart().startsWith('<')) return undefined;
+    const byId = this.db.prepare(
+      'SELECT dedup_key FROM seen WHERE message_id = ? ORDER BY created_at, dedup_key LIMIT 1',
+    ).get(idOrKey) as Record<string, unknown> | undefined;
+    return byId ? String(byId['dedup_key']) : undefined;
   }
 
   /**
