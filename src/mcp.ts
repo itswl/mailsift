@@ -35,6 +35,7 @@ import { PushDispatcher } from './services/push-dispatcher.js';
 import { routeWeb, webUiEnabled } from './web.js';
 import { webPushEnabled } from './web-actions.js';
 import { credentialMark, localHost, secretEquals } from './web-http.js';
+import { warmSession } from './imap/connection.js';
 import { idleEnabled, idleFolderTokens } from './imap/idle.js';
 import {
   ACCOUNT_LAST_ERROR_KEY, ACCOUNT_LAST_FAILURE_KEY, ACCOUNT_LAST_SUCCESS_KEY,
@@ -967,6 +968,7 @@ export async function startMcpHttp(
               // Signing in to the page with this credential is what lets a
               // browser act on mail, the same split the MCP tools make.
               writeToken,
+              warm: warmSession,
             });
             const headers: Record<string, string> = { 'content-type': answer.contentType };
             if (answer.cookie) headers['set-cookie'] = answer.cookie;

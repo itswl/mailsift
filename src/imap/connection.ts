@@ -11,12 +11,14 @@
  * a provider drops half of its handshakes, that is a reader watching a
  * spinner. So the reading view gets two things here:
  *
- * - `connectInteractive`: short attempts, and a second one started beside
- *   the first if the first has not connected in a few seconds. Whichever
- *   arrives is used and the other is hung up on.
- * - `withSession`: one connection per mailbox that stays open for a couple of
+ * - `connectInteractive`: short attempts on a clock kept here, and another
+ *   started beside the first if the first has not signed in within two
+ *   seconds. Whichever arrives is used and the others are hung up on.
+ * - `withSession`: one connection per mailbox that stays open for ten
  *   minutes after its last use. Everything the reader asks of that mailbox
  *   goes down it in turn, so the handshake is paid once, not per click.
+ * - `warmSession`: that connection made when the page is opened, before
+ *   anything is asked of it.
  */
 import { setTimeout as sleep } from 'node:timers/promises';
 import { ImapFlow } from 'imapflow';
@@ -31,6 +33,8 @@ const TRANSIENT_CONNECT_MARKERS = [
   'connection reset', 'connection refused', 'socket hang up',
   'timed out', 'timeout', 'econnreset', 'econnrefused', 'etimedout',
   'temporarily unavailable', 'try again',
+  // A server that takes the connection and then drops it before saying anything.
+  'unexpected close',
 ];
 
 export function imapErrorText(error: unknown): string {
@@ -188,11 +192,18 @@ export async function connect(account: Account, options: ConnectOptions = {}): P
 
 // ---- The reader's connection ----
 
-/** One attempt is given this long. A healthy server answers in well under a second. */
+/**
+ * One attempt is given this long, from the first packet to being signed in.
+ * A healthy server takes well under a second. The clock is kept here, not
+ * left to the library's own timeouts: those cover reaching the server and its
+ * greeting, and a server that greets and then never answers the sign-in
+ * (which is what a provider in trouble does) would be waited on for minutes.
+ */
 const INTERACTIVE_ATTEMPT_MS = 9_000;
 /** With no answer after this long, another attempt is started beside the ones running. */
-const HEDGE_AFTER_MS = 2_500;
-const INTERACTIVE_ATTEMPTS = 3;
+const HEDGE_AFTER_MS = 2_000;
+/** Four: with a provider stalling every other sign-in, that is a one-in-sixteen chance of none getting through. */
+const INTERACTIVE_ATTEMPTS = 4;
 
 export interface InteractiveTiming {
   attemptMs?: number;
@@ -203,13 +214,17 @@ export interface InteractiveTiming {
 /**
  * Connect for someone who is waiting.
  *
- * Up to three attempts, started a few seconds apart and left running side by
+ * Up to four attempts, started two seconds apart and left running side by
  * side; the first to connect is the connection, and the rest are hung up on.
  * An attempt that fails outright is replaced at once. When a provider is
  * stalling one handshake in two, this turns a fair chance of a long wait into
  * a small chance of a short one, at the cost of a second handshake now and
- * then. A refusal another try would not change, such as a rejected password,
- * ends it immediately.
+ * then.
+ *
+ * A refused sign-in is tried once more and no further. The same provider in
+ * trouble answers "Login failed" to a token it accepted a second ago, so one
+ * refusal proves nothing; but a password that really is wrong must not be
+ * presented three times for every message someone tries to open.
  */
 export async function connectInteractive(account: Account, timing: InteractiveTiming = {}): Promise<ImapFlow> {
   if (stopped) throw new Error('shutting down; no new mailbox connections');
@@ -234,13 +249,19 @@ export async function connectInteractive(account: Account, timing: InteractiveTi
       for (const other of racing) hangUp(other);
       racing.clear();
     };
+    let refusals = 0;
     const start = (): void => {
       if (settled || stopped || started >= maxAttempts) return;
       started += 1;
       running += 1;
       const client = newClient(account, auth, { connectionTimeout: attemptMs, greetingTimeout: attemptMs });
       racing.add(client);
+      // Out of time: hang up, which fails the attempt, and it is counted as a
+      // stall whatever words the library finds for a connection closed on it.
+      let outOfTime = false;
+      const deadline = setTimeout(() => { outOfTime = true; hangUp(client); }, attemptMs);
       attempt(client).then(() => {
+        clearTimeout(deadline);
         running -= 1;
         racing.delete(client);
         if (settled) {
@@ -251,14 +272,17 @@ export async function connectInteractive(account: Account, timing: InteractiveTi
         settle();
         resolve(client);
       }, (error: unknown) => {
+        clearTimeout(deadline);
         running -= 1;
         racing.delete(client);
-        lastError = error;
+        lastError = outOfTime ? new Error('the mail server did not complete the sign-in in time | ETIMEDOUT') : error;
         hangUp(client);
         if (settled) return;
-        if (stopped || !isTransientConnectError(error)) {
+        const stalled = outOfTime || isTransientConnectError(error);
+        if (!stalled) refusals += 1;
+        if (stopped || refusals >= 2) {
           settle();
-          reject(new Error(imapErrorText(error), { cause: error }));
+          reject(new Error(imapErrorText(lastError), { cause: lastError }));
           return;
         }
         if (started < maxAttempts) start();
@@ -275,8 +299,16 @@ export async function connectInteractive(account: Account, timing: InteractiveTi
 
 // ---- One connection per mailbox, kept for the reader ----
 
-/** How long a connection is kept after its last use. Long enough to read a few messages in a row. */
-const SESSION_IDLE_MS = 120_000;
+/**
+ * How long a connection is kept after its last use. Making one is the slow
+ * and uncertain part, so it is kept for as long as someone is plausibly still
+ * reading; the library keeps it alive in the meantime.
+ */
+const SESSION_IDLE_MS = 10 * 60_000;
+/** After a connection could not be made, requests in the next few seconds are told so at once. */
+const FAILURE_MEMORY_MS = 4_000;
+/** A mailbox is not warmed more often than this, whether or not the last warming worked. */
+const WARM_EVERY_MS = 60_000;
 /** A single request of the mailbox. Past this the connection is treated as dead and closed. */
 const SESSION_WORK_MS = 30_000;
 
@@ -287,6 +319,9 @@ interface Session {
 
 const sessions = new Map<string, Session>();
 const queues = new Map<string, Promise<unknown>>();
+/** The last failure to connect, per mailbox: the page asks for several things at once, and each would try again. */
+const failures = new Map<string, { at: number; error: Error }>();
+const warmed = new Map<string, number>();
 
 function endSession(key: string, session: Session, polite: boolean): void {
   if (session.timer) clearTimeout(session.timer);
@@ -298,6 +333,25 @@ function endSession(key: string, session: Session, polite: boolean): void {
 /** Close every kept connection. Called on shutdown; a later request simply connects again. */
 export function closeSessions(): void {
   for (const [key, session] of [...sessions]) endSession(key, session, true);
+  failures.clear();
+  warmed.clear();
+}
+
+/**
+ * Have a connection ready before it is asked for.
+ *
+ * Called when someone opens the page: by the time they tap a message, the
+ * handshake is likely done. It makes nothing when a connection is already
+ * kept or being made, and tries a mailbox at most once a minute, so a page
+ * left open, or a provider that is down, does not turn into a stream of
+ * sign-ins.
+ */
+export function warmSession(account: Account, now = Date.now()): void {
+  const key = account.username;
+  if (stopped || sessions.get(key)?.client.usable || queues.has(key)) return;
+  if (now - (warmed.get(key) ?? 0) < WARM_EVERY_MS) return;
+  warmed.set(key, now);
+  void withSession(account, async () => undefined).catch(() => undefined);
 }
 
 /** How many mailboxes have a connection kept open; for tests and for curiosity. */
@@ -343,9 +397,20 @@ async function onSession<T>(account: Account, work: (client: ImapFlow) => Promis
   const key = account.username;
   const ms = options.timeoutMs ?? SESSION_WORK_MS;
   const open = async (): Promise<Session> => {
-    const session: Session = { client: await connectInteractive(account, options.timing) };
-    sessions.set(key, session);
-    return session;
+    // The page asks for a message's text and its attachments together. When
+    // the mailbox could not be reached a moment ago, the second is told so
+    // rather than made to wait through the same attempts again.
+    const recent = failures.get(key);
+    if (recent && Date.now() - recent.at < FAILURE_MEMORY_MS) throw recent.error;
+    try {
+      const session: Session = { client: await connectInteractive(account, options.timing) };
+      failures.delete(key);
+      sessions.set(key, session);
+      return session;
+    } catch (error) {
+      failures.set(key, { at: Date.now(), error: error instanceof Error ? error : new Error(String(error)) });
+      throw error;
+    }
   };
 
   let session = sessions.get(key);
