@@ -4,7 +4,7 @@ mailsift watches all your IMAP mailboxes, spam folders included. It judges each 
 
 ![The mailsift web view on a desktop: what needs you and the day's mail on the left, the selected message as it was sent on the right](docs/images/web-desktop.png)
 
-> mailsift reads your mail and changes nothing unless you give it a second, write token. With one, the web view can file, bin and answer mail and MCP can mark, star and move it, and every such action is audited. Classification can be wrong, so keep your provider's mailbox as the source of truth.
+> mailsift reads your mail and changes nothing unless you give it a second, write token. With one, the web view can file, bin and answer mail and MCP can mark it done, star and file it, and every such action is audited. Nothing can send or delete mail through MCP. Classification can be wrong, so keep your provider's mailbox as the source of truth.
 
 中文文档：[README.zh-CN.md](README.zh-CN.md)。
 
@@ -15,7 +15,7 @@ mailsift watches all your IMAP mailboxes, spam folders included. It judges each 
 - **Pushed when it matters.** Important mail goes to Feishu or your webhook as soon as mailsift sees it, within seconds with IMAP IDLE. The rest waits for one daily digest.
 - **Codes at a glance.** A verification code is shown in the Feishu card and, in the web view, as one large copy button. Codes and sign-in links never reach the LLM.
 - **A mail client built on the triage.** The web view opens on what needs you. Read each message as it was sent, safely; mark it done, archive it or answer it; ask a question across your mail. It installs to a phone's home screen and notifies you there.
-- **An MCP server**, so an AI assistant can list, search and read your triaged mail.
+- **An MCP server**, so an AI assistant can see what needs you, and list, search and read your triaged mail.
 - **Says when it cannot see.** Alerts when a mailbox or the LLM keeps failing, and an optional heartbeat lets an outside monitor notice if mailsift itself stops.
 
 ## Quick start
@@ -110,7 +110,7 @@ Docker publishes the port on the host's loopback address only. To reach it from 
 
 ## MCP
 
-The MCP server runs inside mailsift at `http://127.0.0.1:8410/mcp` (Streamable HTTP, `Authorization: Bearer <MCP_TOKEN>`). Add it to an MCP client and an assistant can list, search and read your triaged mail, preview the digest, or check mailbox health. It also ships the workflows those tools are meant to be used in, as prompts: catch up on the mailbox, or work out why something never reached you. It is read-only; a separate `MCP_WRITE_TOKEN` adds marking, starring and moving mail, all audited. See [docs/mcp.md](docs/mcp.md).
+The MCP server runs inside mailsift at `http://127.0.0.1:8410/mcp` (Streamable HTTP, `Authorization: Bearer <MCP_TOKEN>`). Add it to an MCP client and an assistant can see what needs you, list, search and read your triaged mail, preview the digest, or check mailbox health. It also ships the workflows those tools are meant to be used in, as prompts: catch up on the mailbox, or work out why something never reached you. It is read-only; a separate `MCP_WRITE_TOKEN` adds marking mail done, starring, archiving and moving it, all audited. It cannot send or delete mail. An agent that supports skills can load [.agents/skills/mailsift/SKILL.md](.agents/skills/mailsift/SKILL.md). See [docs/mcp.md](docs/mcp.md).
 
 ## Everyday commands
 

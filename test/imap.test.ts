@@ -130,8 +130,14 @@ const fake = vi.hoisted(() => {
           from: [{ name: 'Sender', address: 'sender@example.com' }], to: [{ address: 'me@qq.com' }],
         },
         bodyStructure: structure,
-        // Asked for whole, the header block as the message has it; otherwise none of the two named.
-        headers: query.headers === true ? Buffer.from(`${text.slice(0, text.indexOf('\r\n\r\n'))}\r\n\r\n`, 'latin1') : Buffer.from(''),
+        // Asked for whole, the header block as the message has it; asked for by name, those lines of it, in its order.
+        headers: query.headers === true
+          ? Buffer.from(`${text.slice(0, text.indexOf('\r\n\r\n'))}\r\n\r\n`, 'latin1')
+          : Buffer.from(Array.isArray(query.headers)
+            ? text.slice(0, text.indexOf('\r\n\r\n')).split('\r\n')
+              .filter((line) => (query.headers as string[]).includes(line.slice(0, line.indexOf(':')).toLowerCase()))
+              .map((line) => `${line}\r\n`).join('')
+            : '', 'latin1'),
         // No more of the source than was asked for, as a server sends it. A message said to be
         // larger than the few lines kept here is filled out to that size, up to what was asked for.
         ...(query.source ? { source: !limit ? message.source : Buffer.concat([
@@ -214,7 +220,7 @@ import {
 } from '../src/imap/connection.js';
 import {
   appendToSent, applyMessageAction, applyWebMailAction, connect, connectAttempts, fetchAttachmentManifestByMessageId,
-  fetchByMessageId, fetchReadableByMessageId, imapErrorText, isOversizedLookback, isTransientConnectError,
+  fetchByMessageId, fetchReadableByMessageId, imapErrorText, inspectMailSafety, isOversizedLookback, isTransientConnectError,
   MAIL_ACTIONS, MailActionError, orderLookupFolders, resolveActionDestination, retryDelayMs, selectFetchUids,
   sentFolderPath, WEB_MAIL_ACTIONS,
 } from '../src/imap/client.js';
@@ -669,9 +675,10 @@ describe('where a moving action puts a message', () => {
 });
 
 describe('acting on a message from the web view', () => {
-  it('adds what a mail client does without widening the MCP tool', () => {
-    expect([...MAIL_ACTIONS]).toEqual(['mark_read', 'mark_unread', 'star', 'unstar', 'move']);
-    expect([...WEB_MAIL_ACTIONS]).toEqual([...MAIL_ACTIONS, 'archive', 'trash', 'inbox', 'answered']);
+  it('gives a person what a model is not given: the bin, and marking a message answered', () => {
+    expect([...MAIL_ACTIONS]).toEqual(['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox']);
+    expect([...WEB_MAIL_ACTIONS]).toEqual([...MAIL_ACTIONS, 'trash', 'answered']);
+    expect(MAIL_ACTIONS as readonly string[]).not.toContain('trash');
   });
 
   it('marks, stars and records an answer under a writable lock', async () => {
@@ -792,11 +799,84 @@ describe('the MCP action path', () => {
       action: 'star', account: 'me@qq.com', messageId: '<one@x>', sourceFolder: 'INBOX',
     });
     expect(await applyMessageAction(ME, '<one@x>', 'move', 'Archive')).toEqual({
-      action: 'move', account: 'me@qq.com', messageId: '<one@x>', sourceFolder: 'INBOX', destinationFolder: 'Archive',
+      action: 'move', account: 'me@qq.com', messageId: '<one@x>', sourceFolder: 'INBOX',
+      destinationFolder: 'Archive', destinationIsSpam: false,
     });
-    // No hint on this path: a message outside the configured folders stays out of reach.
+    // Without a hint a message outside the configured folders stays out of reach.
     expect(await applyMessageAction(ME, '<moved@x>', 'mark_read')).toBeUndefined();
     await expect(applyMessageAction(ME, '<one@x>', 'move', 'Projects')).rejects.toThrow(/not found or not selectable/);
+    // Its own connection each time, with a goodbye: nothing is kept open for a tool call.
+    expect(openSessions()).toBe(0);
+  });
+
+  it('archives and brings back by what the mailbox calls those folders, not by a name the caller has to know', async () => {
+    put('INBOX', '<one@x>');
+    put('Junk', '<rescued@x>');
+    expect(await applyMessageAction(ME, '<one@x>', 'archive')).toMatchObject({
+      action: 'archive', sourceFolder: 'INBOX', destinationFolder: 'Archive', destinationIsSpam: false,
+    });
+    expect(idsIn('Archive')).toEqual(['<one@x>']);
+    expect(await applyMessageAction(ME, '<rescued@x>', 'inbox')).toMatchObject({ sourceFolder: 'Junk', destinationFolder: 'INBOX' });
+    expect(idsIn('INBOX')).toEqual(['<rescued@x>']);
+    // A mailbox without an archive is not given one.
+    fake.server.folders = fake.server.folders.filter((folder) => folder.path !== 'Archive');
+    await expect(applyMessageAction(ME, '<rescued@x>', 'archive')).rejects.toThrow(/no archive folder/);
+  });
+
+  it('reaches a message that was filed away when it is told where, and still checks it is that message', async () => {
+    fake.server.saysWhereMoved = true;
+    put('INBOX', '<one@x>');
+    const archived = await applyMessageAction(ME, '<one@x>', 'archive');
+    expect(archived).toMatchObject({ destinationFolder: 'Archive', destinationUid: 101, destinationUidValidity: '1' });
+    const place = { folder: 'Archive', uid: 101, uidValidity: '1' };
+    fake.server.calls = [];
+    expect(await applyMessageAction(ME, '<one@x>', 'star', undefined, place)).toMatchObject({ sourceFolder: 'Archive' });
+    expect(flagsOf('Archive', '<one@x>')).toEqual(['\\Flagged']);
+    expect(fake.server.calls.filter((call) => call.startsWith('search'))).toEqual([]);
+    // The same place, said of another message, changes nothing.
+    put('Archive', '<other@x>', { uid: 7 });
+    expect(await applyMessageAction(ME, '<absent@x>', 'star', undefined, { folder: 'Archive', uid: 7, uidValidity: '1' })).toBeUndefined();
+    expect(flagsOf('Archive', '<other@x>')).toEqual([]);
+    expect(await applyMessageAction(ME, '<one@x>', 'inbox', undefined, place)).toMatchObject({ destinationFolder: 'INBOX' });
+  });
+
+  it('refuses a bin whatever it is called: by the server\'s own flag, and by the names bins go by', async () => {
+    put('INBOX', '<one@x>');
+    fake.server.folders.push(
+      { path: 'Old stuff', specialUse: '\\Trash' }, { path: '[Gmail]/Bin' }, { path: '废纸篓' },
+      // A folder inside a bin goes when the bin is emptied.
+      { path: 'Old stuff/2024' }, { path: 'Deleted Messages/kept' }, { path: 'INBOX.Trash.sub', delimiter: '.' },
+    );
+    for (const bin of ['Old stuff', '[Gmail]/Bin', '废纸篓', 'Deleted Messages', 'Old stuff/2024', 'Deleted Messages/kept', 'INBOX.Trash.sub']) {
+      await expect(applyMessageAction(ME, '<one@x>', 'move', bin), bin).rejects.toThrow(/delete\/trash folder is disabled/);
+    }
+    expect(idsIn('INBOX')).toEqual(['<one@x>']);
+    expect(fake.server.calls.filter((call) => call.startsWith('move'))).toEqual([]);
+  });
+});
+
+describe('what the safety report says of the sender', () => {
+  it('repeats the mailbox provider\'s verdict, and none where the provider is not one whose header can be told', async () => {
+    put('INBOX', '<one@x>');
+    const known = await inspectMailSafety(ME, '<one@x>');
+    expect(known?.senderSignals).toMatchObject({
+      fromAddress: 'sender@example.com',
+      authentication: { result: 'pass', dmarc: 'pass', dkim: 'pass', signedBy: 'example.com' },
+    });
+    expect(known?.limitations).toMatch(/what the mailbox provider reported/);
+    // The same header on a server nobody has named: a sender could have written it.
+    const unknown = await inspectMailSafety(ELSEWHERE, '<one@x>');
+    expect(unknown?.senderSignals.authentication).toMatchObject({ result: 'none', signedBy: null });
+  });
+
+  it('believes only the first header, which is the one the mailbox wrote', async () => {
+    const forged = Buffer.from([
+      'Authentication-Results: mx.qq.com; dmarc=fail header.from=example.com',
+      'Authentication-Results: mx.qq.com; dkim=pass header.d=example.com; dmarc=pass header.from=example.com',
+      'From: Sender <sender@example.com>', 'Subject: A subject', 'Message-ID: <forged@x>', '', 'hi',
+    ].join('\r\n'));
+    fake.server.mail.set('INBOX', [{ uid: 3, messageId: '<forged@x>', source: forged, flags: new Set() }]);
+    expect((await inspectMailSafety(ME, '<forged@x>'))?.senderSignals.authentication).toMatchObject({ result: 'fail', dmarc: 'fail' });
   });
 });
 

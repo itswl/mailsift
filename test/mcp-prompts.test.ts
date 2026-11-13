@@ -12,6 +12,16 @@ describe('catch_up', () => {
     expect(text).not.toContain('search_mail');
   });
 
+  it('starts from the queue, which is what "needs action" means, and changes nothing', () => {
+    const text = renderCatchUp({ hours: '24' });
+    expect(text.indexOf('needs_you')).toBeGreaterThan(-1);
+    expect(text.indexOf('needs_you')).toBeLessThan(text.indexOf('mail_summary'));
+    expect(text).toContain('change nothing');
+    expect(text).not.toContain('mark_handled');
+    // The page can act on mail now; the prompt no longer says the mailbox cannot be changed.
+    expect(text).not.toContain('read-only');
+  });
+
   it('carries the window into every step, so the model does not pick its own', () => {
     expect(renderCatchUp({ hours: '168' }).match(/168/g)?.length).toBeGreaterThanOrEqual(2);
   });
