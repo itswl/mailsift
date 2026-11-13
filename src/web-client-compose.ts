@@ -126,7 +126,11 @@ function openCompose(state) {
     const chosen = state.from || (kept && kept.account) || '';
     if (chosen && sendable.some((a) => a.address === chosen)) select.value = chosen;
     select.onchange = () => { state.from = select.value; };
-    if (!sendable.length) { composeSay(t('compose.cantSend'), true); composeSend.disabled = true; }
+    if (!sendable.length) {
+      const off = ((lastSummary && lastSummary.accounts) || []).some((a) => a.sendReason === 'disabled');
+      composeSay(t(off ? 'compose.sendingOff' : 'compose.cantSend'), true);
+      composeSend.disabled = true;
+    }
   } else value.textContent = state.accountName ? state.accountName + ' <' + state.account + '>' : state.account;
   from.hidden = false;
   $('#compose-cc-row').hidden = true;
@@ -171,7 +175,8 @@ function fillCompose(d) {
   if (!composeForm.subject.value) composeForm.subject.value = d.subject || '';
   showQuoted(composing);
   if (!composing.canSend) {
-    composeSay(d.reason === 'oauth_scope' ? fill('compose.cantSendScope', { account: d.account || '' }) : t('compose.cantSend'), true);
+    composeSay(d.reason === 'oauth_scope' ? fill('compose.cantSendScope', { account: d.account || '' })
+      : d.reason === 'disabled' ? t('compose.sendingOff') : t('compose.cantSend'), true);
     composeSend.disabled = true;
   }
 }

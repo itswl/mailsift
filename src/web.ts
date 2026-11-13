@@ -304,7 +304,10 @@ export async function handleApi(
     return json(200, {
       ...store.summarize(hours),
       categories: CATEGORIES,
-      accounts: accounts.map((a) => ({ address: a.username, name: a.name, canSend: backend.sending(a).available })),
+      accounts: accounts.map((a) => {
+        const sending = backend.sending(a);
+        return { address: a.username, name: a.name, canSend: sending.available, ...(sending.reason ? { sendReason: sending.reason } : {}) };
+      }),
       lastPollAt: store.getMeta(HEARTBEAT_KEY) ?? null,
       pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 300),
       mailboxes: mailboxStatuses(store, accounts),

@@ -372,6 +372,8 @@ export interface MailActionResult {
   destinationFolder?: string;
   /** Set with destinationFolder: whether the message now sits in a spam folder. */
   destinationIsSpam?: boolean;
+  /** Set when the message now sits in the bin, or in a folder inside it, however it was put there. */
+  destinationIsTrash?: boolean;
   /** Where the message landed, when the server said: its new UID and that folder's UIDVALIDITY. */
   destinationUid?: number;
   destinationUidValidity?: string;
@@ -1168,6 +1170,8 @@ async function actOnMessage(
   action: WebMailAction,
   destinationPath: string | undefined,
   hint: MessageHint = {},
+  /** Told the moment before the command that changes the mailbox is sent. */
+  committing: () => void = () => undefined,
 ): Promise<{ sourceFolder: string; destinationUid?: number; destinationUidValidity?: string } | undefined> {
   for (const folder of folders) {
     const lock = await lockFolder(client, folder, false);
@@ -1180,6 +1184,7 @@ async function actOnMessage(
         if (!raw || raw.envelope?.messageId?.trim() !== messageId) continue;
         const change = action in FLAG_CHANGES ? FLAG_CHANGES[action as keyof typeof FLAG_CHANGES] : undefined;
         if (change) {
+          committing();
           const accepted = change.add
             ? await client.messageFlagsAdd([uid], [change.flag], { uid: true })
             : await client.messageFlagsRemove([uid], [change.flag], { uid: true });
@@ -1188,6 +1193,7 @@ async function actOnMessage(
           if (destinationPath === folder.path) {
             throw new MailActionError('invalid_destination', 'message is already in the destination folder');
           }
+          committing();
           const moved = await client.messageMove([uid], destinationPath, { uid: true });
           if (!moved) throw new MailActionError('failed', 'IMAP server rejected the move operation');
           // A server that says where the message landed saves the next lookup a search.
@@ -1237,6 +1243,24 @@ function entrySelectable(entry: ListResponse): boolean {
 /** RFC 6154 special use, whether the server sent it as an attribute or ImapFlow resolved it. */
 function entryHasUse(entry: ListResponse, use: string): boolean {
   return (entry.specialUse ?? '').trim().toLowerCase() === use || entryFlags(entry).has(use);
+}
+
+/**
+ * Whether a folder is the bin or lies inside it: by the server's special-use
+ * flag or by the names bins go by, at any level of its path. A provider
+ * empties what is under its bin along with it, so a message moved there by
+ * name has been binned as surely as one sent with the bin action.
+ */
+function inBin(entries: readonly ListResponse[], path: string): boolean {
+  const delimiter = entries.find((entry) => entry.path === path)?.delimiter || '/';
+  const parts = path.split(delimiter);
+  for (let depth = 1; depth <= parts.length; depth += 1) {
+    const ancestor = parts.slice(0, depth).join(delimiter);
+    const listed = entries.find((entry) => entry.path === ancestor);
+    if (listed && entryHasUse(listed, '\\trash')) return true;
+    if (TRASH_NAMES.has(ancestor.trim().toLowerCase()) || TRASH_NAMES.has((parts[depth - 1] ?? '').trim().toLowerCase())) return true;
+  }
+  return false;
 }
 
 function entryByName(entries: readonly ListResponse[], names: ReadonlySet<string>): ListResponse | undefined {
@@ -1313,6 +1337,10 @@ export async function applyWebMailAction(
     throw new MailActionError('invalid_destination', 'move requires a destination folder');
   }
 
+  // Until the command that changes the mailbox has been sent, nothing has
+  // happened: a kept connection found dead before then is replaced and the
+  // action done on the new one. After it, the action is never sent twice.
+  let committed = false;
   return withSession(account, async (client) => {
     const entries = await listFolders(client);
     const destination = MOVING_ACTIONS.has(action)
@@ -1320,18 +1348,21 @@ export async function applyWebMailAction(
       : undefined;
     const hint: MessageHint = { ...(options.folderHint ? { folder: options.folderHint } : {}), ...(options.hint ?? {}) };
     const folders = orderLookupFolders(entries, resolveFolders(entries, account.folders), hint.folder);
-    const acted = await actOnMessage(client, messageId, folders, action, destination?.path, hint);
+    const acted = await actOnMessage(client, messageId, folders, action, destination?.path, hint, () => { committed = true; });
     if (acted === undefined) return undefined;
     return {
       action,
       account: account.username,
       messageId,
       sourceFolder: acted.sourceFolder,
-      ...(destination ? { destinationFolder: destination.path, destinationIsSpam: destination.isSpam } : {}),
+      ...(destination ? {
+        destinationFolder: destination.path, destinationIsSpam: destination.isSpam,
+        ...(inBin(entries, destination.path) ? { destinationIsTrash: true } : {}),
+      } : {}),
       ...(acted.destinationUid && acted.destinationUidValidity
         ? { destinationUid: acted.destinationUid, destinationUidValidity: acted.destinationUidValidity } : {}),
     };
-  }, { repeatable: false });
+  }, { repeatable: () => !committed });
 }
 
 /** The folder sent mail is kept in, from the folder list alone. */

@@ -466,7 +466,8 @@ describe('whether a mailbox can send', () => {
     expect(sendingStatus(firstAccount()).available).toBe(true);
     for (const [key, value] of [['SMTP_ENABLED', 'false'], ['SMTP_ENABLED', '0'], ['DRY_RUN', 'true']] as const) {
       process.env[key] = value;
-      expect(sendingStatus(firstAccount()), `${key}=${value}`).toEqual({ available: false, reason: 'no_smtp' });
+      // Its own reason: what to do about it is not what to do about a server nobody named.
+      expect(sendingStatus(firstAccount()), `${key}=${value}`).toEqual({ available: false, reason: 'disabled' });
       // Even a connection handed in is not used.
       const refused = await failure(sendMail(mailbox(), letter(), { transport: transportTo(port) }));
       expect(refused.code).toBe('not_configured');
@@ -557,6 +558,25 @@ describe('replying', () => {
   it('continues a message the owner sent to the people it went to', () => {
     const own = replyEnvelope(original({ from: { name: 'Me', address: 'me@example.com' } }), self, 'reply');
     expect(own.to).toEqual(['sam@example.org']);
+    expect(own.addressedTo).toBe('ownRecipients');
+    expect(replyEnvelope(original(), self, 'reply').addressedTo).toBe('sender');
+    expect(replyEnvelope(original({ replyTo: [{ name: '', address: 'desk@example.org' }] }), self, 'reply').addressedTo).toBe('replyTo');
+  });
+
+  it('answers the sender when the message asks for answers only at the owner\'s own address', () => {
+    // From the boss, to the owner and to everyone, answers asked for at the owner's address: a
+    // private answer goes to the boss, not to the whole list.
+    const message = original({
+      from: { name: 'Boss', address: 'boss@corp.example' },
+      to: [{ name: 'Me', address: 'me@example.com' }, { name: 'All', address: 'all-staff@corp.example' }],
+      cc: [],
+      replyTo: [{ name: 'Me', address: 'ME@example.com' }],
+    });
+    expect(replyEnvelope(message, self, 'reply')).toMatchObject({ to: ['boss@corp.example'], cc: [], addressedTo: 'sender' });
+    // A reply to all still copies the others, and still never the owner.
+    expect(replyEnvelope(message, self, 'replyAll')).toMatchObject({ to: ['boss@corp.example'], cc: ['all-staff@corp.example'] });
+    // A Reply-To that names nothing usable is no instruction either.
+    expect(replyEnvelope(original({ replyTo: [{ name: '', address: 'undisclosed-recipients:;' }] }), self, 'reply').to).toEqual(['mia@example.org']);
   });
 
   it('leaves a subject that is already a reply alone', () => {
@@ -590,8 +610,9 @@ describe('replying', () => {
       messageId: '<original@example.org>\r\nX-Injected: 1',
       references: ['<first@example.org>', 'two words'],
     }), self, 'replyAll');
-    // No usable sender, so it falls to the people the message went to.
+    // No usable sender, so it falls to the people the message went to, and says so.
     expect(reply.to).toEqual(['lee@example.org']);
+    expect(reply.addressedTo).toBe('recipients');
     expect(reply.cc).toEqual([]);
     expect(reply.inReplyTo).toBeUndefined();
     expect(reply.references).toEqual(['<first@example.org>']);

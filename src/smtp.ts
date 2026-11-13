@@ -195,8 +195,9 @@ function authorizationCoversSending(account: Account): boolean {
 /** Whether this mailbox can send, decided without opening a connection. */
 export function sendingStatus(
   account: Account,
-): { available: boolean; reason?: 'no_smtp' | 'oauth_scope'; host?: string; port?: number } {
-  if (!sendingEnabled()) return { available: false, reason: 'no_smtp' };
+): { available: boolean; reason?: 'disabled' | 'no_smtp' | 'oauth_scope'; host?: string; port?: number } {
+  // Switched off on purpose, which is a different thing to fix than a server nobody named.
+  if (!sendingEnabled()) return { available: false, reason: 'disabled' };
   const server = smtpServer(account);
   // A login that is not an address (some self-hosted servers) is nothing to send from.
   if (!server || !isSendableAddress(account.username)) return { available: false, reason: 'no_smtp' };
@@ -578,7 +579,15 @@ export function replyEnvelope(
   self: string[],
   mode: 'reply' | 'replyAll',
   lang: 'en' | 'zh-CN' = 'en',
-): { to: string[]; cc: string[]; subject: string; quoted: string; inReplyTo?: string; references: string[] } {
+): {
+  to: string[]; cc: string[]; subject: string; quoted: string; inReplyTo?: string; references: string[];
+  /**
+   * Where `to` came from: the address the message asks answers to go to, its
+   * sender, the people a message the owner sent went to, or (`recipients`)
+   * the people it went to because it named nobody else to answer.
+   */
+  addressedTo: 'replyTo' | 'sender' | 'ownRecipients' | 'recipients';
+} {
   const mine = new Set(self.map((address) => address.trim().toLowerCase()));
   const taken = new Set<string>();
   const usable = (list: MailAddress[] | null | undefined): string[] => {
@@ -593,10 +602,21 @@ export function replyEnvelope(
     return out;
   };
 
-  // Reply-To is where the sender asked for answers; From is the default.
-  let to = usable(original.replyTo?.length ? original.replyTo : original.from ? [original.from] : []);
+  // Reply-To is where the sender asked for answers; From is the default, and
+  // also where a Reply-To that names only the owner (or nothing usable) leaves
+  // the answer: that is not a request to answer everyone else.
+  let addressedTo: 'replyTo' | 'sender' | 'ownRecipients' | 'recipients' = 'replyTo';
+  let to = usable(original.replyTo);
+  if (to.length === 0) {
+    addressedTo = 'sender';
+    to = usable(original.from ? [original.from] : []);
+  }
   // Answering a message the owner sent themselves continues it to the people it went to.
-  if (to.length === 0) to = usable(original.to);
+  if (to.length === 0) {
+    const fromOwner = mine.has((original.from?.address ?? '').trim().toLowerCase());
+    addressedTo = fromOwner ? 'ownRecipients' : 'recipients';
+    to = usable(original.to);
+  }
   const cc = mode === 'replyAll' ? usable([...(original.to ?? []), ...(original.cc ?? [])]) : [];
 
   const subject = oneLine(original.subject ?? '');
@@ -616,5 +636,6 @@ export function replyEnvelope(
     quoted,
     ...(inReplyTo ? { inReplyTo } : {}),
     references,
+    addressedTo,
   };
 }

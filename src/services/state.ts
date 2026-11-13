@@ -969,6 +969,18 @@ export class StateStore {
     ).map(toRow);
   }
 
+  /**
+   * Every stored record a Message-ID or a key names, with its mailbox. One
+   * message can be stored once per mailbox (a forwarded copy, or a message
+   * addressed to two of them), and getMail returns only one of those.
+   */
+  recordsFor(messageId: string): Array<{ dedupKey: string; account: string }> {
+    return (this.db.prepare(
+      'SELECT dedup_key, account FROM seen WHERE message_id = ? OR dedup_key = ? ORDER BY created_at, dedup_key',
+    ).all(messageId, messageId) as Array<Record<string, unknown>>)
+      .map((row) => ({ dedupKey: String(row['dedup_key']), account: String(row['account'] ?? '') }));
+  }
+
   getMail(messageId: string): MailRow | undefined {
     const row = this.db
       .prepare(

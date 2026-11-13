@@ -459,6 +459,8 @@ export async function actOnMail(
   const audit = {
     account: row.account, messageId: row.messageId, action, client: ctx.client,
     ...(row.folder ? { sourceFolder: row.folder } : {}),
+    // Where a move was aimed, so a refused one can still be traced; a move that goes through records where it landed.
+    ...(destination ? { destinationFolder: destination } : {}),
   };
   // What the mailbox said, written down and turned into an answer. This runs
   // when the mailbox answers, which may be after the page stopped waiting:
@@ -480,8 +482,8 @@ export async function actOnMail(
           ? { uid: result.destinationUid, uidValidity: result.destinationUidValidity } : {}),
       });
     }
-    // Filing a message away is dealing with it.
-    if (action === 'archive' || action === 'trash') db.setHandled(row.dedupKey, true);
+    // Filing a message away is dealing with it, and so is putting it in the bin by the bin's name.
+    if (action === 'archive' || action === 'trash' || result.destinationIsTrash) db.setHandled(row.dedupKey, true);
     const after = db.getMail(row.dedupKey) ?? row;
     return json(200, { ok: true, action, row: ctx.decorate(after), attention: db.attentionCount() });
   };
