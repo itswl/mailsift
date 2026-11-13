@@ -1,10 +1,10 @@
 # mailsift
 
-mailsift watches all your IMAP mailboxes, spam folders included. It judges each new message with your own rules and an LLM, pushes the ones that matter to Feishu or a webhook, and gathers the rest into a daily digest.
+mailsift watches all your IMAP mailboxes, spam folders included. It judges each new message with your own rules and an LLM, pushes the ones that matter to Feishu or a webhook, and gathers the rest into a daily digest. Its web view is a mail client built on that judgement: it opens on what needs you, and you read, file and answer it there.
 
-![The mailsift web view on a desktop: one list of judgements on the left, the selected message's detail pane on the right](docs/images/web-desktop.png)
+![The mailsift web view on a desktop: what needs you and the day's mail on the left, the selected message as it was sent on the right](docs/images/web-desktop.png)
 
-> mailsift is an assistant, not a mail client. It is read-only by default and never sends, replies to or deletes mail; a separate write token can enable a small audited set of actions (mark, star and move). Classification can be wrong, so keep using your mail client as the source of truth.
+> mailsift reads your mail and changes nothing unless you give it a second, write token. With one, the web view can file, bin and answer mail and MCP can mark, star and move it, and every such action is audited. Classification can be wrong, so keep your provider's mailbox as the source of truth.
 
 中文文档：[README.zh-CN.md](README.zh-CN.md)。
 
@@ -14,7 +14,7 @@ mailsift watches all your IMAP mailboxes, spam folders included. It judges each 
 - **Judged, not just filtered.** Your sender rules decide first; an LLM rates the rest critical, warning or info, with a one-line summary and the reason. Without an LLM, or while it fails, keyword rules keep mail moving.
 - **Pushed when it matters.** Important mail goes to Feishu or your webhook as soon as mailsift sees it, within seconds with IMAP IDLE. The rest waits for one daily digest.
 - **Codes at a glance.** A verification code is shown in the Feishu card and, in the web view, as one large copy button. Codes and sign-in links never reach the LLM.
-- **A web view for your phone.** A read-only page you can install to the home screen: what arrived, how it was judged and why, with search and filters.
+- **A mail client built on the triage.** The web view opens on what needs you. Read each message as it was sent, safely; mark it done, archive it or answer it; ask a question across your mail. It installs to a phone's home screen and notifies you there.
 - **An MCP server**, so an AI assistant can list, search and read your triaged mail.
 - **Says when it cannot see.** Alerts when a mailbox or the LLM keeps failing, and an optional heartbeat lets an outside monitor notice if mailsift itself stops.
 
@@ -71,6 +71,7 @@ Without Docker, use Node 22.5 or newer: `npm install`, `npm run check`, then `np
 - `DIGEST_HOUR`: the digest's hour on the server's clock (default `9`). Set `TZ` to your time zone.
 - `IMAP_IDLE_ENABLED=true`: wake on new mail instead of waiting for the next poll.
 - `WEB_UI_ENABLED=true`: the [web view](#web-view).
+- `MCP_WRITE_TOKEN`: a second token that lets the web view and MCP act on mail. Without it mailsift only reads.
 
 [docs/configuration.md](docs/configuration.md) explains them in depth.
 
@@ -93,13 +94,19 @@ Personal Gmail can also use `gmail_pw` with an app password; Google Workspace ca
 
 ## Web view
 
-Set `WEB_UI_ENABLED=true` and open `http://<host>:8410/` (the `MCP_PORT`). Sign in with `MCP_TOKEN`; the browser stays signed in.
+Set `WEB_UI_ENABLED=true` and open `http://<host>:8410/` (the `MCP_PORT`). Sign in with `MCP_TOKEN` to read, or with `MCP_WRITE_TOKEN` to act on mail as well; the browser stays signed in.
 
-The page lists what arrived, grouped by day, with the model's one-line summary, level and category. Tap a message for the reason, the full text, attachments and safety clues. Verification codes are set large and copy on tap. On a phone, add the page to the home screen: its **Latest code** shortcut opens on the newest code and waits for one that is still on its way.
+- **What needs you** comes first: mail judged important that you have not dealt with. Tick it off, swipe it away, or open it.
+- **Read** a message as it was sent. Remote images wait until you ask, tracking pixels are dropped, a link that goes somewhere other than it says is marked, and your provider's verdict on the sender is shown.
+- **Act**: done, archive, bin, star, not spam. Reply or write a new message, with a first draft from the model if you want one and five seconds to undo a send.
+- **Ask** a question across your mail and get an answer that cites the messages it came from.
+- **Codes** are set large and copy on tap. On a phone, the **Latest code** home-screen shortcut opens on the newest one and waits for one still on its way.
+- **Notifications** on your phone or desktop for codes and important mail, and a list that updates as mail is judged.
+- `⌘K` opens a command palette, and `?` lists the keys.
 
-<img src="docs/images/web-mobile.png" alt="The same view on a phone: the summary sentence, a fresh verification code set large above the list, then the day's mail" width="340">
+<img src="docs/images/web-mobile.png" alt="The same view on a phone: what needs you, each with a ring to tick it off, above the day's mail" width="340">
 
-Docker publishes the port on the host's loopback address only. To reach it from a phone, put a reverse proxy with TLS in front (and set `TRUSTED_PROXY=true`) or use a tunnel. More in [docs/web-view.md](docs/web-view.md).
+Docker publishes the port on the host's loopback address only. To reach it from a phone, put a reverse proxy with TLS in front (and set `TRUSTED_PROXY=true`) or use a tunnel; notifications and installing need HTTPS. More in [docs/web-view.md](docs/web-view.md).
 
 ## MCP
 
@@ -119,7 +126,7 @@ Every command and flag is in [docs/deployment.md](docs/deployment.md#commands).
 
 - [Configuration](docs/configuration.md): mailboxes and folders, outputs, push thresholds, your own rules, the digest, polling limits, IMAP IDLE, alerts.
 - [Triage](docs/triage.md): how mail is judged, the LLM and what it sees, two-stage triage, fallback, verification codes and sign-in links.
-- [Web view](docs/web-view.md): everything the browser view does.
+- [Web view](docs/web-view.md): the queue, reading and what keeps it safe, acting, writing, asking, notifications, the keyboard, and how the page is protected.
 - [MCP](docs/mcp.md): tools, resources, the write token, attachments, safety clues, audit.
 - [Deployment and operations](docs/deployment.md): Docker, upgrades, systemd, OAuth details, commands, monitoring, recovery.
 - [Troubleshooting](docs/troubleshooting.md)
