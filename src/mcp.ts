@@ -991,9 +991,6 @@ export function createServer(
           args.id ?? '', args.replyTo ?? '', args.account ?? '', args.to ?? null, args.cc ?? null, args.bcc,
           args.subject ?? '', args.text, args.replyAll, args.quote, args.language,
         ]);
-        if (unconfirmed(name)) {
-          throw new McpToolError('PROVIDER_ERROR', 'send_timeout: this letter was sent a moment ago and the mail server did not confirm it', UNCONFIRMED_HINT);
-        }
         /** The page's answer about this letter; one that was not confirmed is remembered as such. */
         const settled = (answer: WebResponse): Record<string, unknown> => {
           try {
@@ -1012,11 +1009,19 @@ export function createServer(
             throw new McpToolError('PROVIDER_ERROR', 'send_timeout: the mail server has not confirmed this letter', UNCONFIRMED_HINT);
           }
           const first = settled(outcome);
+          // It did leave: whatever was feared of an earlier wait, this is now known.
+          unconfirmedSends.delete(name);
           return json({
             sent: true, repeated: true, messageId: first['messageId'],
             accepted: first['accepted'], rejected: first['rejected'], savedCopy: first['savedCopy'],
             note: 'This letter was already sent a moment ago and was not sent again. To send the same letter once more, give a different id.',
           });
+        }
+
+        // Nothing is known to be on its way under this name. If the last that was
+        // heard of it is that the mail server did not confirm it, that still stands.
+        if (unconfirmed(name)) {
+          throw new McpToolError('PROVIDER_ERROR', 'send_timeout: this letter was sent a moment ago and the mail server did not confirm it', UNCONFIRMED_HINT);
         }
 
         let to = args.to?.length ? args.to : [];
