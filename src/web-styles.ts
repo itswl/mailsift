@@ -158,6 +158,21 @@ overflow:hidden;flex-direction:column;transition:transform .2s cubic-bezier(.2,.
 .sheet.bare.popover .sheet-head h2{text-align:left}
 .sheet.bare.popover .sheet-head>span:not(.handle),.sheet.bare.popover .sheet-head .text-btn{display:none}
 #health-sheet.popover .sheet-body,#notify-sheet.popover .sheet-body{padding-bottom:14px}
+/* Opened above its control, near the foot of the screen: the notch points down. */
+.sheet.popover.above{transform-origin:var(--pop-arrow,50%) 100%}
+.sheet.popover.above::before{top:auto;bottom:-7px;transform:rotate(225deg)}
+/* The times a message can be put off until: a word, and the time it means, quieter. */
+#snooze-sheet.popover .sheet-body{padding:0 8px 8px;overflow:auto}
+#snooze-sheet .snooze-now{margin:0 8px 6px}
+.choices{display:flex;flex-direction:column}
+.choice{display:flex;align-items:center;justify-content:space-between;gap:16px;width:100%;min-height:44px;margin:0;padding:0 8px;border:0;border-radius:8px;background:none;color:var(--text);font:inherit;font-size:15px;text-align:left;cursor:pointer}
+.choice-when{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.choice:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.snooze-pick{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;padding:4px 8px 0}
+.snooze-pick input{flex:1;min-width:0;min-height:40px;margin:0;padding:6px 8px;border:0;border-radius:8px;background:var(--fill);color:var(--text);font:inherit;font-size:16px;font-variant-numeric:tabular-nums}
+.snooze-pick .text-btn{padding:8px 10px;min-height:40px}
+.snooze-note{flex-basis:100%;margin:0;font-size:13px;color:var(--critical-text)}
+.snooze-note:empty{display:none}
 dialog.sheet:focus{outline:none}
 .mailbox{padding:12px 0;border-top:1px solid var(--line)}
 .mailbox:first-child{border-top:0}
@@ -209,7 +224,8 @@ dialog.sheet:focus{outline:none}
 .group .row:first-child{border-top:0}
 .row:active{background:var(--fill-2)}
 @media(hover:hover){
-  .row:hover,.text-btn:hover,.token:hover,.actions a:hover,.bar-btn:hover,.menu-item:hover,.chip:hover{background:var(--fill)}
+  .row:hover,.text-btn:hover,.token:hover,.actions a:hover,.bar-btn:hover,.menu-item:hover,.chip:hover,.choice:hover{background:var(--fill)}
+  button.mark.later:hover{color:var(--text)}
   .ring:hover{background:var(--ok-tint);border-color:var(--ok);color:var(--ok)}
   button.mark.done:hover{color:var(--muted)}
   .bar-btn.primary:hover{background:var(--accent);filter:brightness(1.08)}
@@ -245,13 +261,20 @@ mark{background:var(--accent-tint);color:inherit;border-radius:3px;padding:0 1px
 /* The check is a button: pressing it puts the message back. */
 button.mark.done{appearance:none;position:relative;z-index:1;grid-area:mark;border:0;padding:0;font:inherit;cursor:pointer;transition:color .16s}
 button.mark.done::after{content:"";position:absolute;inset:-12px}
-/* What was dealt with lately: one quiet line under the queue, which opens. */
-.done-toggle{display:block;margin:0 0 0 8px;font-weight:500}
-.done-toggle::after{content:"";display:inline-block;width:6px;height:6px;margin:0 0 2px 8px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(-45deg);transition:transform .16s}
-.done-toggle[aria-expanded=true]::after{transform:rotate(45deg)}
+/* A message put off: a clock where its ring was, which opens the times again. */
+.mark.later{width:20px;height:20px;margin:1px 0 0 -2px;border-radius:0;background:none;box-shadow:none;color:var(--muted);display:grid;place-items:center}
+.mark.later .icon{width:15px;height:15px}
+button.mark.later{appearance:none;position:relative;z-index:1;grid-area:mark;border:0;padding:0;font:inherit;cursor:pointer;transition:color .16s}
+button.mark.later::after{content:"";position:absolute;inset:-12px}
+/* What was put off, and what was dealt with lately: quiet lines under the queue, each of which opens. */
+.queue-foot{display:flex;flex-wrap:wrap;gap:0 4px;margin:0 0 0 8px}
+.foot-toggle{font-weight:500}
+.foot-toggle::after{content:"";display:inline-block;width:6px;height:6px;margin:0 0 2px 8px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(-45deg);transition:transform .16s}
+.foot-toggle[aria-expanded=true]{color:var(--text)}
+.foot-toggle[aria-expanded=true]::after{transform:rotate(45deg)}
 .row.handled .who{font-weight:500}.row.handled .who,.row.handled .sum,.row.handled .why{color:var(--muted)}
 .row.completing .ring{background:var(--ok);border-color:var(--ok);color:#fff}
-.row.completing{animation:complete .38s ease-in forwards}
+.row.completing,.row.leaving{animation:complete .38s ease-in forwards}
 @keyframes complete{45%{opacity:1;transform:none}to{opacity:0;transform:translateX(16px)}}
 /* A swipe to the right does the same on a touch screen. */
 .group{overflow-x:clip}
@@ -401,6 +424,8 @@ button.digest-item{cursor:pointer;border-radius:6px}
 .bar-btn.primary.on{background:var(--fill);color:var(--text)}.bar-btn.primary.on .icon{color:var(--ok)}
 .bar-btn.icon-only{min-width:44px;padding:0}.bar-btn.icon-only span{display:none}
 .bar-btn.lit{color:var(--warning)}.bar-btn.lit .icon{fill:currentColor}
+/* A message that is put off: its clock in the accent, drawn and not filled. */
+.bar-btn.snooze-btn.lit{color:var(--accent)}.bar-btn.snooze-btn.lit .icon{fill:none}
 .bar-btn.quiet{color:var(--muted)}
 .bar-space{flex:1}
 .message{margin:6px 0 0;border-top:1px solid var(--line)}

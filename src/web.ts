@@ -281,10 +281,14 @@ export async function handleApi(
     // And what was dealt with lately, so a message marked done can be found
     // again and put back even when it is older than the list's window.
     const done = store.recentlyHandled(intParam(params, 'done', 20, 50));
+    // And what was put off until later, soonest first: it has left the queue
+    // and is coming back, so the page can say when and bring it back sooner.
+    const later = store.snoozed(intParam(params, 'snoozed', 50, 100));
     return json(200, {
       count: store.attentionCount(),
       mail: rows.map(decorate),
       done: done.map(({ row, queued }) => ({ ...decorate(row), queued })),
+      snoozed: later.map(decorate),
     });
   }
 
@@ -700,6 +704,7 @@ const ICONS: Record<string, string> = {
   compose: '<path d="M5 19h4L19 9l-4-4L5 15z"/><path d="M13.5 6.5l4 4"/>',
   image: '<path d="M4 5h16v14H4z"/><path d="M4 16l4.5-4.5 3.5 3.5 2.5-2.5L20 17"/><path d="M9 9.5h.01" stroke-width="2.4"/>',
   read: '<path d="M4 9.5l8-5 8 5V19H4z"/><path d="M4 9.5l8 5 8-5"/>',
+  clock: '<circle cx="12" cy="12" r="8"/><path d="M12 7.5V12l3 2"/>',
 };
 
 function iconSymbols(): string {
@@ -811,6 +816,10 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
     </dialog>
     <dialog id="notify-sheet" class="sheet bare" aria-labelledby="notify-title" tabindex="-1">
       ${sheetHead('notify-title', 'notify.title', 'notify-done')}
+      <div class="sheet-body"></div>
+    </dialog>
+    <dialog id="snooze-sheet" class="sheet bare" aria-labelledby="snooze-title" tabindex="-1">
+      ${sheetHead('snooze-title', 'snooze.title', 'snooze-done')}
       <div class="sheet-body"></div>
     </dialog>
     <dialog id="keys-sheet" class="sheet" aria-labelledby="keys-title" tabindex="-1">

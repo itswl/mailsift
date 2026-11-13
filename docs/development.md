@@ -13,7 +13,7 @@ npm run build
 
 ## Working on the web view
 
-To work on the page without a mailbox, `npx tsx scripts/web-preview.ts` serves it over a week of fixture mail at `http://127.0.0.1:8499/`. Nothing real is behind it: opening a message reads a made-up body (one of them hostile, to see the reader hold), actions move rows between pretend folders, sending goes nowhere (the console prints each letter as it would leave, with its copies and files), forwarding the invoice carries its two made-up files and leaves out the two pictures in its body until asked, and the assistant answers from a script.
+To work on the page without a mailbox, `npx tsx scripts/web-preview.ts` serves it over a week of fixture mail at `http://127.0.0.1:8499/`. Nothing real is behind it: opening a message reads a made-up body (one of them hostile, to see the reader hold), actions move rows between pretend folders, sending goes nowhere (the console prints each letter as it would leave, with its copies and files), forwarding the invoice carries its two made-up files and leaves out the two pictures in its body until asked, and the assistant answers from a script. Two messages are put off, one until tomorrow morning and one whose reminder has come, and a reminder set in the page comes back on its minute, as in the service; a device that subscribed would be told on the console instead.
 
 | Flag | Does |
 |---|---|

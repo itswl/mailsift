@@ -385,6 +385,104 @@ describe('what needs the reader', () => {
     expect(summary.session).toMatchObject({ canMark: true, writable: false, writeConfigured: false });
   });
 
+  it('puts a message off until a time, lists it with the queue soonest first, and brings it back', async () => {
+    const store = seeded();
+    const fake = backend();
+    const tomorrow = new Date(Date.now() + 86_400_000);
+    const sooner = new Date(Date.now() + 3_600_000);
+    // As the page sends it, and as a caller in another time zone might write it: the same moment either way.
+    const offset = new Date(sooner.getTime() + 8 * 3_600_000).toISOString().replace('Z', '+08:00');
+    const put = await post(store, '/api/snooze', { key: 'k1', until: tomorrow.toISOString() }, {}, fake);
+    expect(put.answer.status).toBe(200);
+    expect(put.json).toMatchObject({ key: 'k1', snoozedUntil: tomorrow.toISOString(), handledAt: null, attention: 1 });
+    expect(put.json['row']).toHaveProperty('link');
+    expect((await post(store, '/api/snooze', { key: 'k3', until: offset }, {}, fake)).json).toMatchObject({ snoozedUntil: sooner.toISOString() });
+
+    const queue = (await call(store, '/api/attention', { as: 'read' })).json;
+    expect(queue['count']).toBe(0);
+    expect(queue['mail']).toEqual([]);
+    const later = queue['snoozed'] as Array<Record<string, unknown>>;
+    expect(later.map((m) => [m['dedupKey'], m['snoozedUntil']])).toEqual([['k3', sooner.toISOString()], ['k1', tomorrow.toISOString()]]);
+    expect(later[0]).toHaveProperty('link');
+
+    const back = await post(store, '/api/snooze', { key: 'k1', until: null }, {}, fake);
+    expect(back.json).toMatchObject({ snoozedUntil: null, attention: 1 });
+    expect(store.listMcpAudit(10).map((event) => event.action)).toEqual(expect.arrayContaining(['web:snooze', 'web:unsnooze']));
+    // The queue's own note: the mailbox is not touched.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(fake.calls.act).toEqual([]);
+  });
+
+  it('refuses a reminder in the past, more than a year ahead, or at a time that does not say its offset', async () => {
+    const store = seeded();
+    const refused = async (body: unknown): Promise<unknown> => {
+      const { answer, json } = await post(store, '/api/snooze', body);
+      expect(answer.status, JSON.stringify(body)).toBeGreaterThanOrEqual(400);
+      return json['code'];
+    };
+    expect(await refused({ key: 'k1', until: new Date(Date.now() - 60_000).toISOString() })).toBe('snoozePast');
+    expect(await refused({ key: 'k1', until: new Date(Date.now() + 400 * 86_400_000).toISOString() })).toBe('snoozeFar');
+    expect(await refused({ key: 'k1', until: '2030-01-01T09:00:00' })).toBe('badRequest');
+    expect(await refused({ key: 'k1', until: 'tomorrow' })).toBe('badRequest');
+    expect(await refused({ key: 'k1' })).toBe('badRequest');
+    expect(await refused({ until: null })).toBe('badRequest');
+    expect(await refused({ key: 'absent', until: new Date(Date.now() + 60_000).toISOString() })).toBe('notFound');
+    expect(store.getMail('k1')?.snoozedUntil).toBeNull();
+  });
+
+  it('lets put off only a session that may mark mail done', async () => {
+    const store = seeded();
+    const until = new Date(Date.now() + 3_600_000).toISOString();
+    const refused = await post(store, '/api/snooze', { key: 'k1', until }, { as: 'read' });
+    expect(refused.answer.status).toBe(403);
+    expect(refused.json['code']).toBe('readOnly');
+    expect(store.getMail('k1')?.snoozedUntil).toBeNull();
+    // Where no write token is set, the one credential keeps the queue's books, this included.
+    const single = await routeWeb(
+      request({ method: 'POST', url: '/api/snooze', body: { key: 'k1', until }, headers: { cookie: `${SESSION_COOKIE}=${READ}` } }),
+      url('/api/snooze'), READ, store, 'single', { backend: backend().backend },
+    );
+    expect(single.status).toBe(200);
+    expect(store.getMail('k1')?.snoozedUntil).toBe(until);
+  });
+
+  it('brings a message back now, into the queue whatever it was judged, and records it', async () => {
+    const store = seeded();
+    const fake = backend();
+    // k2 is from the stream: not judged to matter, so never in the queue on its own.
+    const tomorrow = new Date(Date.now() + 86_400_000).toISOString();
+    expect((await post(store, '/api/snooze', { key: 'k2', until: tomorrow }, {}, fake)).json).toMatchObject({ inQueue: false });
+    const back = await post(store, '/api/snooze', { key: 'k2', until: 'now' }, {}, fake);
+    expect(back.answer.status).toBe(200);
+    expect(back.json).toMatchObject({ key: 'k2', inQueue: true, handledAt: null });
+    expect(Date.parse(String(back.json['snoozedUntil']))).toBeLessThanOrEqual(Date.now());
+    const queue = (await call(store, '/api/attention', { as: 'read' })).json;
+    expect((queue['mail'] as Array<{ dedupKey: string }>).map((m) => m.dedupKey)).toContain('k2');
+    expect(queue['snoozed']).toEqual([]);
+    expect(store.listMcpAudit(10).map((event) => event.action)).toEqual(expect.arrayContaining(['web:snooze', 'web:wake']));
+    // Taking the reminder away is still there for the message that never had one: k2 is then only in the list.
+    expect((await post(store, '/api/snooze', { key: 'k2', until: null }, {}, fake)).json).toMatchObject({ inQueue: false });
+    expect((await post(store, '/api/snooze', { key: 'k2', until: 'later' }, {}, fake)).json['code']).toBe('badRequest');
+  });
+
+  it('undoes putting off again a reminder that had come, leaving the message in the queue', async () => {
+    const store = seeded();
+    const fake = backend();
+    store.setMeta('attention_since', new Date(Date.now() - 7 * 86_400_000).toISOString());
+    // Its reminder came twenty minutes ago, so this quiet message is in the queue.
+    store.setSnoozed('k2', new Date(Date.now() + 60_000).toISOString());
+    (store as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db
+      .prepare('UPDATE seen SET snoozed_until = ? WHERE dedup_key = ?').run(new Date(Date.now() - 20 * 60_000).toISOString(), 'k2');
+    const queued = async (): Promise<string[]> =>
+      ((await call(store, '/api/attention', { as: 'read' })).json['mail'] as Array<{ dedupKey: string }>).map((m) => m.dedupKey);
+    expect(await queued()).toContain('k2');
+    // Remind me, Later today; then Undo, which for a time that has come sends "now", as the page does.
+    await post(store, '/api/snooze', { key: 'k2', until: new Date(Date.now() + 3 * 3_600_000).toISOString() }, {}, fake);
+    expect(await queued()).not.toContain('k2');
+    expect((await post(store, '/api/snooze', { key: 'k2', until: 'now' }, {}, fake)).json).toMatchObject({ inQueue: true });
+    expect(await queued()).toContain('k2');
+  });
+
   it('marks it read in the mailbox too, for the session that may write', async () => {
     const store = seeded();
     const writer = backend();
