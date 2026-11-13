@@ -8,6 +8,11 @@
  *   npm run oauth                      authorize all OAuth accounts
  *   npm run oauth -- --account a@b.c   authorize one account
  *   npm run oauth -- --manual          headless server/container mode
+ *   npm run oauth -- --send --force    also ask for permission to send
+ *
+ * Gmail's one scope already covers sending. Outlook consents to it separately,
+ * so an Outlook mailbox can only reply from the web view once it has been
+ * authorized with --send; without it the consent screen asks for reading only.
  *
  * On a server, --manual prints the authorization URL. Open it on your computer,
  * approve access, then paste the complete redirected URL back into the terminal.
@@ -118,8 +123,8 @@ async function waitForCallback(port: number, expectedState: string): Promise<str
   });
 }
 
-async function authorize(account: Account, store: TokenStore, manual: boolean): Promise<boolean> {
-  const provider = getOAuthProvider(account.auth);
+async function authorize(account: Account, store: TokenStore, manual: boolean, send: boolean): Promise<boolean> {
+  const provider = getOAuthProvider(account.auth, { send });
   const port = Number(process.env.OAUTH_REDIRECT_PORT ?? 8765);
   const redirectUri = `http://localhost:${port}/`;
   const { verifier, challenge } = pkcePair();
@@ -150,12 +155,17 @@ async function authorize(account: Account, store: TokenStore, manual: boolean): 
     return false;
   }
   try {
-    await store.save(account.username, buildTokenRecord(await exchangeCode(provider, code, redirectUri, verifier)));
+    // The scopes are kept with the token: a refresh has to ask for the same ones.
+    await store.save(
+      account.username,
+      buildTokenRecord(await exchangeCode(provider, code, redirectUri, verifier), undefined, provider.scope),
+    );
   } catch (error) {
     console.log(`❌ Token exchange failed: ${error instanceof AuthError ? error.message : error}`);
     return false;
   }
-  console.log(`✅ ${account.username} authorized; refresh_token saved.`);
+  const sends = account.auth === 'gmail_oauth' || send;
+  console.log(`✅ ${account.username} authorized for ${sends ? 'reading and sending' : 'reading'}; refresh_token saved.`);
   return true;
 }
 
@@ -165,6 +175,7 @@ async function main(): Promise<number> {
       account: { type: 'string' },
       force: { type: 'boolean', default: false },
       manual: { type: 'boolean', default: false },
+      send: { type: 'boolean', default: false },
     },
     allowPositionals: false,
   });
@@ -189,10 +200,10 @@ async function main(): Promise<number> {
   let failed = 0;
   for (const account of targets) {
     if (existing.has(account.username) && !values.force) {
-      console.log(`⏭  ${account.username} is already authorized; skipping (use --force to repeat).`);
+      console.log(`⏭  ${account.username} is already authorized; skipping (use --force to repeat${values.send ? ' and add sending' : ''}).`);
       continue;
     }
-    if (!(await authorize(account, store, values.manual))) failed += 1;
+    if (!(await authorize(account, store, values.manual, values.send))) failed += 1;
   }
   return failed ? 1 : 0;
 }
