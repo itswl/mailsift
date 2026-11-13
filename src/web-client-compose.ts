@@ -40,9 +40,10 @@ const filePicker = $('#compose-file');
 // quote, or the forwarded message), canSend, signature (as shown, and so as
 // sent), noSignature, files (added here), lost (the names of files a
 // restored draft had, still to be added again), originals (all of a
-// forward's own files, by reference), choice (which of those were put on or
-// taken off by hand), forwardFailed (why the message to forward could not
-// be read) }.
+// forward's own files, by reference), originalsUnlisted (they could not be
+// listed), choice (which of those were put on or taken off by hand),
+// forwardFailed (why the message to forward could not be read), warned
+// (what Send last said the letter would go without) }.
 let composing = null;
 // A letter's draft lives under the message it answers or forwards, or under
 // "new". Once it has been sent off it moves to a name of its own (see
@@ -51,10 +52,13 @@ let composing = null;
 // are two letters, with a draft each.
 const homeId = (state) => 'draft:' + (state && state.mode === 'forward' ? 'fwd:' : '') + (state && state.key ? state.key : 'new');
 const draftId = (state) => (state && state.draftKey) || homeId(state);
-// Files added to a letter, by the draft they belong to, for as long as this
-// page is open. A draft on this device keeps only their names; the files
-// themselves can be held only here, so a letter closed and opened again
-// still has them, and only a new page has to ask for them again.
+// Files added to a letter, by the name its draft is kept under (draftId), for
+// as long as this page is open. A draft on this device keeps only their
+// names; the files themselves can be held only here, so a letter closed and
+// opened again still has them, and only a new page has to ask for them
+// again. They move with the draft: a letter sent off takes its files to its
+// own name, and they go back to the message's only with its words, so a
+// letter begun in the meantime never gets another letter's files.
 const heldFiles = new Map();
 const isAnswer = (state) => Boolean(state) && (state.mode === 'reply' || state.mode === 'replyAll');
 // A new message and a forward choose the mailbox they leave from; an answer
@@ -132,9 +136,10 @@ function letterKey(payload, files) {
 function saveDraft() {
   if (!composing) return;
   const added = composing.files || [];
-  // The files themselves stay with this page, under the letter's draft.
-  if (added.length) heldFiles.set(homeId(composing), { state: composing, files: added });
-  else if ((heldFiles.get(homeId(composing)) || {}).state === composing) heldFiles.delete(homeId(composing));
+  // The files themselves stay with this page, under the letter's draft; a
+  // letter with none left (taken off, or the draft discarded) holds none.
+  if (added.length) heldFiles.set(draftId(composing), { files: added });
+  else heldFiles.delete(draftId(composing));
   const fields = {
     to: composeForm.to.value, cc: composeForm.cc.value, bcc: composeForm.bcc.value,
     subject: composeForm.subject.value, text: composeForm.text.value,
@@ -162,13 +167,37 @@ function saveDraft() {
   }
   writeStorage(draftId(composing), JSON.stringify(fields));
 }
-// The files a restored draft had, which this page does not have: said in a
-// line of its own under the files, so that nothing else said in the
-// composer takes it away, until every one of them is attached again.
+// Files the letter was meant to carry and does not have: those a restored
+// draft had, which this page does not, and a forward's own when they could
+// not be listed. Said in a line of its own under the files, so that nothing
+// else said in the composer (an undo, a refused send) takes it away, until
+// every one of them is attached again.
+// Sentences in a row: a space between them in English, none in Chinese,
+// whose full stop already ends the sentence.
+function sentenceGap() { return lang === 'zh-CN' ? '' : ' '; }
 function drawLost() {
   const owed = composing ? composing.lost || [] : [];
-  composeLost.hidden = !owed.length;
-  composeLost.textContent = owed.length ? fill('compose.filesNotKept', { list: owed.join(', ') }) : '';
+  const words = [];
+  if (owed.length) words.push(fill('compose.filesNotKept', { list: owed.join(', ') }));
+  if (composing && composing.mode === 'forward' && composing.originalsUnlisted) words.push(t('compose.forwardFilesUnavailable'));
+  const containers = composing && composing.mode === 'forward' ? composing.notForwardable || [] : [];
+  if (containers.length) words.push(fill('compose.cannotForward', { list: containers.join(', ') }));
+  composeLost.hidden = !words.length;
+  composeLost.textContent = words.join(sentenceGap());
+}
+// What a letter would go without that it was meant to carry, in words, or
+// ''. The first press of Send says it and sends nothing; a second press,
+// with nothing changed, sends the letter without them. A forward through
+// MCP is refused the same way until it is told to go without its files.
+function missingWords(state) {
+  const owed = state.lost || [];
+  const words = [];
+  if (owed.length) words.push(fill('compose.sendWithoutFiles', { list: owed.join(', ') }));
+  if (state.mode === 'forward' && state.originalsUnlisted) words.push(t('compose.sendWithoutOriginals'));
+  if (state.mode === 'forward' && (state.notForwardable || []).length) {
+    words.push(fill('compose.sendWithoutContainers', { list: state.notForwardable.join(', ') }));
+  }
+  return words.length ? words.concat(t('compose.sendAnyway')).join(sentenceGap()) : '';
 }
 function readDraft(state) {
   try { return JSON.parse(readStorage(draftId(state)) || 'null'); } catch (e) { return null; }
@@ -310,9 +339,11 @@ async function storeSignature(state, from, area, said, buttons) {
 // when it sends, and they never come to the browser.
 let fileSeq = 0;
 // Whether one of a forward's own files goes with it. Each goes unless taken
-// off, except the pictures shown within the original's body (logos, icons,
-// a signature's portrait), which a plain-text forward would otherwise carry
-// by the dozen as files nobody attached: those go only when asked for.
+// off, except the pictures of the original's body (logos, icons, a
+// signature's portrait), which a plain-text forward would otherwise carry by
+// the dozen as files nobody attached: those go only when asked for. The
+// server says which they are (inline: an image its markup shows), so that a
+// PDF sent inline, as Apple Mail sends one, is a file like any other.
 function isOn(state, a) {
   const chosen = (state.choice || {})[a.partId];
   return typeof chosen === 'boolean' ? chosen : !a.inline;
@@ -370,6 +401,8 @@ function addFiles(list, pasted) {
   const state = composing;
   const given = Array.from(list || []);
   if (!state || !given.length) return;
+  // What Send was going to ask about may have changed with the files: ask afresh.
+  state.warned = '';
   const limits = letterLimits();
   state.files = state.files || [];
   let refused = '';
@@ -416,12 +449,15 @@ function removeFile(state, item, at) {
   const next = buttons[Math.min(at, buttons.length - 1)];
   (next || $('#compose-attach')).focus({ preventScroll: true });
 }
-function putBack(state, item, at) {
+function putBack(state, item) {
   chooseOriginal(state, item.partId, true);
   filesChanged(state);
   announce(fill('compose.attachedFile', { name: item.filename }));
+  // The file put back moves to where the files that go are listed: the focus
+  // follows it there, to its own Remove, rather than staying at the place it
+  // left, where another file's Remove now is.
   const buttons = composeFiles.querySelectorAll('.file-remove, .file-back');
-  const next = buttons[Math.min(at, buttons.length - 1)];
+  const next = buttons[fileItems(state).indexOf(item)];
   if (next) next.focus({ preventScroll: true });
 }
 // After a file went on or came off: what is shown, what is kept, and whether
@@ -433,17 +469,22 @@ function filesChanged(state) {
   drawFiles();
   saveDraft();
 }
+// The chips, in order: a forward's own files that are going, then those
+// taken off (still there to be put back), then the ones added here. Pictures
+// of the original's body that are not going are one line under them, not a
+// chip each.
+function fileItems(state) {
+  const originals = state ? state.originals || [] : [];
+  return originals.filter((a) => isOn(state, a))
+    .concat(originals.filter((a) => !a.inline && !isOn(state, a)))
+    .concat(state ? state.files || [] : []);
+}
 function drawFiles() {
   composeFiles.replaceChildren();
   composePictures.replaceChildren();
   const state = composing;
   const originals = state ? state.originals || [] : [];
-  // A forward's own files that are going, then those taken off (still there
-  // to be put back), then the ones added here. Pictures of the original's
-  // body that are not going are one line under them, not a chip each.
-  const items = originals.filter((a) => isOn(state, a))
-    .concat(originals.filter((a) => !a.inline && !isOn(state, a)))
-    .concat(state ? state.files || [] : []);
+  const items = fileItems(state);
   composeFiles.hidden = !items.length;
   items.forEach((item, at) => {
     const name = item.partId ? item.filename : item.name;
@@ -460,7 +501,7 @@ function drawFiles() {
     button.setAttribute('aria-label', label);
     button.title = label;
     if (!off) button.appendChild(icon('i-x'));
-    button.onclick = () => (off ? putBack(state, item, at) : removeFile(state, item, at));
+    button.onclick = () => (off ? putBack(state, item) : removeFile(state, item, at));
     chip.appendChild(button);
     composeFiles.appendChild(chip);
   });
@@ -549,6 +590,9 @@ function openCompose(state) {
   composeForm.reset();
   $('#compose-title').textContent = t(state.titleKey);
   composeSay('');
+  // Back after an undo or a refusal, the letter is asked about again before
+  // it goes without what it lacks: what was said then is no longer on show.
+  state.warned = '';
   composeSend.disabled = false;
   const from = $('#compose-from'), value = $('#compose-from-value');
   value.replaceChildren();
@@ -586,13 +630,17 @@ function openCompose(state) {
   drawChips();
   showQuoted(state);
   // Files are held only by the page that added them. A letter closed and
-  // begun again takes them back from where this page holds them; in a new
-  // page they are gone, and the draft's names say which to add again. Only a
-  // letter opened for the first time takes them: one reopened after an undo
-  // or a refused send still has its own, and those held now may be another
-  // letter's, begun since.
-  const held = heldFiles.get(homeId(state));
-  if (!state.opened && !(state.files && state.files.length) && held && held.files.length) state.files = held.files.slice();
+  // begun again takes them back from where this page holds them, under its
+  // draft's name; in a new page they are gone, and the draft's names say
+  // which to add again. Only a letter opened for the first time takes them:
+  // one reopened after an undo or a refused send still has its own. What it
+  // took is its own from then on, so a file taken off, or a draft discarded,
+  // is not offered again the next time it is opened.
+  const held = heldFiles.get(draftId(state));
+  if (!state.opened && !(state.files && state.files.length) && held && held.files.length) {
+    state.files = held.files.slice();
+    heldFiles.set(draftId(state), { files: state.files });
+  }
   state.opened = true;
   let lost = [];
   if (kept) {
@@ -704,7 +752,14 @@ function fillForward(d) {
   showQuoted(state);
   drawFiles();
   takeSignature(state, d);
-  if (d.attachmentsUnavailable) composeAdd(t('compose.forwardFilesUnavailable'));
+  // Files that could not be listed are said under the files, where an undo
+  // or a refused send does not take the line away, and asked about at Send.
+  state.originalsUnlisted = Boolean(d.attachmentsUnavailable);
+  // A file that holds other parts (Apple Mail's AppleDouble) cannot go on as
+  // one file. Said under the files, and asked about at Send, like the above.
+  state.notForwardable = (Array.isArray(d.notForwardable) ? d.notForwardable : [])
+    .map((a) => cleanFileName(a && a.filename)).filter(Boolean);
+  drawLost();
   const problem = fileProblem(state);
   if (problem) { composeAdd(problem, true); state.saidFiles = true; }
 }
@@ -822,7 +877,9 @@ function hideSending() {
   if (sendingNode.hidePopover) { try { sendingNode.hidePopover(); } catch (e) {} }
 }
 // A letter that did not leave after all goes back to being the draft of its
-// message, unless another letter was begun there in the meantime.
+// message, words and files together, unless another letter was begun there
+// in the meantime: then it keeps the name it was sent off under, and so do
+// its files, and the other letter keeps its own.
 function reclaimDraft(state) {
   const own = state.draftKey;
   if (!own) return;
@@ -830,10 +887,14 @@ function reclaimDraft(state) {
   const home = draftId(state);
   try {
     const kept = localStorage.getItem(own);
-    if (kept === null) return;
-    if (localStorage.getItem(home) === null) { localStorage.setItem(home, kept); localStorage.removeItem(own); }
-    else state.draftKey = own;
-  } catch (e) {}
+    if (localStorage.getItem(home) !== null || heldFiles.has(home)) { state.draftKey = own; return; }
+    if (kept !== null) { localStorage.setItem(home, kept); localStorage.removeItem(own); }
+  } catch (e) {
+    state.draftKey = own;
+    return;
+  }
+  const held = heldFiles.get(own);
+  if (held) { heldFiles.delete(own); heldFiles.set(home, held); }
 }
 function undoSend(job) {
   if (pendingSend !== job) return;
@@ -871,6 +932,15 @@ function sendCompose() {
   }
   const problem = fileProblem(state);
   if (problem) { composeSay(problem, true); state.saidFiles = true; return; }
+  // Going without something it was meant to carry ("see attached" with
+  // nothing attached) is asked about once; the same press again sends it.
+  const missing = missingWords(state);
+  // The confirming press counts only once the question has been on show for
+  // a moment: a double click or a doubled Ctrl+Enter must not answer it unread.
+  if (missing && (state.warned !== missing || Date.now() - (state.warnedAt || 0) < 700)) {
+    if (state.warned !== missing) { state.warned = missing; state.warnedAt = Date.now(); composeSay(missing, true); }
+    return;
+  }
   const from = fromOf(state);
   const payload = {
     account: from, to, cc, bcc, subject: composeForm.subject.value.trim(),
@@ -899,9 +969,10 @@ function sendCompose() {
     const kept = localStorage.getItem(draftId(state));
     if (kept !== null && draftId(state) !== own) { localStorage.setItem(own, kept); localStorage.removeItem(draftId(state)); }
   } catch (e) {}
-  state.draftKey = own;
   // Its files go with it, and come back with it if it is taken back.
-  if ((heldFiles.get(homeId(state)) || {}).state === state) heldFiles.delete(homeId(state));
+  const held = heldFiles.get(draftId(state));
+  if (held && draftId(state) !== own) { heldFiles.delete(draftId(state)); heldFiles.set(own, held); }
+  state.draftKey = own;
   // Another letter still counting leaves now: there is one way back on show at a time.
   if (pendingSend) { clearInterval(pendingSend.timer); deliver(pendingSend); }
   closeSheet(composeSheet, false);
@@ -957,6 +1028,10 @@ function sendFailure(d, status) {
   if (!d || !(d.code || d.error)) {
     if (status === 413) return fill('compose.proxyTooLarge', { maxBytes: sizeLabel(letterLimits().bytes) });
     if (status === 504 || status === 524) return t('error.send_timeout');
+    // The letter took longer to upload than the server waits for one: it
+    // never arrived whole, so nothing was sent, and the mail server was not
+    // asked anything.
+    if (status === 408) return t('compose.uploadTooSlow');
     return t('error.send_connection');
   }
   if (d.code === 'send_too_large' && d.file) return fill('compose.tooLarge', { file: d.file, maxBytes: sizeLabel(d.maxBytes) });
@@ -987,16 +1062,20 @@ async function deliver(job) {
   if (!r.ok) { backToLetter(job, sendFailure(r.data, r.status)); return; }
   try { localStorage.removeItem(draftId(job.state)); } catch (e) {}
   // Gone with the letter: nothing to attach again.
-  if ((heldFiles.get(homeId(job.state)) || {}).state === job.state) heldFiles.delete(homeId(job.state));
+  heldFiles.delete(draftId(job.state));
   const refused = Array.isArray(r.data.rejected) ? r.data.rejected : [];
   toast(refused.length ? fill('compose.partial', { list: refused.join(', ') }) : t(r.data.savedCopy === false ? 'compose.sentNoCopy' : 'compose.sent'),
     refused.length > 0);
   if (job.state.key) {
-    // An answered or forwarded message is a dealt-with message.
-    const counted = attentionSet.has(job.state.key) && !(rowByKey(job.state.key) || {}).handledAt;
-    markHandledLocal(job.state.key, new Date().toISOString());
-    if (counted) attentionCount = Math.max(0, attentionCount - 1);
+    // The message as the mailbox now has it is read afresh next time.
     liveData.delete(job.state.key);
+    // An answered or forwarded message is dealt with, when the server says
+    // so: a forward to nobody but the owner's own mailboxes is not.
+    if (r.data.handled === true) {
+      const counted = attentionSet.has(job.state.key) && !(rowByKey(job.state.key) || {}).handledAt;
+      markHandledLocal(job.state.key, new Date().toISOString());
+      if (counted) attentionCount = Math.max(0, attentionCount - 1);
+    }
   }
   if (typeof r.data.attention === 'number') attentionCount = r.data.attention;
   renderList();
@@ -1015,8 +1094,10 @@ document.addEventListener('visibilitychange', () => {
 });
 // Closing the page outright: the letter goes with it when it is small enough
 // to, and otherwise goes back to being the draft of its message. One with
-// files stays a draft too: they are read as it leaves, and a page that is
-// closing cannot wait for that.
+// files added from this device stays a draft too: they are read as it
+// leaves, and a page that is closing cannot wait for that. A forward's own
+// files are only named in the request, and the server reads them, so a
+// forward that is small enough goes with them.
 window.addEventListener('pagehide', () => {
   const job = pendingSend;
   if (!job) return;

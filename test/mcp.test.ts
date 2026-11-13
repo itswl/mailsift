@@ -34,6 +34,8 @@ interface Mailbox {
   sent: OutgoingMail[];
   /** The parts a forward read from the mailbox. */
   fetched: string[];
+  /** The same, each with the mailbox it was read from: "account:part". */
+  fetchedFrom: string[];
   read: unknown[];
   appended: number;
   act?: (action: string) => Partial<WebMailActionResult> | undefined;
@@ -41,13 +43,13 @@ interface Mailbox {
   backend: Partial<WebBackend>;
 }
 function mailbox(state: StateStore): Mailbox {
-  const box: Mailbox = { acted: [], sent: [], fetched: [], read: [], appended: 0, backend: {} };
+  const box: Mailbox = { acted: [], sent: [], fetched: [], fetchedFrom: [], read: [], appended: 0, backend: {} };
   const manifest = {
     folder: 'INBOX',
     manifest: {
       items: [
         { partId: '2', filename: 'invoice.pdf', contentType: 'application/pdf', sizeBytes: 4000, transferEncoding: 'base64', inline: false },
-        { partId: '3', filename: 'logo.png', contentType: 'image/png', sizeBytes: 800, transferEncoding: 'base64', inline: true },
+        { partId: '3', filename: 'logo.png', contentType: 'image/png', sizeBytes: 800, transferEncoding: 'base64', inline: true, contentId: 'logo' },
       ],
       truncated: false,
     },
@@ -61,6 +63,8 @@ function mailbox(state: StateStore): Mailbox {
       messageId: '<one@x>', inReplyTo: null, references: ['<root@x>'],
       auth: { result: 'pass', dkim: 'pass', spf: 'pass', dmarc: 'pass', signedBy: 'vendor.com' },
       unsubscribe: null, inlineImages: 0,
+      // Its markup shows logo.png as a picture of its body.
+      bodyCids: ['logo'],
     },
   };
   box.backend = {
@@ -81,8 +85,9 @@ function mailbox(state: StateStore): Mailbox {
       return { messageId: '<sent@x>', raw: Buffer.from('raw'), copy: Buffer.from('raw'), accepted: [...mail.to, ...(mail.cc ?? [])], rejected: [] };
     },
     attachments: async () => manifest,
-    attachment: async (_account, _messageId, partId) => {
+    attachment: async (account, _messageId, partId) => {
       box.fetched.push(partId);
+      box.fetchedFrom.push(`${account.username}:${partId}`);
       const metadata = manifest.manifest.items.find((item) => item.partId === partId);
       return metadata ? { metadata, content: Buffer.from(`bytes of ${metadata.filename}`) } : undefined;
     },
@@ -996,7 +1001,7 @@ describe('forwarding and signatures', () => {
     expect(box.fetched).toEqual([]);
   });
 
-  it('forwards a message in one call, with all its files and the signature, once told whom it is for', async () => {
+  it('forwards a message in one call, with its files and the signature, once told whom it is for', async () => {
     const state = seeded();
     const box = mailbox(state);
     const client = await connect(state, true, box.backend);
@@ -1006,29 +1011,34 @@ describe('forwarding and signatures', () => {
     expect(box.sent).toEqual([]);
 
     const sent = await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI, see below.' });
+    // By default what the page sends by default: the files, and not the pictures of the original's body.
     expect(sent).toMatchObject({
       sent: true, account: 'me@qq.com', to: ['colleague@example.org'], cc: [], subject: 'Fwd: subject k1',
-      attachments: ['invoice.pdf', 'logo.png'], needsYou: 1,
+      attachments: ['invoice.pdf'], needsYou: 1, originalHandled: true,
     });
     const letter = box.sent[0]!;
     expect(letter.text.startsWith('FYI, see below.\n\n-- \nAlex\nMailsift Ltd\n\n---------- Forwarded message ----------\n')).toBe(true);
     expect(letter.text.endsWith('\n\nPlease confirm the invoice by Friday.')).toBe(true);
     expect(letter).not.toHaveProperty('inReplyTo');
     expect(letter).not.toHaveProperty('references');
-    expect(letter.attachments!.map((file) => [file.filename, file.content.toString()]))
-      .toEqual([['invoice.pdf', 'bytes of invoice.pdf'], ['logo.png', 'bytes of logo.png']]);
+    expect(letter.attachments!.map((file) => [file.filename, file.content.toString()])).toEqual([['invoice.pdf', 'bytes of invoice.pdf']]);
+    expect(box.fetched).toEqual(['2']);
     // Dealt with, and not marked answered.
     expect(state.getMail('k1')?.handledAt).toBeTruthy();
     await new Promise((resolve) => setImmediate(resolve));
     expect(box.acted.map((entry) => entry.action)).not.toContain('answered');
     // The files are part of the letter: the same forward again is a repeat; without them, another letter.
     expect(await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI, see below.' }))
-      .toMatchObject({ repeated: true, attachments: ['invoice.pdf', 'logo.png'] });
+      .toMatchObject({ repeated: true, attachments: ['invoice.pdf'] });
     expect(box.sent).toHaveLength(1);
     const bare = await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI, see below.', includeAttachments: false });
     expect(bare).not.toHaveProperty('repeated');
     expect(bare['attachments']).toEqual([]);
     expect(box.sent[1]).not.toHaveProperty('attachments');
+    // Named, a picture of the body goes like any file.
+    const named = await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'With the logo.', includeAttachments: ['2', '3'] });
+    expect(named['attachments']).toEqual(['invoice.pdf', 'logo.png']);
+    expect(box.sent[2]!.attachments!.map((file) => file.filename)).toEqual(['invoice.pdf', 'logo.png']);
     // The set_signature row says which mailbox, never what the signature says.
     const rows = state.listMcpAudit(20).filter((row) => row.action === 'set_signature');
     expect(rows).toEqual([expect.objectContaining({ success: true, target: expect.stringContaining('me@qq.com') })]);
@@ -1080,7 +1090,7 @@ describe('forwarding and signatures', () => {
     // Once the files can be had, the same letter is a real attempt, not a repeat of one that did not leave.
     box.backend.attachment = working;
     const fine = await connect(state, true, box.backend);
-    expect(await call(fine, 'send_mail', letter)).toMatchObject({ sent: true, attachments: ['invoice.pdf', 'logo.png'] });
+    expect(await call(fine, 'send_mail', letter)).toMatchObject({ sent: true, attachments: ['invoice.pdf'] });
     expect(box.sent).toHaveLength(2);
   });
 
@@ -1132,7 +1142,7 @@ describe('forwarding and signatures', () => {
     expect(from).toEqual(['work@qq.com']);
     expect(box.sent[0]!.text).toMatch(/^For the team\.\n\n-- \nAlex Lin, Mailsift Ltd\n\n---------- Forwarded/);
     // The files still come from the mailbox the original is in.
-    expect(box.fetched).toEqual(['2']);
+    expect(box.fetchedFrom).toEqual(['me@qq.com:2']);
     // The same forward from the mailbox it arrived in is another letter.
     expect(await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'For the team.', includeAttachments: ['2'] }))
       .toMatchObject({ sent: true, account: 'me@qq.com' });
@@ -1143,6 +1153,126 @@ describe('forwarding and signatures', () => {
     expect(await errorOf(client, 'send_mail', { forward: '<one@x>', from: 'stranger@qq.com', to: ['colleague@example.org'], text: 'x' }))
       .toMatchObject({ code: 'ACCOUNT_UNKNOWN' });
     expect(box.sent).toHaveLength(2);
+  });
+
+  it('leaves the pictures of a newsletter\'s body out by default, as the page does, so one invoice is not refused for two dozen logos', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const logos = Array.from({ length: 22 }, (_, n) => ({
+      partId: `1.${n + 2}`, filename: `icon${n}.png`, contentType: 'image/png', sizeBytes: 100, inline: true, contentId: `icon${n}`,
+    }));
+    const items = [{ partId: '2', filename: 'invoice.pdf', contentType: 'application/pdf', sizeBytes: 4000, inline: false }, ...logos];
+    box.backend.attachments = async () => ({ folder: 'INBOX', manifest: { items, truncated: false } });
+    const read = box.backend.read!;
+    box.backend.read = async (account, messageId, hint) => {
+      const live = (await read(account, messageId, hint))!;
+      return { ...live, readable: { ...live.readable, bodyCids: logos.map((logo) => logo.contentId) } };
+    };
+    const client = await connect(state, true, box.backend);
+    expect(await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI' }))
+      .toMatchObject({ sent: true, attachments: ['invoice.pdf'] });
+    expect(box.fetched).toEqual(['2']);
+    // The descriptions say the same as the behaviour.
+    const tools = (await client.listTools()).tools;
+    expect(tools.find((tool) => tool.name === 'send_mail')?.description).toContain('every file but the pictures of the original\'s body');
+    expect(tools.find((tool) => tool.name === 'prepare_forward')?.description).toContain('which a forward leaves out unless its partId is named');
+  });
+
+  it('tells a caller holding the write credential what the signature it is shown is for', async () => {
+    const tools = (await (await connect(seeded(), true)).listTools()).tools;
+    for (const name of ['prepare_reply', 'prepare_forward']) {
+      const description = tools.find((tool) => tool.name === name)?.description ?? '';
+      expect(description, name).toContain('send_mail puts under your text by itself');
+      expect(description, name).toContain('do not repeat it in text');
+    }
+  });
+
+  it('waits for a repeated forward as long as the first may take, reading its files included, rather than calling it unconfirmed', async () => {
+    vi.useFakeTimers();
+    try {
+      const state = seeded();
+      const box = mailbox(state);
+      const read = box.backend.attachment!;
+      // A large file on a slow mailbox: eighty seconds before it is in hand.
+      box.backend.attachment = async (...args) => {
+        await new Promise((resolve) => setTimeout(resolve, 80_000));
+        return read(...args);
+      };
+      const client = await connect(state, true, box.backend);
+      const letter = { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI' };
+      const patient = { timeout: 300_000 };
+      const first = client.callTool({ name: 'send_mail', arguments: letter }, undefined, patient);
+      await vi.advanceTimersByTimeAsync(2_000);
+      // The caller lost the first answer and asks again, as it is told to.
+      let second: Record<string, unknown> | undefined;
+      void client.callTool({ name: 'send_mail', arguments: letter }, undefined, patient)
+        .then((answer) => { second = JSON.parse((answer.content as Array<{ text: string }>)[0]!.text) as Record<string, unknown>; });
+      // Past the minute and five seconds a repeat used to wait, nothing has been handed over, and nothing is said.
+      await vi.advanceTimersByTimeAsync(66_000);
+      expect(box.sent).toEqual([]);
+      expect(second).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(JSON.parse(((await first).content as Array<{ text: string }>)[0]!.text)).toMatchObject({ sent: true });
+      expect(second).toMatchObject({ sent: true, repeated: true, messageId: '<sent@x>' });
+      expect(box.sent).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('says what to do when the original\'s files cannot be had once it is being sent, without pointing at a file', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const listed = box.backend.attachments!;
+    let lists = 0;
+    // Listed for the forward, then not when it is sent.
+    box.backend.attachments = async (...args) => {
+      lists += 1;
+      if (lists === 2) throw new Error('mailbox down');
+      if (lists === 4) return undefined;
+      return listed(...args);
+    };
+    const client = await connect(state, true, box.backend);
+    const down = await errorOf(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI' });
+    expect(down).toMatchObject({ code: 'MAILBOX_UNAVAILABLE', message: expect.stringContaining('forward_original_unavailable') });
+    expect(String(down['hint'])).toContain('Try again in a moment');
+    expect(String(down['hint'])).not.toContain('that file');
+    forgetLive();
+    const gone = await errorOf(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI again' });
+    expect(gone).toMatchObject({ code: 'NOT_FOUND', message: expect.stringContaining('forward_original_gone') });
+    expect(String(gone['hint'])).toContain('moved or deleted');
+    expect(box.sent).toEqual([]);
+  });
+
+  it('refuses to forward a part that holds other parts, and says why', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const items = [
+      { partId: '2', filename: 'Quarterly.pdf', contentType: 'multipart/appledouble', sizeBytes: 5000, inline: false },
+      { partId: '3', filename: 'notes.txt', contentType: 'text/plain', sizeBytes: 10, inline: false },
+    ];
+    box.backend.attachments = async () => ({ folder: 'INBOX', manifest: { items, truncated: false } });
+    const client = await connect(state, true, box.backend);
+    const draft = await call(client, 'prepare_forward', { messageId: '<one@x>' });
+    expect((draft['attachments'] as Array<{ partId: string }>).map((item) => item.partId)).toEqual(['3']);
+    expect(draft['notForwardable']).toEqual([{ partId: '2', filename: 'Quarterly.pdf', contentType: 'multipart/appledouble' }]);
+    const refused = await errorOf(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'x', includeAttachments: ['2'] });
+    expect(refused).toMatchObject({ code: 'INVALID_ARGUMENT', message: expect.stringContaining('holds other parts') });
+    expect(String(refused['hint'])).toContain('3 (notes.txt)');
+    // By default it goes with what can go.
+    expect(await call(client, 'send_mail', { forward: '<one@x>', to: ['colleague@example.org'], text: 'x' })).toMatchObject({ attachments: ['notes.txt'] });
+    expect(box.fetched).toEqual(['3']);
+  });
+
+  it('leaves the original in needs_you when it was forwarded only to another of the owner\'s mailboxes', async () => {
+    process.env.MAIL_ACCOUNT_2 = 'qq|work@qq.com|pw';
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    const sent = await call(client, 'send_mail', { forward: '<one@x>', to: ['work@qq.com'], text: 'For Monday', includeAttachments: false });
+    expect(sent).toMatchObject({ sent: true, originalHandled: false, needsYou: 2 });
+    expect(state.getMail('k1')?.handledAt).toBeNull();
+    expect((await client.listTools()).tools.find((tool) => tool.name === 'send_mail')?.description).toContain('own mailboxes');
   });
 
   it('counts forwarding among the ways mail is dealt with, where it says what those are', async () => {

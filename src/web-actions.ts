@@ -51,6 +51,7 @@ import {
 } from './web-http.js';
 import type { Language } from './web-strings.js';
 import { getLogger } from './logger.js';
+import { suppressSelfForwards } from './services/triage.js';
 
 const log = getLogger('web');
 
@@ -703,6 +704,34 @@ function decodedSize(item: { sizeBytes?: number; transferEncoding?: string }): n
 }
 
 /**
+ * A part that is itself a container of parts: a Mac file sent as
+ * multipart/appledouble, or any multipart named as if it were a file. It has
+ * no bytes of its own to send on. Asked for it, the mailbox gives its
+ * children run together between boundary lines whose header is not part of
+ * what it gives, and that would arrive under the file's name as something
+ * that is not the file. A forward does not offer it, and refuses it if asked.
+ */
+const isContainer = (contentType: string): boolean => contentType.trim().toLowerCase().startsWith('multipart/');
+
+/**
+ * Whether a part is a picture of the original's own body: an image, sent
+ * inline, whose Content-ID the markup shows (logos, icons, a portrait in a
+ * signature). A plain-text forward would carry each of those as a file
+ * nobody attached, so they go only when asked for. Anything else sent inline
+ * is a file like the rest: Apple Mail sends a PDF or a photo that way, with
+ * no Content-ID and no markup that shows it.
+ */
+function bodyPicture(
+  item: { contentType: string; inline: boolean; contentId?: string }, shown: Set<string> | undefined,
+): boolean {
+  const id = item.contentId?.trim().toLowerCase();
+  if (!item.inline || !item.contentType.trim().toLowerCase().startsWith('image/') || !id) return false;
+  // Unknown only for a message too large to have its markup read for the
+  // pictures it shows: an inline image with a Content-ID is then taken to be one.
+  return shown ? shown.has(id) : true;
+}
+
+/**
  * What a forward of a message starts from: its subject, the forwarded block
  * (who it was from, when, to whom, then its text), and the original's
  * attachments, which a forward sends on by reference without the browser
@@ -735,9 +764,10 @@ export async function forwardDraft(
   }, lang);
 
   // The files go with the forward unless they are taken off. A list that
-  // cannot be read now does not stop the forward: the page says so, and the
-  // letter can still go without them.
+  // cannot be read now does not stop the forward from being written: the
+  // page says so, and asks before the letter goes without them.
   let attachments: Array<{ partId: string; filename: string; contentType: string; size: number | null; inline: boolean }> = [];
+  const notForwardable: Array<{ partId: string; filename: string; contentType: string }> = [];
   let unavailable = false;
   try {
     // Asked where the read just found it, which is now on record.
@@ -746,14 +776,18 @@ export async function forwardDraft(
       : undefined;
     if (timedOut(found) || !found) unavailable = true;
     else {
-      attachments = found.manifest.items.map((item) => ({
-        partId: item.partId,
-        filename: attachmentFilename(item.filename),
-        contentType: attachmentContentType(item.contentType),
-        size: decodedSize(item),
-        // Shown within the original's own body. A forward is plain text, so it carries them as files.
-        inline: item.inline,
-      }));
+      const shown = r.bodyCids ? new Set(r.bodyCids) : r.html === null && r.htmlOmitted ? undefined : new Set<string>();
+      for (const item of found.manifest.items) {
+        const filename = attachmentFilename(item.filename);
+        if (isContainer(item.contentType)) {
+          notForwardable.push({ partId: item.partId, filename, contentType: item.contentType });
+          continue;
+        }
+        attachments.push({
+          partId: item.partId, filename, contentType: attachmentContentType(item.contentType), size: decodedSize(item),
+          inline: bodyPicture(item, shown),
+        });
+      }
     }
   } catch (error) {
     log.warn(`The attachments of a message being forwarded could not be listed: ${String(error).slice(0, 160)}`);
@@ -763,7 +797,7 @@ export async function forwardDraft(
   return json(200, {
     key: row.dedupKey, account: account.username, accountName: account.name,
     subject: envelope.subject, forwarded: envelope.forwarded,
-    attachments, ...(unavailable ? { attachmentsUnavailable: true } : {}),
+    attachments, ...(notForwardable.length ? { notForwardable } : {}), ...(unavailable ? { attachmentsUnavailable: true } : {}),
     canSend: sending.available, ...(sending.reason ? { reason: sending.reason } : {}),
     ...(ctx.session === 'write' ? { signature: signatureOf(store, account.username) } : {}),
   });
@@ -792,8 +826,15 @@ function sendFailure(error: unknown): WebResponse {
  */
 const SEND_MEMORY_MS = 15 * 60_000;
 const SEND_MEMORY_MAX = 200;
-/** `until`: when whoever is waiting for the letter stops, which a forward moves once it knows the size of its files. */
-const sendJobs = new Map<string, { at: number; outcome: Promise<WebResponse>; until: () => number }>();
+/**
+ * When whoever is waiting for a letter stops, which a forward moves once it
+ * knows the size of its files. Kept as a number the send updates, never as a
+ * function made by the send: such a function would keep everything the send
+ * holds (every file it carries, a forward's read from the mailbox included)
+ * in memory for as long as the letter is remembered.
+ */
+interface SendPace { until: number }
+const sendJobs = new Map<string, { at: number; outcome: Promise<WebResponse>; pace: SendPace }>();
 
 /** For tests: no memory of letters sent, and nobody's count of them. */
 export function forgetSends(): void {
@@ -807,12 +848,26 @@ export function earlierSend(id: string, now = Date.now()): Promise<WebResponse> 
   return job && now - job.at <= SEND_MEMORY_MS ? job.outcome : undefined;
 }
 
-function rememberSend(id: string, outcome: Promise<WebResponse>, until: () => number, now = Date.now()): void {
+/**
+ * What became of a letter already asked for under this name, waited for as
+ * long as the first request waits for it, and never less than any send is
+ * given; undefined when there was none. A repeat from the page and one from
+ * MCP both wait here, so that neither calls a letter unconfirmed while it is
+ * still being put together or handed over.
+ */
+export function awaitEarlierSend(id: string): Promise<WebResponse | TimedOut> | undefined {
+  const job = sendJobs.get(id);
+  if (!job || Date.now() - job.at > SEND_MEMORY_MS) return undefined;
+  const asked = Date.now() + SEND_TIMEOUT_MS;
+  return withinUntil(job.outcome, () => Math.max(asked, job.pace.until));
+}
+
+function rememberSend(id: string, outcome: Promise<WebResponse>, pace: SendPace, now = Date.now()): void {
   for (const [known, job] of sendJobs) {
     if (now - job.at > SEND_MEMORY_MS || sendJobs.size >= SEND_MEMORY_MAX) sendJobs.delete(known);
     else break;
   }
-  sendJobs.set(id, { at: now, outcome, until });
+  sendJobs.set(id, { at: now, outcome, pace });
 }
 
 const SEND_UNCERTAIN = (): WebResponse =>
@@ -838,6 +893,21 @@ export function sendBodyLimit(): number {
   return Math.max(28 * 1024 * 1024, Math.ceil(attachmentLimitBytes() / 3) * 4 + 700 * 1024 + MAX_ATTACHMENTS * 1024);
 }
 
+/** A modest uplink: about half a megabit a second, what a weak mobile connection still manages. */
+const MODEST_UPLOAD_BYTES_PER_SECOND = 64 * 1024;
+
+/**
+ * How long one request may take to arrive whole. Node gives every request
+ * five minutes, in which the largest letter arrives only over a link faster
+ * than about three quarters of a megabit; past that it would be cut off with
+ * a 408 before mailsift saw it. This is the time the largest letter takes at
+ * a modest rate, and never less than Node's own. Headers still have to
+ * arrive within Node's minute, however long the body may take.
+ */
+export function requestTimeoutMs(): number {
+  return Math.max(300_000, Math.ceil(sendBodyLimit() / MODEST_UPLOAD_BYTES_PER_SECOND) * 1000);
+}
+
 async function handleSend(req: IncomingMessage, store: StateStore, ctx: ActionContext, life: Life): Promise<WebResponse> {
   if (ctx.session !== 'write') return readOnly();
   const read = await readJsonOrSize(req, sendBodyLimit());
@@ -858,9 +928,22 @@ function sendTooLarge(why: 'files' | 'bytes', file?: string): WebResponse {
   return json(413, { error, code: 'send_too_large', maxBytes: limit, maxFiles: MAX_ATTACHMENTS, ...(file ? { file } : {}) });
 }
 
-/** A file a forward was to carry could not be had, so nothing was sent. */
-function forwardUnavailable(status: number, error: string, file?: string): WebResponse {
-  return json(status, { error: `${error}; nothing was sent`, code: 'forward_attachment_unavailable', ...(file ? { file } : {}) });
+/** A file a forward was to carry, named, could not be had, so nothing was sent. */
+function forwardUnavailable(status: number, error: string, file: string): WebResponse {
+  return json(status, { error: `${error}; nothing was sent`, code: 'forward_attachment_unavailable', file });
+}
+
+/**
+ * The message a forward carries files from could not be read for them, so
+ * nothing was sent. There is no one file to name, and what to do next differs:
+ * a message moved or deleted in its mailbox, or that no longer has a file it
+ * had (404), is found again and forwarded from there, where trying again
+ * would only fail again; a mailbox that did not answer is tried again.
+ */
+function forwardOriginalFailed(status: 404 | 502 | 504, error: string): WebResponse {
+  return json(status, {
+    error: `${error}; nothing was sent`, code: status === 404 ? 'forward_original_gone' : 'forward_original_unavailable',
+  });
 }
 
 /** Bytes from base64 that decodes cleanly, or nothing. */
@@ -939,21 +1022,29 @@ async function forwardedFiles(
   try {
     const found = await within(backend.attachments(source, messageId, hint), Math.min(LIVE_TIMEOUT_MS, left()));
     if (timedOut(found)) {
-      return { refused: forwardUnavailable(504, 'the mailbox did not list the attachments of the message being forwarded in time') };
+      return { refused: forwardOriginalFailed(504, 'the mailbox did not list the attachments of the message being forwarded in time') };
     }
     listed = found;
   } catch (error) {
     log.warn(`The attachments of a message being forwarded could not be listed: ${String(error).slice(0, 160)}`);
-    return { refused: forwardUnavailable(502, 'the attachments of the message being forwarded could not be read from its mailbox') };
+    return { refused: forwardOriginalFailed(502, 'the attachments of the message being forwarded could not be read from its mailbox') };
   }
-  if (!listed) return { refused: forwardUnavailable(404, 'the message being forwarded is no longer in its mailbox') };
+  if (!listed) return { refused: forwardOriginalFailed(404, 'the message being forwarded is no longer in its mailbox') };
 
   const files: OutgoingAttachment[] = [];
   let free = room;
   for (const part of parts) {
     const item = listed.manifest.items.find((candidate) => candidate.partId === part);
-    if (!item) return { refused: forwardUnavailable(404, `the message being forwarded has no attachment ${part}`) };
+    if (!item) return { refused: forwardOriginalFailed(404, `the message being forwarded no longer has attachment ${part}`) };
     const filename = attachmentFilename(item.filename);
+    if (isContainer(item.contentType)) {
+      return {
+        refused: json(422, {
+          error: `${filename} holds other parts rather than being one file, and cannot be forwarded; nothing was sent`,
+          code: 'forward_attachment_container', file: filename,
+        }),
+      };
+    }
     let got: DownloadedAttachment | undefined;
     try {
       const fetched = await within(backend.attachment(source, messageId, part, hint, free), left());
@@ -997,11 +1088,9 @@ export async function sendMessage(
   // The same letter again: answer with what became of it the first time.
   const named = text(body['id'], 80);
   const sendId = /^[A-Za-z0-9_-]{8,64}$/.test(named) ? named : '';
-  const earlier = sendId ? sendJobs.get(sendId) : undefined;
-  if (earlier && Date.now() - earlier.at <= SEND_MEMORY_MS) {
-    // As long as the first request would have waited, and never less than a send is given.
-    const asked = Date.now() + SEND_TIMEOUT_MS;
-    const answer = await withinUntil(earlier.outcome, () => Math.max(asked, earlier.until()));
+  const earlier = sendId ? awaitEarlierSend(sendId) : undefined;
+  if (earlier) {
+    const answer = await earlier;
     return timedOut(answer) ? SEND_UNCERTAIN() : { ...answer };
   }
 
@@ -1050,7 +1139,7 @@ export async function sendMessage(
   const source = forwarded && parts.length ? accountOf(forwarded) : undefined;
   if (forwarded && parts.length) {
     if (!source) return json(409, { error: 'the mailbox the forwarded message is in is no longer configured', code: 'unconfigured' });
-    if (!forwarded.messageId) return forwardUnavailable(404, 'the message being forwarded cannot be found in its mailbox');
+    if (!forwarded.messageId) return forwardOriginalFailed(404, 'the message being forwarded cannot be found in its mailbox');
   }
   const forwardPlace = forwarded ? whereabouts(store, forwarded) : undefined;
   const forwardMessageId = forwarded?.messageId ?? '';
@@ -1069,16 +1158,29 @@ export async function sendMessage(
 
   const audit = { account: account.username, action: 'send', client: ctx.client };
   const about = replyKey || forwardKey || '(new message)';
+  // Answering a message deals with it, and so does passing it on to whoever
+  // it is for. A forward to nobody but the owner's own mailboxes (to deal with
+  // it at work rather than at home) has dealt with nothing: the copy that
+  // arrives there is ruled a forwarded copy of a message already judged and
+  // is not put before the owner again, so the original has to stay where it is.
+  // That holds only where the copy is in fact ruled one: with SUPPRESS_SELF_FORWARDS
+  // on, and when it arrives in another of the owner's mailboxes than the one it left.
+  const own = new Set(configuredAccounts().map((candidate) => candidate.username.toLowerCase()));
+  const leftFrom = account.username.toLowerCase();
+  const toSelfOnly = suppressSelfForwards() && [...recipients.to, ...recipients.cc, ...recipients.bcc]
+    .every((address) => { const a = address.trim().toLowerCase(); return own.has(a) && a !== leftFrom; });
+  const dealtWith = Boolean(original) || (Boolean(forwarded) && !toSelfOnly);
   // How long the request waits for the letter: the time any letter is given,
-  // and on top of it the time its files take to travel, base64 and all, to
-  // the mail server, and again to Sent for a provider whose copy is filed from
-  // here (allowed for every letter: waiting longer than needed costs nothing
-  // when the answer comes sooner). A forward's files are known only once they
-  // are read, so it is first given the time reading them may take, and then
-  // the time for what was read.
+  // and on top of it the time its files take to travel, base64 and all: to
+  // the mail server, as long again for the server to answer once it has them
+  // (see smtpTransportOptions), and once more to Sent for a provider whose
+  // copy is filed from here (allowed for every letter: waiting longer than
+  // needed costs nothing when the answer comes sooner). A forward's files are
+  // known only once they are read, so it is first given the time reading them
+  // may take, and then the time for what was read.
   const travel = (files: OutgoingAttachment[]): number =>
-    2 * transferAllowanceMs(Math.ceil(files.reduce((sum, file) => sum + file.content.length, 0) / 3) * 4);
-  let until = Date.now() + SEND_TIMEOUT_MS + travel(uploads.files) + (parts.length ? FORWARD_FETCH_MS : 0);
+    3 * transferAllowanceMs(Math.ceil(files.reduce((sum, file) => sum + file.content.length, 0) / 3) * 4);
+  const pace: SendPace = { until: Date.now() + SEND_TIMEOUT_MS + travel(uploads.files) + (parts.length ? FORWARD_FETCH_MS : 0) };
   // The whole of a send, from reading what a forward carries to the server
   // taking the message to the last note about it. It never rejects, and it
   // runs to its end whether or not the request that started it is still waiting.
@@ -1096,7 +1198,7 @@ export async function sendMessage(
         return gathered.refused;
       }
       mail.attachments = [...(mail.attachments ?? []), ...gathered.files];
-      until = Date.now() + SEND_TIMEOUT_MS + travel(mail.attachments);
+      pace.until = Date.now() + SEND_TIMEOUT_MS + travel(mail.attachments);
     }
 
     let sent: SentMail;
@@ -1134,12 +1236,12 @@ export async function sendMessage(
       }
     }
 
-    // Answering a message deals with it, and so does passing it on to whoever
-    // it was for. Only an answer is flagged answered in the mailbox: a forward is not one.
+    // The message answered, or passed on to someone else, is dealt with (see
+    // dealtWith). Only an answer is flagged answered in the mailbox: a forward is not one.
     let attention: number | undefined;
     quietly('An answered or forwarded message', () => record(ctx, store, life, (db) => {
       if (original) db.setHandled(original.dedupKey, true);
-      if (forwarded) db.setHandled(forwarded.dedupKey, true);
+      if (forwarded && dealtWith) db.setHandled(forwarded.dedupKey, true);
       attention = db.attentionCount();
     }));
     if (original) {
@@ -1166,11 +1268,14 @@ export async function sendMessage(
     return json(200, {
       sent: true, messageId: sent.messageId, accepted: sent.accepted.length, rejected: sent.rejected,
       savedCopy, ...(attention !== undefined ? { attention } : {}),
+      // Whether the message answered or forwarded now counts as dealt with,
+      // for the page to follow rather than decide for itself.
+      ...(original || forwarded ? { handled: dealtWith } : {}),
     });
   })();
-  if (sendId) rememberSend(sendId, outcome, () => until);
+  if (sendId) rememberSend(sendId, outcome, pace);
 
-  const answer = await withinUntil(outcome, () => until);
+  const answer = await withinUntil(outcome, () => pace.until);
   if (!timedOut(answer)) return answer;
   // Not known to have failed: the server may still take it, and that is recorded when it does.
   store.recordMailAction({ ...audit, messageId: about, success: false, error: 'timeout' });

@@ -36,6 +36,7 @@ import { markDigestSent, type DigestItem } from '../src/services/digest.js';
 import { StateStore, type MailRecord } from '../src/services/state.js';
 import { HEARTBEAT_KEY, type PollStats } from '../src/services/watcher.js';
 import { routeWeb, type WebBackend } from '../src/web.js';
+import { requestTimeoutMs } from '../src/web-actions.js';
 
 // The config reader wants mailboxes before it answers. These are fixtures: the
 // names feed the mailbox filter and the provider feeds the "open in" link, and
@@ -83,8 +84,8 @@ const pdf = (filename: string, sizeBytes: number): AttachmentManifest => ({
 });
 /**
  * The invoice carries two files, so a forward can be tried with one of them
- * taken off and put back, and two pictures in its body, which a forward
- * leaves out until asked.
+ * taken off and put back, and two pictures in its body (its markup shows them
+ * by Content-ID, see liveFixture), which a forward leaves out until asked.
  */
 const invoiceFiles: AttachmentManifest = {
   items: [
@@ -384,6 +385,8 @@ function liveFixture(messageId: string): LiveMessage | undefined {
   if (subject.startsWith('Invoice #4821')) {
     return { folder, flags, readable: readable({
       ...base, html: INVOICE_HTML,
+      // The two pictures its files list with a Content-ID are the ones its markup shows.
+      bodyCids: ['logo', 'x'],
       text: 'Hi there,\n\nThis is a reminder that invoice #4821 for $240.00 is due soon. You can pay it from the dashboard or by bank transfer.\n\nConsulting, October  $200.00\nTax  $40.00\nAmount due  $240.00\n\nPay invoice: https://dashboard.stripe.com/invoices/in_4821',
       auth: { result: 'pass', dkim: 'pass', spf: 'pass', dmarc: 'pass', signedBy: 'stripe.com' },
       unsubscribe: 'https://stripe.com/unsubscribe?u=preview',
@@ -532,6 +535,9 @@ const server = createServer((req, res) => {
     }
   })();
 });
+
+// As the real server: a large letter over a slow link is given time to arrive.
+server.requestTimeout = requestTimeoutMs();
 
 server.listen(port, '127.0.0.1', () => {
   console.log(`mailsift web preview: http://127.0.0.1:${port}/` + (token ? ` (token: ${token})` : '')
