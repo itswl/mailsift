@@ -869,7 +869,9 @@ describe('the page’s own protection', () => {
     const nonce = /script-src 'nonce-([^']+)'/.exec(policy)?.[1];
     expect(nonce).toBeTruthy();
     const page = String(answer.body);
-    const scripts = page.match(/<script[^>]*>/g) ?? [];
+    // Every script tag however it is cased: one written <SCRIPT> runs just the same,
+    // and has to be held to the same nonce.
+    const scripts = page.match(/<script[^>]*>/gi) ?? [];
     expect(scripts.length).toBeGreaterThan(0);
     for (const tag of scripts) expect(tag).toBe(`<script nonce="${nonce}">`);
     expect(policy).toContain("default-src 'none'");
