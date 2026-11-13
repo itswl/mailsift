@@ -308,7 +308,12 @@ async function renderNotify() {
   say(t('notify.private'), 'sheet-text quiet');
   drawDevices(body, sub);
 }
-bell.onclick = () => { openSheet(notifySheet, {}); renderNotify(); };
+bell.onclick = () => {
+  if (notifySheet.open) { closePopover(notifySheet, false); return; }
+  // Under the bell, where the eye already is; the header is sticky, so it stays there.
+  openPopover(notifySheet, bell, { width: 360, fixed: true, history: !isWide() });
+  renderNotify();
+};
 // A tap on a notification lands here when the page is already open.
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('message', (event) => {

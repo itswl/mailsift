@@ -149,7 +149,7 @@ The bell turns on Web Push for the device you are holding: a verification code o
 - A notification is about mail that still needs you and has only just arrived: nothing is sent for a message already marked done, for a code fetched more than fifteen minutes ago or sent more than an hour before it was fetched, or for other mail more than a day old, so catching up after downtime does not bury a phone. Mail that was filed quietly while the LLM was down is notified when it is judged properly. A dry run notifies nobody.
 - Tapping one opens that message, or the code.
 - On iPhone and iPad, notifications work only from the app installed to the Home Screen.
-- The bell's sheet lists the other devices that have notifications on, and the owner can remove one, which is how a lost phone is cut off. A subscription is also tied to the token it was made under: replace `MCP_TOKEN` or `MCP_WRITE_TOKEN` and restart, and every device that subscribed under the old one stops being told.
+- The panel under the bell lists the other devices that have notifications on, and the owner can remove one, which is how a lost phone is cut off. A subscription is also tied to the token it was made under: replace `MCP_TOKEN` or `MCP_WRITE_TOKEN` and restart, and every device that subscribed under the old one stops being told.
 - Subscriptions are accepted only for the push services browsers actually use (Google, Mozilla, Apple, Microsoft), because the endpoint is an address this server will post to. `WEB_PUSH_ALLOWED_HOSTS` adds others. `WEB_PUSH_ENABLED=false` removes the feature.
 
 ## Keyboard and the command palette

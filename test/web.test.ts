@@ -405,6 +405,13 @@ describe('installable app', () => {
     expect(page).toContain('<dialog id="sheet"');
     expect(page).toContain('<dialog id="health-sheet"');
     expect(page).toContain('id="health"');
+    // Notifications and the mailboxes' health open as panels under their controls, which say
+    // whether they are open; every sheet but the reader and the composer takes the focus itself.
+    expect(page).toMatch(/<dialog id="notify-sheet" class="sheet bare"[^>]*tabindex="-1"/);
+    expect(page).toMatch(/<dialog id="health-sheet" class="sheet bare"[^>]*tabindex="-1"/);
+    expect(page).toContain('aria-controls="notify-sheet" aria-expanded="false"');
+    expect(page).toContain('aria-controls="health-sheet" aria-expanded="false"');
+    expect(page).toMatch(/<dialog id="filter-sheet"[^>]*tabindex="-1"/);
     expect(page).toContain('id="lede"');
     expect(page).toContain('id="announce"');
     expect(page).toContain('<section id="list"></section>');

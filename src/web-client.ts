@@ -302,14 +302,25 @@ filters.addEventListener('submit', (e) => e.preventDefault());
 // Sheets stack: a reply opens over the message it answers, and back closes
 // only the one on top.
 const sheetStack = [];
+// Popovers open now, with what opened each (see openPopover). Declared here: openSheet closes them.
+const popovers = new Map();
 const topSheet = () => (sheetStack.length ? sheetStack[sheetStack.length - 1].dialog : null);
 // With here set, the current history entry becomes the sheet's instead of a new one:
 // the entry already exists when a link or the forward button brought us to it.
 function openSheet(dialog, state, here) {
   if (dialog.open) return;
+  // A popover makes way for a sheet, which takes over its history entry.
+  for (const [open, p] of [...popovers]) {
+    const ours = p.history && history.state && history.state.popover === open.id;
+    closePopover(open, ours);
+    if (ours) here = true;
+  }
   sheetStack.push({ dialog, back: document.activeElement });
   dialog.classList.remove('closing');
   dialog.showModal();
+  // The sheet itself takes the focus, not its first button: a sheet opened by
+  // a tap would otherwise show a keyboard focus ring on "Done".
+  if (dialog.hasAttribute('tabindex')) dialog.focus({ preventScroll: true });
   dialog.classList.add('opening');
   dialog.addEventListener('animationend', () => dialog.classList.remove('opening'), { once: true });
   rehomeToast();
@@ -398,6 +409,7 @@ for (const dialog of [sheet, filterSheet, installHelp, healthSheet, notifySheet,
   dialog.addEventListener('cancel', (e) => {
     e.preventDefault();
     if (dialog === filterSheet && dialog.classList.contains('popover')) closeFilters();
+    else if (popovers.has(dialog)) closePopover(dialog, false);
     else closeSheet(dialog, false);
   });
   // A click on the dialog itself is a click on the backdrop: the content fills
@@ -411,8 +423,8 @@ for (const dialog of [sheet, filterSheet, installHelp, healthSheet, notifySheet,
 $('#sheet-close').onclick = () => closeSheet(sheet, false);
 $('#install-close').onclick = () => closeSheet(installHelp, false);
 $('#install-done').onclick = () => closeSheet(installHelp, false);
-$('#health-done').onclick = () => closeSheet(healthSheet, false);
-$('#notify-done').onclick = () => closeSheet(notifySheet, false);
+$('#health-done').onclick = () => closePopover(healthSheet, false);
+$('#notify-done').onclick = () => closePopover(notifySheet, false);
 $('#keys-done').onclick = () => closeSheet(keysSheet, false);
 $('#menu-done').onclick = () => closeSheet(menuSheet, false);
 window.addEventListener('popstate', () => {
@@ -420,6 +432,10 @@ window.addEventListener('popstate', () => {
   const depth = history.state && history.state.sheet ? history.state.depth || 1 : 0;
   while (sheetStack.length > depth) closeSheet(topSheet(), true);
   if (filterSheet.open && filterSheet.classList.contains('popover')) closeFilters();
+  // A popover whose entry we have left: the back gesture closed it.
+  for (const [open, p] of [...popovers]) {
+    if (p.history && !(history.state && history.state.popover === open.id)) closePopover(open, true);
+  }
   if (!sheetStack.length) {
     // A #m= link followed while the page is open, or the forward button back
     // onto a message: show it, on the entry we are already on.
@@ -437,55 +453,109 @@ function keyFromHash(hash) {
   try { return decodeURIComponent(hash.slice(3)) || null; } catch (e) { return null; }
 }
 
+// ---- Popovers: a small panel under the control that opened it. ----
+// For what is looked at and set in a moment (notifications, the mailboxes'
+// health, and on a desk the filters): it opens where the eye already is, with
+// a notch pointing at its control, and dims nothing. It is not modal. A tap
+// outside closes it, and on a touch screen that tap does nothing else, as in
+// the system's own menus; so do Escape and its control again. On a phone it
+// takes a history entry, so the back gesture closes it as it closes a sheet.
+// Where it goes, through custom properties only the popover style reads. A
+// control in the sticky header keeps its place on screen, so its popover is
+// fixed; one in the page scrolls with it, in document coordinates.
+function placePopover(dialog) {
+  const p = popovers.get(dialog);
+  if (!p) return;
+  const r = p.anchor.getBoundingClientRect();
+  const vw = document.documentElement.clientWidth;
+  // On a phone the panel takes the width, margins aside: a panel nearly as wide as the screen that
+  // stops short of one edge looks misplaced. The notch still points at its control.
+  const width = vw < 600 ? vw - 24 : Math.min(p.width, vw - 24);
+  const left = p.align === 'start'
+    ? Math.max(12, Math.min(r.left - 4, vw - width - 12))
+    : Math.max(12, Math.min(vw - 12, r.right + 4) - width);
+  const top = r.bottom + 10;
+  const sx = p.fixed ? 0 : window.scrollX, sy = p.fixed ? 0 : window.scrollY;
+  dialog.classList.toggle('fixed', p.fixed);
+  dialog.style.setProperty('--pop-left', (left + sx) + 'px');
+  dialog.style.setProperty('--pop-top', (top + sy) + 'px');
+  dialog.style.setProperty('--pop-width', width + 'px');
+  dialog.style.setProperty('--pop-arrow', Math.max(20, Math.min(width - 20, r.left + r.width / 2 - left)) + 'px');
+  dialog.style.setProperty('--pop-max', Math.max(240, window.innerHeight - top - 12) + 'px');
+}
+function openPopover(dialog, anchor, options) {
+  if (dialog.open) return;
+  const p = Object.assign({ anchor, width: 320, align: 'end', fixed: false, history: false }, options || {});
+  popovers.set(dialog, p);
+  dialog.classList.remove('closing');
+  dialog.classList.add('popover');
+  placePopover(dialog);
+  dialog.show();
+  dialog.focus({ preventScroll: true });
+  if (!reduceMotion()) {
+    dialog.classList.add('opening');
+    dialog.addEventListener('animationend', () => dialog.classList.remove('opening'), { once: true });
+  }
+  anchor.setAttribute('aria-expanded', 'true');
+  if (p.history) history.pushState({ popover: dialog.id, depth: sheetStack.length }, '', location.href);
+}
+function closePopover(dialog, viaHistory) {
+  const p = popovers.get(dialog);
+  popovers.delete(dialog);
+  if (!p) return;
+  dialog.classList.remove('opening');
+  if (dialog.open) dialog.close();
+  p.anchor.setAttribute('aria-expanded', 'false');
+  if (p.history && !viaHistory && history.state && history.state.popover === dialog.id) oweBack();
+}
+function swallowNextClick() {
+  const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+  document.addEventListener('click', stop, { capture: true, once: true });
+  setTimeout(() => document.removeEventListener('click', stop, true), 600);
+}
+document.addEventListener('pointerdown', (e) => {
+  if (!popovers.size) return;
+  const target = e.target;
+  // The line that says what happened floats above everything, a popover included.
+  if (target instanceof Element && target.closest('#toast, #sending')) return;
+  let closed = false;
+  for (const [dialog, p] of [...popovers]) {
+    if (!dialog.open) { popovers.delete(dialog); continue; }
+    if (dialog.contains(target) || p.anchor.contains(target)) continue;
+    if (dialog === filterSheet) closeFilters(); else closePopover(dialog, false);
+    closed = true;
+  }
+  if (closed && e.pointerType !== 'mouse') swallowNextClick();
+}, true);
+// Not modal, so the browser sends no cancel: Escape is ours to handle.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || !popovers.size || document.querySelector('dialog[open]:not(.popover)')) return;
+  const [dialog, p] = [...popovers].pop();
+  e.preventDefault();
+  e.stopPropagation();
+  if (dialog === filterSheet) closeFilters(); else closePopover(dialog, false);
+  p.anchor.focus({ preventScroll: true });
+}, true);
+window.addEventListener('resize', () => { for (const dialog of popovers.keys()) placePopover(dialog); });
+
 // ---- The filter sheet: a sheet on a phone, a popover on a desk. ----
 const filtersOpen = $('#filters-open');
-// In document coordinates, through custom properties only the popover style
-// reads: it scrolls with the page under its button, and the bottom sheet the
-// same dialog becomes on a phone keeps its own place.
-function positionPopover() {
-  const r = filtersOpen.getBoundingClientRect();
-  const width = 320;
-  const left = Math.max(12, Math.min(r.right - width, document.documentElement.clientWidth - width - 12));
-  filterSheet.style.setProperty('--pop-left', (left + window.scrollX) + 'px');
-  filterSheet.style.setProperty('--pop-top', (r.bottom + 6 + window.scrollY) + 'px');
-}
-function outsideClose(e) {
-  if (!filterSheet.open) { document.removeEventListener('pointerdown', outsideClose, true); return; }
-  if (!filterSheet.contains(e.target) && !filtersOpen.contains(e.target)) closeFilters();
-}
 function openFilters() {
-  if (isWide()) {
-    filterSheet.classList.add('popover');
-    positionPopover();
-    filterSheet.show();
-    document.addEventListener('pointerdown', outsideClose, true);
-  } else {
+  if (isWide()) openPopover(filterSheet, filtersOpen, { width: 320 });
+  else {
     filterSheet.classList.remove('popover');
     openSheet(filterSheet, {});
+    filtersOpen.setAttribute('aria-expanded', 'true');
   }
-  filtersOpen.setAttribute('aria-expanded', 'true');
 }
 function closeFilters() {
   if (!filterSheet.open) return;
-  if (filterSheet.classList.contains('popover')) {
-    filterSheet.close();
-    document.removeEventListener('pointerdown', outsideClose, true);
-    filtersOpen.setAttribute('aria-expanded', 'false');
-  } else closeSheet(filterSheet, false);
+  if (popovers.has(filterSheet)) closePopover(filterSheet, false);
+  else closeSheet(filterSheet, false);
 }
 filtersOpen.onclick = () => (filterSheet.open ? closeFilters() : openFilters());
 $('#filter-done').onclick = closeFilters;
 $('#filter-clear').onclick = () => { clearFilters(); setFilters({ view: 'mail' }); };
-// A popover is not modal, so the browser sends it no cancel: Escape is ours to handle.
-filterSheet.addEventListener('keydown', (e) => {
-  if (e.key !== 'Escape' || !filterSheet.classList.contains('popover')) return;
-  e.preventDefault();
-  closeFilters();
-  filtersOpen.focus();
-});
-window.addEventListener('resize', () => {
-  if (filterSheet.open && filterSheet.classList.contains('popover')) positionPopover();
-});
 
 // ---- Status and announcements ----
 let connectionProblem = !navigator.onLine;
@@ -836,8 +906,9 @@ function renderHealth() {
   if (waiting > 0) body.appendChild(el('p', 'mailbox-outbox', waiting === 1 ? t('mailboxes.outbox1') : fill('mailboxes.outbox', { count: waiting })));
 }
 function openHealth() {
+  if (healthSheet.open) { closePopover(healthSheet, false); return; }
   renderHealth();
-  openSheet(healthSheet, {});
+  openPopover(healthSheet, healthLine, { align: 'start', width: 380, history: !isWide() });
 }
 // The minute refresh redraws the open sheet so its times stay true, but not
 // while a command is selected for copying by hand, and keeps the focus.
@@ -1098,7 +1169,7 @@ function narrateCode(text) {
 // closes. A popover is not owed anything: the reader is working in it.
 let owedFocus = null;
 function oweFocus(what) {
-  // The only dialog opened without showModal is the desk filter popover.
+  // Popovers are opened without showModal and owe nothing (see openPopover).
   const sheet = document.querySelector('dialog[open]:not(.popover)');
   owedFocus = sheet ? Object.assign({ sheet }, what) : null;
 }

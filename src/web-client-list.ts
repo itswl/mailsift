@@ -825,9 +825,9 @@ let bootKey = keyFromHash(location.hash);
 const bootParams = new URLSearchParams(location.search);
 const wantsCode = bootParams.get('focus') === 'code';
 // Stripped even when it does not decode, so a broken link does not survive a reload.
-// So is the mark of a sheet that was open when the page was reloaded: the
-// sheet is gone, and an entry that still claims it would swallow the next Back.
-if (location.hash.indexOf('#m=') === 0 || (history.state && history.state.sheet)) {
+// So is the mark of a sheet or a popover that was open when the page was
+// reloaded: it is gone, and an entry that still claims it would swallow the next Back.
+if (location.hash.indexOf('#m=') === 0 || (history.state && (history.state.sheet || history.state.popover))) {
   history.replaceState(null, '', location.pathname + location.search);
 }
 function focusCode() {

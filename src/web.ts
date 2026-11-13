@@ -741,7 +741,7 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
         <div class="header-actions">
           ${refresh}
           ${iconButton('compose-open', 'compose', 'compose.new', 'aria-haspopup="dialog" aria-controls="compose"')}
-          ${iconButton('bell', 'bell', 'notify.title', 'aria-haspopup="dialog" aria-controls="notify-sheet"')}
+          ${iconButton('bell', 'bell', 'notify.title', 'aria-haspopup="dialog" aria-controls="notify-sheet" aria-expanded="false"')}
           <button id="lang" type="button" class="word-btn" aria-label="${s('lang.label')}">${s('lang.face')}</button>
           <button id="theme" type="button" class="icon-btn" aria-label="${s('theme.title')}"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 0 0 16z" fill="currentColor" stroke="none"/></svg></button>
         </div>
@@ -754,7 +754,7 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
           <p id="lede" class="lede pending">${s('lede.loading')}</p>
           <p id="tally" class="tally"></p>
           <p id="status" class="status" role="status" aria-live="polite"></p>
-          <button id="health" type="button" class="health-line" aria-haspopup="dialog" aria-controls="health-sheet" hidden></button>
+          <button id="health" type="button" class="health-line" aria-haspopup="dialog" aria-controls="health-sheet" aria-expanded="false" hidden></button>
         </section>
         <form id="filters" class="controls" autocomplete="off">
           <div id="control-line" class="control-line">
@@ -769,7 +769,7 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
             <button id="search-cancel" type="button" class="text-btn quiet" data-i18n="search.cancel">${s('search.cancel')}</button>
           </div>
           <div id="tokens" class="tokens" hidden></div>
-          <dialog id="filter-sheet" class="sheet" aria-labelledby="filter-title">
+          <dialog id="filter-sheet" class="sheet" aria-labelledby="filter-title" tabindex="-1">
             <div class="sheet-head"><span class="handle"></span><button id="filter-clear" type="button" class="text-btn quiet" data-i18n="filter.clearAll">${s('filter.clearAll')}</button><h2 id="filter-title" data-i18n="filter.more">${s('filter.more')}</h2><button id="filter-done" type="button" class="text-btn" data-i18n="done" autofocus>${s('done')}</button></div>
             <div class="sheet-body">
               <div class="field">${worded('span', 'filter.view', 'class="label"')}<fieldset class="segset" role="radiogroup" aria-label="${s('filter.view')}" data-i18n-label="filter.view">${seg('view', 'mail', 'view.mail', true)}${seg('view', 'threads', 'view.threads')}</fieldset></div>
@@ -797,19 +797,19 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
       <div class="sheet-body"></div>
       <div id="sheet-bar" class="action-bar"></div>
     </dialog>
-    <dialog id="health-sheet" class="sheet" aria-labelledby="health-title">
+    <dialog id="health-sheet" class="sheet bare" aria-labelledby="health-title" tabindex="-1">
       ${sheetHead('health-title', 'mailboxes.title', 'health-done')}
       <div class="sheet-body"></div>
     </dialog>
-    <dialog id="notify-sheet" class="sheet" aria-labelledby="notify-title">
+    <dialog id="notify-sheet" class="sheet bare" aria-labelledby="notify-title" tabindex="-1">
       ${sheetHead('notify-title', 'notify.title', 'notify-done')}
       <div class="sheet-body"></div>
     </dialog>
-    <dialog id="keys-sheet" class="sheet" aria-labelledby="keys-title">
+    <dialog id="keys-sheet" class="sheet" aria-labelledby="keys-title" tabindex="-1">
       ${sheetHead('keys-title', 'keys.title', 'keys-done')}
       <div class="sheet-body"></div>
     </dialog>
-    <dialog id="menu-sheet" class="sheet" aria-labelledby="menu-title">
+    <dialog id="menu-sheet" class="sheet" aria-labelledby="menu-title" tabindex="-1">
       ${sheetHead('menu-title', 'menu.title', 'menu-done')}
       <div class="sheet-body"></div>
     </dialog>
@@ -839,7 +839,7 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
       ${iconButton('lightbox-close', 'x', 'detail.close')}
       <img alt="">
     </dialog>
-    <dialog id="install-help" class="sheet install-help" aria-labelledby="install-title">
+    <dialog id="install-help" class="sheet install-help" aria-labelledby="install-title" tabindex="-1">
       <div class="sheet-head"><span class="handle"></span><h2 id="install-title" data-i18n="pwa.iosTitle">${s('pwa.iosTitle')}</h2><button id="install-close" type="button" class="text-btn" data-i18n="done">${s('done')}</button></div>
       <div class="sheet-body">
         <ol class="steps">
