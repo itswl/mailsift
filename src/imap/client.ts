@@ -1258,7 +1258,12 @@ function inBin(entries: readonly ListResponse[], path: string): boolean {
     const ancestor = parts.slice(0, depth).join(delimiter);
     const listed = entries.find((entry) => entry.path === ancestor);
     if (listed && entryHasUse(listed, '\\trash')) return true;
-    if (TRASH_NAMES.has(ancestor.trim().toLowerCase()) || TRASH_NAMES.has((parts[depth - 1] ?? '').trim().toLowerCase())) return true;
+    // By name only where a mailbox keeps its bin: at the top, or directly
+    // under INBOX or Gmail's own folder. "Projects/Bin" is someone's folder.
+    const name = (parts[depth - 1] ?? '').trim().toLowerCase();
+    const parent = depth === 2 ? (parts[0] ?? '').trim().toLowerCase() : '';
+    const whereBinsLive = depth === 1 || (depth === 2 && ['inbox', '[gmail]', '[google mail]'].includes(parent));
+    if (whereBinsLive && (TRASH_NAMES.has(name) || TRASH_NAMES.has(ancestor.trim().toLowerCase()))) return true;
   }
   return false;
 }

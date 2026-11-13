@@ -785,6 +785,113 @@ describe('the review of what goes out', () => {
     }
   });
 
+  it('acts on the message it was given, not on one whose Message-ID was made to look like its key', async () => {
+    const state = seeded();
+    // An attacker's message, stored first, with a Message-ID that spells the real message's key.
+    state.markSeen('me@qq.com|me@qq.com|<one@x>', 'me@qq.com', 'look-alike');
+    state.recordOutcome('me@qq.com|me@qq.com|<one@x>', 'info', false, { messageId: 'me@qq.com|<one@x>', sender: 'attacker@evil.example', folder: 'INBOX' });
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    for (const id of ['<one@x>', 'k1']) {
+      expect(await call(client, 'manage_mail', { messageId: id, action: 'star' }), id).toMatchObject({ success: true });
+    }
+    expect(box.acted.map((a) => a.messageId)).toEqual(['<one@x>', '<one@x>']);
+    expect(await call(client, 'send_mail', { replyTo: '<one@x>', text: 'To the real sender.' })).toMatchObject({ to: ['billing@vendor.com'] });
+    expect(box.sent[0]).toMatchObject({ inReplyTo: '<one@x>' });
+  });
+
+  it('does not answer everyone a message went to because its From line names the owner', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const forged = { ...(await box.backend.read!({} as never, '<one@x>'))! };
+    forged.readable = {
+      ...forged.readable, from: { name: 'Me', address: 'me@qq.com' }, replyTo: [], cc: [],
+      to: [{ name: '', address: 'me@qq.com' }, { name: '', address: 'attacker@evil.example' }],
+    };
+    box.backend.read = async () => forged;
+    const client = await connect(state, true, box.backend);
+    expect(await call(client, 'prepare_reply', { messageId: '<one@x>' })).toMatchObject({ to: ['attacker@evil.example'], addressedTo: 'ownRecipients' });
+    const refused = await errorOf(client, 'send_mail', { replyTo: '<one@x>', text: 'Hm.' });
+    expect(refused).toMatchObject({ code: 'INVALID_ARGUMENT', hint: expect.stringContaining('attacker@evil.example') });
+    expect(box.sent).toEqual([]);
+    // Told whom, and asked to answer everyone: the others the composer would have addressed are copied.
+    await call(client, 'send_mail', { replyTo: '<one@x>', to: ['boss@corp.example'], replyAll: true, text: 'Copying all.' });
+    expect(box.sent[0]).toMatchObject({ to: ['boss@corp.example'], cc: ['attacker@evil.example'] });
+  });
+
+  it('does not drop a reply-all\'s other recipients when the original cannot be read to find them', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    box.backend.read = async () => undefined;
+    const client = await connect(state, true, box.backend);
+    const refused = await errorOf(client, 'send_mail', { replyTo: '<one@x>', replyAll: true, to: ['billing@vendor.com'], quote: false, text: 'All of you.' });
+    expect(refused).toMatchObject({ code: 'NOT_FOUND', hint: expect.stringContaining('cc as well') });
+    expect(box.sent).toEqual([]);
+    await call(client, 'send_mail', { replyTo: '<one@x>', replyAll: true, to: ['billing@vendor.com'], cc: ['ann@vendor.com'], quote: false, text: 'All of you.' });
+    expect(box.sent[0]).toMatchObject({ to: ['billing@vendor.com'], cc: ['ann@vendor.com'] });
+  });
+
+  it('tells a second identical call that shared the first one\'s read of the original that it was a repeat', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const read = box.backend.read!;
+    let reads = 0;
+    box.backend.read = async (...a) => { reads += 1; await held; return read(...a); };
+    const client = await connect(state, true, box.backend);
+    const letter = { replyTo: '<one@x>', text: 'Confirmed.' };
+    const calls = [call(client, 'send_mail', letter), call(client, 'send_mail', letter), call(client, 'send_mail', letter)];
+    // All three are waiting on the same read of the original before it comes back.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(reads).toBe(1);
+    release();
+    const answers = await Promise.all(calls);
+    expect(box.sent).toHaveLength(1);
+    expect(answers.filter((answer) => answer['repeated'] === true)).toHaveLength(2);
+    expect(answers.every((answer) => answer['messageId'] === '<sent@x>')).toBe(true);
+  });
+
+  it('records feedback against the copy meant, and get_mail says when there is more than one', async () => {
+    process.env.MAIL_ACCOUNT_2 = 'qq|work@qq.com|pw';
+    const state = seeded();
+    state.markSeen('work@qq.com|<one@x>', 'work@qq.com', 'subject k1');
+    state.recordOutcome('work@qq.com|<one@x>', 'critical', true, { messageId: '<one@x>', folder: 'INBOX' });
+    const client = await connect(state, true, mailbox(state).backend);
+    expect(await errorOf(client, 'record_feedback', { messageId: '<one@x>', label: 'handled' })).toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(await call(client, 'record_feedback', { messageId: '<one@x>', label: 'handled', account: 'work@qq.com' })).toMatchObject({ account: 'work@qq.com' });
+    expect(state.getMail('work@qq.com|<one@x>')?.handledAt).toBeTruthy();
+    expect(state.getMail('k1')?.handledAt).toBeNull();
+    expect(await call(client, 'get_mail', { messageId: '<one@x>' })).toMatchObject({ found: true, storedFor: ['me@qq.com', 'work@qq.com'] });
+    expect(await call(client, 'get_mail', { messageId: '<one@x>', account: 'work@qq.com' })).toMatchObject({ found: true, account: 'work@qq.com' });
+  });
+
+  it('survives an attempt it stopped waiting for that then ends without an answer', async () => {
+    vi.useFakeTimers();
+    try {
+      const state = seeded();
+      const box = mailbox(state);
+      let release: () => void = () => undefined;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const send = box.backend.send!;
+      box.backend.send = async (account, mail) => { await held; return send(account, mail); };
+      // Filing the copy fails after the message has left, which no real backend does but nothing should die of.
+      box.backend.savesSentCopy = () => { throw new Error('savesSentCopy threw'); };
+      const client = await connect(state, true, box.backend);
+      const letter = { account: 'me@qq.com', to: ['friend@example.org'], subject: 'Odd', text: 'Ends oddly.' };
+      const first = client.callTool({ name: 'send_mail', arguments: letter }, undefined, { timeout: 300_000 });
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(JSON.parse(((await first).content as Array<{ text: string }>)[0]!.text)).toMatchObject({ code: 'PROVIDER_ERROR' });
+      release();
+      await vi.advanceTimersByTimeAsync(10);
+      // Still uncertain: the same letter is not sent again.
+      expect(await errorOf(client, 'send_mail', letter)).toMatchObject({ code: 'PROVIDER_ERROR' });
+      expect(box.sent).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('says whether a copy is in Sent, and the instructions only promise one when it is', async () => {
     const state = seeded();
     const box = mailbox(state);

@@ -579,7 +579,7 @@ export async function replyDraft(
   const domain = (address: string): string => address.slice(address.lastIndexOf('@') + 1).trim().toLowerCase();
   const sender = r.from?.address ?? '';
   // A sender with no address to compare is no reassurance: answers are still asked for somewhere of the message's choosing.
-  const replyToElsewhere = r.replyTo.length > 0
+  const replyToElsewhere = envelope.addressedTo === 'replyTo'
     && envelope.to.some((address) => !sender || domain(address) !== domain(sender));
   return json(200, {
     key: row.dedupKey, account: account.username, accountName: account.name,

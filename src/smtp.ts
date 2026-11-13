@@ -607,14 +607,20 @@ export function replyEnvelope(
   // the answer: that is not a request to answer everyone else.
   let addressedTo: 'replyTo' | 'sender' | 'ownRecipients' | 'recipients' = 'replyTo';
   let to = usable(original.replyTo);
-  if (to.length === 0) {
+  const isMine = (entry: MailAddress | null | undefined): boolean =>
+    mine.has((typeof entry?.address === 'string' ? entry.address : '').trim().toLowerCase());
+  // Answers asked for only at the owner's address, on a message the owner was
+  // not sent: mail a service sent in the owner's name (an invoice to a
+  // customer). Answering it continues it to the people it went to.
+  const sentForOwner = to.length === 0 && (original.replyTo ?? []).length > 0 && (original.replyTo ?? []).every(isMine)
+    && ![...(original.to ?? []), ...(original.cc ?? [])].some(isMine);
+  if (to.length === 0 && !sentForOwner) {
     addressedTo = 'sender';
     to = usable(original.from ? [original.from] : []);
   }
   // Answering a message the owner sent themselves continues it to the people it went to.
   if (to.length === 0) {
-    const fromOwner = mine.has((original.from?.address ?? '').trim().toLowerCase());
-    addressedTo = fromOwner ? 'ownRecipients' : 'recipients';
+    addressedTo = isMine(original.from) || sentForOwner ? 'ownRecipients' : 'recipients';
     to = usable(original.to);
   }
   const cc = mode === 'replyAll' ? usable([...(original.to ?? []), ...(original.cc ?? [])]) : [];

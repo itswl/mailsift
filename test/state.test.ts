@@ -444,6 +444,25 @@ describe('the needs-you queue', () => {
   });
 });
 
+describe('finding a stored message by its key or its Message-ID', () => {
+  it('does not let a Message-ID shaped like another message\'s key stand in for it', () => {
+    const s = store();
+    // Stored first: a message whose sender chose a Message-ID that spells another message's key.
+    s.markSeen('me@qq.com|me@qq.com|<real@x>', 'me@qq.com', 'look-alike');
+    s.recordOutcome('me@qq.com|me@qq.com|<real@x>', 'info', false, { messageId: 'me@qq.com|<real@x>', sender: 'attacker@evil.example' });
+    s.markSeen('me@qq.com|<real@x>', 'me@qq.com', 'the real one');
+    s.recordOutcome('me@qq.com|<real@x>', 'critical', true, { messageId: '<real@x>', sender: 'boss@corp.example' });
+
+    expect(s.getMail('me@qq.com|<real@x>')).toMatchObject({ dedupKey: 'me@qq.com|<real@x>', sender: 'boss@corp.example' });
+    expect(s.recordsFor('me@qq.com|<real@x>')).toEqual([{ dedupKey: 'me@qq.com|<real@x>', account: 'me@qq.com' }]);
+    expect(s.setHandled('me@qq.com|<real@x>', true)?.sender).toBe('boss@corp.example');
+    s.recordFeedback('me@qq.com|<real@x>', 'false_positive');
+    expect(s.feedbackRuleHints(1).neverImportant).toEqual(['boss@corp.example']);
+    // By its Message-ID it is found as well, and lists every mailbox it is stored for.
+    expect(s.recordsFor('<real@x>')).toEqual([{ dedupKey: 'me@qq.com|<real@x>', account: 'me@qq.com' }]);
+  });
+});
+
 describe('where a message is in its folder', () => {
   function seed(s: StateStore, key: string, fields: Record<string, unknown> = {}): void {
     s.markSeen(key, 'me@qq.com', key);

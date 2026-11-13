@@ -798,10 +798,14 @@ export class StateStore {
     return Number(row['n'] ?? 0);
   }
 
-  recordFeedback(messageId: string, label: FeedbackLabel, note = ''): void {
-    const row = this.db.prepare(
-      'SELECT dedup_key FROM seen WHERE message_id = ? OR dedup_key = ? LIMIT 1',
-    ).get(messageId, messageId) as Record<string, unknown> | undefined;
+  recordFeedback(messageId: string, label: FeedbackLabel, note = '', dedupKey?: string): void {
+    // The caller may already know which stored copy it means; otherwise the id is looked up.
+    const row = (dedupKey
+      ? this.db.prepare('SELECT dedup_key FROM seen WHERE dedup_key = ?').get(dedupKey)
+      : this.db.prepare(
+        `SELECT dedup_key FROM seen WHERE message_id = ? OR dedup_key = ?
+         ORDER BY (dedup_key = ?) DESC, created_at, dedup_key LIMIT 1`,
+      ).get(messageId, messageId, messageId)) as Record<string, unknown> | undefined;
     this.db.prepare(
       'INSERT INTO feedback (message_id, dedup_key, label, note, created_at) VALUES (?, ?, ?, ?, ?)',
     ).run(messageId, row ? String(row['dedup_key']) : null, label, note.slice(0, 1000), now());
@@ -975,19 +979,27 @@ export class StateStore {
    * addressed to two of them), and getMail returns only one of those.
    */
   recordsFor(messageId: string): Array<{ dedupKey: string; account: string }> {
-    return (this.db.prepare(
+    const rows = (this.db.prepare(
       'SELECT dedup_key, account FROM seen WHERE message_id = ? OR dedup_key = ? ORDER BY created_at, dedup_key',
     ).all(messageId, messageId) as Array<Record<string, unknown>>)
       .map((row) => ({ dedupKey: String(row['dedup_key']), account: String(row['account'] ?? '') }));
+    // A key names exactly one record. A Message-ID that merely looks like that
+    // key was written by a sender, and does not get to share the name.
+    const exact = rows.find((row) => row.dedupKey === messageId);
+    return exact ? [exact] : rows;
   }
 
   getMail(messageId: string): MailRow | undefined {
+    // A key names its own row first. A Message-ID is the sender's to write, so
+    // one shaped like another message's key ("<mailbox>|<id>") must not be able
+    // to stand in for that message; among Message-IDs, the first stored wins.
     const row = this.db
       .prepare(
         `SELECT ${ROW_COLUMNS.join(', ')}, snippet FROM seen
-         WHERE message_id = ? OR dedup_key = ? LIMIT 1`,
+         WHERE message_id = ? OR dedup_key = ?
+         ORDER BY (dedup_key = ?) DESC, created_at, dedup_key LIMIT 1`,
       )
-      .get(messageId, messageId) as Record<string, unknown> | undefined;
+      .get(messageId, messageId, messageId) as Record<string, unknown> | undefined;
     return row ? toRow(row) : undefined;
   }
 
@@ -997,7 +1009,7 @@ export class StateStore {
   private keyOf(idOrKey: string): string | undefined {
     const row = this.db.prepare(
       `SELECT dedup_key FROM seen WHERE message_id = ? OR dedup_key = ?
-       ORDER BY (dedup_key = ?) DESC LIMIT 1`,
+       ORDER BY (dedup_key = ?) DESC, created_at, dedup_key LIMIT 1`,
     ).get(idOrKey, idOrKey, idOrKey) as Record<string, unknown> | undefined;
     return row ? String(row['dedup_key']) : undefined;
   }

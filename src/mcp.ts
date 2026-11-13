@@ -267,10 +267,10 @@ function unconfirmed(name: string, now = Date.now()): boolean {
     else break;
   }
   // What was said about each letter goes with the page's own memory of it.
-  for (const known of letters.keys()) {
-    if (letters.size > 200 || (!earlierSend(known) && !unconfirmedSends.has(known))) letters.delete(known);
-    else break;
+  for (const known of [...letters.keys()]) {
+    if (!earlierSend(known) && !unconfirmedSends.has(known)) letters.delete(known);
   }
+  while (letters.size > 200) letters.delete(letters.keys().next().value!);
   return unconfirmedSends.has(name);
 }
 
@@ -291,6 +291,8 @@ function fearUnconfirmed(name: string): void {
     let code = '';
     try { code = String((JSON.parse(String(answer.body)) as Record<string, unknown>)['code'] ?? ''); } catch { /* not JSON */ }
     if (code !== 'send_timeout') unconfirmedSends.delete(name);
+  }, () => {
+    // An attempt that ended without an answer is not a certain outcome: the doubt stands.
   });
 }
 
@@ -556,12 +558,18 @@ export function createServer(
   registerTool(
     'get_mail',
     {
-      description: 'Get the stored triage record by Message-ID, including a bounded body preview and triage reason. It does not fetch or return the full raw email.',
-      inputSchema: { messageId: z.string().min(1) },
+      description:
+        'Get the stored triage record by Message-ID, including a bounded body preview and triage reason. It does ' +
+        'not fetch or return the full raw email. When one message is stored for more than one mailbox, storedFor ' +
+        'lists them and account picks the copy (otherwise the first stored is returned).',
+      inputSchema: { messageId: z.string().min(1), account: z.string().min(3).max(320).optional() },
     },
     async (args) => {
-      const found = store.getMail(args.messageId);
-      return json(found ? { found: true, ...found } : { found: false, messageId: args.messageId });
+      const records = store.recordsFor(args.messageId);
+      const chosen = args.account ? records.find((record) => record.account === args.account) : records[0];
+      const found = chosen ? store.getMail(chosen.dedupKey) : undefined;
+      if (!found) return json({ found: false, messageId: args.messageId, ...(args.account ? { account: args.account } : {}) });
+      return json({ found: true, ...found, ...(records.length > 1 ? { storedFor: records.map((record) => record.account) } : {}) });
     },
   );
 
@@ -619,12 +627,13 @@ export function createServer(
         'to (mode replyAll adds the other recipients, never the owner\'s own addresses), its subject, the thread ' +
         'references, the original quoted, and whether this mailbox can send. It sends nothing. send_mail with ' +
         'replyTo does this by itself; call this first when the user wants to see or change who an answer goes to. ' +
-        'replyToElsewhere=true means the message asks for answers at an address on another domain than its ' +
-        'sender\'s: say so before anything is sent. ' +
+        'replyToElsewhere=true means the answer would go to a Reply-To address on another domain than its ' +
+        'sender\'s, or the message names no sender address to compare it with: say so before anything is sent. ' +
         'language is the language of the line that introduces the quote ("On ..., ... wrote:"). ' +
         'addressedTo says where to came from: replyTo, sender, ownRecipients (a message the owner sent, continued ' +
         'to the people it went to), or recipients (the message named nobody to answer, so it would go to the ' +
-        'people it was sent to; send_mail will not do that without an explicit to). ' +
+        'people it was sent to). send_mail fills in to only from replyTo or sender; for the other two it needs ' +
+        'an explicit to, since a From line can be forged to look like the owner\'s. ' +
         'account (an address from list_accounts) says which copy is meant when one message is stored for more than one mailbox.',
       inputSchema: {
         messageId: z.string().min(1).max(1000),
@@ -931,8 +940,7 @@ export function createServer(
       description:
         'List recent MCP tool and resource calls, those that change or send included, and the audited mailbox ' +
         'actions and sends from the web view and from MCP. Targets contain only bounded account/message/part ' +
-        'identifiers and never credentials, recipients or message bodies. Nothing here changes or sends anything ' +
-        'unless a separate write credential is configured.',
+        'identifiers and never credentials, recipients or message bodies. This tool only reads.',
       inputSchema: { limit: z.number().int().positive().max(200).default(50) },
     },
     async (args) => json({
@@ -982,16 +990,21 @@ export function createServer(
     registerTool(
       'record_feedback',
       {
-        description: 'Record feedback for a processed message so future rules and triage evaluation can use it.',
+        description:
+          'Record feedback for a processed message so future rules and triage evaluation can use it. account ' +
+          '(an address from list_accounts) says which copy is meant when one message is stored for more than one mailbox.',
         inputSchema: {
           messageId: z.string().min(1).max(1000),
           label: z.enum(['false_positive', 'missed', 'handled', 'correct']),
           note: z.string().max(1000).default(''),
+          account: z.string().min(3).max(320).optional(),
         },
       },
       async (args) => {
-        store.recordFeedback(args.messageId, args.label as FeedbackLabel, args.note);
-        return json({ recorded: true, messageId: args.messageId, label: args.label });
+        const key = recordKey(args.messageId, args.account);
+        const row = store.getMail(key);
+        store.recordFeedback(row?.messageId ?? args.messageId, args.label as FeedbackLabel, args.note, key);
+        return json({ recorded: true, messageId: args.messageId, account: row?.account, label: args.label });
       },
     );
 
@@ -1082,7 +1095,11 @@ export function createServer(
             return body;
           } catch (error) {
             if (error instanceof McpToolError && error.message.startsWith('send_timeout')) fearUnconfirmed(name);
-            else unconfirmedSends.delete(name);
+            else {
+              // It did not leave: nothing is remembered of it, and asking again sends it.
+              unconfirmedSends.delete(name);
+              letters.delete(name);
+            }
             throw error;
           }
         };
@@ -1134,10 +1151,13 @@ export function createServer(
             // The original cannot be read now (moved, deleted, or its mailbox down). An answer
             // that needs nothing from it, addressed and unquoted, can still go, as on the page.
             const unreadable = error instanceof McpToolError && (error.code === 'NOT_FOUND' || error.code === 'MAILBOX_UNAVAILABLE');
-            if (!unreadable || to.length === 0 || args.quote) {
+            // Answering everyone needs to know who everyone was; that is in the message that cannot be read.
+            const replyAllUnknown = args.replyAll && args.cc === undefined;
+            if (!unreadable || to.length === 0 || args.quote || replyAllUnknown) {
               if (error instanceof McpToolError && unreadable) {
                 throw new McpToolError(error.code, error.message,
-                  'The message being answered could not be read. To answer it anyway, give to and quote=false.');
+                  'The message being answered could not be read. To answer it anyway, give to and quote=false, ' +
+                  'and with replyAll the cc as well: who else it went to cannot be read either.');
               }
               throw error;
             }
@@ -1146,18 +1166,32 @@ export function createServer(
           if (draft) {
             // Each of to and cc is the composer's unless the caller said otherwise; nobody is addressed twice.
             const filledTo = to.length === 0;
+            // Where the composer would answer the people a message went to rather than
+            // its sender, nobody sees that To line before it leaves from here: a
+            // message that names nobody to answer, or one that only looks like the
+            // owner's own (a From line is the sender's to write).
+            const toEveryone = draft['addressedTo'] === 'recipients' || draft['addressedTo'] === 'ownRecipients';
             if (filledTo) {
-              // A message that names nobody to answer is not answered to everyone it was sent to on a guess.
-              if (draft['addressedTo'] === 'recipients') {
+              if (toEveryone) {
                 throw new McpToolError('INVALID_ARGUMENT',
-                  'the message names no sender or reply address to answer, so an answer would go to everyone it was sent to',
-                  'Ask the user who the answer is for, and give to.');
+                  draft['addressedTo'] === 'recipients'
+                    ? 'the message names no sender or reply address to answer, so an answer would go to everyone it was sent to'
+                    : 'the message is from the owner\'s own address, so an answer would go on to everyone it was sent to',
+                  `Ask the user who the answer is for, and give to. prepare_reply shows who it went to: ${list(draft['to']).join(', ') || 'nobody usable'}.`);
               }
               to = list(draft['to']);
             }
             if (args.cc === undefined) {
               const taken = new Set(to.map((address) => address.toLowerCase()));
-              cc = list(draft['cc']).filter((address) => !taken.has(address.toLowerCase()));
+              // Answering everyone: the people the composer would have put in To are copied
+              // when the caller chose the To line themselves.
+              const others = args.replyAll && !filledTo && toEveryone ? [...list(draft['to']), ...list(draft['cc'])] : list(draft['cc']);
+              cc = others.filter((address) => {
+                const key = address.toLowerCase();
+                if (taken.has(key)) return false;
+                taken.add(key);
+                return true;
+              });
             }
             if (!subject) subject = String(draft['subject'] ?? '');
             references = list(draft['references']);
@@ -1178,8 +1212,9 @@ export function createServer(
           throw new McpToolError('INVALID_ARGUMENT', 'the message has nobody to go to: give to');
         }
         // Another call for the same letter may have started while this one read the original.
-        const during = await repeat();
-        if (during) return during;
+        // From this check to the moment the page registers the letter there is no await,
+        // so two calls that read the original together cannot both pass it.
+        if (earlierSend(name)) return (await repeat())!;
         if (unconfirmed(name)) throw doubt();
 
         const note = notes.join(' ') || undefined;
