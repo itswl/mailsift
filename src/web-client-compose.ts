@@ -169,8 +169,17 @@ function fillCompose(d) {
   if (!composeForm.to.value) composeForm.to.value = (d.to || []).join(', ');
   // A message that names nobody to answer: the person chooses, and is told why the line is empty.
   if (!composeForm.to.value && d.addressedTo === 'recipients') {
-    composeSay(t('compose.noAddressee'));
-    setTimeout(() => { if (composeSheet.open && !composeForm.to.value) composeForm.to.focus(); }, 120);
+    // Beside a restored draft's line and its Discard button, not instead of them.
+    if (composeNote.querySelector('button')) composeNote.appendChild(el('span', 'compose-why', ' ' + t('compose.noAddressee')));
+    else composeSay(t('compose.noAddressee'));
+    // Into To, unless the person has started on the body meanwhile.
+    const letter = composing, body = composeForm.text.value;
+    setTimeout(() => {
+      if (!composeSheet.open || composing !== letter || composeForm.to.value) return;
+      if (composeForm.text.value !== body) return;
+      if (document.activeElement && document.activeElement !== composeForm.text && document.activeElement !== document.body) return;
+      composeForm.to.focus();
+    }, 120);
   }
   if (!composeForm.cc.value && d.cc && d.cc.length) {
     composeForm.cc.value = d.cc.join(', ');

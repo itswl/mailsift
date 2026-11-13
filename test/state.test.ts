@@ -490,9 +490,14 @@ describe('finding a stored message by its key or its Message-ID', () => {
     expect(s.keyShaped('bare@x')).toBe(false);
     expect(s.getMail('bare@x')).toMatchObject({ dedupKey: 'me@qq.com|bare@x' });
     expect(s.recordsFor('bare@x')).toEqual([{ dedupKey: 'me@qq.com|bare@x', account: 'me@qq.com', by: 'messageId' }]);
-    // A bar in a Message-ID is not a key unless what comes before it is a mailbox held here.
+    // Shape alone decides, so it holds once retention has removed every record of a mailbox.
     expect(s.keyShaped('<a|b@x>')).toBe(false);
-    expect(s.keyShaped('someone@else.example|<x>')).toBe(false);
+    expect(s.keyShaped('abc|def@x')).toBe(false);
+    expect(s.keyShaped('someone@else.example|<x>')).toBe(true);
+    s.markSeen('b@y.com|b@y.com|<gone@x>', 'b@y.com', 'look-alike elsewhere');
+    s.recordOutcome('b@y.com|b@y.com|<gone@x>', 'info', false, { messageId: 'nobody@left.example|<gone@x>' });
+    expect(s.getMail('nobody@left.example|<gone@x>')).toBeUndefined();
+    expect(s.recordsFor('nobody@left.example|<gone@x>')).toEqual([]);
   });
 });
 

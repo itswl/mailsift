@@ -84,7 +84,7 @@ A `pass` proves the domain, not the intent: a real domain can still send a scam.
 
 Rules for using it:
 
-- Pass the `messageId` that `list_mail`, `needs_you` or `search_mail` shows. A sender can write a Message-ID that spells another record's `dedupKey`. A string that is both is refused with `INVALID_ARGUMENT` rather than guessed: reach the message whose Message-ID it is by that message's own `dedupKey`, and the record whose key it is by its own `messageId`. A string shaped like a key (a monitored mailbox, `|`, the rest) only ever names a record by its key.
+- Pass the `messageId` that `list_mail`, `needs_you` or `search_mail` shows. A sender can write a Message-ID that spells another record's `dedupKey`. A string that is both is refused with `INVALID_ARGUMENT` rather than guessed: reach the message whose Message-ID it is by that message's own `dedupKey`, and the record whose key it is by its own `messageId`. A string shaped like a key (an email address, `|`, the rest) only ever names a record by its key.
 - One message can be stored once per monitored mailbox (a forwarded copy, or a message sent to two of them). Then `manage_mail`, `mark_handled`, `record_feedback`, `read_message`, `prepare_reply` and `send_mail` with `replyTo` answer `INVALID_ARGUMENT` naming the mailboxes; call again with `account` set to the one the user means. `get_mail` returns the first stored copy and lists the others under `storedFor`; give `account` there too to see a particular one.
 
 - One message, named by the user, per call. Do not sweep a folder or act on "all of these" without the user listing or confirming them.
