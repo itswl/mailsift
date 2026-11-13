@@ -1,42 +1,53 @@
 /**
- * Read-only web view of triage results.
+ * The web view: a mail client over what the poller stored.
  *
- * A browser surface over what the poller already stored: what arrived, how it
- * was judged and why. It does not open, alter or send mail. Every mailbox
- * operation in this service uses a read-only lock. On demand it can fetch a
- * single message body, selected MIME metadata, or one attachment, and persists
- * nothing.
+ * This file is the page and the part of it that reads: what arrived, how it
+ * was judged and why, and one message fetched live under a read-only lock and
+ * persisted nowhere. The part that changes things (marking done, mailbox
+ * actions, sending, asking the model, notifications) is in web-actions.ts.
  *
- * It shares the MCP server's port and token, because it shares that trust
- * boundary: whoever can read triage results over JSON-RPC can read them here.
- * Disabled unless WEB_UI_ENABLED=true, since a page a browser can reach is a
- * wider surface than a JSON-RPC endpoint and should be opted into.
+ * It shares the MCP server's port and its two tokens, because it shares that
+ * trust boundary: whoever can read triage results over JSON-RPC can read them
+ * here, and only the write credential can act. Disabled unless
+ * WEB_UI_ENABLED=true, since a page a browser can reach is a wider surface
+ * than a JSON-RPC endpoint and should be opted into.
  */
-import { timingSafeEqual } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
-import { loadConfig, type Account } from './config.js';
+import { loadConfig } from './config.js';
 import { escapeHtml } from './html.js';
 import {
   AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
-  fetchAttachmentManifestByMessageId, fetchByMessageId, inspectMailSafety, scanAttachmentByMessageId,
+  fetchAttachmentManifestByMessageId, inspectMailSafety, scanAttachmentByMessageId,
 } from './imap/client.js';
 import { buildLink } from './links.js';
 import { nextDigestAt, renderDigest, type DigestItem } from './services/digest.js';
 import { mailboxStatuses } from './services/health.js';
 import { CATEGORIES } from './services/triage.js';
 import { HEARTBEAT_KEY, type PollStats } from './services/watcher.js';
+import {
+  configuredAccounts, defaultBackend, forgetLive, liveMessage, routeActions, webPushEnabled,
+  type ActionContext, type WebBackend,
+} from './web-actions.js';
 import { clientScript, LANGUAGE_COOKIE, storeLanguageScript } from './web-client.js';
+import {
+  credentialMark, crossSite, embedded, json, localHost, presentedToken, rateWindow, readBody, readCookie,
+  SESSION_COOKIE, sessionOf, timedOut, tokenMatches, within, type Session, type WebResponse,
+} from './web-http.js';
 import { appleTouch180, favicon64, icon192, icon512, maskable512 } from './web-icons.js';
+import { liveHub } from './web-live.js';
 import { LIGHT_BAR, styles } from './web-styles.js';
 import { isLanguage, LANGUAGES, t, type Language, type StringKey } from './web-strings.js';
-import type { StateStore } from './services/state.js';
+import { appPolicy, framePolicy, MAIL_FRAME, SERVICE_WORKER, SHELL_HEADER } from './web-worker.js';
+import type { MailRow, StateStore } from './services/state.js';
 
-export const SESSION_COOKIE = 'mailsift_session';
-export { LANGUAGE_COOKIE };
+export { LANGUAGE_COOKIE, readCookie, SESSION_COOKIE, tokenMatches };
+export type { Session, WebBackend, WebResponse };
 /** A live IMAP read can be slow on providers with poor search; do not hang a tab on it. */
 const LIVE_FETCH_TIMEOUT_MS = 25_000;
 const LIVE_ATTACHMENT_TIMEOUT_MS = 60_000;
 const LIVE_SAFETY_TIMEOUT_MS = 25_000;
+/** The plain text kept under `body` for callers that read the API directly. */
 const LIVE_BODY_CHARS = 20_000;
 
 /**
@@ -48,18 +59,7 @@ const LIVE_BODY_CHARS = 20_000;
  * real traffic, whatever it achieves against a long token.
  */
 const AUTH_ATTEMPTS_PER_MINUTE = 10;
-const authWindows = new Map<string, { startedAt: number; count: number }>();
-
-export function allowAuthAttempt(client: string, now = Date.now()): boolean {
-  const current = authWindows.get(client);
-  if (!current || now - current.startedAt >= 60_000) {
-    authWindows.set(client, { startedAt: now, count: 1 });
-    return true;
-  }
-  if (current.count >= AUTH_ATTEMPTS_PER_MINUTE) return false;
-  current.count += 1;
-  return true;
-}
+export const allowAuthAttempt = rateWindow(AUTH_ATTEMPTS_PER_MINUTE);
 
 /**
  * Manual polls per client per minute.
@@ -69,18 +69,7 @@ export function allowAuthAttempt(client: string, now = Date.now()): boolean {
  * is plenty for a person waiting on a verification code.
  */
 const REFRESHES_PER_MINUTE = 6;
-const refreshWindows = new Map<string, { startedAt: number; count: number }>();
-
-export function allowManualRefresh(client: string, now = Date.now()): boolean {
-  const current = refreshWindows.get(client);
-  if (!current || now - current.startedAt >= 60_000) {
-    refreshWindows.set(client, { startedAt: now, count: 1 });
-    return true;
-  }
-  if (current.count >= REFRESHES_PER_MINUTE) return false;
-  current.count += 1;
-  return true;
-}
+export const allowManualRefresh = rateWindow(REFRESHES_PER_MINUTE);
 
 export function webUiEnabled(): boolean {
   return (process.env.WEB_UI_ENABLED ?? 'false').toLowerCase() === 'true';
@@ -92,56 +81,25 @@ export function webVersion(): string {
   return version.startsWith('v') ? version : `v${version}`;
 }
 
-export interface WebResponse {
-  status: number;
-  body: string | Buffer;
-  contentType: string;
-  /** Set-Cookie value, when a request establishes a session. */
-  cookie?: string;
-  cacheControl?: string;
-  headers?: Record<string, string>;
-}
-
 /**
  * What the page may do beyond reading what the poller stored.
  *
  * `onRefresh` is absent in the standalone MCP server, which has no watcher to
  * poll with; the button and the endpoint then stay out of the page entirely
- * rather than offering a control that can only fail.
+ * rather than offering a control that can only fail. `writeToken` is the
+ * credential that turns a session into one that may act on mail; without it
+ * the view is read-only for everyone. `backend` stands in for the mailbox,
+ * the mail server and the model in the preview and in tests.
  */
 export interface WebOptions {
   onRefresh?: (() => Promise<PollStats>) | undefined;
-}
-
-const json = (status: number, value: unknown): WebResponse => ({
-  status,
-  body: JSON.stringify(value),
-  contentType: 'application/json; charset=utf-8',
-});
-
-/** Constant-time comparison, so a wrong token cannot be found a character at a time. */
-export function tokenMatches(expected: string, presented: string): boolean {
-  if (!expected) return true;
-  if (expected.length !== presented.length) return false;
-  return timingSafeEqual(Buffer.from(expected), Buffer.from(presented));
-}
-
-export function readCookie(header: string | undefined, name: string): string {
-  for (const part of (header ?? '').split(';')) {
-    const [key, ...rest] = part.trim().split('=');
-    if (key === name) return decodeURIComponent(rest.join('='));
-  }
-  return '';
+  writeToken?: string | undefined;
+  backend?: Partial<WebBackend> | undefined;
 }
 
 /** Whether this request may see triage data: a bearer token or an established session. */
-export function authorized(req: IncomingMessage, token: string): boolean {
-  if (!token) return true;
-  const bearer = req.headers.authorization?.startsWith('Bearer ')
-    ? req.headers.authorization.slice('Bearer '.length)
-    : '';
-  if (bearer && tokenMatches(token, bearer)) return true;
-  return tokenMatches(token, readCookie(req.headers.cookie, SESSION_COOKIE));
+export function authorized(req: IncomingMessage, token: string, writeToken = ''): boolean {
+  return sessionOf(req, token, writeToken) !== 'none';
 }
 
 /**
@@ -213,6 +171,26 @@ function decodeMailCursor(raw: string | null): MailCursor | undefined {
   }
 }
 
+/** What a read route needs to know about who asked and what stands behind the page. */
+export interface ApiContext {
+  session?: Session;
+  options?: WebOptions;
+  lang?: Language;
+  /** Whether this server asks for a token at all, so the page knows to offer signing out. */
+  authRequired?: boolean;
+}
+
+function backendOf(options: WebOptions | undefined): WebBackend {
+  return { ...defaultBackend, ...(options?.backend ?? {}) };
+}
+
+/** A stored row as the list shows it: with its provider and its link out. */
+function decorate(row: MailRow): Record<string, unknown> {
+  const provider = providerOf(row.account);
+  // The provider travels with the link so the browser can word it in its own language.
+  return { ...row, provider, link: buildLink(provider, row.account, row.messageId ?? '') };
+}
+
 /**
  * Answer one API path.
  *
@@ -223,7 +201,11 @@ export async function handleApi(
   path: string,
   params: URLSearchParams,
   store: StateStore,
+  context: ApiContext = {},
 ): Promise<WebResponse> {
+  const backend = backendOf(context.options);
+  const session = context.session ?? 'read';
+
   if (path === '/api/mail') {
     const search = params.get('q')?.trim();
     const importance = params.get('importance')?.trim();
@@ -251,11 +233,7 @@ export async function handleApi(
       : undefined;
     return json(200, {
       count: mail.length,
-      mail: mail.map((row) => {
-        const provider = providerOf(row.account);
-        // The provider travels with the link so the browser can word it in its own language.
-        return { ...row, provider, link: buildLink(provider, row.account, row.messageId ?? '') };
-      }),
+      mail: mail.map(decorate),
       ...(nextCursor ? { nextCursor } : {}),
     });
   }
@@ -277,19 +255,22 @@ export async function handleApi(
       codesOnly: boolParam(params, 'codesOnly'),
       limit,
     });
-    const addLink = (row: (typeof threads)[number]['latest']) => {
-      const provider = providerOf(row.account);
-      return { ...row, provider, link: buildLink(provider, row.account, row.messageId ?? '') };
-    };
     return json(200, {
       count: threads.length,
       windowHours: intParam(params, 'hours', 24, 24 * 90),
       threads: threads.map((thread) => ({
         ...thread,
-        latest: addLink(thread.latest),
-        messages: thread.messages.map(addLink),
+        latest: decorate(thread.latest),
+        messages: thread.messages.map(decorate),
       })),
     });
+  }
+
+  if (path === '/api/attention') {
+    // What was judged to matter and has not been dealt with, whatever the
+    // window the list is showing: a deadline does not expire with the day.
+    const rows = store.attention(intParam(params, 'limit', 50, 100));
+    return json(200, { count: store.attentionCount(), mail: rows.map(decorate) });
   }
 
   if (path === '/api/summary') {
@@ -302,11 +283,23 @@ export async function handleApi(
     return json(200, {
       ...store.summarize(hours),
       categories: CATEGORIES,
-      accounts: accounts.map((a) => ({ address: a.username, name: a.name })),
+      accounts: accounts.map((a) => ({ address: a.username, name: a.name, canSend: backend.sending(a).available })),
       lastPollAt: store.getMeta(HEARTBEAT_KEY) ?? null,
       pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 300),
       mailboxes: mailboxStatuses(store, accounts),
       outboxPending: store.notificationOutboxPending(),
+      attention: store.attentionCount(),
+      // What this session may do, so the page offers only what will work.
+      session: {
+        writable: session === 'write',
+        auth: Boolean(context.authRequired),
+        writeConfigured: Boolean(context.options?.writeToken),
+        // Marking mail dealt with: the write session's, unless no write token
+        // exists and the one credential is the owner's.
+        canMark: session === 'write' || !context.options?.writeToken,
+        assistant: backend.assistant(),
+        push: webPushEnabled(),
+      },
     });
   }
 
@@ -334,24 +327,34 @@ export async function handleApi(
     const messageId = params.get('id')?.trim();
     if (!messageId) return json(400, { error: 'id is required' });
     const found = store.getMail(messageId);
-    if (!found) return json(404, { error: 'not found' });
+    if (!found) return json(404, { error: 'not found', code: 'notFound' });
     // Linked like a row of the list, so a message opened from a shared link
     // still offers the provider's own client.
-    const provider = providerOf(found.account);
-    const stored = { ...found, provider, link: buildLink(provider, found.account, found.messageId ?? '') };
+    const stored = decorate(found);
     if (params.get('live') !== 'true') return json(200, { ...stored, body: null });
 
-    const account = loadConfig().accounts.find((a) => a.username === stored.account);
+    const account = loadConfig().accounts.find((a) => a.username === found.account);
     // Each failure carries a code as well as the message, so the browser can
     // word it in the reader's language while a JSON client still reads the text.
     if (!account) return json(409, { error: 'this mailbox is no longer configured', code: 'unconfigured' });
+    // A retry asks the mailbox again rather than a copy read a moment ago.
+    if (params.get('fresh') === 'true') forgetLive(found.dedupKey);
     try {
-      const live = await Promise.race([
-        fetchByMessageId(account, messageId),
-        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), LIVE_FETCH_TIMEOUT_MS).unref()),
-      ]);
-      if (!live) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
-      return json(200, { ...stored, body: live.body.slice(0, LIVE_BODY_CHARS) });
+      const live = await within(liveMessage(found, account, backend), LIVE_FETCH_TIMEOUT_MS);
+      if (timedOut(live)) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
+      if (!live) return json(404, { error: 'the message is no longer where it was filed', code: 'notInMailbox' });
+      const r = live.readable;
+      return json(200, {
+        ...stored,
+        body: r.text.slice(0, LIVE_BODY_CHARS),
+        // The message as it was written. `html` is the sender's own markup and
+        // is not safe to put in a page: the browser view cleans it and shows it
+        // in a sandboxed frame; any other caller should prefer `text`.
+        text: r.text, quoted: r.quoted, html: r.html, htmlOmitted: r.htmlOmitted, truncated: r.truncated,
+        from: r.from, to: r.to, cc: r.cc, replyTo: r.replyTo, references: r.references,
+        auth: r.auth, unsubscribe: r.unsubscribe, inlineImages: r.inlineImages,
+        flags: live.flags, liveFolder: live.folder,
+      });
     } catch (error) {
       const detail = String(error).slice(0, 200);
       return json(502, { error: `mailbox read failed: ${detail}`, code: 'readFailed', detail });
@@ -394,7 +397,7 @@ async function handleAttachmentsApi(
   const stored = store.getMail(id);
   if (!stored?.messageId) {
     store.recordMcpAudit('web:list-attachments', client, false, target);
-    return json(404, { error: 'mail record not found' });
+    return json(404, { error: 'mail record not found', code: 'notFound' });
   }
   const account = loadConfig().accounts.find((candidate) => candidate.username === stored.account);
   if (!account) {
@@ -405,7 +408,7 @@ async function handleAttachmentsApi(
   try {
     const timeout = Symbol('attachment lookup timeout');
     const found = await Promise.race([
-      fetchAttachmentManifestByMessageId(account, stored.messageId),
+      fetchAttachmentManifestByMessageId(account, stored.messageId, stored.folder ?? undefined),
       new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_ATTACHMENT_TIMEOUT_MS).unref()),
     ]);
     if (found === timeout) {
@@ -413,7 +416,7 @@ async function handleAttachmentsApi(
       return json(504, { error: 'the mailbox did not return attachment metadata in time', code: 'attachmentTimeout' });
     }
     store.recordMcpAudit('web:list-attachments', client, Boolean(found), target);
-    if (!found) return json(404, { error: 'message not found in configured read-only folders' });
+    if (!found) return json(404, { error: 'message not found in configured read-only folders', code: 'actionNotFound' });
     return json(200, {
       folder: found.folder,
       attachments: found.manifest.items,
@@ -451,7 +454,7 @@ async function handleMailSafetyApi(
   try {
     const timeout = Symbol('mail safety lookup timeout');
     const report = await Promise.race([
-      inspectMailSafety(account, stored.messageId),
+      inspectMailSafety(account, stored.messageId, stored.folder ?? undefined),
       new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_SAFETY_TIMEOUT_MS).unref()),
     ]);
     if (report === timeout) {
@@ -485,7 +488,7 @@ async function handleAttachmentApi(
   const stored = store.getMail(id);
   if (!stored?.messageId) {
     store.recordMcpAudit('web:get-attachment', client, false, target);
-    return json(404, { error: 'mail record not found' });
+    return json(404, { error: 'mail record not found', code: 'notFound' });
   }
   const account = loadConfig().accounts.find((candidate) => candidate.username === stored.account);
   if (!account) {
@@ -496,7 +499,7 @@ async function handleAttachmentApi(
   try {
     const timeout = Symbol('attachment download timeout');
     const found = await Promise.race([
-      fetchAttachmentByMessageId(account, stored.messageId, partId),
+      fetchAttachmentByMessageId(account, stored.messageId, partId, stored.folder ?? undefined),
       new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_ATTACHMENT_TIMEOUT_MS).unref()),
     ]);
     if (found === timeout) {
@@ -504,7 +507,7 @@ async function handleAttachmentApi(
       return json(504, { error: 'the mailbox did not return this attachment in time', code: 'attachmentTimeout' });
     }
     store.recordMcpAudit('web:get-attachment', client, Boolean(found), target);
-    if (!found) return json(404, { error: 'message not found in configured read-only folders' });
+    if (!found) return json(404, { error: 'message not found in configured read-only folders', code: 'actionNotFound' });
     return {
       status: 200,
       body: found.content,
@@ -547,7 +550,7 @@ async function handleAttachmentScanApi(
   const stored = store.getMail(id);
   if (!stored?.messageId) {
     store.recordMcpAudit('web:scan-attachment', client, false, target);
-    return json(404, { error: 'mail record not found' });
+    return json(404, { error: 'mail record not found', code: 'notFound' });
   }
   const account = loadConfig().accounts.find((candidate) => candidate.username === stored.account);
   if (!account) {
@@ -558,7 +561,7 @@ async function handleAttachmentScanApi(
   try {
     const timeout = Symbol('attachment scan timeout');
     const report = await Promise.race([
-      scanAttachmentByMessageId(account, stored.messageId, partId),
+      scanAttachmentByMessageId(account, stored.messageId, partId, stored.folder ?? undefined),
       new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_ATTACHMENT_TIMEOUT_MS).unref()),
     ]);
     if (report === timeout) {
@@ -575,14 +578,6 @@ async function handleAttachmentScanApi(
     }
     const detail = String(error).slice(0, 200);
     return json(502, { error: `attachment scan failed: ${detail}`, code: 'attachmentFailed', detail });
-  }
-}
-
-function configuredAccounts(): Account[] {
-  try {
-    return loadConfig().accounts;
-  } catch {
-    return [];
   }
 }
 
@@ -609,18 +604,19 @@ function providerOf(address: string): string {
  * The login form, shown when a token is configured and the browser has none.
  *
  * The token is posted rather than put in the URL, so it does not end up in
- * browser history, proxy logs or a Referer header.
+ * browser history, proxy logs or a Referer header. One field takes either
+ * credential: the token decides what the session may do.
  */
-export function renderLogin(lang: Language, error?: StringKey): string {
+export function renderLogin(lang: Language, error?: StringKey, nonce = '', upgrade = false): string {
   const s = (key: StringKey): string => escapeHtml(t(lang, key));
   // The switch reloads here rather than rewording in place: there is nothing
-  // on this page to lose, and the reload goes to GET / so a refused sign-in is
+  // on this page to lose, and the reload goes to a GET so a refused sign-in is
   // not posted a second time.
   return page(lang, s('login.title'), `
     <form method="post" action="/auth" class="login">
       <img class="brand-mark" src="/icon-192.png?v=3" alt="" aria-hidden="true">
       <h1>mailsift</h1>
-      <p class="muted">${s('login.intro')}</p>
+      <p class="muted">${s(upgrade ? 'login.introWrite' : 'login.intro')}</p>
       <input type="text" name="user" value="mailsift" autocomplete="username" readonly aria-label="${s('login.account')}">
       <input type="password" name="token" autocomplete="current-password" placeholder="${s('login.token')}" enterkeyhint="go" autofocus>
       <button type="submit">${s('login.open')}</button>
@@ -628,8 +624,8 @@ export function renderLogin(lang: Language, error?: StringKey): string {
       <button type="button" id="lang" class="lang" aria-label="${s('lang.label')}">${s('lang.face')}</button>
       <p class="version">${escapeHtml(webVersion())}</p>
     </form>
-    <script>${storeLanguageScript()}
-    document.querySelector('#lang').onclick = () => { storeLanguage('${nextLanguage(lang)}'); location.replace('/'); };</script>`);
+    <script nonce="${nonce}">${storeLanguageScript()}
+    document.querySelector('#lang').onclick = () => { storeLanguage('${nextLanguage(lang)}'); location.replace('${upgrade ? '/signin' : '/'}'); };</script>`, nonce);
 }
 
 /**
@@ -650,6 +646,44 @@ function themeBoot(): string {
     + "if(a)a.setAttribute('content',d?'black-translucent':'default');}catch(e){}})();";
 }
 
+/** The line icons the page draws with, defined once and referenced by id. */
+const ICONS: Record<string, string> = {
+  check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+  chevron: '<path d="M9 6l6 6-6 6"/>',
+  arrow: '<path d="M7 17L17 7M8 7h9v9"/>',
+  x: '<path d="M6 6l12 12M18 6L6 18"/>',
+  up: '<path d="M6 15l6-6 6 6"/>',
+  down: '<path d="M6 9l6 6 6-6"/>',
+  reply: '<path d="M10 8l-5 5 5 5"/><path d="M5 13h9a5 5 0 0 1 5 5v1"/>',
+  'reply-all': '<path d="M7 8l-5 5 5 5"/><path d="M13 8l-5 5 5 5"/><path d="M8 13h8a5 5 0 0 1 5 5v1"/>',
+  archive: '<path d="M4 5h16v4H4z"/><path d="M6 9v9a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V9"/><path d="M10 13h4"/>',
+  star: '<path d="M12 4l2.5 5.1 5.6.8-4 4 1 5.6-5.1-2.7-5.1 2.7 1-5.6-4-4 5.6-.8z"/>',
+  trash: '<path d="M5 7h14"/><path d="M10 7V5h4v2"/><path d="M7 7l1 12h8l1-12"/>',
+  inbox: '<path d="M4 13l2.5-7h11L20 13v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z"/><path d="M4 13h4.5l1 2h5l1-2H20"/>',
+  more: '<path d="M6 12h.01M12 12h.01M18 12h.01" stroke-width="2.6"/>',
+  sparkle: '<path d="M11 4l1.7 4.3L17 10l-4.3 1.7L11 16l-1.7-4.3L5 10l4.3-1.7z"/><path d="M18 14.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/>',
+  send: '<path d="M20 4L4 11l6 2.5L12.5 20z"/><path d="M10 13.5L20 4"/>',
+  bell: '<path d="M6 17v-6a6 6 0 1 1 12 0v6l1.5 1.5h-15z"/><path d="M10 21a2 2 0 0 0 4 0"/>',
+  clip: '<path d="M15.5 7.5l-7 7a2 2 0 0 0 2.8 2.8l7.4-7.4a4 4 0 0 0-5.6-5.6L5.6 11.8a6 6 0 0 0 8.5 8.5l6-6"/>',
+  shield: '<path d="M12 3.5l7 2.5v5.5c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6z"/><path d="M9 12l2.2 2.2 4-4.2"/>',
+  alert: '<path d="M12 4l9 15.5H3z"/><path d="M12 10v4"/><path d="M12 17h.01"/>',
+  search: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/>',
+  compose: '<path d="M5 19h4L19 9l-4-4L5 15z"/><path d="M13.5 6.5l4 4"/>',
+  image: '<path d="M4 5h16v14H4z"/><path d="M4 16l4.5-4.5 3.5 3.5 2.5-2.5L20 17"/><path d="M9 9.5h.01" stroke-width="2.4"/>',
+  read: '<path d="M4 9.5l8-5 8 5V19H4z"/><path d="M4 9.5l8 5 8-5"/>',
+};
+
+function iconSymbols(): string {
+  return '<svg hidden aria-hidden="true" focusable="false">'
+    + Object.entries(ICONS).map(([id, body]) => `<symbol id="i-${id}" viewBox="0 0 24 24">${body}</symbol>`).join('')
+    + '</svg>';
+}
+
+/** One of the icons above, inline, for the parts of the shell rendered here. */
+function icon(id: string, cls = 'icon'): string {
+  return `<svg class="${cls}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${ICONS[id] ?? ''}</svg>`;
+}
+
 /**
  * The application shell. All content is built in the browser from the JSON API.
  *
@@ -657,7 +691,7 @@ function themeBoot(): string {
  * their key, so the switch can reword them in place instead of reloading and
  * losing the filters.
  */
-export function renderApp(lang: Language, canRefresh = false): string {
+export function renderApp(lang: Language, canRefresh = false, nonce = ''): string {
   const s = (key: StringKey): string => escapeHtml(t(lang, key));
   const worded = (tag: string, key: StringKey, attrs = ''): string =>
     `<${tag}${attrs ? ' ' + attrs : ''} data-i18n="${key}">${s(key)}</${tag}>`;
@@ -666,7 +700,10 @@ export function renderApp(lang: Language, canRefresh = false): string {
   // the query the page sends is built from the form exactly as before.
   const seg = (name: string, value: string, key: StringKey, checked = false): string =>
     `<label class="seg${checked ? ' on' : ''}"><input type="radio" name="${name}" value="${value}"${checked ? ' checked' : ''}>${worded('span', key)}</label>`;
-  const chevron = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 6l6 6-6 6"/></svg>';
+  // An icon-only button: its name lives in the label and the title, both reworded with the page.
+  const iconButton = (id: string, glyph: string, key: StringKey, attrs = ''): string =>
+    `<button id="${id}" type="button" class="icon-btn" aria-label="${s(key)}" title="${s(key)}" data-i18n-label="${key}" data-i18n-title="${key}"${attrs ? ' ' + attrs : ''}>${icon(glyph, '')}</button>`;
+  const chevron = icon('chevron');
   // Icon-only, like the theme switch: the label lives in its title and in the
   // accessible name, and the arrow spins while a poll is running.
   const refresh = canRefresh
@@ -674,12 +711,16 @@ export function renderApp(lang: Language, canRefresh = false): string {
       + '<svg class="refresh-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
       + '<path d="M20 11a8 8 0 1 0-2.34 5.66"/><path d="M20 4v7h-7"/></svg></button>'
     : '';
+  const sheetHead = (titleId: string, key: StringKey, doneId: string): string =>
+    `<div class="sheet-head"><span class="handle"></span><span></span><h2 id="${titleId}" data-i18n="${key}">${s(key)}</h2><button id="${doneId}" type="button" class="text-btn" data-i18n="done">${s('done')}</button></div>`;
   return page(lang, 'mailsift', `
     <header class="app-header">
       <div class="header-inner">
         <div class="brand"><img class="brand-mark" src="/icon-192.png?v=3" alt="" aria-hidden="true"><strong>mailsift</strong></div>
         <div class="header-actions">
           ${refresh}
+          ${iconButton('compose-open', 'compose', 'compose.new', 'aria-haspopup="dialog" aria-controls="compose"')}
+          ${iconButton('bell', 'bell', 'notify.title', 'aria-haspopup="dialog" aria-controls="notify-sheet"')}
           <button id="lang" type="button" class="word-btn" aria-label="${s('lang.label')}">${s('lang.face')}</button>
           <button id="theme" type="button" class="icon-btn" aria-label="${s('theme.title')}"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 0 0 16z" fill="currentColor" stroke="none"/></svg></button>
         </div>
@@ -690,6 +731,7 @@ export function renderApp(lang: Language, canRefresh = false): string {
         <div id="network" class="banner" hidden><span id="network-text"></span><button id="network-retry" type="button" class="text-btn" data-i18n="network.retry">${s('network.retry')}</button></div>
         <section class="title" aria-label="${s('overview.title')}" data-i18n-label="overview.title">
           <p id="lede" class="lede pending">${s('lede.loading')}</p>
+          <p id="tally" class="tally"></p>
           <p id="status" class="status" role="status" aria-live="polite"></p>
           <button id="health" type="button" class="health-line" aria-haspopup="dialog" aria-controls="health-sheet" hidden></button>
         </section>
@@ -698,11 +740,11 @@ export function renderApp(lang: Language, canRefresh = false): string {
             <fieldset class="window" role="radiogroup" aria-label="${s('filter.window')}" data-i18n-label="filter.window">
               ${seg('hours', '24', 'window.24h', true)}${seg('hours', '72', 'window.3d')}${seg('hours', '168', 'window.7d')}${seg('hours', '720', 'window.30d')}
             </fieldset>
-            <button id="search-open" type="button" class="icon-btn" aria-label="${s('search.open')}" title="${s('search.open')}" data-i18n-label="search.open" data-i18n-title="search.open"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></svg></button>
+            ${iconButton('search-open', 'search', 'search.open')}
             <button id="filters-open" type="button" class="text-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="filter-sheet">${s('filter.more')}</button>
           </div>
           <div id="search-line" class="search-line" hidden>
-            <div class="search-field"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></svg><input type="search" name="q" placeholder="${s('search.short')}" aria-label="${s('search')}" data-i18n-label="search" inputmode="search" enterkeyhint="search" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+            <div class="search-field">${icon('search')}<input type="search" name="q" placeholder="${s('search.short')}" aria-label="${s('search')}" data-i18n-label="search" inputmode="search" enterkeyhint="search" autocapitalize="off" autocorrect="off" spellcheck="false"><button id="ask" type="button" class="ask-btn" hidden>${icon('sparkle')}${worded('span', 'ask.button')}</button><kbd id="palette-hint" class="kbd" hidden></kbd></div>
             <button id="search-cancel" type="button" class="text-btn quiet" data-i18n="search.cancel">${s('search.cancel')}</button>
           </div>
           <div id="tokens" class="tokens" hidden></div>
@@ -719,20 +761,62 @@ export function renderApp(lang: Language, canRefresh = false): string {
             </div>
           </dialog>
         </form>
+        <section id="answer" class="answer" hidden></section>
         <section id="lane" class="lane" hidden></section>
+        <section id="queue" class="queue" hidden></section>
         <section id="list"></section>
         <section id="digest" class="digest" hidden></section>
       </div>
-      <aside id="pane" class="pane"><div class="pane-head"><button id="pane-close" type="button" class="text-btn quiet" data-i18n="detail.close" hidden>${s('detail.close')}</button></div><div class="pane-body"></div></aside>
+      <aside id="pane" class="pane"><div id="pane-bar" class="pane-bar"></div><div class="pane-body"></div></aside>
     </main>
-    <footer class="version">${escapeHtml(webVersion())}</footer>
-    <dialog id="sheet" class="sheet" aria-labelledby="sheet-title">
-      <div class="sheet-head"><span class="handle"></span><span></span><button id="sheet-done" type="button" class="text-btn" data-i18n="done">${s('done')}</button></div>
+    <footer class="version"><span id="version">${escapeHtml(webVersion())}</span><span id="session-line"></span></footer>
+    <button id="fresh-pill" type="button" class="fresh-pill" hidden></button>
+    <dialog id="sheet" class="sheet reader" aria-labelledby="sheet-title">
+      <div class="sheet-head"><span class="handle"></span>${iconButton('sheet-close', 'x', 'detail.close')}<span class="sheet-nav">${iconButton('sheet-prev', 'up', 'nav.prev')}${iconButton('sheet-next', 'down', 'nav.next')}</span></div>
       <div class="sheet-body"></div>
+      <div id="sheet-bar" class="action-bar"></div>
     </dialog>
     <dialog id="health-sheet" class="sheet" aria-labelledby="health-title">
-      <div class="sheet-head"><span class="handle"></span><span></span><h2 id="health-title" data-i18n="mailboxes.title">${s('mailboxes.title')}</h2><button id="health-done" type="button" class="text-btn" data-i18n="done">${s('done')}</button></div>
+      ${sheetHead('health-title', 'mailboxes.title', 'health-done')}
       <div class="sheet-body"></div>
+    </dialog>
+    <dialog id="notify-sheet" class="sheet" aria-labelledby="notify-title">
+      ${sheetHead('notify-title', 'notify.title', 'notify-done')}
+      <div class="sheet-body"></div>
+    </dialog>
+    <dialog id="keys-sheet" class="sheet" aria-labelledby="keys-title">
+      ${sheetHead('keys-title', 'keys.title', 'keys-done')}
+      <div class="sheet-body"></div>
+    </dialog>
+    <dialog id="menu-sheet" class="sheet" aria-labelledby="menu-title">
+      ${sheetHead('menu-title', 'menu.title', 'menu-done')}
+      <div class="sheet-body"></div>
+    </dialog>
+    <dialog id="compose" class="sheet compose" aria-labelledby="compose-title">
+      <div class="sheet-head"><span class="handle"></span><button id="compose-cancel" type="button" class="text-btn quiet" data-i18n="search.cancel">${s('search.cancel')}</button><h2 id="compose-title"></h2><button id="compose-send" type="button" class="text-btn strong">${icon('send')}${worded('span', 'compose.send')}</button></div>
+      <div class="sheet-body">
+        <form id="compose-form" autocomplete="off">
+          <div id="compose-from" class="cfield" hidden>${worded('span', 'compose.from', 'class="label"')}<span id="compose-from-value" class="cvalue"></span></div>
+          <label class="cfield">${worded('span', 'compose.to', 'class="label"')}<input name="to" type="text" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false"><button id="compose-cc-toggle" type="button" class="text-btn quiet" data-i18n="compose.cc">${s('compose.cc')}</button></label>
+          <label id="compose-cc-row" class="cfield" hidden>${worded('span', 'compose.cc', 'class="label"')}<input name="cc" type="text" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+          <label class="cfield">${worded('span', 'compose.subject', 'class="label"')}<input name="subject" type="text"></label>
+          <div id="compose-ai" class="compose-ai" hidden>
+            <div class="ai-line">${icon('sparkle')}<input name="instruction" type="text" placeholder="${s('compose.aiHint')}" aria-label="${s('compose.aiHint')}" data-i18n-label="compose.aiHint" enterkeyhint="go"><button id="compose-draft" type="button" class="text-btn" data-i18n="compose.draft">${s('compose.draft')}</button></div>
+            <div id="compose-chips" class="chips"></div>
+          </div>
+          <textarea name="text" rows="9" placeholder="${s('compose.body')}" aria-label="${s('compose.body')}" data-i18n-label="compose.body"></textarea>
+          <details id="compose-quoted" class="quoted" hidden><summary data-i18n="compose.quoted">${s('compose.quoted')}</summary><pre></pre></details>
+          <p id="compose-note" class="compose-note" role="status"></p>
+        </form>
+      </div>
+    </dialog>
+    <dialog id="palette" class="palette" aria-label="${s('palette.title')}" data-i18n-label="palette.title">
+      <div class="palette-field">${icon('search')}<input id="palette-input" type="text" role="combobox" aria-controls="palette-list" aria-expanded="true" aria-autocomplete="list" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="${s('palette.hint')}"></div>
+      <ul id="palette-list" class="palette-list" role="listbox"></ul>
+    </dialog>
+    <dialog id="lightbox" class="lightbox" aria-label="${s('lightbox.title')}" data-i18n-label="lightbox.title">
+      ${iconButton('lightbox-close', 'x', 'detail.close')}
+      <img alt="">
     </dialog>
     <dialog id="install-help" class="sheet install-help" aria-labelledby="install-title">
       <div class="sheet-head"><span class="handle"></span><h2 id="install-title" data-i18n="pwa.iosTitle">${s('pwa.iosTitle')}</h2><button id="install-close" type="button" class="text-btn" data-i18n="done">${s('done')}</button></div>
@@ -745,17 +829,14 @@ export function renderApp(lang: Language, canRefresh = false): string {
         <button id="install-done" type="button" class="primary-action" data-i18n="pwa.done">${s('pwa.done')}</button>
       </div>
     </dialog>
-    <div id="toast" class="toast" hidden></div>
+    <div id="toast" class="toast" popover="manual" hidden></div>
+    <div id="sending" class="toast sending" popover="manual" role="status" hidden></div>
     <div id="announce" class="sr-only" aria-live="polite"></div>
-    <svg hidden aria-hidden="true" focusable="false">
-      <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
-      <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
-      <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M7 17L17 7M8 7h9v9"/></symbol>
-    </svg>
-    <script>` + clientScript() + `</script>`);
+    ${iconSymbols()}
+    <script nonce="${nonce}">` + clientScript() + `</script>`, nonce);
 }
 
-function page(lang: Language, title: string, body: string): string {
+function page(lang: Language, title: string, body: string, nonce = ''): string {
   return '<!doctype html><html lang="' + lang + '"><head><meta charset="utf-8">'
     // viewport-fit=cover lets the page reach under a notch; the CSS then pads
     // it back with the safe-area insets, which is what an installed app needs.
@@ -777,7 +858,7 @@ function page(lang: Language, title: string, body: string): string {
     + '<meta name="theme-color" content="' + LIGHT_BAR + '">'
     + '<title>' + title + '</title><style>' + styles() + '</style>'
     // Before the body renders, so a stored choice never flashes the other theme.
-    + '<script>' + themeBoot() + '</script>'
+    + '<script nonce="' + nonce + '">' + themeBoot() + '</script>'
     + '</head><body>' + body + '</body></html>';
 }
 
@@ -817,19 +898,6 @@ function manifest(lang: Language): string {
   });
 }
 
-/**
- * A service worker that caches nothing.
- *
- * It exists so the app is installable. Caching would be actively wrong here:
- * this is a live view of mailbox state, and a page showing yesterday's triage
- * is worse than no page at all.
- */
-const SERVICE_WORKER = [
-  "self.addEventListener('install', () => self.skipWaiting());",
-  "self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));",
-  "self.addEventListener('fetch', () => {});",
-].join('\n');
-
 /** Assets a browser fetches before it has a session, and which hold nothing private. */
 const PUBLIC_ASSETS: Record<string, { body: string | Buffer; type: string; cache: string }> = {
   '/sw.js': { body: SERVICE_WORKER, type: 'text/javascript; charset=utf-8', cache: 'no-cache' },
@@ -840,32 +908,20 @@ const PUBLIC_ASSETS: Record<string, { body: string | Buffer; type: string; cache
   '/favicon.ico': { body: favicon64, type: 'image/png', cache: 'public, max-age=604800, immutable' },
 };
 
-/** Read a small request body; anything larger than a token is refused outright. */
-async function readBody(req: IncomingMessage, limit = 4096): Promise<string> {
-  let size = 0;
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    const buf = chunk as Buffer;
-    size += buf.length;
-    if (size > limit) throw new Error('request body too large');
-    chunks.push(buf);
-  }
-  return Buffer.concat(chunks).toString('utf8');
-}
-
 /** Six months. Long enough that a browser in regular use is never asked again. */
 const SESSION_MAX_AGE = 180 * 24 * 60 * 60;
 
-function sessionCookie(req: IncomingMessage, token: string): string {
+function sessionCookie(req: IncomingMessage, token: string, maxAge = SESSION_MAX_AGE): string {
   // Secure only when the request really arrived over TLS: setting it on plain
   // HTTP would make the cookie unusable behind a loopback-only setup.
   const https = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim() === 'https';
   // Lax, not Strict. Strict withholds the cookie on a navigation that starts
   // outside the site, which is exactly how an installed app launches from a
   // home screen and how a shared link opens, so it asked for the token again
-  // for no gain: this surface has no route that changes anything, and signing
-  // in still requires the token in the request body rather than a cookie.
-  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}`
+  // for no gain. Lax still keeps the cookie off a POST another site starts,
+  // and every route that changes something checks where its request came
+  // from besides.
+  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`
     + (https ? '; Secure' : '');
 }
 
@@ -873,8 +929,7 @@ function sessionCookie(req: IncomingMessage, token: string): string {
  * Run the poll the refresh button asked for.
  *
  * The response carries the poller's own stats so the page can say how many new
- * messages it found. A poll can read mail but changes nothing, keeping this
- * route inside the same read-only boundary as the rest of the view.
+ * messages it found. A poll reads mail and changes nothing in a mailbox.
  */
 async function handleRefresh(
   store: StateStore, client: string, options: WebOptions,
@@ -894,6 +949,9 @@ async function handleRefresh(
   }
 }
 
+/** Sent with every response: never guess a content type, never send a referrer. */
+const COMMON_HEADERS = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' };
+
 /**
  * Serve one non-MCP request.
  *
@@ -908,7 +966,32 @@ export async function routeWeb(
   client = 'unknown',
   options: WebOptions = {},
 ): Promise<WebResponse> {
-  const html = (status: number, body: string): WebResponse => ({ status, body, contentType: 'text/html; charset=utf-8' });
+  const answer = await route(req, url, token, store, client, options);
+  answer.headers = { ...COMMON_HEADERS, ...(answer.headers ?? {}) };
+  return answer;
+}
+
+async function route(
+  req: IncomingMessage,
+  url: URL,
+  token: string,
+  store: StateStore,
+  client: string,
+  options: WebOptions,
+): Promise<WebResponse> {
+  const writeToken = options.writeToken ?? '';
+  // One nonce per response: only the script that carries it runs.
+  const nonce = randomBytes(16).toString('base64');
+  const html = (status: number, body: string, shell = false): WebResponse => ({
+    status, body, contentType: 'text/html; charset=utf-8',
+    headers: {
+      'content-security-policy': appPolicy(nonce),
+      'x-frame-options': 'DENY',
+      'cross-origin-opener-policy': 'same-origin',
+      'permissions-policy': 'camera=(), microphone=(), geolocation=(), payment=()',
+      ...(shell ? { [SHELL_HEADER]: '1' } : {}),
+    },
+  });
 
   // Icons and the manifest carry nothing private, and a browser asks for them
   // before it has a session; refusing would leave the install without a mark.
@@ -928,40 +1011,117 @@ export async function routeWeb(
 
   const lang = pickLanguage(req);
 
+  // With no token there is no credential to check, so the request has to have
+  // come under one of this machine's own names (see localHost).
+  if (!token && !localHost(req.headers.host)) {
+    return {
+      status: 421, contentType: 'text/plain; charset=utf-8',
+      body: 'mailsift answers only to localhost while MCP_TOKEN is unset. Set MCP_TOKEN, or list this host name in MCP_ALLOWED_HOSTS.\n',
+    };
+  }
+  // Nothing under these paths is an image, a stylesheet or a frame. A request
+  // that says it is one was put there by a document, possibly a message.
+  if ((url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth')) && embedded(req)) {
+    return json(403, { error: 'not an embeddable resource', code: 'embedded' });
+  }
+
   if (url.pathname === '/auth' && req.method === 'POST') {
+    // Signing a browser in from another site's form would let that site pick
+    // which credential the browser holds, a weaker one included.
+    if (crossSite(req)) return html(403, renderLogin(lang, 'login.rejected', nonce));
     if (!allowAuthAttempt(client)) {
-      return html(429, renderLogin(lang, 'login.tooMany'));
+      return html(429, renderLogin(lang, 'login.tooMany', nonce));
     }
     let presented = '';
     try {
       presented = new URLSearchParams(await readBody(req)).get('token')?.trim() ?? '';
     } catch {
-      return html(413, renderLogin(lang, 'login.tooLarge'));
+      return html(413, renderLogin(lang, 'login.tooLarge', nonce));
     }
-    if (!tokenMatches(token, presented)) return html(401, renderLogin(lang, 'login.rejected'));
+    // Either credential signs in; which one it was decides what the session may do.
+    const writes = writeToken !== '' && presented !== '' && tokenMatches(writeToken, presented);
+    if (!writes && !tokenMatches(token, presented)) return html(401, renderLogin(lang, 'login.rejected', nonce));
     return { status: 303, body: '', contentType: 'text/html; charset=utf-8', cookie: sessionCookie(req, presented) };
   }
 
-  if (!authorized(req, token)) {
+  const session = sessionOf(req, token, writeToken);
+
+  // The form on its own address, so a read-only session can sign in again
+  // with the credential that may act on mail.
+  if (url.pathname === '/signin' && req.method === 'GET') {
+    return html(200, renderLogin(lang, undefined, nonce, session !== 'none'));
+  }
+
+  if (session === 'none') {
     return url.pathname.startsWith('/api/')
       ? json(401, { error: 'unauthorized' })
-      : html(401, renderLogin(lang));
+      : html(401, renderLogin(lang, undefined, nonce));
+  }
+
+  // Every POST here changes something. One that another site started is
+  // refused before it reaches a handler, whatever cookie came with it.
+  if (req.method === 'POST' && crossSite(req)) {
+    return json(403, { error: 'cross-site request refused', code: 'crossSite' });
   }
 
   if (url.pathname === '/' && req.method === 'GET') {
-    const answer = html(200, renderApp(lang, Boolean(options.onRefresh)));
+    const answer = html(200, renderApp(lang, Boolean(options.onRefresh), nonce), true);
     // Roll the session forward on each visit, so regular use never expires.
     // Only on the page: doing it on the polling calls would rewrite the cookie
     // every minute for nothing.
-    const session = readCookie(req.headers.cookie, SESSION_COOKIE);
-    if (token && session) answer.cookie = sessionCookie(req, session);
+    const cookie = readCookie(req.headers.cookie, SESSION_COOKIE);
+    if ((token || writeToken) && cookie) answer.cookie = sessionCookie(req, cookie);
     return answer;
+  }
+  if (url.pathname === '/mail-frame' && req.method === 'GET') {
+    // The empty document a message is shown in. It is the same for every
+    // message, so the browser may keep it; what differs is its policy.
+    return {
+      status: 200, body: MAIL_FRAME, contentType: 'text/html; charset=utf-8',
+      cacheControl: 'private, max-age=86400',
+      headers: {
+        'content-security-policy': framePolicy(url.searchParams.get('images') === '1'),
+        'x-frame-options': 'SAMEORIGIN',
+      },
+    };
+  }
+  if (url.pathname === '/auth/signout' && req.method === 'POST') {
+    return { ...json(200, { signedOut: true }), cookie: sessionCookie(req, '', 0), cacheControl: 'no-store' };
+  }
+  if (url.pathname === '/api/events' && req.method === 'GET') {
+    // The page's live line: one event when the stored mail changes, one when
+    // a poll finishes. A hub that is full says so and the page falls back to
+    // asking on a timer.
+    if (!liveHub.hasRoom(client)) {
+      return { ...json(503, { error: 'no room for another live stream', code: 'liveFull' }), cacheControl: 'no-store', headers: { 'retry-after': '120' } };
+    }
+    return {
+      status: 200, body: '', contentType: 'text/event-stream; charset=utf-8',
+      cacheControl: 'no-store, no-transform',
+      headers: { 'x-accel-buffering': 'no' },
+      stream: (channel) => {
+        if (liveHub.attach(channel, client)) return;
+        // Not taken on after all (the database would not open): say so and
+        // end the response, so the page is not left holding a silent request.
+        try { channel.write('event: full\ndata: {}\n\n'); } catch { /* already gone */ }
+        channel.close();
+      },
+    };
   }
   if (url.pathname === '/api/refresh' && req.method === 'POST') {
     const answer = await handleRefresh(store, client, options);
     answer.cacheControl = 'no-store';
     return answer;
   }
+
+  const context: ActionContext = {
+    session, backend: backendOf(options), lang, client, decorate,
+    mayMark: session === 'write' || writeToken === '',
+    credential: credentialMark(session === 'write' ? writeToken : token),
+  };
+  const acted = await routeActions(req, url, store, context);
+  if (acted) return acted;
+
   if (url.pathname === '/api/attachments' && req.method === 'GET') {
     const answer = await handleAttachmentsApi(url.searchParams, store, client);
     answer.cacheControl = 'no-store';
@@ -983,7 +1143,12 @@ export async function routeWeb(
     return answer;
   }
   if (url.pathname.startsWith('/api/') && req.method === 'GET') {
-    return handleApi(url.pathname, url.searchParams, store);
+    const answer = await handleApi(url.pathname, url.searchParams, store, {
+      session, options, lang, authRequired: Boolean(token || writeToken),
+    });
+    // Mail data is never a cache's to keep.
+    answer.cacheControl = 'no-store';
+    return answer;
   }
   return json(404, { error: 'not found' });
 }
