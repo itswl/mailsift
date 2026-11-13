@@ -48,13 +48,13 @@ export function reconnectDelayMs(failures: number, transient: boolean): number {
 export type WakeHandler = (account: Account, folder: Folder, client: ImapFlow) => Promise<void>;
 
 export interface ListenerDeps {
-  connect: (account: Account) => Promise<ImapFlow>;
+  connect: (account: Account, purpose?: string) => Promise<ImapFlow>;
   sleep: (ms: number) => Promise<void>;
   debounceMs: number;
 }
 
 const DEFAULT_DEPS: ListenerDeps = {
-  connect: (account) => connect(account, { idle: true }),
+  connect: (account, purpose) => connect(account, { idle: true, ...(purpose ? { purpose } : {}) }),
   // ref:false — a backoff timer must not keep the process alive after stop().
   sleep: (ms) => sleep(ms, undefined, { ref: false }),
   debounceMs: WAKE_DEBOUNCE_MS,
@@ -162,7 +162,7 @@ export class FolderListener {
   /** Resolves when the connection closes; 'unsupported' means polling must cover this folder. */
   private async session(): Promise<'closed' | 'unsupported'> {
     this.listeningSince = undefined;
-    const client = await this.deps.connect(this.account);
+    const client = await this.deps.connect(this.account, `listening on ${this.folder?.path ?? this.token}`);
     this.client = client;
     try {
       if (this.stopping) return 'closed';

@@ -68,11 +68,6 @@ export function retryDelayMs(account: Account, attempt: number): number {
   return 2_000 * 2 ** Math.max(0, attempt - 1);
 }
 
-export interface ConnectOptions {
-  /** Tune the connection for a long-lived IDLE listener instead of a short poll. */
-  idle?: boolean;
-}
-
 type ImapAuth = { user: string; accessToken: string } | { user: string; pass: string };
 
 async function authFor(account: Account): Promise<ImapAuth> {
@@ -156,42 +151,114 @@ async function attempt(client: ImapFlow): Promise<void> {
 
 // ---- The poller's connection ----
 
+/**
+ * Sign-ins to one mailbox are spaced out, for the callers that can wait.
+ *
+ * The service keeps a listener on each watched folder and polls beside them.
+ * Started together, they used to sign in to the same mailbox at the same
+ * instant: three at once after every restart, and again whenever a provider
+ * dropped them all. Providers limit bursts of sign-ins, and answer one with
+ * "Login failed" for a token that is perfectly good. Here no two attempts on
+ * a mailbox begin within a moment of each other.
+ *
+ * Only the start is spaced. An attempt does not wait for the one before it
+ * to finish: with a provider that leaves sign-ins hanging, that would put
+ * every caller behind the slowest.
+ */
+let signInGapMs = 1_500;
+const nextStart = new Map<string, number>();
+
+/** For tests, which have no provider to be polite to. */
+export function setSignInGap(ms: number): void {
+  signInGapMs = ms;
+  nextStart.clear();
+}
+
+async function inTurn<T>(key: string, work: () => Promise<T>): Promise<T> {
+  const now = Date.now();
+  const at = Math.max(now, nextStart.get(key) ?? 0);
+  nextStart.set(key, at + signInGapMs);
+  if (at > now) await sleep(at - now);
+  return work();
+}
+
+/**
+ * How long one of the poller's attempts may take, from the first packet to
+ * being signed in. A healthy provider takes one to three seconds. The library
+ * stops waiting for the connection and the greeting by itself, after a minute
+ * and a half; a server that greets and then never answers the sign-in it
+ * would wait on for minutes, with the whole poll behind it. Measured against
+ * a provider in trouble, an attempt that had not signed in after half a
+ * minute never did.
+ */
+const PATIENT_ATTEMPT_MS = 30_000;
+
+export interface ConnectOptions {
+  /** Tune the connection for a long-lived IDLE listener instead of a short poll. */
+  idle?: boolean;
+  /** Who is connecting, for the log: several callers share a mailbox, and their lines used to look alike. */
+  purpose?: string;
+  /** How long one attempt may take; for tests. */
+  attemptMs?: number;
+}
+
 export async function connect(account: Account, options: ConnectOptions = {}): Promise<ImapFlow> {
   const auth = await authFor(account);
   const maxAttempts = connectAttempts(account);
+  const who = options.purpose ? ` for ${options.purpose}` : '';
+  const attemptMs = options.attemptMs ?? PATIENT_ATTEMPT_MS;
+  // A refused sign-in is final for a password: asking again is how accounts
+  // get locked. A token is another matter. A provider in trouble refuses
+  // tokens it accepts a moment later, and one more try costs nothing.
+  let refusedOnce = false;
   for (let tried = 1; tried <= maxAttempts; tried += 1) {
     if (stopped) throw new Error('shutting down; no new mailbox connections');
-    log.info(
-      `Connecting ${account.name} (${account.host}:${account.port}, auth=${account.auth}, attempt ${tried}/${maxAttempts})`,
-    );
-    const client = newClient(account, auth, options.idle
-      ? {
-          // Re-enter IDLE soon after a wake-up fetch so the listening gap stays
-          // short; this connection issues few commands, so the extra round
-          // trips do not matter. RFC 2177 lets servers drop an IDLE after 29
-          // minutes, so restart it well before that.
-          autoIdleDelay: 1_000,
-          maxIdleTime: 20 * 60_000,
-          missingIdleCommand: 'NOOP' as const,
-        }
-      : {});
+    let outOfTime = false;
+    let client: ImapFlow | undefined;
     try {
-      await attempt(client);
+      client = await inTurn(account.username, async () => {
+        if (stopped) throw new Error('shutting down; no new mailbox connections');
+        log.info(
+          `Connecting ${account.name}${who} (${account.host}:${account.port}, auth=${account.auth}, attempt ${tried}/${maxAttempts})`,
+        );
+        const opened = newClient(account, auth, options.idle
+          ? {
+              // Re-enter IDLE soon after a wake-up fetch so the listening gap stays
+              // short; this connection issues few commands, so the extra round
+              // trips do not matter. RFC 2177 lets servers drop an IDLE after 29
+              // minutes, so restart it well before that.
+              autoIdleDelay: 1_000,
+              maxIdleTime: 20 * 60_000,
+              missingIdleCommand: 'NOOP' as const,
+            }
+          : {});
+        const deadline = setTimeout(() => { outOfTime = true; hangUp(opened); }, attemptMs);
+        try {
+          await attempt(opened);
+          return opened;
+        } catch (error) {
+          // A failed handshake can leave a half-open TLS socket behind. Close it
+          // before retrying or handing the connection failure back to the watcher.
+          hangUp(opened);
+          throw error;
+        } finally {
+          clearTimeout(deadline);
+        }
+      });
       return client;
     } catch (error) {
-      // A failed handshake can leave a half-open TLS socket behind. Close it
-      // before retrying or handing the connection failure back to the watcher.
-      hangUp(client);
-
-      const detail = imapErrorText(error);
-      if (stopped || tried === maxAttempts || !isTransientConnectError(error)) {
+      const detail = outOfTime ? 'the mail server did not complete the sign-in in time | ETIMEDOUT' : imapErrorText(error);
+      const transient = outOfTime || isTransientConnectError(error);
+      const tokenRefused = !transient && needsOAuth(account) && !refusedOnce;
+      if (stopped || tried === maxAttempts || (!transient && !tokenRefused)) {
         throw new Error(detail, { cause: error });
       }
+      if (tokenRefused) refusedOnce = true;
 
       const delayMs = retryDelayMs(account, tried);
       log.warn(
-        `[${account.name}] transient IMAP connection failure (${tried}/${maxAttempts}); ` +
-          `retrying in ${delayMs}ms: ${detail}`,
+        `[${account.name}] ${tokenRefused ? 'sign-in refused' : 'transient IMAP connection failure'}${who} `
+          + `(${tried}/${maxAttempts}); retrying in ${delayMs}ms: ${detail}`,
       );
       await sleep(delayMs);
     }
