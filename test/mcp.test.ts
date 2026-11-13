@@ -1,5 +1,27 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
+
+/**
+ * The mailbox is stood in for here: these tests are about what the server
+ * does around an action (who may ask, what is recorded, where the record
+ * goes), and test/imap.test.ts is where the action itself is run.
+ */
+const mailbox = vi.hoisted(() => ({
+  calls: [] as Array<{ messageId: string; action: string; destination?: string; hint: unknown }>,
+  answer: undefined as undefined | ((action: string) => Record<string, unknown> | undefined),
+}));
+vi.mock('../src/imap/client.js', async (original) => {
+  const real = await original<typeof import('../src/imap/client.js')>();
+  return {
+    ...real,
+    applyMessageAction: async (account: { username: string }, messageId: string, action: string, destination?: string, hint?: unknown) => {
+      if (!mailbox.answer) return real.applyMessageAction(account as never, messageId, action as never, destination, hint as never);
+      mailbox.calls.push({ messageId, action, ...(destination ? { destination } : {}), hint });
+      const answer = mailbox.answer(action);
+      return answer ? { action, account: account.username, messageId, sourceFolder: 'INBOX', ...answer } : undefined;
+    },
+  };
+});
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { allowMcpRequest, createServer } from '../src/mcp.js';
@@ -63,7 +85,7 @@ describe('tool surface', () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       'feedback_rules', 'get_mail', 'health', 'inspect_mail_safety', 'list_accounts', 'list_attachments', 'list_audit', 'list_dead_letters',
-      'list_digest', 'list_folders', 'list_mail', 'list_threads', 'mail_summary', 'observability',
+      'list_digest', 'list_folders', 'list_mail', 'list_threads', 'mail_summary', 'needs_you', 'observability',
       'recovery_status', 'scan_attachment', 'search_mail',
     ]);
     for (const tool of tools) expect(tool.description ?? '').not.toBe('');
@@ -78,16 +100,24 @@ describe('tool surface', () => {
     expect(names).not.toContain('record_feedback');
     expect(names).not.toContain('retry_dead_letter');
     expect(names).not.toContain('manage_mail');
+    expect(names).not.toContain('mark_handled');
 
     // Absent from the listing and also unreachable by name.
     expect(await client.callTool({ name: 'record_feedback', arguments: { messageId: '<one@x>', label: 'false_positive' } }))
       .toMatchObject({ isError: true });
   });
 
-  it('adds exactly the two write tools for a caller holding the write credential', async () => {
+  it('adds exactly the tools that change something for a caller holding the write credential', async () => {
     const reader = new Set((await (await connect(new StateStore(':memory:'))).listTools()).tools.map((t) => t.name));
     const writer = (await (await connect(new StateStore(':memory:'), true)).listTools()).tools.map((t) => t.name);
-    expect(writer.filter((name) => !reader.has(name)).sort()).toEqual(['manage_mail', 'record_feedback', 'retry_dead_letter']);
+    expect(writer.filter((name) => !reader.has(name)).sort()).toEqual(['manage_mail', 'mark_handled', 'record_feedback', 'retry_dead_letter']);
+  });
+
+  it('offers no way to send mail or to delete it, to anyone', async () => {
+    const writer = (await (await connect(new StateStore(':memory:'), true)).listTools()).tools;
+    expect(writer.map((t) => t.name).filter((name) => /send|reply|delete|trash|bin/i.test(name))).toEqual([]);
+    const actions = (writer.find((t) => t.name === 'manage_mail')?.inputSchema.properties as Record<string, { enum?: string[] }>)['action']?.enum;
+    expect(actions).toEqual(['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox']);
   });
 
   it('warns a client that message fields are untrusted data', async () => {
@@ -219,6 +249,111 @@ describe('queries', () => {
     const client = await connect(seeded());
     expect(await call(client, 'mail_summary', { hours: 24 })).toMatchObject({ total: 3, pushed: 2 });
     expect(await call(client, 'observability')).toMatchObject({ seenTotal: 3, pushedTotal: 2 });
+  });
+});
+
+describe('what needs the mailbox owner', () => {
+  it('is the queue the web view opens on: judged to matter, and not dealt with', async () => {
+    const state = seeded();
+    const client = await connect(state);
+    const queue = await call(client, 'needs_you');
+    expect(queue['count']).toBe(2);
+    expect((queue['mail'] as Array<{ messageId: string }>).map((m) => m.messageId).sort()).toEqual(['<one@x>', '<two@x>']);
+    expect(queue).not.toHaveProperty('recentlyDone');
+    // Where a message sits in its folder is the mailbox's business, not a caller's.
+    expect((queue['mail'] as Array<Record<string, unknown>>)[0]).not.toHaveProperty('uid');
+
+    state.setHandled('k1', true);
+    state.setHandled('k3', true);
+    const after = await call(client, 'needs_you', { includeDone: true, limit: 1 });
+    expect(after['count']).toBe(1);
+    expect((after['mail'] as Array<{ messageId: string }>).map((m) => m.messageId)).toEqual(['<two@x>']);
+    const done = after['recentlyDone'] as Array<{ messageId: string; queued: boolean; handledAt: string }>;
+    expect(done.map((m) => [m.messageId, m.queued]).sort()).toEqual([['<one@x>', true], ['<three@x>', false]]);
+    expect(done[0]?.handledAt).toEqual(expect.any(String));
+  });
+
+  it('lets a writer say a message is done, and put it back', async () => {
+    const state = seeded();
+    const client = await connect(state, true);
+    // No mailbox is configured here: the message is done all the same, and the answer says the mailbox was not told.
+    const done = await call(client, 'mark_handled', { messageId: '<one@x>' });
+    expect(done).toMatchObject({ messageId: '<one@x>', handled: true, markedRead: false, needsYou: 1 });
+    expect(done['handledAt']).toEqual(expect.any(String));
+    expect(state.getMail('k1')?.handledAt).toBeTruthy();
+    expect(state.listMailActions(5)[0]).toMatchObject({ action: 'mark_read', success: false, client: 'test' });
+
+    const back = await call(client, 'mark_handled', { messageId: '<one@x>', handled: false });
+    expect(back).toMatchObject({ handled: false, handledAt: null, needsYou: 2 });
+    expect(back).not.toHaveProperty('markedRead');
+    expect(await client.callTool({ name: 'mark_handled', arguments: { messageId: '<absent@x>' } })).toMatchObject({ isError: true });
+  });
+
+  it('marks a done message read in its mailbox, at the place the record remembers', async () => {
+    process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw';
+    const state = seeded();
+    state.rememberUid('k1', 'INBOX', 17, '9');
+    mailbox.calls = [];
+    mailbox.answer = () => ({});
+    try {
+      const done = await call(await connect(state, true), 'mark_handled', { messageId: '<one@x>' });
+      expect(done).toMatchObject({ handled: true, markedRead: true, needsYou: 1 });
+      expect(mailbox.calls).toEqual([{ messageId: '<one@x>', action: 'mark_read', hint: { folder: 'INBOX', uid: 17, uidValidity: '9' } }]);
+      expect(state.listMailActions(5)[0]).toMatchObject({ action: 'mark_read', success: true, sourceFolder: 'INBOX' });
+    } finally {
+      mailbox.answer = undefined;
+    }
+  });
+});
+
+describe('acting on a mailbox', () => {
+  it('keeps the record with the message when it is archived, and counts it dealt with', async () => {
+    process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw';
+    const state = seeded();
+    state.rememberUid('k1', 'INBOX', 17, '9');
+    mailbox.calls = [];
+    mailbox.answer = (action) => (action === 'archive'
+      ? { destinationFolder: 'Archive', destinationIsSpam: false, destinationUid: 101, destinationUidValidity: '4' }
+      : action === 'inbox' ? { sourceFolder: 'Archive', destinationFolder: 'INBOX', destinationIsSpam: false } : {});
+    try {
+      const client = await connect(state, true);
+      const archived = await call(client, 'manage_mail', { messageId: '<one@x>', action: 'archive' });
+      // What a caller is told is the action and the folders, not where in the folder.
+      expect(archived).toEqual({
+        success: true, action: 'archive', account: 'me@qq.com', messageId: '<one@x>', sourceFolder: 'INBOX', destinationFolder: 'Archive',
+      });
+      expect(mailbox.calls[0]).toMatchObject({ action: 'archive', hint: { folder: 'INBOX', uid: 17, uidValidity: '9' } });
+      expect(state.getMail('k1')).toMatchObject({ folder: 'Archive', inSpam: false });
+      expect(state.getMail('k1')?.handledAt).toBeTruthy();
+      expect(state.placeOf('k1')).toEqual({ uid: 101, uidValidity: '4' });
+      expect(state.listMailActions(5)[0]).toMatchObject({ action: 'archive', success: true, destinationFolder: 'Archive' });
+      expect((await call(client, 'needs_you'))['count']).toBe(1);
+
+      // Brought back, it is looked for where the record now says it is; the server did not say where it landed.
+      await call(client, 'manage_mail', { messageId: '<one@x>', action: 'inbox' });
+      expect(mailbox.calls[1]).toMatchObject({ action: 'inbox', hint: { folder: 'Archive', uid: 101, uidValidity: '4' } });
+      expect(state.getMail('k1')).toMatchObject({ folder: 'INBOX' });
+      expect(state.placeOf('k1')).toBeUndefined();
+      // Starring moves nothing, and leaves the record alone.
+      await call(client, 'manage_mail', { messageId: '<two@x>', action: 'star' });
+      expect(state.getMail('k2')).toMatchObject({ folder: 'INBOX', handledAt: null });
+    } finally {
+      mailbox.answer = undefined;
+    }
+  });
+
+  it('records a message that could not be found, and changes nothing', async () => {
+    process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw';
+    const state = seeded();
+    mailbox.answer = () => undefined;
+    try {
+      const client = await connect(state, true);
+      expect(await client.callTool({ name: 'manage_mail', arguments: { messageId: '<one@x>', action: 'archive' } })).toMatchObject({ isError: true });
+      expect(state.getMail('k1')).toMatchObject({ folder: 'INBOX', handledAt: null });
+      expect(state.listMailActions(5)[0]).toMatchObject({ action: 'archive', success: false });
+    } finally {
+      mailbox.answer = undefined;
+    }
   });
 });
 

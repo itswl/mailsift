@@ -14,7 +14,10 @@ import {
   extractAttachmentManifest, extractBody, fallbackMessageId, findBodyParts, findTextBodyPart, htmlToText, normalizeDate,
   type AttachmentInfo, type AttachmentManifest, type MailMessage,
 } from './message.js';
-import { authservTrust, MAX_HTML_BYTES, parseReadable, slimSource, type ReadableMessage } from './readable.js';
+import {
+  authservTrust, mailboxAuthHeaders, MAX_HTML_BYTES, parseAuthenticationResults, parseReadable, slimSource,
+  type ReadableAuth, type ReadableMessage,
+} from './readable.js';
 import {
   inspectLinkRisks,
   scanAttachment,
@@ -327,6 +330,13 @@ export interface MailSafetyReport {
     fromAddress: string;
     replyToAddresses: string[];
     replyToDomainMismatch: boolean;
+    /**
+     * What the mailbox's own provider reported about the sender, as the
+     * reading view shows it. mailsift checks no signature itself, and
+     * `result` is "none" when the provider is not one it can recognise the
+     * header of, or said nothing.
+     */
+    authentication: ReadableAuth;
   };
   attachments: AttachmentInfo[];
   attachmentsTruncated: boolean;
@@ -345,7 +355,12 @@ interface DownloadedPrefix {
   truncated: boolean;
 }
 
-export const MAIL_ACTIONS = ['mark_read', 'mark_unread', 'star', 'unstar', 'move'] as const;
+/**
+ * What the MCP tool may do to a message: mark it, star it, and move it within
+ * the mailbox, by a folder's name or to the mailbox's own archive or inbox.
+ * Nothing in this list destroys mail or sends any.
+ */
+export const MAIL_ACTIONS = ['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox'] as const;
 export type MailAction = (typeof MAIL_ACTIONS)[number];
 
 export interface MailActionResult {
@@ -354,6 +369,11 @@ export interface MailActionResult {
   messageId: string;
   sourceFolder: string;
   destinationFolder?: string;
+  /** Set with destinationFolder: whether the message now sits in a spam folder. */
+  destinationIsSpam?: boolean;
+  /** Where the message landed, when the server said: its new UID and that folder's UIDVALIDITY. */
+  destinationUid?: number;
+  destinationUidValidity?: string;
 }
 
 export class MailActionError extends Error {
@@ -363,6 +383,10 @@ export class MailActionError extends Error {
   }
 }
 
+/**
+ * A destination that names a bin outright, told before any connection is
+ * made. The server's own list is checked again once it is at hand (inTrash).
+ */
 function isUnsafeMoveDestination(path: string): boolean {
   const normalized = path.trim().toLowerCase();
   const leaf = normalized.split('/').at(-1) ?? normalized;
@@ -931,7 +955,7 @@ export async function inspectMailSafety(
               uid: true,
               envelope: true,
               bodyStructure: true,
-              headers: ['list-id', 'list-unsubscribe', 'precedence'],
+              headers: ['list-id', 'list-unsubscribe', 'precedence', 'authentication-results'],
             },
             { uid: true },
           );
@@ -1048,6 +1072,15 @@ export async function inspectMailSafety(
               fromAddress,
               replyToAddresses,
               replyToDomainMismatch,
+              // Believed only from the mailbox's own server, and only the first such header: see readable.ts.
+              // Those helpers take whole header lines, so each value is given its name back.
+              authentication: parseAuthenticationResults(
+                mailboxAuthHeaders(
+                  (values.get('authentication-results') ?? []).map((value) => `Authentication-Results: ${value}`),
+                  authservTrust(account.host, account.authservId),
+                ),
+                fromAddress,
+              ),
             },
             attachments,
             attachmentsTruncated: attachmentManifest.truncated,
@@ -1055,8 +1088,9 @@ export async function inspectMailSafety(
             findings,
             limitations:
               'Heuristics only. Bulk headers are not a spam verdict; From and Reply-To may be spoofed. ' +
-              'Sender authentication is not verified. Links are parsed from a bounded body prefix but never opened; ' +
-              'attachment contents are not inspected here.',
+              'Sender authentication is what the mailbox provider reported, not something checked here, and is "none" ' +
+              'when the provider said nothing or is not recognised. Links are parsed from a bounded body prefix but ' +
+              'never opened; attachment contents are not inspected here.',
           };
         }
       } finally {
@@ -1181,14 +1215,23 @@ async function actOnMessage(
 
 /**
  * Apply one narrowly-scoped mailbox action after the caller has presented the
- * separate write credential. Message IDs are resolved again inside the
- * selected mailbox, so a stale local row cannot turn into an arbitrary UID.
+ * separate write credential. This is the MCP tool's path.
+ *
+ * Message IDs are resolved again inside the selected mailbox, so a stale
+ * local row cannot turn into an arbitrary UID: `hint` only says where to
+ * look first, and what is found there is checked before anything changes.
+ * Without a hint the configured folders are searched, as before.
+ *
+ * `archive` and `inbox` are moves to a folder the mailbox itself names, so a
+ * caller need not know what a provider calls it. Nothing here deletes: a
+ * move to the bin is refused whatever the folder is called.
  */
 export async function applyMessageAction(
   account: Account,
   messageId: string,
   action: MailAction,
   destination?: string,
+  hint: MessageHint = {},
 ): Promise<MailActionResult | undefined> {
   if (!MAIL_ACTIONS.includes(action)) {
     throw new MailActionError('invalid_action', `unsupported mail action: ${action}`);
@@ -1203,26 +1246,28 @@ export async function applyMessageAction(
 
   const client = await connect(account);
   try {
-    let destinationPath: string | undefined;
-    if (action === 'move') {
-      const listed = await listFolders(client);
-      const found = listed.find((entry) => entry.path === target);
-      const flags = new Set([...((found?.flags ?? []) as Iterable<string>)].map((flag) => String(flag).toLowerCase()));
-      if (!found || flags.has('\\noselect')) {
-        throw new MailActionError('invalid_destination', `destination folder not found or not selectable: ${target}`);
+    const listed = await listFolders(client);
+    let to: { path: string; isSpam: boolean } | undefined;
+    if (action === 'move' || action === 'archive' || action === 'inbox') {
+      to = resolveActionDestination(listed, action, account.provider, target);
+      // The name was checked above, before connecting. Here the server's own
+      // list is at hand: its flag for the bin, and the folders inside one.
+      if (inTrash(listed, to.path)) {
+        throw new MailActionError('invalid_destination', 'moving to a delete/trash folder is disabled');
       }
-      destinationPath = found.path;
     }
 
-    const folders = await targetFolders(client, account);
-    const acted = await actOnMessage(client, messageId, folders, action, destinationPath);
+    const folders = orderLookupFolders(listed, resolveFolders(listed, account.folders), hint.folder);
+    const acted = await actOnMessage(client, messageId, folders, action, to?.path, hint);
     if (acted === undefined) return undefined;
     return {
       action,
       account: account.username,
       messageId,
       sourceFolder: acted.sourceFolder,
-      ...(destinationPath ? { destinationFolder: destinationPath } : {}),
+      ...(to ? { destinationFolder: to.path, destinationIsSpam: to.isSpam } : {}),
+      ...(acted.destinationUid && acted.destinationUidValidity
+        ? { destinationUid: acted.destinationUid, destinationUidValidity: acted.destinationUidValidity } : {}),
     };
   } finally {
     await client.logout().catch(() => undefined);
@@ -1233,22 +1278,15 @@ export async function applyMessageAction(
  * What the web view may do to a message.
  *
  * A person looking at one message and pressing one button, not an agent with a
- * tool: so this set adds what a mail client is expected to do (archive, bin,
- * rescue to the inbox, mark as answered) to the actions the MCP tool has.
- * MAIL_ACTIONS is deliberately left as it was. The MCP tool builds its schema
- * from it and promises there that nothing can be sent to the trash.
+ * tool: so this set adds, to what the MCP tool has, the two things only a
+ * person is given: binning a message, and marking it answered once a reply
+ * has left. MAIL_ACTIONS stays without them. The MCP tool builds its schema
+ * from that list and promises there that nothing can be sent to the trash.
  */
-export const WEB_MAIL_ACTIONS = [...MAIL_ACTIONS, 'archive', 'trash', 'inbox', 'answered'] as const;
+export const WEB_MAIL_ACTIONS = [...MAIL_ACTIONS, 'trash', 'answered'] as const;
 export type WebMailAction = (typeof WEB_MAIL_ACTIONS)[number];
 
-export type WebMailActionResult = Omit<MailActionResult, 'action'> & {
-  action: WebMailAction;
-  /** Set with destinationFolder: whether the message now sits in a spam folder. */
-  destinationIsSpam?: boolean;
-  /** Where the message landed, when the server said: its new UID and that folder's UIDVALIDITY. */
-  destinationUid?: number;
-  destinationUidValidity?: string;
-};
+export type WebMailActionResult = Omit<MailActionResult, 'action'> & { action: WebMailAction };
 
 type MovingAction = 'move' | 'archive' | 'trash' | 'inbox';
 const MOVING_ACTIONS = new Set<WebMailAction>(['move', 'archive', 'trash', 'inbox']);
@@ -1274,6 +1312,23 @@ function entrySelectable(entry: ListResponse): boolean {
 /** RFC 6154 special use, whether the server sent it as an attribute or ImapFlow resolved it. */
 function entryHasUse(entry: ListResponse, use: string): boolean {
   return (entry.specialUse ?? '').trim().toLowerCase() === use || entryFlags(entry).has(use);
+}
+
+/**
+ * Whether a folder is a bin or lies inside one: by the server's special-use
+ * flag or by the names bins go by, at any level of its path. A provider
+ * empties what is under its bin along with it.
+ */
+function inTrash(entries: readonly ListResponse[], path: string): boolean {
+  const delimiter = entries.find((entry) => entry.path === path)?.delimiter || '/';
+  const parts = path.split(delimiter);
+  for (let depth = 1; depth <= parts.length; depth += 1) {
+    const ancestor = parts.slice(0, depth).join(delimiter);
+    const listed = entries.find((entry) => entry.path === ancestor);
+    if (listed && entryHasUse(listed, '\\trash')) return true;
+    if (TRASH_NAMES.has(ancestor.trim().toLowerCase()) || TRASH_NAMES.has((parts[depth - 1] ?? '').trim().toLowerCase())) return true;
+  }
+  return false;
 }
 
 function entryByName(entries: readonly ListResponse[], names: ReadonlySet<string>): ListResponse | undefined {

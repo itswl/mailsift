@@ -1,6 +1,8 @@
 # MCP
 
-mailsift includes an MCP server, so an AI assistant can list, search and read your triaged mail, preview the digest, look at attachments, and check whether mailsift is healthy.
+mailsift includes an MCP server, so an AI assistant can see what needs you, list, search and read your triaged mail, preview the digest, look at attachments and at what your provider said about a sender, and check whether mailsift is healthy. With a second, write token it can also mark mail done and file it. It can never send mail or delete it.
+
+An agent that supports skills can load [`.agents/skills/mailsift/SKILL.md`](../.agents/skills/mailsift/SKILL.md), which says how these tools are meant to be used and where the limits are.
 
 - [Connecting](#connecting)
 - [Tools and resources](#tools-and-resources)
@@ -36,6 +38,7 @@ For local stdio clients, point the command at `dist/src/mcp.js` (or `npm run mcp
 
 | Tool | What it does |
 | --- | --- |
+| `needs_you` | The queue the web view opens on: mail judged to matter that nobody has dealt with yet. Optionally also what was dealt with in the last seven days. Start here for "what needs me". |
 | `list_mail` | Recently processed mail (24 hours by default), filtered by level, exact category, mailbox, spam only or pushed only. |
 | `list_threads` | Recent conversations, grouped by their References/In-Reply-To root. |
 | `search_mail` | Keyword search over subject, sender, category, summary, reason, the stored body preview and attachment metadata. |
@@ -46,14 +49,15 @@ For local stdio clients, point the command at `dist/src/mcp.js` (or `npm run mcp
 | `list_folders` | One mailbox's IMAP folders. |
 | `list_attachments` | A message's attachments, each with a resource URI to fetch the file. |
 | `scan_attachment` | A bounded local check of one attachment. |
-| `inspect_mail_safety` | Spam and safety clues for one message. |
+| `inspect_mail_safety` | Spam and safety clues for one message, with what the mailbox's provider reported about the sender. |
 | `health` | Last poll, mailbox failures, LLM status and queues. Start here when a notification is missing. |
 | `recovery_status` | Mailbox health timelines, folder UID progress, dead letters, and notifications queued for retry. |
 | `list_dead_letters` | Messages skipped because they were oversized or could not be parsed. |
 | `observability` | Totals for processing, delivery, dead letters, feedback and mailbox actions, plus access audit by tool. |
 | `list_audit` | Recent tool and resource calls and audited mailbox actions. |
 | `feedback_rules` | Sender rules inferred from feedback. |
-| `manage_mail` | Write: mark read or unread, star or unstar, move. |
+| `manage_mail` | Write: mark read or unread, star or unstar, archive, bring back to the inbox, move. |
+| `mark_handled` | Write: say a message is dealt with, which takes it out of `needs_you`, or put it back. |
 | `record_feedback` | Write: label a message `false_positive`, `missed`, `handled` or `correct`. |
 | `retry_dead_letter` | Write: rewind one folder cursor so the next poll retries a dead letter. |
 
@@ -77,7 +81,7 @@ Prompts are workflows, not questions. Each one fixes an order of tool calls that
 
 | Prompt | Arguments | What it does |
 | --- | --- | --- |
-| `catch_up` | `hours`, optional `focus` | Reports what arrived and what needs action, reading `mail_summary`, `list_mail` and the pending digest rather than searching. |
+| `catch_up` | `hours`, optional `focus` | Reports what arrived and what needs action, starting from `needs_you` and reading `mail_summary`, `list_mail` and the pending digest rather than searching. It changes nothing. |
 | `why_not_notified` | `about` | Diagnoses a missing notification in order: was the mailbox read, was it judged above the threshold, was it delivered. Starts at `health`, which answers most cases on its own. |
 | `review_triage` | `hours` | Goes through recent judgements and records feedback on the wrong ones. Asks before recording anything, because two records for one sender become a standing rule. Registered only where `MCP_WRITE_TOKEN` is configured. |
 
@@ -101,13 +105,17 @@ A Message-ID that was never seen is not an error: `get_mail` answers `found: fal
 
 ## Write tools and the write token
 
-`manage_mail`, `record_feedback`, and `retry_dead_letter` are write tools, and they are not registered at all unless `MCP_WRITE_TOKEN` is set. `manage_mail` supports `mark_read`, `mark_unread`, `star`, `unstar`, and `move`; it refuses delete/trash destinations and never sends mail. Every operation resolves the Message-ID again inside a writable IMAP lock and records an audit row. The separate token keeps a leaked read credential from changing either mailbox contents or future triage policy.
+`manage_mail`, `mark_handled`, `record_feedback`, and `retry_dead_letter` are write tools, and they are not registered at all unless `MCP_WRITE_TOKEN` is set. The separate token keeps a leaked read credential from changing either mailbox contents or future triage policy.
+
+`manage_mail` supports `mark_read`, `mark_unread`, `star`, `unstar`, `archive`, `inbox` and `move`. `archive` files a message in the mailbox's own archive folder (All Mail on Gmail; refused where there is none) and counts it as dealt with; `inbox` brings one back from spam or from the archive; `move` takes a folder path from `list_folders`. It never sends mail, and it refuses a move to a bin whatever the folder is called: by the usual names and by the server's own `\Trash` flag. Every operation looks the message up again in the mailbox, starting where mailsift last saw it, and checks its Message-ID inside a writable IMAP lock before changing anything; then it records an audit row. After a move the stored record follows the message, so the web view and the next call look where it now is.
+
+`mark_handled` is the ring in the web view: it takes a message out of the queue, or with `handled: false` puts it back. Marking one done also marks it read in its mailbox, and the answer's `markedRead` says whether the mailbox could be told; a mailbox that cannot be reached does not undo the mark.
 
 Set `MCP_WRITE_TOKEN` to a second secret that differs from `MCP_TOKEN`; reusing one value for both is refused at startup. Present it as the bearer token to get the full surface. `MCP_TOKEN` then stays a read-only credential, which is what any shared client should hold. Over stdio the caller can already read the env file, so setting `MCP_WRITE_TOKEN` alone enables the write tools there without a second presentation.
 
-The [web view](web-view.md#signing-in-and-what-a-session-may-do) makes the same split: a browser that signs in with `MCP_WRITE_TOKEN` can act on mail, and one that signs in with `MCP_TOKEN` reads. The page can do two things the MCP tools deliberately cannot, move a message to the bin and send a reply, because there a person presses the button. An MCP client is a model following instructions that may have come from the mail it is reading, so `manage_mail` stays as narrow as it was. Both write to the same audit tables.
+The [web view](web-view.md#signing-in-and-what-a-session-may-do) makes the same split: a browser that signs in with `MCP_WRITE_TOKEN` can act on mail, and one that signs in with `MCP_TOKEN` reads. The page can do two things the MCP tools deliberately cannot, move a message to the bin and send a reply, because there a person presses the button. An MCP client is a model following instructions that may have come from the mail it is reading, so what it is given is what can be undone from the same place: flags flip back, and a message that was archived or moved can be brought back. Both write to the same audit tables.
 
-`record_feedback` records `false_positive`, `missed`, `handled`, and `correct` labels for later rule and triage evaluation. Two `missed` or two `false_positive` records for one sender become a rule; see [Configuration](configuration.md#your-own-rules).
+`record_feedback` records `false_positive`, `missed`, `handled`, and `correct` labels for later rule and triage evaluation. Two `missed` or two `false_positive` records for one sender become a rule; see [Configuration](configuration.md#your-own-rules). The `handled` label also takes the message out of the queue, but it cannot put one back: `mark_handled` is the tool for the queue.
 
 ## Attachments
 
@@ -119,11 +127,11 @@ The [web view](web-view.md#signing-in-and-what-a-session-may-do) makes the same 
 
 ## Spam and safety clues
 
-The `inspect_mail_safety` tool checks a message's configured folder, mailing-list or bulk-mail headers, a From/Reply-To domain mismatch, attachment filename/MIME types, and links parsed from a bounded text body prefix. The web detail view offers the same check, and attachment lists show file-type cautions and a bounded scan button. Mailbox reads use a read-only lock; only the selected text body prefix is read for link parsing, and no link is opened.
+The `inspect_mail_safety` tool checks a message's configured folder, mailing-list or bulk-mail headers, a From/Reply-To domain mismatch, attachment filename/MIME types, and links parsed from a bounded text body prefix. Under `senderSignals.authentication` it also repeats what the mailbox's own provider reported about SPF, DKIM and DMARC, by the same rules as the reader (`pass`, `fail`, or `none` when the provider said nothing or is not one whose header can be recognised). The web detail view offers the same check, and attachment lists show file-type cautions and a bounded scan button. Mailbox reads use a read-only lock; only the selected text body prefix is read for link parsing, and no link is opened.
 
 Link parsing reads at most `MCP_SAFETY_BODY_BYTES` (default 256 KiB, hard cap 1 MiB) from a selected text body part. It reports scheme, IP-host, punycode, userinfo, and common shortener clues while omitting URL paths and query values.
 
-These are clues, not a spam or malware verdict. Mailing-list headers do not prove spam; sender fields can be forged. mailsift does not verify SPF, DKIM or DMARC itself (the web view's reader shows what the mailbox's own provider reported, see [Reading a message](web-view.md#reading-a-message)), resolve or reputation-check links, unpack attachments, or provide an antivirus verdict. It does not move, delete, flag, or otherwise change messages as part of these checks.
+These are clues, not a spam or malware verdict. Mailing-list headers do not prove spam; sender fields can be forged. mailsift does not verify SPF, DKIM or DMARC itself (it repeats what the mailbox's own provider reported, see [Reading a message](web-view.md#reading-a-message), and a pass proves the domain, not the intent), resolve or reputation-check links, unpack attachments, or provide an antivirus verdict. It does not move, delete, flag, or otherwise change messages as part of these checks.
 
 ## Health and recovery
 
