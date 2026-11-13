@@ -1,7 +1,7 @@
 {
   "name": "mailsift",
   "version": "1.0.0",
-  "description": "Read-only multi-mailbox triage: watch inboxes and spam, judge what actually matters with an LLM, and push only that to Feishu or a webhook. MCP server and a web view included.",
+  "description": "Multi-mailbox AI mail triage with its own web mail: watch inboxes and spam, judge what actually matters with an LLM, push only that, and read, file and answer it in the browser. MCP server included.",
   "type": "module",
   "engines": {
     "node": ">=22.5"
@@ -25,6 +25,7 @@
     "@opentelemetry/sdk-metrics": "^3.0.0",
     "imapflow": "^2.10.2",
     "mailparser": "^3.14.2",
+    "nodemailer": "^10.3.1",
     "zod": "^4.6.7"
   },
   "devDependencies": {

@@ -7,6 +7,7 @@
  * access_token values are short-lived; refresh_token values are persisted.
  * Initial authorization is handled by scripts/oauth-setup.ts.
  */
+import { readFileSync, statSync } from 'node:fs';
 import { chmod, mkdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -36,7 +37,20 @@ export interface TokenRecord {
   refreshToken: string;
   accessToken: string;
   expiresAt: number;
+  /**
+   * The scopes this authorization was asked for. A refresh must ask for the
+   * same ones: asking for more than was consented to is refused, and that
+   * would take reading down with it. Absent on records made before sending
+   * existed, which were all asked for the provider's default.
+   */
+  scope?: string;
 }
+
+/**
+ * Microsoft consents to sending separately from reading. Asked for only when
+ * the owner authorizes a mailbox with `npm run oauth -- --send`.
+ */
+export const OUTLOOK_SEND_SCOPE = 'https://outlook.office.com/SMTP.Send';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -55,6 +69,7 @@ function parseTokenStore(value: unknown): Record<string, TokenRecord> {
       refreshToken: raw.refreshToken,
       accessToken: raw.accessToken,
       expiresAt: raw.expiresAt,
+      ...(typeof raw.scope === 'string' && raw.scope ? { scope: raw.scope } : {}),
     };
   }
   return records;
@@ -64,7 +79,35 @@ export function tokenStorePath(): string {
   return process.env.TOKEN_STORE_PATH ?? 'data/tokens.json';
 }
 
-export function getOAuthProvider(auth: AuthKind): OAuthProvider {
+/**
+ * The scopes a mailbox was authorized with, read from the token file.
+ *
+ * Synchronous and cached by the file's modification time, because whether a
+ * mailbox can send is asked on every page load and must not wait on a lock.
+ * Undefined when there is no record or it predates stored scopes.
+ */
+let scopeCache: { path: string; mtimeMs: number; scopes: Map<string, string> } | undefined;
+export function authorizedScope(username: string, path = tokenStorePath()): string | undefined {
+  try {
+    const mtimeMs = statSync(path).mtimeMs;
+    if (!scopeCache || scopeCache.path !== path || scopeCache.mtimeMs !== mtimeMs) {
+      const scopes = new Map<string, string>();
+      const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      if (isRecord(parsed)) {
+        for (const [name, raw] of Object.entries(parsed)) {
+          if (isRecord(raw) && typeof raw.scope === 'string' && raw.scope) scopes.set(name, raw.scope);
+        }
+      }
+      scopeCache = { path, mtimeMs, scopes };
+    }
+    return scopeCache.scopes.get(username);
+  } catch {
+    // No token file, or one that cannot be read: nothing is known to be granted.
+    return undefined;
+  }
+}
+
+export function getOAuthProvider(auth: AuthKind, options: { send?: boolean } = {}): OAuthProvider {
   if (auth === 'gmail_oauth') {
     const clientId = process.env.GMAIL_CLIENT_ID?.trim();
     if (!clientId) {
@@ -99,7 +142,13 @@ export function getOAuthProvider(auth: AuthKind): OAuthProvider {
       name: 'outlook',
       authorizeUrl: `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize`,
       tokenUrl: `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`,
-      scope: 'https://outlook.office.com/IMAP.AccessAsUser.All offline_access',
+      // Reading only, unless sending was asked for: the consent screen should
+      // not offer "send mail as you" to someone who wants their mail triaged.
+      scope: [
+        'https://outlook.office.com/IMAP.AccessAsUser.All',
+        ...(options.send ? [OUTLOOK_SEND_SCOPE] : []),
+        'offline_access',
+      ].join(' '),
       clientId,
       ...(process.env.OUTLOOK_CLIENT_SECRET?.trim()
         ? { clientSecret: process.env.OUTLOOK_CLIENT_SECRET.trim() }
@@ -245,7 +294,7 @@ export function exchangeCode(
  * Refresh responses may omit refresh_token (Google usually does); preserve the
  * previous value or one refresh would lose the long-lived credential.
  */
-export function buildTokenRecord(payload: unknown, previous?: TokenRecord): TokenRecord {
+export function buildTokenRecord(payload: unknown, previous?: TokenRecord, scope?: string): TokenRecord {
   if (!isRecord(payload)) throw new AuthError('Authorization response is not an object');
   const data = payload as { refresh_token?: unknown; access_token?: unknown; expires_in?: unknown };
   const refreshToken = data.refresh_token ?? previous?.refreshToken;
@@ -259,10 +308,12 @@ export function buildTokenRecord(payload: unknown, previous?: TokenRecord): Toke
   if (!Number.isFinite(expiresIn) || expiresIn <= 0) {
     throw new AuthError('Authorization response has an invalid expires_in');
   }
+  const asked = scope ?? previous?.scope;
   return {
     refreshToken,
     accessToken: data.access_token,
     expiresAt: Date.now() / 1000 + expiresIn,
+    ...(asked ? { scope: asked } : {}),
   };
 }
 
@@ -286,7 +337,8 @@ export async function getAccessToken(
     await postToken(provider, {
       refresh_token: record.refreshToken,
       grant_type: 'refresh_token',
-      scope: provider.scope,
+      // What this mailbox was authorized for, not what a new one would ask.
+      scope: record.scope ?? provider.scope,
     }),
     record,
   );
