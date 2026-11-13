@@ -1,6 +1,7 @@
 # Deployment and operations
 
 - [Docker](#docker)
+- [Serving the web view](#serving-the-web-view)
 - [Upgrading](#upgrading)
 - [Building from source](#building-from-source)
 - [systemd](#systemd)
@@ -16,6 +17,23 @@
 The container runs as uid `10001` and stores SQLite state (`data/mailsift.db`) and OAuth refresh tokens in the `mailsift-data` named volume; a root-owned host bind mount would not be writable for that user. MCP and the web view listen on `MCP_PORT` (default `8410`), published on the host's loopback address unless `MCP_PUBLIC_HOST` says otherwise; see [MCP](mcp.md#connecting). `TZ` (default `Asia/Shanghai`) sets the clock that `DIGEST_HOUR` is read on. Logs go to stdout and Docker rotates them. On shutdown mailsift finishes the current poll first, so the compose file allows it 60 seconds.
 
 Docker's healthcheck runs `--healthcheck`, which only checks for a recent poll heartbeat; see [Monitoring](#monitoring) for the rest.
+
+## Serving the web view
+
+The [web view](web-view.md) is the same port as MCP. To use it from a phone it has to be reachable over HTTPS: a browser only installs an app, registers a service worker or accepts notifications on a secure address. The usual shape is a reverse proxy or tunnel with a certificate in front of `127.0.0.1:8410`, and in `.env`:
+
+```dotenv
+WEB_UI_ENABLED=true
+MCP_TOKEN=<random-long-token>
+MCP_WRITE_TOKEN=<a-second-random-long-token>
+TRUSTED_PROXY=true
+```
+
+`MCP_TOKEN` signs a browser in to read. `MCP_WRITE_TOKEN` signs it in to act: archive, reply, send. Leave the second one unset and the page never changes a mailbox. The proxy has to pass the live line through unbuffered; [Behind a reverse proxy](web-view.md#behind-a-reverse-proxy) has the nginx lines.
+
+Replacing either token signs out every browser that held it, and after the restart ends the notification subscriptions made under it. That is the way to cut off a lost device you cannot reach.
+
+The state database also holds the key that signs notifications and the list of subscribed devices, so restoring an old copy of it means devices subscribe again the next time their page opens.
 
 ## Upgrading
 
@@ -55,7 +73,9 @@ For a headless server or Docker:
 docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual
 ```
 
-Without flags it authorizes every OAuth account that is not authorized yet. `--account` selects one account. `--manual` prints the authorization URL: open it on any computer, approve access, and paste the complete redirected URL back into the terminal. `--force` repeats the authorization for an account that already has one. The callback listener uses `OAUTH_REDIRECT_PORT` (default `8765`); register `http://localhost:<port>/` with the provider.
+Without flags it authorizes every OAuth account that is not authorized yet. `--account` selects one account. `--manual` prints the authorization URL: open it on any computer, approve access, and paste the complete redirected URL back into the terminal. `--force` repeats the authorization for an account that already has one.
+
+`--send` also asks for permission to send, which only matters for Outlook: Microsoft consents to sending separately from reading, and without the flag the consent screen asks for reading alone. An Outlook mailbox that should answer mail from the web view needs `--send --force` once, and the Entra app registration needs the `SMTP.Send` delegated permission next to `IMAP.AccessAsUser.All`. Gmail's one scope already covers both. The scopes an account was authorized with are stored beside its token and used for every refresh, so adding `--send` to one account changes nothing for the others. The callback listener uses `OAUTH_REDIRECT_PORT` (default `8765`); register `http://localhost:<port>/` with the provider.
 
 The refresh-token store is `data/tokens.json`. Treat it as a long-lived mailbox credential, keep it out of version control, and preserve its file ownership in Docker (`uid 10001`). A host-side `npm run oauth` writes to `./data/tokens.json`, which is not the Docker volume; run the OAuth command through `docker compose run --rm mailsift ...` when authorizing the container's accounts.
 
@@ -74,6 +94,7 @@ npm run dev -- --once --dry-run
 npm run probe
 npm run probe -- --account me@example.com --no-counts
 npm run oauth -- --account me@example.com --manual --force
+npm run oauth -- --account me@outlook.com --send --force
 npm run dev -- --digest-now
 npm run dev -- --healthcheck
 npm run dev -- --recover

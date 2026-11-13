@@ -3,6 +3,7 @@
 Every setting is an environment variable read from `.env`. [`.env.example`](../.env.example) lists all of them with their defaults and a line about each. This page covers the ones whose effect needs more than a line.
 
 - [Mailboxes and folders](#mailboxes-and-folders)
+- [Sending mail](#sending-mail)
 - [Outputs](#outputs)
 - [What gets pushed](#what-gets-pushed)
 - [Your own rules](#your-own-rules)
@@ -11,7 +12,7 @@ Every setting is an environment variable read from `.env`. [`.env.example`](../.
 - [Real-time wake-ups with IMAP IDLE](#real-time-wake-ups-with-imap-idle)
 - [Alerts](#alerts)
 
-The LLM settings are described in [Triage](triage.md). The settings for MCP and the web view are in [MCP](mcp.md) and [Web view](web-view.md).
+The LLM settings are described in [Triage](triage.md). The settings for MCP are in [MCP](mcp.md), and what the web view does with the ones below is in [Web view](web-view.md).
 
 ## Mailboxes and folders
 
@@ -28,6 +29,23 @@ MAIL_ACCOUNT_2=imap|me@example.com|password|imap.example.com
 `MAIL_ACCOUNT_N_NAME` is the name shown in notifications. `MAIL_ACCOUNT_N_FOLDERS` accepts `all`, `INBOX,spam` (the default), or explicit folder names. The `all` token excludes sent, drafts, trash, and provider-wide virtual views. The `spam` token detects the provider's spam folder. `npm run probe` lists the folders a server offers.
 
 `SUPPRESS_SELF_FORWARDS=true` (the default) stops one message notifying twice when your mailboxes forward to each other. A forwarded copy is a new message with its own Message-ID, so deduplication cannot recognise it, but its sender is one of the configured accounts. Such a copy is recorded and stays searchable through `list_mail`, but it is neither pushed nor repeated in the daily digest, since the original was already triaged at its source. It costs no LLM call either. Mail you send to yourself inside a single mailbox is unaffected, and an explicit `MAIL_ALWAYS_IMPORTANT` sender still wins.
+
+## Sending mail
+
+Nothing in mailsift sends mail unless the [web view](web-view.md#writing) is on and a browser has signed in with `MCP_WRITE_TOKEN`. Then a reply or a new message leaves through the provider's own SMTP submission server, signed in with the credential that already reads the mailbox.
+
+Every provider preset knows its server, so most mailboxes need no setting. The exceptions:
+
+- **A custom host** (`imap|address|password|host`) has no known submission server. Set `MAIL_ACCOUNT_N_SMTP_HOST`, and `MAIL_ACCOUNT_N_SMTP_PORT` when it is not 465. Port 465 is TLS from the first byte; any other port must offer STARTTLS. There is no setting that sends a password unencrypted.
+- **Outlook with OAuth** is authorized for reading only by default, because Microsoft consents to sending separately. Run `npm run oauth -- --account you@outlook.com --send --force` to add it. Gmail's OAuth scope already covers sending.
+
+`MAIL_ACCOUNT_N_FROM_NAME` is the name mail is sent under; without it the bare address is used. The sender is always the mailbox's own address.
+
+Gmail, Outlook and QQ file a copy of what was sent into Sent by themselves. For every other provider mailsift appends the copy over IMAP.
+
+`SMTP_ENABLED=false` switches sending off for every mailbox, and so does `DRY_RUN=true`.
+
+`MAIL_ACCOUNT_N_AUTHSERV_ID` is unrelated to sending but lives beside these: it names the server that receives this mailbox's mail, so the reader can tell a provider's verdict on a sender from one the sender wrote. See [Reading a message](web-view.md#reading-a-message).
 
 ## Outputs
 
@@ -64,7 +82,7 @@ Triage rates every message `critical`, `warning` or `info`. `PUSH_MIN_IMPORTANCE
 
 `MAIL_KEYWORDS` are the keywords the local fallback looks for, on top of its built-in list, when no LLM is configured or it fails; see [Triage](triage.md#when-the-llm-fails).
 
-Feedback becomes rules too. After two feedback records for the same sender, recorded through MCP `record_feedback`, `missed` feedback infers an always-important rule and `false_positive` feedback infers a never-important rule. Explicit environment rules take precedence; inspect inferred rules with MCP `feedback_rules`.
+Feedback becomes rules too. After two feedback records for the same sender, recorded through MCP `record_feedback` or by correcting a judgement in the web view, `missed` feedback infers an always-important rule and `false_positive` feedback infers a never-important rule. Explicit environment rules take precedence; inspect inferred rules with MCP `feedback_rules`.
 
 ## Daily digest
 
