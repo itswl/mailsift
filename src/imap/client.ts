@@ -12,9 +12,10 @@ import { ImapFlow, type FetchMessageObject, type ListResponse } from 'imapflow';
 import { getAccessToken } from './auth.js';
 import { resolveFolders, toFolder, type Folder } from './folders.js';
 import {
-  extractAttachmentManifest, extractBody, fallbackMessageId, findTextBodyPart, htmlToText, normalizeDate,
+  extractAttachmentManifest, extractBody, fallbackMessageId, findBodyParts, findTextBodyPart, htmlToText, normalizeDate,
   type AttachmentInfo, type AttachmentManifest, type MailMessage,
 } from './message.js';
+import { authservTrust, MAX_HTML_BYTES, parseReadable, slimSource, type ReadableMessage } from './readable.js';
 import {
   inspectLinkRisks,
   scanAttachment,
@@ -215,6 +216,61 @@ export async function discoverMailboxFolders(account: Account): Promise<MailboxF
 
 export async function targetFolders(client: ImapFlow, account: Account): Promise<Folder[]> {
   return resolveFolders(await listFolders(client), account.folders);
+}
+
+/** A folder to look for one message in. */
+interface LookupFolder extends Folder {
+  /**
+   * Named by the caller rather than by configuration. If it cannot be opened
+   * (renamed or removed since) the lookup moves on to the configured folders
+   * instead of failing.
+   */
+  optional?: boolean;
+}
+
+type MailboxLock = Awaited<ReturnType<ImapFlow['getMailboxLock']>>;
+
+/**
+ * Put a folder the caller last saw the message in ahead of the configured ones.
+ *
+ * Pure, so the order can be checked without a server. The hint may name a
+ * folder outside the configured set: a message archived or moved to the trash
+ * from the web view is no longer where the poller found it, and without the
+ * hint it could not be opened again. A hint that names nothing selectable is
+ * ignored rather than trusted.
+ */
+export function orderLookupFolders(
+  entries: readonly ListResponse[],
+  configured: readonly Folder[],
+  folderHint?: string,
+): LookupFolder[] {
+  const hint = folderHint?.trim();
+  if (!hint) return [...configured];
+  const first = configured.find((folder) => folder.path === hint || folder.rawPath === hint);
+  if (first) return [first, ...configured.filter((folder) => folder !== first)];
+  const listed = entries.map(toFolder);
+  const hinted = listed.find((folder) => folder.path === hint || folder.rawPath === hint)
+    ?? listed.find((folder) => folder.path.toLowerCase() === hint.toLowerCase());
+  if (!hinted || !hinted.selectable) return [...configured];
+  return [{ ...hinted, optional: true }, ...configured.filter((folder) => folder.path !== hinted.path)];
+}
+
+async function lookupFolders(client: ImapFlow, account: Account, folderHint?: string): Promise<LookupFolder[]> {
+  // Without a hint this is exactly targetFolders, one LIST and the same order.
+  if (!folderHint?.trim()) return targetFolders(client, account);
+  const entries = await listFolders(client);
+  return orderLookupFolders(entries, resolveFolders(entries, account.folders), folderHint);
+}
+
+/** Lock a folder, or return nothing when an optional one cannot be opened. */
+async function lockFolder(client: ImapFlow, folder: LookupFolder, readOnly: boolean): Promise<MailboxLock | undefined> {
+  try {
+    return await client.getMailboxLock(folder.path, { readOnly });
+  } catch (error) {
+    if (!folder.optional) throw error;
+    log.info(`Hinted folder ${folder.path} could not be opened; trying the configured folders: ${imapErrorText(error).slice(0, 160)}`);
+    return undefined;
+  }
 }
 
 function firstAddress(input: unknown): { name: string; address: string } {
@@ -581,6 +637,97 @@ export async function fetchNew(
 }
 
 /**
+ * Find one message by its Message-ID and return its raw source.
+ *
+ * The loop both live readers share: each folder in turn under a read-only
+ * lock, the bounded source fetched, and the id confirmed on the parsed
+ * envelope rather than trusted from the search, which can match on text.
+ * `parseBody` is off for a caller that reads the source itself, so the
+ * message is not run through the MIME parser twice.
+ *
+ * A message over the size limit is refused, unless the caller asks for it
+ * `slim`: then the message is first identified from its headers alone, and
+ * its source is either fetched whole (when it fits) or rebuilt from its
+ * headers and its text parts, so that a large attachment does not make the
+ * few lines around it unreadable.
+ */
+async function findLiveSource(
+  client: ImapFlow,
+  account: Account,
+  messageId: string,
+  folders: readonly LookupFolder[],
+  options: { withFlags: boolean; parseBody: boolean; oversize?: 'slim' },
+): Promise<{ raw: FetchMessageObject; folder: Folder; message: MailMessage } | undefined> {
+  const maxSourceBytes = intEnv('MCP_LIVE_SOURCE_BYTES', 5 * 1024 * 1024);
+  const slim = options.oversize === 'slim';
+  for (const folder of folders) {
+    const lock = await lockFolder(client, folder, true);
+    if (!lock) continue;
+    try {
+      const foundUids = await searchMessageUids(client, messageId);
+      if (!foundUids.length) continue;
+      // Collected before anything else is asked of the server: a command
+      // issued while a fetch is still being read would wait on it forever.
+      const candidates: FetchMessageObject[] = [];
+      for await (const raw of client.fetch(
+        foundUids,
+        {
+          uid: true,
+          size: true,
+          envelope: true,
+          bodyStructure: true,
+          ...(slim
+            ? { headers: true }
+            : { source: { maxLength: maxSourceBytes + 1 }, headers: ['list-unsubscribe', 'references'] }),
+          ...(options.withFlags ? { flags: true } : {}),
+        },
+        { uid: true },
+      )) candidates.push(raw);
+
+      for (const raw of candidates) {
+        if (!slim && raw.size !== undefined && raw.size > maxSourceBytes) {
+          throw new Error(`message exceeds MCP_LIVE_SOURCE_BYTES (${maxSourceBytes})`);
+        }
+        const message = await toMailMessage(
+          raw, account, folder, options.parseBody ? undefined : { body: '', hasAttachments: false },
+        );
+        if (message.messageId !== messageId) continue;
+        if (slim) raw.source = await readingSource(client, raw, maxSourceBytes);
+        return { raw, folder, message };
+      }
+    } finally {
+      lock.release();
+    }
+  }
+  return undefined;
+}
+
+/** Text read from a message too large to fetch whole. Far more than anyone reads; markup past the reader's own limit would be dropped anyway. */
+const SLIM_TEXT_BYTES = 1024 * 1024;
+
+/**
+ * The source the reading view parses: the whole message when it fits, and
+ * otherwise its headers with only its text and its markup (see slimSource).
+ */
+async function readingSource(client: ImapFlow, raw: FetchMessageObject, maxSourceBytes: number): Promise<Buffer> {
+  if (raw.size === undefined || raw.size <= maxSourceBytes) {
+    const whole = await client.fetchOne(String(raw.uid), { uid: true, source: { maxLength: maxSourceBytes + 1 } }, { uid: true });
+    const source = whole ? whole.source : undefined;
+    // A server that did not say how large the message is may still hand over too much.
+    if (source && source.length <= maxSourceBytes) return source;
+    if (!source) return Buffer.alloc(0);
+  }
+  const { plain, html } = findBodyParts(raw.bodyStructure);
+  const text = plain ? await downloadDecodedPrefix(client, raw.uid, plain.partId, SLIM_TEXT_BYTES) : undefined;
+  const markup = html ? await downloadDecodedPrefix(client, raw.uid, html.partId, MAX_HTML_BYTES) : undefined;
+  return slimSource(raw.headers ?? Buffer.alloc(0), {
+    ...(text ? { plain: text.content } : {}),
+    // Markup cut off in the middle is not markup; the text stands in for it.
+    ...(markup && !markup.truncated ? { html: markup.content } : {}),
+  });
+}
+
+/**
  * Fetch one message on demand without persisting it or changing mailbox state.
  *
  * This is used by the MCP Resource path. The caller supplies a configured
@@ -588,40 +735,56 @@ export async function fetchNew(
  */
 export async function fetchByMessageId(account: Account, messageId: string): Promise<MailMessage | undefined> {
   const client = await connect(account);
-  const maxSourceBytes = intEnv('MCP_LIVE_SOURCE_BYTES', 5 * 1024 * 1024);
   try {
     const folders = await targetFolders(client, account);
-    for (const folder of folders) {
-      const lock = await client.getMailboxLock(folder.path, { readOnly: true });
-      try {
-        const foundUids = await searchMessageUids(client, messageId);
-        if (!foundUids.length) continue;
-        for await (const raw of client.fetch(
-          foundUids,
-          {
-            uid: true,
-            size: true,
-            envelope: true,
-            bodyStructure: true,
-            source: { maxLength: maxSourceBytes + 1 },
-            headers: ['list-unsubscribe', 'references'],
-          },
-          { uid: true },
-        )) {
-          if (raw.size !== undefined && raw.size > maxSourceBytes) {
-            throw new Error(`message exceeds MCP_LIVE_SOURCE_BYTES (${maxSourceBytes})`);
-          }
-          const message = await toMailMessage(raw, account, folder);
-          if (message.messageId === messageId) return message;
-        }
-      } finally {
-        lock.release();
-      }
-    }
-    return undefined;
+    return (await findLiveSource(client, account, messageId, folders, { withFlags: false, parseBody: true }))?.message;
   } finally {
     await client.logout().catch(() => undefined);
   }
+}
+
+/** One message as the reading view shows it, with where it is and how the mailbox has it flagged. */
+export interface LiveMessage {
+  readable: ReadableMessage;
+  /** The folder it was found in, which is the hint to pass next time. */
+  folder: string;
+  flags: { seen: boolean; flagged: boolean; answered: boolean };
+}
+
+/**
+ * Fetch one message for reading: its markup, its text, its headers and flags.
+ *
+ * One IMAP session and a read-only lock, so opening a message in the web view
+ * does not mark it read in the mailbox. `folderHint` is searched first; it may
+ * be a folder outside the configured ones, because a message archived or
+ * binned from the web view has left the folder the poller found it in.
+ * Nothing is persisted: the source is parsed and dropped.
+ */
+export async function fetchReadableByMessageId(
+  account: Account,
+  messageId: string,
+  folderHint?: string,
+): Promise<LiveMessage | undefined> {
+  const client = await connect(account);
+  let found: Awaited<ReturnType<typeof findLiveSource>>;
+  try {
+    const folders = await lookupFolders(client, account, folderHint);
+    found = await findLiveSource(client, account, messageId, folders, { withFlags: true, parseBody: false, oversize: 'slim' });
+  } finally {
+    await client.logout().catch(() => undefined);
+  }
+  if (!found) return undefined;
+  // Parsed after the connection is closed: it needs no server, and a large
+  // message should not hold a mailbox session open while it is read.
+  // The sender's authentication is believed only from this mailbox's own server.
+  const authserv = authservTrust(account.host, account.authservId);
+  const readable = await parseReadable(found.raw.source ?? Buffer.alloc(0), authserv ? { authserv } : {});
+  const flags = found.raw.flags ?? new Set<string>();
+  return {
+    readable,
+    folder: found.folder.path,
+    flags: { seen: flags.has('\\Seen'), flagged: flags.has('\\Flagged'), answered: flags.has('\\Answered') },
+  };
 }
 
 /**
@@ -631,12 +794,14 @@ export async function fetchByMessageId(account: Account, messageId: string): Pro
 export async function fetchAttachmentManifestByMessageId(
   account: Account,
   messageId: string,
+  folderHint?: string,
 ): Promise<AttachmentManifestLookup | undefined> {
   const client = await connect(account);
   try {
-    const folders = await targetFolders(client, account);
+    const folders = await lookupFolders(client, account, folderHint);
     for (const folder of folders) {
-      const lock = await client.getMailboxLock(folder.path, { readOnly: true });
+      const lock = await lockFolder(client, folder, true);
+      if (!lock) continue;
       try {
         const uids = await searchMessageUids(client, messageId);
         if (!uids.length) continue;
@@ -694,14 +859,16 @@ export async function scanAttachmentByMessageId(
   account: Account,
   messageId: string,
   partId: string,
+  folderHint?: string,
 ): Promise<AttachmentScanReport | undefined> {
   if (!/^\d+(?:\.\d+)*$/.test(partId)) throw new AttachmentNotFoundError(partId);
   const maxBytes = attachmentScanMaxBytes();
   const client = await connect(account);
   try {
-    const folders = await targetFolders(client, account);
+    const folders = await lookupFolders(client, account, folderHint);
     for (const folder of folders) {
-      const lock = await client.getMailboxLock(folder.path, { readOnly: true });
+      const lock = await lockFolder(client, folder, true);
+      if (!lock) continue;
       try {
         const uids = await searchMessageUids(client, messageId);
         if (!uids.length) continue;
@@ -735,12 +902,14 @@ export async function scanAttachmentByMessageId(
 export async function inspectMailSafety(
   account: Account,
   messageId: string,
+  folderHint?: string,
 ): Promise<MailSafetyReport | undefined> {
   const client = await connect(account);
   try {
-    const folders = await targetFolders(client, account);
+    const folders = await lookupFolders(client, account, folderHint);
     for (const folder of folders) {
-      const lock = await client.getMailboxLock(folder.path, { readOnly: true });
+      const lock = await lockFolder(client, folder, true);
+      if (!lock) continue;
       try {
         const uids = await searchMessageUids(client, messageId);
         if (!uids.length) continue;
@@ -900,14 +1069,16 @@ export async function fetchAttachmentByMessageId(
   account: Account,
   messageId: string,
   partId: string,
+  folderHint?: string,
 ): Promise<DownloadedAttachment | undefined> {
   if (!/^\d+(?:\.\d+)*$/.test(partId)) throw new AttachmentNotFoundError(partId);
   const maxBytes = attachmentMaxBytes();
   const client = await connect(account);
   try {
-    const folders = await targetFolders(client, account);
+    const folders = await lookupFolders(client, account, folderHint);
     for (const folder of folders) {
-      const lock = await client.getMailboxLock(folder.path, { readOnly: true });
+      const lock = await lockFolder(client, folder, true);
+      if (!lock) continue;
       try {
         const uids = await searchMessageUids(client, messageId);
         if (!uids.length) continue;
@@ -943,6 +1114,61 @@ export async function fetchAttachmentByMessageId(
   } finally {
     await client.logout().catch(() => undefined);
   }
+}
+
+/** What each flag action does, and the word its refusal is reported with. */
+const FLAG_CHANGES = {
+  mark_read: { flag: '\\Seen', add: true, name: 'mark-read' },
+  mark_unread: { flag: '\\Seen', add: false, name: 'mark-unread' },
+  star: { flag: '\\Flagged', add: true, name: 'star' },
+  unstar: { flag: '\\Flagged', add: false, name: 'unstar' },
+  answered: { flag: '\\Answered', add: true, name: 'mark-answered' },
+} as const;
+
+/**
+ * Apply one action to one message and return the folder it was found in.
+ *
+ * Shared by the MCP tool and the web view. The message is located again by
+ * its Message-ID inside each folder and confirmed on its envelope before
+ * anything is changed, so a stale local row cannot turn into an arbitrary UID.
+ */
+async function actOnMessage(
+  client: ImapFlow,
+  messageId: string,
+  folders: readonly LookupFolder[],
+  action: WebMailAction,
+  destinationPath: string | undefined,
+): Promise<string | undefined> {
+  for (const folder of folders) {
+    const lock = await lockFolder(client, folder, false);
+    if (!lock) continue;
+    try {
+      const uids = await searchMessageUids(client, messageId);
+      if (!uids.length) continue;
+      for (const uid of uids) {
+        const raw = await client.fetchOne(uid, { uid: true, envelope: true }, { uid: true });
+        if (!raw || raw.envelope?.messageId?.trim() !== messageId) continue;
+        const change = action in FLAG_CHANGES ? FLAG_CHANGES[action as keyof typeof FLAG_CHANGES] : undefined;
+        if (change) {
+          const accepted = change.add
+            ? await client.messageFlagsAdd([uid], [change.flag], { uid: true })
+            : await client.messageFlagsRemove([uid], [change.flag], { uid: true });
+          if (!accepted) throw new MailActionError('failed', `IMAP server rejected the ${change.name} operation`);
+        } else if (destinationPath) {
+          if (destinationPath === folder.path) {
+            throw new MailActionError('invalid_destination', 'message is already in the destination folder');
+          }
+          if (!await client.messageMove([uid], destinationPath, { uid: true })) {
+            throw new MailActionError('failed', 'IMAP server rejected the move operation');
+          }
+        }
+        return folder.path;
+      }
+    } finally {
+      lock.release();
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -981,51 +1207,184 @@ export async function applyMessageAction(
     }
 
     const folders = await targetFolders(client, account);
-    for (const folder of folders) {
-      const lock = await client.getMailboxLock(folder.path, { readOnly: false });
-      try {
-        const uids = await searchMessageUids(client, messageId);
-        if (!uids.length) continue;
-        for (const uid of uids) {
-          const raw = await client.fetchOne(uid, { uid: true, envelope: true }, { uid: true });
-          if (!raw || raw.envelope?.messageId?.trim() !== messageId) continue;
-          if (action === 'mark_read') {
-            if (!await client.messageFlagsAdd([uid], ['\\Seen'], { uid: true })) {
-              throw new MailActionError('failed', 'IMAP server rejected the mark-read operation');
-            }
-          } else if (action === 'mark_unread') {
-            if (!await client.messageFlagsRemove([uid], ['\\Seen'], { uid: true })) {
-              throw new MailActionError('failed', 'IMAP server rejected the mark-unread operation');
-            }
-          } else if (action === 'star') {
-            if (!await client.messageFlagsAdd([uid], ['\\Flagged'], { uid: true })) {
-              throw new MailActionError('failed', 'IMAP server rejected the star operation');
-            }
-          } else if (action === 'unstar') {
-            if (!await client.messageFlagsRemove([uid], ['\\Flagged'], { uid: true })) {
-              throw new MailActionError('failed', 'IMAP server rejected the unstar operation');
-            }
-          } else if (destinationPath) {
-            if (destinationPath === folder.path) {
-              throw new MailActionError('invalid_destination', 'message is already in the destination folder');
-            }
-            if (!await client.messageMove([uid], destinationPath, { uid: true })) {
-              throw new MailActionError('failed', 'IMAP server rejected the move operation');
-            }
-          }
-          return {
-            action,
-            account: account.username,
-            messageId,
-            sourceFolder: folder.path,
-            ...(destinationPath ? { destinationFolder: destinationPath } : {}),
-          };
-        }
-      } finally {
-        lock.release();
-      }
+    const sourceFolder = await actOnMessage(client, messageId, folders, action, destinationPath);
+    if (sourceFolder === undefined) return undefined;
+    return {
+      action,
+      account: account.username,
+      messageId,
+      sourceFolder,
+      ...(destinationPath ? { destinationFolder: destinationPath } : {}),
+    };
+  } finally {
+    await client.logout().catch(() => undefined);
+  }
+}
+
+/**
+ * What the web view may do to a message.
+ *
+ * A person looking at one message and pressing one button, not an agent with a
+ * tool: so this set adds what a mail client is expected to do (archive, bin,
+ * rescue to the inbox, mark as answered) to the actions the MCP tool has.
+ * MAIL_ACTIONS is deliberately left as it was. The MCP tool builds its schema
+ * from it and promises there that nothing can be sent to the trash.
+ */
+export const WEB_MAIL_ACTIONS = [...MAIL_ACTIONS, 'archive', 'trash', 'inbox', 'answered'] as const;
+export type WebMailAction = (typeof WEB_MAIL_ACTIONS)[number];
+
+export type WebMailActionResult = Omit<MailActionResult, 'action'> & {
+  action: WebMailAction;
+  /** Set with destinationFolder: whether the message now sits in a spam folder. */
+  destinationIsSpam?: boolean;
+};
+
+type MovingAction = 'move' | 'archive' | 'trash' | 'inbox';
+const MOVING_ACTIONS = new Set<WebMailAction>(['move', 'archive', 'trash', 'inbox']);
+
+/** Names for servers that list an archive folder without its special-use flag. */
+const ARCHIVE_NAMES = new Set(['archive', 'archives', '归档', '已归档', '存档', '封存']);
+/** Gmail has no archive folder: archiving is leaving the inbox for All Mail. */
+const GMAIL_ALL_NAMES = new Set(['[gmail]/all mail', '[google mail]/all mail']);
+const TRASH_NAMES = new Set([
+  'trash', 'deleted', 'deleted items', 'deleted messages', 'bin',
+  '已删除', '已刪除', '已删除邮件', '回收站', '废纸篓', '廢紙簍',
+]);
+const SENT_NAMES = new Set(['sent', 'sent messages', 'sent items', 'sent mail', '已发送', '已发送邮件', '已寄郵件']);
+
+function entryFlags(entry: ListResponse): Set<string> {
+  return new Set([...((entry.flags ?? []) as Iterable<string>)].map((flag) => String(flag).toLowerCase()));
+}
+
+function entrySelectable(entry: ListResponse): boolean {
+  return !entryFlags(entry).has('\\noselect');
+}
+
+/** RFC 6154 special use, whether the server sent it as an attribute or ImapFlow resolved it. */
+function entryHasUse(entry: ListResponse, use: string): boolean {
+  return (entry.specialUse ?? '').trim().toLowerCase() === use || entryFlags(entry).has(use);
+}
+
+function entryByName(entries: readonly ListResponse[], names: ReadonlySet<string>): ListResponse | undefined {
+  return entries.find((entry) => {
+    if (!entrySelectable(entry)) return false;
+    const path = entry.path.trim().toLowerCase();
+    const leaf = path.split(entry.delimiter || '/').at(-1) ?? path;
+    return names.has(path) || names.has(leaf);
+  });
+}
+
+/**
+ * Where a moving action puts the message, decided from the folder list alone.
+ *
+ * Pure, so each provider's layout can be checked without a server. Special-use
+ * flags come first because names are localized and users rename folders;
+ * well-known names are the fallback for servers that send no flags. A mailbox
+ * with no such folder is refused rather than given one: creating folders in
+ * someone's mailbox is not what pressing Archive asks for.
+ */
+export function resolveActionDestination(
+  entries: readonly ListResponse[],
+  action: MovingAction,
+  provider = '',
+  destination?: string,
+): { path: string; isSpam: boolean } {
+  let found: ListResponse | undefined;
+  if (action === 'move') {
+    const target = destination?.trim();
+    if (!target) throw new MailActionError('invalid_destination', 'move requires a destination folder');
+    found = entries.find((entry) => entry.path === target);
+    if (!found || !entrySelectable(found)) {
+      throw new MailActionError('invalid_destination', `destination folder not found or not selectable: ${target}`);
     }
-    return undefined;
+  } else if (action === 'inbox') {
+    found = entries.find((entry) => entrySelectable(entry) && (entryHasUse(entry, '\\inbox') || entry.path.toUpperCase() === 'INBOX'));
+    // Every IMAP server has INBOX, listed or not.
+    if (!found) return { path: 'INBOX', isSpam: false };
+  } else if (action === 'archive') {
+    const gmail = provider.toLowerCase().startsWith('gmail');
+    found = entries.find((entry) => entrySelectable(entry) && entryHasUse(entry, '\\archive'))
+      ?? entries.find((entry) => entrySelectable(entry) && entryHasUse(entry, '\\all')
+        && (gmail || /^\[(?:gmail|google mail)\]\//i.test(entry.path)))
+      ?? entryByName(entries, GMAIL_ALL_NAMES)
+      ?? entryByName(entries, ARCHIVE_NAMES);
+    if (!found) throw new MailActionError('invalid_destination', 'this mailbox has no archive folder');
+  } else {
+    found = entries.find((entry) => entrySelectable(entry) && entryHasUse(entry, '\\trash'))
+      ?? entryByName(entries, TRASH_NAMES);
+    if (!found) throw new MailActionError('invalid_destination', 'this mailbox has no trash folder');
+  }
+  return { path: found.path, isSpam: toFolder(found).isSpam };
+}
+
+/**
+ * Apply one web-view action to a stored message.
+ *
+ * The caller is responsible for who may ask: this is reached only from a
+ * session that signed in with the write credential. `folderHint` is searched
+ * first, as in the live readers, so a message that was already moved once can
+ * be acted on again. Returns undefined when the message is in none of the
+ * folders searched.
+ */
+export async function applyWebMailAction(
+  account: Account,
+  messageId: string,
+  action: WebMailAction,
+  options: { destination?: string; folderHint?: string } = {},
+): Promise<WebMailActionResult | undefined> {
+  if (!WEB_MAIL_ACTIONS.includes(action)) {
+    throw new MailActionError('invalid_action', `unsupported mail action: ${String(action)}`);
+  }
+  if (action === 'move' && !options.destination?.trim()) {
+    throw new MailActionError('invalid_destination', 'move requires a destination folder');
+  }
+
+  const client = await connect(account);
+  try {
+    const entries = await listFolders(client);
+    const destination = MOVING_ACTIONS.has(action)
+      ? resolveActionDestination(entries, action as MovingAction, account.provider, options.destination)
+      : undefined;
+    const folders = orderLookupFolders(entries, resolveFolders(entries, account.folders), options.folderHint);
+    const sourceFolder = await actOnMessage(client, messageId, folders, action, destination?.path);
+    if (sourceFolder === undefined) return undefined;
+    return {
+      action,
+      account: account.username,
+      messageId,
+      sourceFolder,
+      ...(destination ? { destinationFolder: destination.path, destinationIsSpam: destination.isSpam } : {}),
+    };
+  } finally {
+    await client.logout().catch(() => undefined);
+  }
+}
+
+/** The folder sent mail is kept in, from the folder list alone. */
+export function sentFolderPath(entries: readonly ListResponse[]): string | undefined {
+  return (entries.find((entry) => entrySelectable(entry) && entryHasUse(entry, '\\sent'))
+    ?? entryByName(entries, SENT_NAMES))?.path;
+}
+
+/**
+ * File a message this service sent into the mailbox's Sent folder.
+ *
+ * SMTP submission does not keep a copy on most providers, so without this a
+ * reply written here would be missing from the conversation everywhere else.
+ * Gmail and Outlook save submitted mail themselves; the caller should skip
+ * them, or the copy appears twice. Returns the folder, or undefined when the
+ * mailbox has no Sent folder to put it in, which is not an error.
+ */
+export async function appendToSent(account: Account, raw: Buffer): Promise<string | undefined> {
+  const client = await connect(account);
+  try {
+    const path = sentFolderPath(await listFolders(client));
+    if (!path) return undefined;
+    // Marked read: it is the owner's own message.
+    if (!await client.append(path, raw, ['\\Seen'])) {
+      throw new Error(`IMAP server rejected the append to ${path}`);
+    }
+    return path;
   } finally {
     await client.logout().catch(() => undefined);
   }
