@@ -60,6 +60,9 @@ function readable(partial: Partial<ReadableMessage> = {}): ReadableMessage {
 
 interface Calls {
   read: string[];
+  /** What each read and each action was told about where the message is. */
+  readHints: unknown[];
+  actHints: unknown[];
   act: Array<{ messageId: string; action: string; folderHint?: string }>;
   sent: OutgoingMail[];
   appended: number;
@@ -68,14 +71,15 @@ interface Calls {
 }
 
 function backend(overrides: Partial<WebBackend> = {}): { calls: Calls; backend: Partial<WebBackend> } {
-  const calls: Calls = { read: [], act: [], sent: [], appended: 0, asked: [], drafted: [] };
+  const calls: Calls = { read: [], readHints: [], actHints: [], act: [], sent: [], appended: 0, asked: [], drafted: [] };
   const live: LiveMessage = { readable: readable(), folder: 'INBOX', flags: { seen: false, flagged: false, answered: false } };
   return {
     calls,
     backend: {
-      read: async (_account, messageId) => { calls.read.push(messageId); return live; },
+      read: async (_account, messageId, hint) => { calls.read.push(messageId); calls.readHints.push(hint); return live; },
       act: async (account, messageId, action, options) => {
         calls.act.push({ messageId, action, ...(options?.folderHint ? { folderHint: options.folderHint } : {}) });
+        calls.actHints.push(options?.hint);
         const moved = action === 'archive' ? 'Archive' : action === 'trash' ? 'Trash' : action === 'inbox' ? 'INBOX' : undefined;
         return { action, account: account.username, messageId, sourceFolder: 'INBOX', ...(moved ? { destinationFolder: moved, destinationIsSpam: false } : {}) };
       },
@@ -336,6 +340,66 @@ describe('what needs the reader', () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(store.listMailActions(5)[0]).toMatchObject({ action: 'mark_read', success: false, messageId: '<one@x>' });
     expect(store.getMail('k1')?.handledAt).toBeTruthy();
+  });
+});
+
+describe('remembering where a message is in its mailbox', () => {
+  const live = (place: Partial<LiveMessage> = {}): LiveMessage => (
+    { readable: readable(), folder: 'INBOX', flags: { seen: false, flagged: false, answered: false }, ...place }
+  );
+
+  it('learns the place the first time a message is read, and passes it to every lookup after', async () => {
+    const store = seeded();
+    const fake = backend({ read: async (_account, _id, hint) => { fake.calls.readHints.push(hint); return live({ uid: 17, uidValidity: '9' }); } });
+    const first = await call(store, '/api/message?live=true&id=k1', {}, fake);
+    expect(first.answer.status).toBe(200);
+    // Nothing was known, so only the folder could be said.
+    expect(fake.calls.readHints).toEqual([{ folder: 'INBOX' }]);
+    expect(store.placeOf('k1')).toEqual({ uid: 17, uidValidity: '9' });
+    // Where the message sits is the server's business: the page is not sent it.
+    expect(first.json).not.toHaveProperty('uid');
+    expect(first.json).not.toHaveProperty('uidValidity');
+
+    await call(store, '/api/message?live=true&fresh=true&id=k1', {}, fake);
+    expect(fake.calls.readHints[1]).toEqual({ folder: 'INBOX', uid: 17, uidValidity: '9' });
+    await post(store, '/api/action', { key: 'k1', action: 'star' }, {}, fake);
+    expect(fake.calls.actHints).toEqual([{ folder: 'INBOX', uid: 17, uidValidity: '9' }]);
+  });
+
+  it('does not note a place in a folder the record does not say the message is in', async () => {
+    const store = seeded();
+    const fake = backend({ read: async () => live({ folder: 'Archive', uid: 3, uidValidity: '2' }) });
+    await call(store, '/api/message?live=true&id=k1', {}, fake);
+    expect(store.placeOf('k1')).toBeUndefined();
+  });
+
+  it('follows a message that was filed away: to its new place when the server said, to none when it did not', async () => {
+    const store = seeded();
+    store.rememberUid('k1', 'INBOX', 17, '9');
+    store.rememberUid('k3', 'INBOX', 18, '9');
+    const said = backend({
+      act: async (account, messageId, action) => ({
+        action, account: account.username, messageId, sourceFolder: 'INBOX',
+        destinationFolder: 'Archive', destinationIsSpam: false, destinationUid: 101, destinationUidValidity: '4',
+      }),
+    });
+    await post(store, '/api/action', { key: 'k1', action: 'archive' }, {}, said);
+    expect(store.getMail('k1')).toMatchObject({ folder: 'Archive' });
+    expect(store.placeOf('k1')).toEqual({ uid: 101, uidValidity: '4' });
+
+    await post(store, '/api/action', { key: 'k3', action: 'archive' });
+    expect(store.getMail('k3')).toMatchObject({ folder: 'Archive' });
+    expect(store.placeOf('k3')).toBeUndefined();
+  });
+
+  it('tells the mailbox where an answered message is, read before the message was sent', async () => {
+    const store = seeded();
+    store.rememberUid('k1', 'INBOX', 17, '9');
+    const fake = backend();
+    const sent = await post(store, '/api/send', { account: 'me@qq.com', replyTo: 'k1', to: ['billing@vendor.com'], subject: 'Re: subject k1', text: 'Thanks.' }, {}, fake);
+    expect(sent.answer.status).toBe(200);
+    await vi.waitFor(() => expect(fake.calls.act).toContainEqual({ messageId: '<one@x>', action: 'answered', folderHint: 'INBOX' }));
+    expect(fake.calls.actHints).toContainEqual({ folder: 'INBOX', uid: 17, uidValidity: '9' });
   });
 });
 

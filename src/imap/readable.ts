@@ -185,6 +185,10 @@ const KNOWN_AUTHSERV: Array<{ host: RegExp; trust: AuthservTrust }> = [
   { host: /(^|\.)yahoo\.com$/, trust: { id: 'yahoo.com', subdomains: true } },
   { host: /(^|\.)(me|icloud)\.com$/, trust: { id: 'icloud.com', subdomains: true, perCheck: true } },
   { host: /(^|\.)(fastmail|messagingengine)\.com$/, trust: { id: 'messagingengine.com', subdomains: true } },
+  // Read from a live mailbox: 89 of 89 messages from outside carried QQ's own
+  // header on top, opening with exactly this name. The business service
+  // (exmail) was not looked at, so it is not assumed here.
+  { host: /^imap\.qq\.com$/, trust: { id: 'mx.qq.com' } },
 ];
 
 /**

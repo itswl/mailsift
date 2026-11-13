@@ -332,6 +332,8 @@ export class Watcher {
       senderName: message.fromName,
       folder: message.folder,
       inSpam: message.inSpam,
+      // Its place in the folder, so the reader can fetch it later without searching.
+      ...(message.uid > 0 && message.uidValidity ? { uid: message.uid, uidValidity: message.uidValidity } : {}),
       category: result.category,
       summary: result.summary,
       reason: result.reason,

@@ -30,7 +30,7 @@ import { loadConfig, type Account } from './config.js';
 import { MailboxUnreachableError } from './imap/connection.js';
 import {
   appendToSent, applyWebMailAction, fetchReadableByMessageId, MailActionError,
-  type LiveMessage, type WebMailAction, type WebMailActionResult,
+  type LiveMessage, type LookupHint, type MessageHint, type WebMailAction, type WebMailActionResult,
 } from './imap/client.js';
 import {
   askMail, AssistantError, assistantConfigured, draftReply, type AskAnswer, type DraftInput,
@@ -50,9 +50,10 @@ import { getLogger } from './logger.js';
 const log = getLogger('web');
 
 export interface WebBackend {
-  read: (account: Account, messageId: string, folderHint?: string) => Promise<LiveMessage | undefined>;
+  read: (account: Account, messageId: string, hint?: LookupHint) => Promise<LiveMessage | undefined>;
   act: (
-    account: Account, messageId: string, action: WebMailAction, options?: { destination?: string; folderHint?: string },
+    account: Account, messageId: string, action: WebMailAction,
+    options?: { destination?: string; folderHint?: string; hint?: MessageHint },
   ) => Promise<WebMailActionResult | undefined>;
   send: (account: Account, mail: OutgoingMail) => Promise<SentMail>;
   appendSent: (account: Account, raw: Buffer) => Promise<string | undefined>;
@@ -155,14 +156,54 @@ export function forgetLive(key?: string): void {
   liveInFlight.delete(key);
 }
 
+/**
+ * Where a stored message was last known to be: its folder, and its UID there
+ * when that is known. Undefined when nothing is.
+ *
+ * Read while the request's database handle is open. It only makes a lookup
+ * shorter, so a failure to read it is not a failure of the lookup.
+ */
+export function whereabouts(store: StateStore, row: MailRow): MessageHint | undefined {
+  if (!row.folder) return undefined;
+  let place: { uid: number; uidValidity: string } | undefined;
+  try {
+    place = store.placeOf(row.dedupKey);
+  } catch (error) {
+    log.warn(`A message's place in its mailbox could not be read: ${String(error).slice(0, 120)}`);
+  }
+  return { folder: row.folder, ...(place ?? {}) };
+}
+
+/** What `act` is told about where to find the message. */
+type ActHint = { folderHint?: string; hint?: MessageHint };
+function actHint(store: StateStore, row: MailRow): ActHint {
+  const hint = whereabouts(store, row);
+  return hint ? { folderHint: row.folder!, hint } : {};
+}
+
+/**
+ * Keep where a message was just found, so that opening it again is a fetch.
+ * A row that predates stored UIDs learns its own the first time it is read.
+ */
+export function rememberWhereabouts(store: StateStore, row: MailRow, live: LiveMessage | undefined): void {
+  if (!live?.uid || !live.uidValidity || live.folder !== row.folder) return;
+  try {
+    store.rememberUid(row.dedupKey, live.folder, live.uid, live.uidValidity);
+  } catch (error) {
+    log.warn(`A message's place in its mailbox could not be noted: ${String(error).slice(0, 120)}`);
+  }
+}
+
 /** The message as the mailbox has it now, from memory when it was read moments ago. */
-export async function liveMessage(row: MailRow, account: Account, backend: WebBackend): Promise<LiveMessage | undefined> {
+export async function liveMessage(
+  row: MailRow, account: Account, backend: WebBackend, hint?: MessageHint,
+): Promise<LiveMessage | undefined> {
   const cached = liveCache.get(row.dedupKey);
   if (cached && Date.now() - cached.at < LIVE_TTL_MS) return cached.value;
   if (!row.messageId) return undefined;
   const running = liveInFlight.get(row.dedupKey);
   if (running) return running;
-  const work: Promise<LiveMessage | undefined> = backend.read(account, row.messageId, row.folder ?? undefined)
+  const work: Promise<LiveMessage | undefined> = backend.read(account, row.messageId, hint ?? (row.folder ? { folder: row.folder } : undefined))
     .then((value) => {
       // An abandoned read keeps its result to itself: something newer was asked for since.
       if (value && liveInFlight.get(row.dedupKey) === work) rememberLive(row.dedupKey, value);
@@ -340,7 +381,7 @@ async function handleHandled(req: IncomingMessage, store: StateStore, ctx: Actio
         account: row.account, messageId, action: 'mark_read', client: ctx.client,
         ...(row.folder ? { sourceFolder: row.folder } : {}),
       };
-      void ctx.backend.act(account, messageId, 'mark_read', row.folder ? { folderHint: row.folder } : {}).then(
+      void ctx.backend.act(account, messageId, 'mark_read', actHint(store, row)).then(
         (result) => {
           forgetLive(row.dedupKey);
           quietly('Marking a handled message read', () => record(ctx, store, life, (db) => db.recordMailAction(
@@ -389,7 +430,10 @@ async function handleAction(req: IncomingMessage, store: StateStore, ctx: Action
     forgetLive(row.dedupKey);
     // The row follows the message, so the next read looks where it now is.
     if (result.destinationFolder) {
-      db.updateMailLocation(row.dedupKey, result.destinationFolder, Boolean(result.destinationIsSpam));
+      db.updateMailLocation(row.dedupKey, result.destinationFolder, Boolean(result.destinationIsSpam), {
+        ...(result.destinationUid && result.destinationUidValidity
+          ? { uid: result.destinationUid, uidValidity: result.destinationUidValidity } : {}),
+      });
     }
     // Filing a message away is dealing with it.
     if (action === 'archive' || action === 'trash') db.setHandled(row.dedupKey, true);
@@ -400,7 +444,7 @@ async function handleAction(req: IncomingMessage, store: StateStore, ctx: Action
     if (error instanceof MailActionError) return json(409, { error: error.message, code: `action_${error.code}` });
     return json(502, { error: 'the mailbox action failed', code: 'actionFailed', detail: String(error).slice(0, 200) });
   };
-  const work: Promise<WebResponse> = ctx.backend.act(account, row.messageId, action, row.folder ? { folderHint: row.folder } : {}).then(
+  const work: Promise<WebResponse> = ctx.backend.act(account, row.messageId, action, actHint(store, row)).then(
     (result) => record(ctx, store, life, (db) => settle(db, result)),
     (error: unknown) => {
       quietly('A failed mailbox action', () => record(ctx, store, life, (db) => db.recordMailAction(
@@ -454,9 +498,10 @@ async function handleReply(params: URLSearchParams, store: StateStore, ctx: Acti
   if (!account) return json(409, { error: 'this mailbox is no longer configured', code: 'unconfigured' });
   let live: LiveMessage | undefined;
   try {
-    const found = await within(liveMessage(row, account, ctx.backend), LIVE_TIMEOUT_MS);
+    const found = await within(liveMessage(row, account, ctx.backend, whereabouts(store, row)), LIVE_TIMEOUT_MS);
     if (timedOut(found)) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
     live = found;
+    rememberWhereabouts(store, row, live);
   } catch (error) {
     return mailboxFailure(error, 'readFailed', 'mailbox read failed');
   }
@@ -543,6 +588,8 @@ async function handleSend(req: IncomingMessage, store: StateStore, ctx: ActionCo
   // from another address is how a thread loses its other half.
   const replyKey = text(body['replyTo'], 1200);
   const original = replyKey ? store.getMail(replyKey) : undefined;
+  // Read now: by the time the message has left, this handle may be closed.
+  const originalPlace: ActHint = original ? actHint(store, original) : {};
   if (replyKey && !original) return json(404, { error: 'the message being answered was not found', code: 'notFound' });
   const address = original ? original.account : text(body['account'], 320);
   const account = configuredAccounts().find((candidate) => candidate.username === address);
@@ -617,7 +664,7 @@ async function handleSend(req: IncomingMessage, store: StateStore, ctx: ActionCo
           account: account.username, messageId, action: 'answered', client: ctx.client,
           ...(original.folder ? { sourceFolder: original.folder } : {}),
         };
-        void ctx.backend.act(account, messageId, 'answered', original.folder ? { folderHint: original.folder } : {}).then(
+        void ctx.backend.act(account, messageId, 'answered', originalPlace).then(
           (result) => quietly('Marking a message answered', () => record(ctx, store, life, (db) => db.recordMailAction(
             result ? { ...flagged, success: true, sourceFolder: result.sourceFolder } : { ...flagged, success: false, error: 'not found' },
           ))),
@@ -661,9 +708,10 @@ async function handleDraft(req: IncomingMessage, store: StateStore, ctx: ActionC
     if (!account) return json(409, { error: 'this mailbox is no longer configured', code: 'unconfigured' });
     let live: LiveMessage | undefined;
     try {
-      const found = await within(liveMessage(row, account, ctx.backend), LIVE_TIMEOUT_MS);
+      const found = await within(liveMessage(row, account, ctx.backend, whereabouts(store, row)), LIVE_TIMEOUT_MS);
       if (timedOut(found)) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
       live = found;
+      rememberWhereabouts(store, row, live);
     } catch (error) {
       return mailboxFailure(error, 'readFailed', 'mailbox read failed');
     }

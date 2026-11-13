@@ -139,6 +139,46 @@ interface LookupFolder extends Folder {
 type MailboxLock = Awaited<ReturnType<ImapFlow['getMailboxLock']>>;
 
 /**
+ * Where a message was last known to be.
+ *
+ * The folder alone is where to look first. With the UID and the folder's
+ * UIDVALIDITY as well, the message is fetched directly and only checked,
+ * not searched for. That matters on servers whose search cannot be trusted:
+ * QQ answers a header search for a Message-ID with nothing and a text search
+ * with every message in the folder.
+ */
+export interface MessageHint {
+  folder?: string;
+  uid?: number;
+  uidValidity?: string;
+}
+
+/** A folder name, as before, or the fuller hint. */
+export type LookupHint = string | MessageHint | undefined;
+
+function hintOf(hint: LookupHint): MessageHint {
+  if (typeof hint === 'string') return hint.trim() ? { folder: hint.trim() } : {};
+  return hint ?? {};
+}
+
+/** The UIDVALIDITY of the folder now selected. */
+function selectedValidity(client: ImapFlow): string {
+  const mailbox = client.mailbox;
+  return typeof mailbox === 'object' && mailbox ? String(mailbox.uidValidity ?? '') : '';
+}
+
+/**
+ * The UID the hint gives for the folder now selected, when it can still be
+ * believed: the hint is for this folder and the folder has not been rebuilt
+ * since. Whoever uses it still checks the Message-ID of what comes back.
+ */
+function hintedUid(client: ImapFlow, folder: Folder, hint: MessageHint): number | undefined {
+  if (!hint.uid || hint.uid <= 0 || !hint.uidValidity) return undefined;
+  if (hint.folder !== folder.path && hint.folder !== folder.rawPath) return undefined;
+  return selectedValidity(client) === hint.uidValidity ? hint.uid : undefined;
+}
+
+/**
  * Put a folder the caller last saw the message in ahead of the configured ones.
  *
  * Pure, so the order can be checked without a server. The hint may name a
@@ -163,7 +203,8 @@ export function orderLookupFolders(
   return [{ ...hinted, optional: true }, ...configured.filter((folder) => folder.path !== hinted.path)];
 }
 
-async function lookupFolders(client: ImapFlow, account: Account, folderHint?: string): Promise<LookupFolder[]> {
+async function lookupFolders(client: ImapFlow, account: Account, hint?: LookupHint): Promise<LookupFolder[]> {
+  const folderHint = hintOf(hint).folder;
   // Without a hint this is exactly targetFolders, one LIST and the same order.
   if (!folderHint?.trim()) return targetFolders(client, account);
   const entries = await listFolders(client);
@@ -357,41 +398,68 @@ async function extractLargeMessageBody(
 }
 
 /** Find candidate UIDs in the currently selected folder and confirm exact IDs at fetch time. */
-async function searchMessageUids(client: ImapFlow, messageId: string): Promise<number[]> {
+async function searchMessageUids(
+  client: ImapFlow, messageId: string, folder?: Folder, hint: MessageHint = {},
+): Promise<number[]> {
+  // 1. Where it was last seen. One small fetch settles it, and no search runs.
+  const remembered = folder ? hintedUid(client, folder, hint) : undefined;
+  if (remembered !== undefined) {
+    const one = await client.fetchOne(String(remembered), { uid: true, envelope: true }, { uid: true });
+    if (one && one.envelope?.messageId?.trim() === messageId) return [remembered];
+  }
+
+  // 2. The header search, which is exact on the servers that implement it.
   const headerFound = await client.search({ header: { 'message-id': messageId } }, { uid: true });
-  const found = Array.isArray(headerFound) && headerFound.length
-    ? headerFound
-    : await client.search({ text: messageId }, { uid: true });
-  let foundUids = Array.isArray(found) ? found : [];
-  if (foundUids.length === 0) {
+  if (Array.isArray(headerFound) && headerFound.length) return headerFound;
+
+  // 3. A text search, for servers without a header search. A short answer is
+  //    taken as it is; every caller checks the Message-ID of what it fetches.
+  const textFound = await client.search({ text: messageId }, { uid: true });
+  let candidates = Array.isArray(textFound) ? textFound : [];
+  if (candidates.length > 0 && candidates.length <= TRUSTED_SEARCH_HITS) return candidates;
+
+  const maxCandidates = intEnv('MCP_LIVE_SEARCH_MAX_MESSAGES', 500);
+  const overLimit = (): Error => new Error(`live IMAP search exceeds MCP_LIVE_SEARCH_MAX_MESSAGES (${maxCandidates})`);
+  let cutShort = false;
+  if (candidates.length === 0) {
+    // 4. Nothing at all: go through the recent mail of the folder.
     const lookbackDays = intEnv('MCP_LIVE_LOOKBACK_DAYS', 90);
-    const maxCandidates = intEnv('MCP_LIVE_SEARCH_MAX_MESSAGES', 500);
     const broad = await client.search(
       { since: new Date(Date.now() - lookbackDays * 86_400_000) },
       { uid: true },
     );
-    if (Array.isArray(broad) && broad.length > maxCandidates) {
-      throw new Error(`live IMAP search exceeds MCP_LIVE_SEARCH_MAX_MESSAGES (${maxCandidates})`);
-    }
-    const matching: number[] = [];
-    for await (const raw of client.fetch(
-      Array.isArray(broad) ? broad : [],
-      { uid: true, envelope: true },
-      { uid: true },
-    )) {
-      if (raw.envelope?.messageId?.trim() === messageId) matching.push(raw.uid);
-    }
-    foundUids = matching;
+    candidates = Array.isArray(broad) ? broad : [];
+    if (candidates.length > maxCandidates) throw overLimit();
+  } else if (candidates.length > maxCandidates) {
+    // A long answer to a search for one id is a server answering with the
+    // folder (QQ does). The newest are where a message someone is opening
+    // will be, so those are gone through and the rest are not.
+    candidates = [...candidates].sort((a, b) => a - b).slice(-maxCandidates);
+    cutShort = true;
   }
-  return foundUids;
+
+  // Either way these are candidates, not hits: only their envelopes are
+  // read here, so that no caller fetches the body of a whole folder to find
+  // one message in it.
+  const matching: number[] = [];
+  for await (const raw of client.fetch(candidates, { uid: true, envelope: true }, { uid: true })) {
+    if (raw.envelope?.messageId?.trim() === messageId) matching.push(raw.uid);
+  }
+  // Not among the ones looked at is not the same as not there: say the
+  // search was too large, as the lookback does, rather than that it is gone.
+  if (!matching.length && cutShort) throw overLimit();
+  return matching;
 }
 
+/** More hits than this for one Message-ID is not an answer to believe. */
+const TRUSTED_SEARCH_HITS = 3;
 
 async function toMailMessage(
   raw: FetchMessageObject,
   account: Account,
   folder: Folder,
   parsedBody?: { body: string; hasAttachments: boolean },
+  uidValidity?: string,
 ): Promise<MailMessage> {
   const envelope = raw.envelope;
   const from = firstAddress(envelope?.from);
@@ -417,6 +485,7 @@ async function toMailMessage(
     folder: folder.path,
     inSpam: folder.isSpam,
     uid: raw.uid,
+    ...(uidValidity ? { uidValidity } : {}),
     messageId,
     subject: envelope?.subject?.trim() ?? '',
     fromAddr: from.address,
@@ -527,7 +596,7 @@ export async function fetchNew(
         const parsedBody = needsTextPart
           ? await extractLargeMessageBody(client, raw.uid, raw.bodyStructure, maxSourceBytes)
           : await extractBody(source);
-        messages.push(await toMailMessage(raw, account, folder, parsedBody));
+        messages.push(await toMailMessage(raw, account, folder, parsedBody, uidValidity));
       } catch (error) {
         // One malformed message must not stop the entire folder.
         log.warn(`Failed to parse uid=${raw.uid}; skipping: ${error}`);
@@ -564,15 +633,45 @@ async function findLiveSource(
   account: Account,
   messageId: string,
   folders: readonly LookupFolder[],
-  options: { withFlags: boolean; parseBody: boolean; oversize?: 'slim' },
-): Promise<{ raw: FetchMessageObject; folder: Folder; message: MailMessage } | undefined> {
+  options: { withFlags: boolean; parseBody: boolean; oversize?: 'slim'; hint?: MessageHint },
+): Promise<{ raw: FetchMessageObject; folder: Folder; message: MailMessage; uidValidity: string } | undefined> {
   const maxSourceBytes = intEnv('MCP_LIVE_SOURCE_BYTES', 5 * 1024 * 1024);
   const slim = options.oversize === 'slim';
+  const hint = options.hint ?? {};
   for (const folder of folders) {
     const lock = await lockFolder(client, folder, true);
     if (!lock) continue;
     try {
-      const foundUids = await searchMessageUids(client, messageId);
+      const uidValidity = selectedValidity(client);
+      // Remembered from the last time: everything about the message in one
+      // request, checked against its Message-ID. Only when that is not the
+      // message any more (moved, or the folder rebuilt) is it searched for.
+      const remembered = slim ? hintedUid(client, folder, hint) : undefined;
+      if (remembered !== undefined) {
+        const bite = Math.min(FIRST_BITE_BYTES, maxSourceBytes);
+        const raw = await client.fetchOne(
+          String(remembered),
+          {
+            uid: true, size: true, envelope: true, bodyStructure: true, headers: true,
+            source: { maxLength: bite + 1 },
+            ...(options.withFlags ? { flags: true } : {}),
+          },
+          { uid: true },
+        );
+        // Told apart exactly as a message a search found is, a few lines below.
+        const message = raw
+          ? await toMailMessage(raw, account, folder, { body: '', hasAttachments: false }, uidValidity)
+          : undefined;
+        if (raw && message?.messageId === messageId) {
+          // One byte more than the bite was asked for, so anything shorter is
+          // the whole message. A longer one is read the way a search would
+          // have had it read: whole when it fits, slim when it does not.
+          if (!raw.source || raw.source.length > bite) raw.source = await readingSource(client, raw, maxSourceBytes);
+          return { raw, folder, message, uidValidity };
+        }
+      }
+      // The remembered place was tried just above when reading slim; otherwise the search starts with it.
+      const foundUids = await searchMessageUids(client, messageId, folder, slim ? {} : hint);
       if (!foundUids.length) continue;
       // Collected before anything else is asked of the server: a command
       // issued while a fetch is still being read would wait on it forever.
@@ -597,11 +696,11 @@ async function findLiveSource(
           throw new Error(`message exceeds MCP_LIVE_SOURCE_BYTES (${maxSourceBytes})`);
         }
         const message = await toMailMessage(
-          raw, account, folder, options.parseBody ? undefined : { body: '', hasAttachments: false },
+          raw, account, folder, options.parseBody ? undefined : { body: '', hasAttachments: false }, uidValidity,
         );
         if (message.messageId !== messageId) continue;
         if (slim) raw.source = await readingSource(client, raw, maxSourceBytes);
-        return { raw, folder, message };
+        return { raw, folder, message, uidValidity };
       }
     } finally {
       lock.release();
@@ -609,6 +708,13 @@ async function findLiveSource(
   }
   return undefined;
 }
+
+/**
+ * How much of a remembered message comes with the request that checks it is
+ * still the same message. Most mail is smaller, and is then read in that one
+ * request; a larger one costs this much before it is read properly.
+ */
+const FIRST_BITE_BYTES = 256 * 1024;
 
 /** Text read from a message too large to fetch whole. Far more than anyone reads; markup past the reader's own limit would be dropped anyway. */
 const SLIM_TEXT_BYTES = 1024 * 1024;
@@ -657,6 +763,9 @@ export interface LiveMessage {
   /** The folder it was found in, which is the hint to pass next time. */
   folder: string;
   flags: { seen: boolean; flagged: boolean; answered: boolean };
+  /** Its UID there and the folder's UIDVALIDITY: kept, they make the next read a fetch and not a search. */
+  uid?: number;
+  uidValidity?: string;
 }
 
 /**
@@ -671,11 +780,13 @@ export interface LiveMessage {
 export async function fetchReadableByMessageId(
   account: Account,
   messageId: string,
-  folderHint?: string,
+  hint?: LookupHint,
 ): Promise<LiveMessage | undefined> {
   const found = await withSession(account, async (client) => {
-    const folders = await lookupFolders(client, account, folderHint);
-    return findLiveSource(client, account, messageId, folders, { withFlags: true, parseBody: false, oversize: 'slim' });
+    const folders = await lookupFolders(client, account, hint);
+    return findLiveSource(client, account, messageId, folders, {
+      withFlags: true, parseBody: false, oversize: 'slim', hint: hintOf(hint),
+    });
   });
   if (!found) return undefined;
   // Parsed after the connection is closed: it needs no server, and a large
@@ -688,6 +799,7 @@ export async function fetchReadableByMessageId(
     readable,
     folder: found.folder.path,
     flags: { seen: flags.has('\\Seen'), flagged: flags.has('\\Flagged'), answered: flags.has('\\Answered') },
+    ...(found.raw.uid > 0 && found.uidValidity ? { uid: found.raw.uid, uidValidity: found.uidValidity } : {}),
   };
 }
 
@@ -698,15 +810,15 @@ export async function fetchReadableByMessageId(
 export async function fetchAttachmentManifestByMessageId(
   account: Account,
   messageId: string,
-  folderHint?: string,
+  hint?: LookupHint,
 ): Promise<AttachmentManifestLookup | undefined> {
   return withSession(account, async (client) => {
-    const folders = await lookupFolders(client, account, folderHint);
+    const folders = await lookupFolders(client, account, hint);
     for (const folder of folders) {
       const lock = await lockFolder(client, folder, true);
       if (!lock) continue;
       try {
-        const uids = await searchMessageUids(client, messageId);
+        const uids = await searchMessageUids(client, messageId, folder, hintOf(hint));
         if (!uids.length) continue;
         for await (const raw of client.fetch(
           uids,
@@ -760,17 +872,17 @@ export async function scanAttachmentByMessageId(
   account: Account,
   messageId: string,
   partId: string,
-  folderHint?: string,
+  hint?: LookupHint,
 ): Promise<AttachmentScanReport | undefined> {
   if (!/^\d+(?:\.\d+)*$/.test(partId)) throw new AttachmentNotFoundError(partId);
   const maxBytes = attachmentScanMaxBytes();
   return withSession(account, async (client) => {
-    const folders = await lookupFolders(client, account, folderHint);
+    const folders = await lookupFolders(client, account, hint);
     for (const folder of folders) {
       const lock = await lockFolder(client, folder, true);
       if (!lock) continue;
       try {
-        const uids = await searchMessageUids(client, messageId);
+        const uids = await searchMessageUids(client, messageId, folder, hintOf(hint));
         if (!uids.length) continue;
         for (const uid of uids) {
           const raw = await client.fetchOne(
@@ -800,15 +912,15 @@ export async function scanAttachmentByMessageId(
 export async function inspectMailSafety(
   account: Account,
   messageId: string,
-  folderHint?: string,
+  hint?: LookupHint,
 ): Promise<MailSafetyReport | undefined> {
   return withSession(account, async (client) => {
-    const folders = await lookupFolders(client, account, folderHint);
+    const folders = await lookupFolders(client, account, hint);
     for (const folder of folders) {
       const lock = await lockFolder(client, folder, true);
       if (!lock) continue;
       try {
-        const uids = await searchMessageUids(client, messageId);
+        const uids = await searchMessageUids(client, messageId, folder, hintOf(hint));
         if (!uids.length) continue;
         // Use one FETCH at a time because a matching record may need a
         // bounded body-part DOWNLOAD while the read-only lock is held.
@@ -964,17 +1076,17 @@ export async function fetchAttachmentByMessageId(
   account: Account,
   messageId: string,
   partId: string,
-  folderHint?: string,
+  hint?: LookupHint,
 ): Promise<DownloadedAttachment | undefined> {
   if (!/^\d+(?:\.\d+)*$/.test(partId)) throw new AttachmentNotFoundError(partId);
   const maxBytes = attachmentMaxBytes();
   return withSession(account, async (client) => {
-    const folders = await lookupFolders(client, account, folderHint);
+    const folders = await lookupFolders(client, account, hint);
     for (const folder of folders) {
       const lock = await lockFolder(client, folder, true);
       if (!lock) continue;
       try {
-        const uids = await searchMessageUids(client, messageId);
+        const uids = await searchMessageUids(client, messageId, folder, hintOf(hint));
         if (!uids.length) continue;
         for (const uid of uids) {
           const raw = await client.fetchOne(
@@ -1030,12 +1142,13 @@ async function actOnMessage(
   folders: readonly LookupFolder[],
   action: WebMailAction,
   destinationPath: string | undefined,
-): Promise<string | undefined> {
+  hint: MessageHint = {},
+): Promise<{ sourceFolder: string; destinationUid?: number; destinationUidValidity?: string } | undefined> {
   for (const folder of folders) {
     const lock = await lockFolder(client, folder, false);
     if (!lock) continue;
     try {
-      const uids = await searchMessageUids(client, messageId);
+      const uids = await searchMessageUids(client, messageId, folder, hint);
       if (!uids.length) continue;
       for (const uid of uids) {
         const raw = await client.fetchOne(uid, { uid: true, envelope: true }, { uid: true });
@@ -1050,11 +1163,14 @@ async function actOnMessage(
           if (destinationPath === folder.path) {
             throw new MailActionError('invalid_destination', 'message is already in the destination folder');
           }
-          if (!await client.messageMove([uid], destinationPath, { uid: true })) {
-            throw new MailActionError('failed', 'IMAP server rejected the move operation');
-          }
+          const moved = await client.messageMove([uid], destinationPath, { uid: true });
+          if (!moved) throw new MailActionError('failed', 'IMAP server rejected the move operation');
+          // A server that says where the message landed saves the next lookup a search.
+          const landed = moved.uidMap?.get(uid);
+          const validity = moved.uidValidity !== undefined ? String(moved.uidValidity) : '';
+          if (landed && validity) return { sourceFolder: folder.path, destinationUid: landed, destinationUidValidity: validity };
         }
-        return folder.path;
+        return { sourceFolder: folder.path };
       }
     } finally {
       lock.release();
@@ -1099,13 +1215,13 @@ export async function applyMessageAction(
     }
 
     const folders = await targetFolders(client, account);
-    const sourceFolder = await actOnMessage(client, messageId, folders, action, destinationPath);
-    if (sourceFolder === undefined) return undefined;
+    const acted = await actOnMessage(client, messageId, folders, action, destinationPath);
+    if (acted === undefined) return undefined;
     return {
       action,
       account: account.username,
       messageId,
-      sourceFolder,
+      sourceFolder: acted.sourceFolder,
       ...(destinationPath ? { destinationFolder: destinationPath } : {}),
     };
   } finally {
@@ -1129,6 +1245,9 @@ export type WebMailActionResult = Omit<MailActionResult, 'action'> & {
   action: WebMailAction;
   /** Set with destinationFolder: whether the message now sits in a spam folder. */
   destinationIsSpam?: boolean;
+  /** Where the message landed, when the server said: its new UID and that folder's UIDVALIDITY. */
+  destinationUid?: number;
+  destinationUidValidity?: string;
 };
 
 type MovingAction = 'move' | 'archive' | 'trash' | 'inbox';
@@ -1222,7 +1341,7 @@ export async function applyWebMailAction(
   account: Account,
   messageId: string,
   action: WebMailAction,
-  options: { destination?: string; folderHint?: string } = {},
+  options: { destination?: string; folderHint?: string; hint?: MessageHint } = {},
 ): Promise<WebMailActionResult | undefined> {
   if (!WEB_MAIL_ACTIONS.includes(action)) {
     throw new MailActionError('invalid_action', `unsupported mail action: ${String(action)}`);
@@ -1236,15 +1355,18 @@ export async function applyWebMailAction(
     const destination = MOVING_ACTIONS.has(action)
       ? resolveActionDestination(entries, action as MovingAction, account.provider, options.destination)
       : undefined;
-    const folders = orderLookupFolders(entries, resolveFolders(entries, account.folders), options.folderHint);
-    const sourceFolder = await actOnMessage(client, messageId, folders, action, destination?.path);
-    if (sourceFolder === undefined) return undefined;
+    const hint: MessageHint = { ...(options.folderHint ? { folder: options.folderHint } : {}), ...(options.hint ?? {}) };
+    const folders = orderLookupFolders(entries, resolveFolders(entries, account.folders), hint.folder);
+    const acted = await actOnMessage(client, messageId, folders, action, destination?.path, hint);
+    if (acted === undefined) return undefined;
     return {
       action,
       account: account.username,
       messageId,
-      sourceFolder,
+      sourceFolder: acted.sourceFolder,
       ...(destination ? { destinationFolder: destination.path, destinationIsSpam: destination.isSpam } : {}),
+      ...(acted.destinationUid && acted.destinationUidValidity
+        ? { destinationUid: acted.destinationUid, destinationUidValidity: acted.destinationUidValidity } : {}),
     };
   }, { repeatable: false });
 }

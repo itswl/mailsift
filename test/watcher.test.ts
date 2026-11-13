@@ -141,6 +141,18 @@ describe('deduplication', () => {
     expect(fresh).toHaveLength(2);
   });
 
+  it('files where each message is in its folder, so the reader can fetch it without searching', async () => {
+    const { w, state } = watcher();
+    stubTriage({ '<a@x>': makeResult(), '<b@x>': makeResult() });
+    await w.dispatch(w.filterFresh([
+      makeMessage({ messageId: '<a@x>', uid: 31, uidValidity: '1700000000' }),
+      // A message that did not come from a mailbox fetch says nothing, and nothing is made up for it.
+      makeMessage({ messageId: '<b@x>', uid: 32 }),
+    ]), stats());
+    expect(state.placeOf('me@qq.com|<a@x>')).toEqual({ uid: 31, uidValidity: '1700000000' });
+    expect(state.placeOf('me@qq.com|<b@x>')).toBeUndefined();
+  });
+
   it('does not reprocess handled messages on the next round', async () => {
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
     const { w } = watcher();
