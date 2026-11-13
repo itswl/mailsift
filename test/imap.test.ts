@@ -170,10 +170,15 @@ const fake = vi.hoisted(() => {
 });
 
 vi.mock('imapflow', () => ({ ImapFlow: fake.ImapFlow }));
+// A mailbox that signs in with a token gets one here without a token file or a provider.
+vi.mock('../src/imap/auth.js', async (original) => ({
+  ...(await original<typeof import('../src/imap/auth.js')>()),
+  getAccessToken: async () => 'access-token',
+}));
 
 import {
-  closeSessions, connectInteractive, MailboxUnreachableError, openSessions, resumeConnecting, stopConnecting,
-  warmSession, withSession,
+  closeSessions, connectInteractive, MailboxUnreachableError, openSessions, resumeConnecting, setSignInGap,
+  stopConnecting, warmSession, withSession,
 } from '../src/imap/connection.js';
 import {
   appendToSent, applyMessageAction, applyWebMailAction, connect, connectAttempts, fetchAttachmentManifestByMessageId,
@@ -288,6 +293,8 @@ beforeEach(() => {
   // No connection is carried from one test into the next.
   closeSessions();
   resumeConnecting();
+  // No provider here to be polite to; the test that is about the pause sets it.
+  setSignInGap(0);
   fake.server.reset();
   fake.server.folders = [
     { path: 'INBOX' },
@@ -887,4 +894,84 @@ describe('being told to stop', () => {
     expect(openSessions()).toBe(0);
     expect(fake.server.calls.at(-1)).toBe('logout');
   });
+});
+
+describe('signing in when nobody is waiting', () => {
+  const refused = (): Error => Object.assign(new Error('Command failed'), { responseText: 'Login failed.' });
+
+  it('spaces out sign-ins to one mailbox: the poll and the listeners no longer start at the same instant', async () => {
+    // What a restart used to do: three connections to the same mailbox begun together.
+    setSignInGap(40);
+    const starts: number[] = [];
+    const original = fake.ImapFlow.prototype.connect;
+    fake.ImapFlow.prototype.connect = async function timed(this: InstanceType<typeof fake.ImapFlow>): Promise<void> {
+      starts.push(Date.now());
+      this.usable = true;
+    };
+    try {
+      const clients = await Promise.all([
+        connect(ME, { purpose: 'the poll' }), connect(ME, { idle: true, purpose: 'listening on INBOX' }), connect(ME, { idle: true, purpose: 'listening on Junk' }),
+      ]);
+      expect(starts).toHaveLength(3);
+      expect(starts[1]! - starts[0]!).toBeGreaterThanOrEqual(35);
+      expect(starts[2]! - starts[1]!).toBeGreaterThanOrEqual(35);
+      for (const client of clients) client.close();
+      // Another mailbox is not made to wait for this one.
+      starts.length = 0;
+      const began = Date.now();
+      const other = await connect(GMAIL);
+      expect(starts[0]! - began).toBeLessThan(30);
+      other.close();
+    } finally {
+      fake.ImapFlow.prototype.connect = original;
+    }
+  });
+
+  it('does not put one caller behind another whose sign-in is hanging', async () => {
+    // Only the start is spaced. With a provider that leaves sign-ins hanging,
+    // waiting for the one before would put everyone behind the slowest.
+    setSignInGap(20);
+    fake.server.connectPlan = ['hang', 'ok'];
+    const stuck = connect(ME, { purpose: 'the poll', attemptMs: 5_000 });
+    stuck.catch(() => undefined);
+    const started = Date.now();
+    const client = await connect(ME, { purpose: 'listening on INBOX' });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(client.usable).toBe(true);
+    client.close();
+    stopConnecting();
+    await expect(stuck).rejects.toThrow();
+  });
+
+  it('gives up on an attempt whose sign-in never comes, instead of holding the poll for minutes', async () => {
+    fake.server.connectPlan = ['hang', 'ok'];
+    const started = Date.now();
+    const client = await connect(ME, { attemptMs: 50 });
+    // One stalled attempt, the two-second pause, then a connection.
+    expect(Date.now() - started).toBeLessThan(4_000);
+    expect(fake.server.calls.filter((call) => call === 'connect')).toHaveLength(2);
+    expect(fake.server.closed).toBeGreaterThanOrEqual(1);
+    client.close();
+  }, 10_000);
+
+  it('never asks a second time with a password that was refused', async () => {
+    // That is how accounts get locked.
+    fake.server.connectPlan = [refused(), 'ok'];
+    await expect(connect(ME)).rejects.toThrow(/Login failed/);
+    expect(fake.server.calls.filter((call) => call === 'connect')).toHaveLength(1);
+  });
+
+  it('asks once more with a token that was refused, and only once', async () => {
+    // A provider in trouble says "Login failed" to a token it accepts a moment later.
+    fake.server.connectPlan = [refused(), 'ok'];
+    const client = await connect(OUTLOOK);
+    expect(client.usable).toBe(true);
+    expect(fake.server.calls.filter((call) => call === 'connect')).toHaveLength(2);
+    client.close();
+    // Refused twice running, it is taken at its word.
+    fake.server.calls.length = 0;
+    fake.server.connectPlan = [refused(), refused(), 'ok'];
+    await expect(connect(OUTLOOK)).rejects.toThrow(/Login failed/);
+    expect(fake.server.calls.filter((call) => call === 'connect')).toHaveLength(2);
+  }, 15_000);
 });

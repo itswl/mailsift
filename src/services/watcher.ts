@@ -130,7 +130,7 @@ export class Watcher {
     const cursors: PendingCursor[] = [];
     const failures: string[] = [];
     const deadLetters: FetchFailure[] = [];
-    const client = await connect(account);
+    const client = await connect(account, { purpose: 'the poll' });
 
     try {
       const folders = await targetFolders(client, account);
