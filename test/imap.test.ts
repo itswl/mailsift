@@ -730,6 +730,49 @@ describe('acting on a message from the web view', () => {
     expect(await applyWebMailAction(ME, '<one@x>', 'star', { hint: { folder: 'INBOX', uid: 1, uidValidity: '1' } })).toBeUndefined();
   });
 
+  it('says when a move put the message in the bin, by the bin\'s name or under it', async () => {
+    put('INBOX', '<one@x>');
+    put('INBOX', '<two@x>');
+    fake.server.folders.push({ path: 'Deleted Messages/kept' });
+    expect(await applyWebMailAction(ME, '<one@x>', 'move', { destination: 'Deleted Messages' }))
+      .toMatchObject({ destinationFolder: 'Deleted Messages', destinationIsTrash: true });
+    expect(await applyWebMailAction(ME, '<two@x>', 'move', { destination: 'Deleted Messages/kept' }))
+      .toMatchObject({ destinationIsTrash: true });
+    expect(await applyWebMailAction(ME, '<two@x>', 'inbox', { folderHint: 'Deleted Messages/kept' })).not.toHaveProperty('destinationIsTrash');
+    expect(await applyWebMailAction(ME, '<two@x>', 'trash')).toMatchObject({ destinationIsTrash: true });
+  });
+
+  it('does an action on a new connection when the kept one is found dead before anything was changed', async () => {
+    put('INBOX', '<one@x>');
+    // A read keeps a connection, and the server then drops it without a word.
+    await fetchReadableByMessageId(ME, '<one@x>');
+    const [kept] = fake.server.clients;
+    const lock = (kept as unknown as { getMailboxLock: (...a: unknown[]) => Promise<unknown> }).getMailboxLock.bind(kept);
+    let dropped = false;
+    (kept as unknown as { getMailboxLock: (...a: unknown[]) => Promise<unknown> }).getMailboxLock = async (...a: unknown[]) => {
+      if (!dropped) { dropped = true; kept!.usable = false; throw Object.assign(new Error('Connection not available'), { code: 'NoConnection' }); }
+      return lock(...a);
+    };
+    expect(await applyWebMailAction(ME, '<one@x>', 'archive')).toMatchObject({ sourceFolder: 'INBOX', destinationFolder: 'Archive' });
+    expect(idsIn('Archive')).toEqual(['<one@x>']);
+    expect(fake.server.calls.filter((call) => call.startsWith('move'))).toEqual(['move INBOX -> Archive']);
+  });
+
+  it('never sends a change twice: a line that drops after the change was sent fails the action', async () => {
+    put('INBOX', '<one@x>');
+    await fetchReadableByMessageId(ME, '<one@x>');
+    const [kept] = fake.server.clients;
+    const move = (kept as unknown as { messageMove: (...a: unknown[]) => Promise<unknown> }).messageMove.bind(kept);
+    (kept as unknown as { messageMove: (...a: unknown[]) => Promise<unknown> }).messageMove = async (...a: unknown[]) => {
+      await move(...a);
+      kept!.usable = false;
+      throw Object.assign(new Error('Connection not available'), { code: 'NoConnection' });
+    };
+    await expect(applyWebMailAction(ME, '<one@x>', 'archive')).rejects.toThrow(/Connection not available/);
+    // Moved once, and not tried again on a new connection.
+    expect(fake.server.calls.filter((call) => call.startsWith('move'))).toEqual(['move INBOX -> Archive']);
+  });
+
   it('rescues a message from spam and can send one to the bin', async () => {
     put('Junk', '<rescued@x>');
     expect(await applyWebMailAction(ME, '<rescued@x>', 'inbox')).toMatchObject({ sourceFolder: 'Junk', destinationFolder: 'INBOX' });

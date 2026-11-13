@@ -444,9 +444,11 @@ export interface SessionOptions {
    * Whether the work may be done again on a new connection when the kept one
    * turns out to have died. True for reading. False for anything that changes
    * the mailbox: a move that went through just before the line dropped must
-   * not be attempted twice.
+   * not be attempted twice. A function is asked at the moment of failure, so
+   * that a change which had not yet been sent when the line dropped can be
+   * done on a new connection after all.
    */
-  repeatable?: boolean;
+  repeatable?: boolean | (() => boolean);
   /** How long the work may take before the connection is given up on. */
   timeoutMs?: number;
   timing?: InteractiveTiming;
@@ -506,7 +508,8 @@ async function onSession<T>(account: Account, work: (client: ImapFlow) => Promis
       // A connection that sat idle may have been dropped by the server
       // without a word. That shows on first use, and says nothing about the
       // mailbox: reading is simply done again on a new connection.
-      if (session.client.usable || !kept || options.repeatable === false) throw error;
+      const mayRepeat = typeof options.repeatable === 'function' ? options.repeatable() : options.repeatable !== false;
+      if (session.client.usable || !kept || !mayRepeat) throw error;
       endSession(key, session, false);
       session = await open();
       return await bounded(session.client, work, ms);

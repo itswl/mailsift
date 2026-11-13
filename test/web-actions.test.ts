@@ -426,6 +426,22 @@ describe('remembering where a message is in its mailbox', () => {
 });
 
 describe('acting on a mailbox', () => {
+  it('counts a move into the bin as dealt with, and records where a refused move was aimed', async () => {
+    const store = seeded();
+    const binning = backend({
+      act: async (account, messageId, action, options) => ({
+        action, account: account.username, messageId, sourceFolder: 'INBOX',
+        destinationFolder: options?.destination ?? '', destinationIsSpam: false, destinationIsTrash: true,
+      }),
+    });
+    expect((await post(store, '/api/action', { key: 'k1', action: 'move', destination: 'Deleted Messages' }, {}, binning)).answer.status).toBe(200);
+    expect(store.getMail('k1')).toMatchObject({ folder: 'Deleted Messages', handledAt: expect.any(String) });
+
+    const refusing = backend({ act: async () => { throw new MailActionError('invalid_destination', 'destination folder not found or not selectable: Nope'); } });
+    expect((await post(store, '/api/action', { key: 'k3', action: 'move', destination: 'Nope' }, {}, refusing)).answer.status).toBe(409);
+    expect(store.listMailActions(1)[0]).toMatchObject({ action: 'move', success: false, destinationFolder: 'Nope' });
+  });
+
   it('moves a message to a named folder, and needs to be told which', async () => {
     const store = seeded();
     const fake = backend({
@@ -497,7 +513,7 @@ describe('acting on a mailbox', () => {
     expect(store.getMail('k2')?.handledAt).toBeNull();
   });
 
-  it('offers no move to a folder of the caller’s choosing, and no unknown action', async () => {
+  it('refuses a move with nowhere to go, an action nobody asks for, and an unknown one', async () => {
     const store = seeded();
     const fake = backend();
     for (const action of ['move', 'delete', 'answered', '']) {
