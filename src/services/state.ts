@@ -973,23 +973,25 @@ export class StateStore {
   }
 
   /**
-   * Every stored record a Message-ID or a key names, with its mailbox. One
-   * message can be stored once per mailbox (a forwarded copy, or a message
-   * addressed to two of them), and getMail returns only one of those.
-   */
-  /**
-   * Whether a string has the shape of a record key: a mailbox this store
-   * holds mail for, a bar, and the rest. A real Message-ID ("<...>", or a
-   * bare one with no bar) never does; a look-alike's does.
+   * Whether a string has the shape of a record key: an email address, a bar,
+   * and the rest. A real Message-ID ("<...>", or a bare one with no bar
+   * after an address) never does; a look-alike's does. Decided by shape
+   * alone, so that it holds after retention has removed every record of a
+   * mailbox, and for a mailbox no longer configured.
    */
   keyShaped(value: string): boolean {
     const text = value.trim();
     if (text.startsWith('<')) return false;
     const bar = text.indexOf('|');
     if (bar <= 0) return false;
-    return Boolean(this.db.prepare('SELECT 1 FROM seen WHERE account = ? LIMIT 1').get(text.slice(0, bar)));
+    return /^[^\s@<>|]+@[^\s@<>|]+$/.test(text.slice(0, bar));
   }
 
+  /**
+   * Every stored record a Message-ID or a key names, with its mailbox. One
+   * message can be stored once per mailbox (a forwarded copy, or a message
+   * addressed to two of them), and getMail returns only one of those.
+   */
   recordsFor(messageId: string): Array<{ dedupKey: string; account: string; by: 'messageId' | 'key' }> {
     // Every record the string names: as a Message-ID (one per mailbox it was
     // stored for), and as a record's own key. A sender can write a Message-ID
