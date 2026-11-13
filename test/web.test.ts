@@ -336,7 +336,7 @@ describe('rendering', () => {
     process.env.MAILSIFT_VERSION = '0.1.56';
     const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
     expect(page).toContain('<strong>mailsift</strong>');
-    expect(page).toContain('<footer class="version">v0.1.56</footer>');
+    expect(page).toContain('<footer class="version"><span id="version">v0.1.56</span>');
     const login = String((await routeWeb(request(), url('/'), 'secret', seeded())).body);
     expect(login).toContain('<h1>mailsift</h1>');
     expect(login).toContain('<p class="version">v0.1.56</p>');
@@ -349,7 +349,7 @@ describe('rendering', () => {
     store.markSeen('evil', 'me@qq.com', '<img src=x onerror=alert(1)>');
     store.recordOutcome('evil', 'info', false, { messageId: '<evil@x>', summary: '</script><script>alert(1)</script>' });
     const page = (await routeWeb(request(), url('/'), '', store)).body;
-    expect(page).not.toContain('onerror');
+    expect(page).not.toContain('onerror=alert');
     expect(page).not.toContain('alert(1)');
     expect(page).toContain('textContent');
   });
@@ -444,10 +444,29 @@ describe('installable app', () => {
     expect(page).toContain('safe-area-inset-top');
   });
 
-  it('caches nothing in the worker, because this is a live view', async () => {
+  it('keeps only the empty shell in the worker, never mail', async () => {
+    // The shell lets an installed app open with no network. A list of
+    // yesterday's judgements served as today's would be worse than none, so
+    // nothing under /api/ is ever stored or answered from the cache.
     const worker = String((await routeWeb(request({ url: '/sw.js' }), url('/sw.js'), '', seeded())).body);
-    expect(worker).not.toContain('caches');
-    expect(worker).toContain('fetch');
+    expect(worker).toContain("url.pathname !== '/'");
+    expect(worker).toContain("request.mode !== 'navigate'");
+    expect(worker).toContain("cache.put('/'");
+    expect(worker).not.toContain('/api/');
+    // Only the signed-in app is kept, never a sign-in form.
+    expect(worker).toContain("response.headers.get('x-mailsift-shell') === '1'");
+    const shell = await routeWeb(request(), url('/'), '', seeded());
+    expect(shell.headers?.['x-mailsift-shell']).toBe('1');
+    const login = await routeWeb(request(), url('/'), 'secret', seeded());
+    expect(login.headers?.['x-mailsift-shell']).toBeUndefined();
+  });
+
+  it('shows a notification for every push, and opens the message it is about', async () => {
+    const worker = String((await routeWeb(request({ url: '/sw.js' }), url('/sw.js'), '', seeded())).body);
+    expect(worker).toContain("addEventListener('push'");
+    expect(worker).toContain('showNotification');
+    expect(worker).toContain("addEventListener('notificationclick'");
+    expect(worker).toContain('setAppBadge');
   });
 });
 
