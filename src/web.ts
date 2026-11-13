@@ -26,7 +26,7 @@ import { mailboxStatuses } from './services/health.js';
 import { CATEGORIES } from './services/triage.js';
 import { HEARTBEAT_KEY, type PollStats } from './services/watcher.js';
 import {
-  configuredAccounts, defaultBackend, forgetLive, liveMessage, routeActions, webPushEnabled,
+  configuredAccounts, defaultBackend, forgetLive, liveMessage, mailboxFailure, routeActions, webPushEnabled,
   type ActionContext, type WebBackend,
 } from './web-actions.js';
 import { clientScript, LANGUAGE_COOKIE, storeLanguageScript } from './web-client.js';
@@ -369,8 +369,7 @@ export async function handleApi(
         flags: live.flags, liveFolder: live.folder,
       });
     } catch (error) {
-      const detail = String(error).slice(0, 200);
-      return json(502, { error: `mailbox read failed: ${detail}`, code: 'readFailed', detail });
+      return mailboxFailure(error, 'readFailed', 'mailbox read failed');
     }
   }
 
@@ -437,8 +436,7 @@ async function handleAttachmentsApi(
     });
   } catch (error) {
     store.recordMcpAudit('web:list-attachments', client, false, target);
-    const detail = String(error).slice(0, 200);
-    return json(502, { error: `mailbox attachment lookup failed: ${detail}`, code: 'attachmentFailed', detail });
+    return mailboxFailure(error, 'attachmentFailed', 'mailbox attachment lookup failed');
   }
 }
 
@@ -481,8 +479,7 @@ async function handleMailSafetyApi(
     return json(200, report);
   } catch (error) {
     store.recordMcpAudit('web:inspect-mail-safety', client, false, target);
-    const detail = String(error).slice(0, 200);
-    return json(502, { error: 'mail safety inspection failed: ' + detail, code: 'safetyFailed', detail });
+    return mailboxFailure(error, 'safetyFailed', 'mail safety inspection failed');
   }
 }
 
@@ -543,8 +540,7 @@ async function handleAttachmentApi(
         maxBytes: error.maxBytes,
       });
     }
-    const detail = String(error).slice(0, 200);
-    return json(502, { error: `attachment read failed: ${detail}`, code: 'attachmentFailed', detail });
+    return mailboxFailure(error, 'attachmentFailed', 'attachment read failed');
   }
 }
 
@@ -589,8 +585,7 @@ async function handleAttachmentScanApi(
     if (error instanceof AttachmentNotFoundError) {
       return json(404, { error: 'attachment not found', code: 'attachmentNotFound' });
     }
-    const detail = String(error).slice(0, 200);
-    return json(502, { error: `attachment scan failed: ${detail}`, code: 'attachmentFailed', detail });
+    return mailboxFailure(error, 'attachmentFailed', 'attachment scan failed');
   }
 }
 

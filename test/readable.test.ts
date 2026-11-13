@@ -306,9 +306,40 @@ describe('what the receiving server said about the sender', () => {
     expect((await parseReadable(eml(...bare), { authserv: { bare: true } })).auth.result).toBe('pass');
   });
 
+  it('reads Outlook.com as it really writes it: a named server, a version, and other headers around it', async () => {
+    // The shape of twelve out of twelve messages in a live Outlook.com mailbox.
+    const outlook = { authserv: authservTrust('outlook.office365.com')! };
+    const message = await parseReadable(eml(
+      'Received: from a.prod.outlook.com by b.prod.outlook.com',
+      'ARC-Authentication-Results: i=2; mx.microsoft.com 1; spf=pass; dmarc=pass; dkim=pass; arc=pass',
+      'Received: from c.prod.outlook.com by a.prod.outlook.com',
+      'Authentication-Results: mx.microsoft.com 1; spf=pass (sender ip is 192.0.2.9) smtp.rcpttodomain=live.com'
+        + ' smtp.mailfrom=github.com; dmarc=pass (p=reject sp=reject pct=100) action=none header.from=github.com;'
+        + ' dkim=pass (signature was verified) header.d=github.com; compauth=pass reason=100',
+      'ARC-Authentication-Results: i=1; mx.microsoft.com 1; spf=pass; dmarc=pass; dkim=pass; arc=none',
+      'From: GitHub <noreply@github.com>',
+      'Subject: hello',
+      '',
+      'hi',
+    ), outlook);
+    expect(message.auth).toEqual({ result: 'pass', dkim: 'pass', spf: 'pass', dmarc: 'pass', signedBy: 'github.com' });
+    // The business service writes no name, and is still believed for a Microsoft mailbox.
+    const bare = await parseReadable(eml(
+      'Authentication-Results: spf=pass smtp.mailfrom=contoso.com; dkim=pass header.d=contoso.com; dmarc=pass header.from=contoso.com',
+      'From: it@contoso.com', '', 'hi',
+    ), outlook);
+    expect(bare.auth.result).toBe('pass');
+    // Someone else's server name on top is still someone else's.
+    const stranger = await parseReadable(eml(
+      'Authentication-Results: mx.attacker.example 1; dmarc=pass header.from=github.com',
+      'From: GitHub <noreply@github.com>', '', 'hi',
+    ), outlook);
+    expect(stranger.auth.result).toBe('none');
+  });
+
   it('knows what the common providers call their receiving server', () => {
     expect(authservTrust('imap.gmail.com')).toEqual({ id: 'mx.google.com' });
-    expect(authservTrust('outlook.office365.com')).toEqual({ bare: true });
+    expect(authservTrust('outlook.office365.com')).toEqual({ id: 'mx.microsoft.com', bare: true });
     expect(authservTrust('imap.mail.yahoo.com')).toEqual({ id: 'yahoo.com', subdomains: true });
     expect(authservTrust('imap.mail.me.com')).toEqual({ id: 'icloud.com', subdomains: true, perCheck: true });
     expect(authservTrust('imap.fastmail.com')).toEqual({ id: 'messagingengine.com', subdomains: true });

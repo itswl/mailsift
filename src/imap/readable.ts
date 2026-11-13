@@ -158,7 +158,8 @@ const SPF_FAILED = new Set(['fail', 'softfail']);
  * Anyone can put an Authentication-Results header into a message. A receiving
  * server adds its own above it and names itself there (the authserv-id), so a
  * header is a verdict only when that name is the one this mailbox's provider
- * uses. Microsoft is the exception that writes no name at all.
+ * uses. Microsoft's business service is the exception that writes no name at
+ * all; its consumer mailboxes (Outlook.com, Hotmail, Live) do write one.
  */
 export interface AuthservTrust {
   /** The authserv-id. */
@@ -178,7 +179,9 @@ export interface AuthservTrust {
  */
 const KNOWN_AUTHSERV: Array<{ host: RegExp; trust: AuthservTrust }> = [
   { host: /(^|\.)(gmail|googlemail)\.com$/, trust: { id: 'mx.google.com' } },
-  { host: /(^|\.)(office365|outlook|hotmail|live)\.com$/, trust: { bare: true } },
+  // Read from live mailboxes: Outlook.com opens with "mx.microsoft.com 1", while
+  // Exchange Online tenants open straight into their results. Both are Microsoft's.
+  { host: /(^|\.)(office365|outlook|hotmail|live)\.com$/, trust: { id: 'mx.microsoft.com', bare: true } },
   { host: /(^|\.)yahoo\.com$/, trust: { id: 'yahoo.com', subdomains: true } },
   { host: /(^|\.)(me|icloud)\.com$/, trust: { id: 'icloud.com', subdomains: true, perCheck: true } },
   { host: /(^|\.)(fastmail|messagingengine)\.com$/, trust: { id: 'messagingengine.com', subdomains: true } },

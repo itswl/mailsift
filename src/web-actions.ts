@@ -27,6 +27,7 @@
 import { createHash } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { loadConfig, type Account } from './config.js';
+import { MailboxUnreachableError } from './imap/connection.js';
 import {
   appendToSent, applyWebMailAction, fetchReadableByMessageId, MailActionError,
   type LiveMessage, type WebMailAction, type WebMailActionResult,
@@ -280,6 +281,24 @@ const readOnly = (): WebResponse =>
 
 const badRequest = (error: string): WebResponse => json(400, { error, code: 'badRequest' });
 
+/**
+ * The answer for a mailbox request that failed.
+ *
+ * A provider that is not answering is said as that, in words of the page's
+ * own: it is nobody's fault here and trying again is the whole remedy. Any
+ * other failure keeps its code and its detail.
+ */
+export function mailboxFailure(error: unknown, code: string, what: string): WebResponse {
+  if (error instanceof MailboxUnreachableError) {
+    return {
+      ...json(503, { error: 'the mail provider is not answering right now', code: 'mailboxUnreachable' }),
+      headers: { 'retry-after': '15' },
+    };
+  }
+  const detail = String(error).slice(0, 200);
+  return json(502, { error: `${what}: ${detail}`, code, detail });
+}
+
 function accountOf(row: MailRow): Account | undefined {
   return configuredAccounts().find((candidate) => candidate.username === row.account);
 }
@@ -439,8 +458,7 @@ async function handleReply(params: URLSearchParams, store: StateStore, ctx: Acti
     if (timedOut(found)) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
     live = found;
   } catch (error) {
-    const detail = String(error).slice(0, 200);
-    return json(502, { error: `mailbox read failed: ${detail}`, code: 'readFailed', detail });
+    return mailboxFailure(error, 'readFailed', 'mailbox read failed');
   }
   if (!live) return json(404, { error: 'message not found in the mailbox', code: 'actionNotFound' });
   const r = live.readable;
@@ -647,8 +665,7 @@ async function handleDraft(req: IncomingMessage, store: StateStore, ctx: ActionC
       if (timedOut(found)) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
       live = found;
     } catch (error) {
-      const detail = String(error).slice(0, 200);
-      return json(502, { error: `mailbox read failed: ${detail}`, code: 'readFailed', detail });
+      return mailboxFailure(error, 'readFailed', 'mailbox read failed');
     }
     if (!live) return json(404, { error: 'message not found in the mailbox', code: 'actionNotFound' });
     const from = live.readable.from;

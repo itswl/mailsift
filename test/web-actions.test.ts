@@ -3,6 +3,7 @@ import './setup.js';
 import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
 import { MailActionError, type LiveMessage } from '../src/imap/client.js';
+import { MailboxUnreachableError } from '../src/imap/connection.js';
 import type { ReadableMessage } from '../src/imap/readable.js';
 import { AssistantError } from '../src/services/assistant.js';
 import { StateStore } from '../src/services/state.js';
@@ -441,6 +442,23 @@ describe('reading a message as it was written', () => {
     // A retry asks the mailbox again.
     await call(store, '/api/message?live=true&fresh=true&id=k1', {}, fake);
     expect(fake.calls.read).toHaveLength(2);
+  });
+
+  it('says a provider is not answering in words of its own, not as a fault in the message', async () => {
+    const store = seeded();
+    const down = backend({ read: async () => { throw new MailboxUnreachableError('the mail server did not complete the sign-in in time | ETIMEDOUT'); } });
+    const read = await call(store, '/api/message?live=true&id=k1', {}, down);
+    expect(read.answer.status).toBe(503);
+    expect(read.json).toEqual({ error: 'the mail provider is not answering right now', code: 'mailboxUnreachable' });
+    expect(read.answer.headers?.['retry-after']).toBe('15');
+    // Nothing about sockets or timeouts reaches the reader.
+    expect(JSON.stringify(read.json)).not.toMatch(/ETIMEDOUT|sign-in/);
+    expect((await call(store, '/api/reply?key=k1', {}, down)).json['code']).toBe('mailboxUnreachable');
+    // Any other failure keeps its own code and says what happened.
+    const broken = backend({ read: async () => { throw new Error('Mailbox is locked'); } });
+    const other = await call(store, '/api/message?live=true&fresh=true&id=k1', {}, broken);
+    expect(other.answer.status).toBe(502);
+    expect(other.json).toMatchObject({ code: 'readFailed', detail: expect.stringContaining('Mailbox is locked') });
   });
 
   it('does not queue a fresh read behind one that hung', async () => {
