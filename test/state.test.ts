@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import './setup.js';
-import { StateStore } from '../src/services/state.js';
+import { REJUDGED_KEY, StateStore } from '../src/services/state.js';
 import { makeMessage, makeResult } from './helpers.js';
 
 function store(): StateStore {
@@ -288,5 +288,375 @@ describe('honest labels for old rows', () => {
     expect(store.getMail('code')).toMatchObject({ decidedBy: 'local', verificationCode: '482913' });
     expect(store.getMail('other')).toMatchObject({ decidedBy: 'fallback' });
     store.close();
+  });
+});
+
+/** Reach under the store for the one thing no method does: moving a row in time. */
+function rawRun(s: StateStore, sql: string, ...args: unknown[]): void {
+  (s as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db.prepare(sql).run(...args);
+}
+
+async function tempDb(prefix: string): Promise<string> {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return join(mkdtempSync(join(tmpdir(), prefix)), 'state.db');
+}
+
+describe('the needs-you queue', () => {
+  function seed(s: StateStore, key: string, importance: string, pushed: boolean, fields: Record<string, unknown> = {}): void {
+    s.markSeen(key, 'me@qq.com', key);
+    s.recordOutcome(key, importance, pushed, { messageId: `<${key}@x>`, summary: `summary of ${key}`, decidedBy: 'llm', ...fields });
+  }
+
+  it('holds notified and critical mail until someone handles it', () => {
+    const s = store();
+    seed(s, 'notified', 'warning', true);
+    seed(s, 'critical-unsent', 'critical', false);
+    seed(s, 'quiet', 'info', false);
+    seed(s, 'warning-unsent', 'warning', false);
+    expect(s.attention().map((row) => row.dedupKey).sort()).toEqual(['critical-unsent', 'notified']);
+    expect(s.attentionCount()).toBe(2);
+    expect(s.attention()[0]).toMatchObject({ handledAt: null });
+
+    const handled = s.setHandled('notified', true);
+    expect(handled?.handledAt).toEqual(expect.any(String));
+    expect(s.attention().map((row) => row.dedupKey)).toEqual(['critical-unsent']);
+    // By message id too, which is what an MCP caller holds.
+    expect(s.setHandled('<critical-unsent@x>', true)?.dedupKey).toBe('critical-unsent');
+    expect(s.attentionCount()).toBe(0);
+    expect(s.setHandled('<absent@x>', true)).toBeUndefined();
+  });
+
+  it('keeps the first handled time, and can put a message back', () => {
+    const s = store();
+    seed(s, 'k1', 'critical', true);
+    const first = s.setHandled('k1', true)?.handledAt;
+    rawRun(s, "UPDATE seen SET handled_at = '2026-01-01T00:00:00.000Z' WHERE dedup_key = 'k1'");
+    expect(s.setHandled('k1', true)?.handledAt).toBe('2026-01-01T00:00:00.000Z');
+    expect(first).toEqual(expect.any(String));
+    expect(s.setHandled('k1', false)?.handledAt).toBeNull();
+    expect(s.attentionCount()).toBe(1);
+    expect(s.getMail('k1')).toMatchObject({ handledAt: null });
+    expect(s.queryMail()[0]).toHaveProperty('handledAt', null);
+  });
+
+  it('is not a place for codes, sign-in links, health alerts or digests', () => {
+    // A code is gone in minutes, and mailsift's own notices are not mail.
+    const s = store();
+    seed(s, 'code', 'warning', true, { summary: '收到验证码邮件。', verificationCode: '482913' });
+    seed(s, 'unread-code', 'warning', true, { summary: '收到验证码邮件，但未能自动提取验证码。' });
+    seed(s, 'link', 'warning', true, { summary: '收到登录链接邮件。' });
+    seed(s, 'unasked-link', 'warning', true, { summary: '收到登录链接邮件（如果不是你刚刚请求的，请勿打开）。' });
+    seed(s, 'health', 'critical', true, { decidedBy: 'health' });
+    seed(s, 'digest', 'warning', true, { decidedBy: 'digest' });
+    seed(s, 'no-source', 'critical', true, { decidedBy: undefined, summary: undefined });
+    seed(s, 'real', 'critical', true);
+    expect(s.attention().map((row) => row.dedupKey).sort()).toEqual(['no-source', 'real']);
+  });
+
+  it('starts when the queue did, not with the backlog an upgrade finds', () => {
+    const s = store();
+    seed(s, 'before', 'critical', true);
+    seed(s, 'after', 'critical', true);
+    rawRun(s, "UPDATE seen SET created_at = '2026-01-01T00:00:00.000Z' WHERE dedup_key = 'before'");
+    expect(s.attention().map((row) => row.dedupKey)).toEqual(['after']);
+    // The start is stamped once and then kept.
+    const since = s.attentionSince();
+    expect(Date.parse(since)).toBeLessThanOrEqual(Date.now());
+    s.setMeta('attention_since', '2025-01-01T00:00:00.000Z');
+    expect(s.attentionSince()).toBe('2025-01-01T00:00:00.000Z');
+    // Even with an early start, a to-do nobody touched for a month is dropped.
+    expect(s.attention().map((row) => row.dedupKey)).toEqual(['after']);
+    rawRun(s, 'UPDATE seen SET created_at = ? WHERE dedup_key = ?', new Date(Date.now() - 5 * 86_400_000).toISOString(), 'before');
+    expect(s.attention().map((row) => row.dedupKey)).toEqual(['after', 'before']);
+  });
+
+  it('stamps the start on a database an older release created', async () => {
+    const { DatabaseSync } = await import('node:sqlite');
+    const path = await tempDb('mailsift-attention-');
+    const first = new StateStore(path);
+    first.markSeen('old', 'me@x', 'old');
+    first.recordOutcome('old', 'critical', true, { messageId: '<old@x>' });
+    first.close();
+    // As an older release left it: no start, no handled column.
+    const raw = new DatabaseSync(path);
+    raw.prepare("DELETE FROM meta WHERE key = 'attention_since'").run();
+    raw.exec('ALTER TABLE seen DROP COLUMN handled_at');
+    raw.prepare("UPDATE seen SET created_at = '2026-01-01T00:00:00.000Z'").run();
+    raw.close();
+
+    const upgraded = new StateStore(path);
+    expect(upgraded.getMeta('attention_since')).toEqual(expect.any(String));
+    expect(upgraded.attentionCount()).toBe(0);
+    expect(upgraded.getMail('old')).toMatchObject({ handledAt: null });
+    upgraded.close();
+  });
+
+  it('agrees with "handled" said through feedback', () => {
+    const s = store();
+    seed(s, 'k1', 'critical', true);
+    s.recordFeedback('<k1@x>', 'correct');
+    expect(s.attentionCount()).toBe(1);
+    s.recordFeedback('<k1@x>', 'handled');
+    expect(s.attentionCount()).toBe(0);
+    expect(s.getMail('k1')?.handledAt).toEqual(expect.any(String));
+    // Feedback about a message that is not stored still records, and marks nothing.
+    s.recordFeedback('<absent@x>', 'handled');
+    expect(s.feedbackSummary()).toMatchObject({ handled: 2 });
+  });
+
+  it('follows a message to the folder an action moved it to', () => {
+    const s = store();
+    seed(s, 'k1', 'critical', true, { folder: 'Junk', inSpam: true });
+    s.updateMailLocation('k1', 'INBOX', false);
+    expect(s.getMail('k1')).toMatchObject({ folder: 'INBOX', inSpam: false });
+  });
+});
+
+describe('change tracking', () => {
+  function seed(s: StateStore, key: string, importance = 'info', pushed = false): void {
+    s.markSeen(key, 'me@qq.com', key);
+    s.recordOutcome(key, importance, pushed, { messageId: `<${key}@x>`, folder: 'INBOX' });
+  }
+
+  it('reports only other connections\' commits as a new data version', async () => {
+    const path = await tempDb('mailsift-version-');
+    const reader = new StateStore(path);
+    const writer = new StateStore(path);
+    const before = reader.dataVersion();
+    reader.setMeta('own-write', '1');
+    expect(reader.dataVersion()).toBe(before);
+    writer.setMeta('other-write', '1');
+    expect(reader.dataVersion()).not.toBe(before);
+    reader.close();
+    writer.close();
+  });
+
+  it('changes the mail signature for everything the list would draw differently', () => {
+    const s = store();
+    const seen = new Set<string>([s.changeSignature().mail]);
+    const changed = (what: string): void => {
+      const sig = s.changeSignature().mail;
+      expect(seen.has(sig), what).toBe(false);
+      seen.add(sig);
+    };
+    s.markSeen('k1', 'me@qq.com', 'k1');
+    changed('a row filed');
+    s.recordOutcome('k1', 'info', false, { messageId: '<k1@x>', folder: 'INBOX' });
+    changed('a row judged');
+    s.recordOutcome('k1', 'warning', false, { messageId: '<k1@x>', folder: 'INBOX' });
+    changed('a row judged again, higher');
+    s.recordOutcome('k1', 'warning', true, { messageId: '<k1@x>', folder: 'INBOX' });
+    changed('a row notified');
+    s.setHandled('k1', true);
+    changed('a row handled');
+    s.setHandled('k1', false);
+    changed('a row put back');
+    // Same length, same spam flag: no aggregate over the rows can tell these apart.
+    s.updateMailLocation('k1', 'Trash', false);
+    changed('a row moved');
+    s.queueDigest('k1', { subject: 'q' });
+    changed('a digest entry queued');
+    s.upsertDigest('k1', { subject: 'q, rewritten' });
+    changed('a digest entry rewritten');
+    s.recordDigestLog(new Date().toISOString(), [{ dedupKey: 'k1', payload: {} }]);
+    changed('a digest sent');
+    s.clearDigest();
+    changed('the digest queue emptied');
+  });
+
+  it('sees one message handled while another is put back, though the count stays the same', () => {
+    const s = store();
+    seed(s, 'a', 'critical', true);
+    seed(s, 'b', 'critical', true);
+    s.setHandled('b', true);
+    const before = s.changeSignature().mail;
+    s.setHandled('a', true);
+    s.setHandled('b', false);
+    expect(s.changeSignature().mail).not.toBe(before);
+  });
+
+  it('leaves both signatures alone for what the page does not show', () => {
+    const s = store();
+    seed(s, 'k1');
+    const before = s.changeSignature();
+    s.recordMcpAudit('web:refresh', 'reader', true);
+    s.saveCursor('me@qq.com', 'INBOX', '1', 10);
+    s.setMeta('idle_last_wake_at:me@qq.com|INBOX', new Date().toISOString());
+    s.setHandled('k1', false);
+    expect(s.changeSignature()).toEqual(before);
+  });
+
+  it('changes the poll signature with the heartbeat, a failing mailbox and the outbox', () => {
+    const s = store();
+    const before = s.changeSignature();
+    s.setMeta('last_poll_at', '2026-11-12T08:00:00.000Z');
+    const polled = s.changeSignature();
+    expect(polled.poll).not.toBe(before.poll);
+    expect(polled.mail).toBe(before.mail);
+    s.setMeta('account_fail_count:me@gmail.com', '3');
+    const failing = s.changeSignature();
+    expect(failing.poll).not.toBe(polled.poll);
+    s.enqueueNotification('me@qq.com|<o@x>', makeMessage(), makeResult());
+    expect(s.changeSignature().poll).not.toBe(failing.poll);
+  });
+
+  it('ignores rows older than any window the page offers', () => {
+    const s = store();
+    // Filed long ago and only now given its first verdict: nothing the page lists changed.
+    s.markSeen('ancient', 'me@qq.com', 'ancient');
+    rawRun(s, "UPDATE seen SET created_at = '2020-01-01T00:00:00.000Z' WHERE dedup_key = 'ancient'");
+    const before = s.changeSignature().mail;
+    s.recordOutcome('ancient', 'critical', true, { messageId: '<ancient@x>' });
+    expect(s.changeSignature().mail).toBe(before);
+  });
+
+  it('sees a second verdict even when every count stays the same', () => {
+    const s = store();
+    seed(s, 'a', 'critical', true);
+    seed(s, 'b', 'warning', true);
+    const before = s.changeSignature().mail;
+    // The two swap levels: one critical and one warning before, and after.
+    s.recordOutcome('a', 'warning', true, { messageId: '<a@x>', folder: 'INBOX' });
+    s.recordOutcome('b', 'critical', true, { messageId: '<b@x>', folder: 'INBOX' });
+    const swapped = s.changeSignature().mail;
+    expect(swapped).not.toBe(before);
+    // Same level, new words: the row reads differently, so the page should fetch it.
+    s.recordOutcome('a', 'warning', true, { messageId: '<a@x>', folder: 'INBOX', summary: 'reworded' });
+    expect(s.changeSignature().mail).not.toBe(swapped);
+  });
+
+  it('leaves the keys of re-judged rows for the notification dispatcher, without growing forever', () => {
+    const s = store();
+    seed(s, 'k', 'info');
+    expect(s.getMeta(REJUDGED_KEY)).toBeUndefined();
+    s.recordOutcome('k', 'critical', true, { messageId: '<k@x>' });
+    expect(JSON.parse(s.getMeta(REJUDGED_KEY) ?? '[]')).toEqual(['k']);
+    // The same verdict again is not news.
+    s.recordOutcome('k', 'critical', true, { messageId: '<k@x>' });
+    expect(JSON.parse(s.getMeta(REJUDGED_KEY) ?? '[]')).toEqual(['k']);
+    // A list nobody takes (notifications off) stops at its cap, and a damaged one starts over.
+    for (let n = 0; n < 260; n += 1) {
+      seed(s, `r${n}`, 'info');
+      s.recordOutcome(`r${n}`, 'warning', true, { messageId: `<r${n}@x>` });
+    }
+    expect(JSON.parse(s.getMeta(REJUDGED_KEY) ?? '[]')).toHaveLength(200);
+    s.setMeta(REJUDGED_KEY, 'not json');
+    s.recordOutcome('k', 'info', false, { messageId: '<k@x>' });
+    expect(JSON.parse(s.getMeta(REJUDGED_KEY) ?? '[]')).toEqual(['k']);
+  });
+});
+
+describe('compare-and-swap on a meta value', () => {
+  it('lets exactly one caller make each change', async () => {
+    const path = await tempDb('mailsift-cas-');
+    const one = new StateStore(path);
+    const two = new StateStore(path);
+    expect(one.casMeta('k', undefined, 'a')).toBe(true);
+    expect(two.casMeta('k', undefined, 'b')).toBe(false);
+    expect(two.getMeta('k')).toBe('a');
+    expect(one.casMeta('k', 'a', 'c')).toBe(true);
+    expect(two.casMeta('k', 'a', 'd')).toBe(false);
+    expect(one.getMeta('k')).toBe('c');
+    // Swapping a value for itself changes nothing, so nobody wins it.
+    expect(one.casMeta('k', 'c', 'c')).toBe(false);
+    expect(one.casMeta('absent', 'x', 'y')).toBe(false);
+    one.close();
+    two.close();
+  });
+});
+
+describe('judged rows after a cursor', () => {
+  it('returns them oldest first, strictly after the cursor, and never an unjudged one', () => {
+    const s = store();
+    for (const key of ['a', 'b', 'c', 'd']) {
+      s.markSeen(key, 'me@qq.com', key);
+      if (key !== 'd') s.recordOutcome(key, 'info', false, { messageId: `<${key}@x>` });
+    }
+    // Two rows filed in the same instant are ordered by key.
+    rawRun(s, "UPDATE seen SET created_at = '2026-11-12T08:00:00.000Z' WHERE dedup_key IN ('a', 'b')");
+    rawRun(s, "UPDATE seen SET created_at = '2026-11-12T08:00:01.000Z' WHERE dedup_key = 'c'");
+    rawRun(s, "UPDATE seen SET created_at = '2026-11-12T08:00:02.000Z' WHERE dedup_key = 'd'");
+    const start = { createdAt: '2026-11-12T07:00:00.000Z', dedupKey: '' };
+    expect(s.rowsAfter(start).map((row) => row.dedupKey)).toEqual(['a', 'b', 'c']);
+    expect(s.rowsAfter({ createdAt: '2026-11-12T08:00:00.000Z', dedupKey: 'a' }).map((row) => row.dedupKey)).toEqual(['b', 'c']);
+    expect(s.rowsAfter({ createdAt: '2026-11-12T08:00:01.000Z', dedupKey: 'c' })).toEqual([]);
+    expect(s.rowsAfter(start, 2).map((row) => row.dedupKey)).toEqual(['a', 'b']);
+    // The row still waiting for its outcome is picked up once it has one.
+    s.recordOutcome('d', 'warning', true, { messageId: '<d@x>' });
+    expect(s.rowsAfter({ createdAt: '2026-11-12T08:00:01.000Z', dedupKey: 'c' }).map((row) => row.dedupKey)).toEqual(['d']);
+  });
+});
+
+describe('push subscriptions', () => {
+  const sub = (n: number, over: Record<string, unknown> = {}) => ({
+    endpoint: `https://fcm.googleapis.com/fcm/send/${n}`, p256dh: 'key', auth: 'secret',
+    level: 'warning' as const, codes: true, lang: 'en', ...over,
+  });
+
+  it('remembers what a browser asked for, and updates it in place', () => {
+    const s = store();
+    s.savePushSubscription(sub(1, { label: 'iPhone', origin: 'https://mail.example.org' }));
+    const saved = s.getPushSubscription(sub(1).endpoint);
+    expect(saved).toMatchObject({
+      level: 'warning', codes: true, lang: 'en', label: 'iPhone', origin: 'https://mail.example.org',
+      lastOkAt: null, failures: 0,
+    });
+    s.recordPushResult(sub(1).endpoint, false);
+    rawRun(s, "UPDATE push_subscriptions SET created_at = '2026-01-01T00:00:00.000Z'");
+    s.savePushSubscription(sub(1, { level: 'critical', codes: false, lang: 'zh-CN' }));
+    // The same browser again: its choices change, its first day and a clean record stay.
+    expect(s.listPushSubscriptions()).toHaveLength(1);
+    expect(s.getPushSubscription(sub(1).endpoint)).toMatchObject({
+      level: 'critical', codes: false, lang: 'zh-CN', label: null, createdAt: '2026-01-01T00:00:00.000Z', failures: 0,
+    });
+    expect(s.deletePushSubscription(sub(1).endpoint)).toBe(true);
+    expect(s.deletePushSubscription(sub(1).endpoint)).toBe(false);
+    expect(s.getPushSubscription(sub(1).endpoint)).toBeUndefined();
+  });
+
+  it('counts failures in a row and clears them on a success', () => {
+    const s = store();
+    s.savePushSubscription(sub(1));
+    expect(s.recordPushResult(sub(1).endpoint, false)).toBe(1);
+    expect(s.recordPushResult(sub(1).endpoint, false)).toBe(2);
+    expect(s.recordPushResult(sub(1).endpoint, true)).toBe(0);
+    expect(s.getPushSubscription(sub(1).endpoint)).toMatchObject({ failures: 0, lastOkAt: expect.any(String) });
+    expect(s.recordPushResult('https://fcm.googleapis.com/fcm/send/absent', false)).toBe(0);
+  });
+
+  it('keeps at most fifty, and refuses the next rather than dropping a real device', () => {
+    const s = store();
+    for (let n = 1; n <= 50; n += 1) expect(s.savePushSubscription(sub(n))).toBe(true);
+    expect(s.savePushSubscription(sub(51))).toBe(false);
+    const kept = s.listPushSubscriptions().map((row) => row.endpoint);
+    expect(kept).toHaveLength(50);
+    expect(kept).toContain(sub(1).endpoint);
+    expect(kept).not.toContain(sub(51).endpoint);
+    // One that is already there can still be updated, and a place freed is a place to take.
+    expect(s.savePushSubscription(sub(1, { level: 'critical' }))).toBe(true);
+    s.deletePushSubscription(sub(2).endpoint);
+    expect(s.savePushSubscription(sub(51))).toBe(true);
+  });
+
+  it('ends the subscriptions made under a credential that is no longer the server’s', () => {
+    const s = store();
+    s.savePushSubscription(sub(1, { credential: 'old-mark' }));
+    s.savePushSubscription(sub(2, { credential: 'current-mark' }));
+    s.savePushSubscription(sub(3));
+    expect(s.prunePushSubscriptions(['current-mark', ''])).toBe(1);
+    expect(s.listPushSubscriptions().map((row) => row.endpoint)).toEqual([sub(2).endpoint, sub(3).endpoint]);
+    // A token was set where there was none: what was made without one ends too.
+    expect(s.prunePushSubscriptions(['current-mark'])).toBe(1);
+    expect(s.listPushSubscriptions().map((row) => row.credential)).toEqual(['current-mark']);
+  });
+
+  it('survives pruning, which is about mail and not about devices', () => {
+    const s = store();
+    s.savePushSubscription(sub(1));
+    rawRun(s, "UPDATE push_subscriptions SET created_at = '2020-01-01T00:00:00.000Z'");
+    s.prune(90);
+    expect(s.listPushSubscriptions()).toHaveLength(1);
   });
 });
