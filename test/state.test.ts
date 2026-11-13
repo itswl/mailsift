@@ -341,6 +341,36 @@ describe('the needs-you queue', () => {
     expect(s.queryMail()[0]).toHaveProperty('handledAt', null);
   });
 
+  it('remembers what was dealt with lately, most recently first, and whether each would return to the queue', () => {
+    const s = store();
+    seed(s, 'notified', 'warning', true);
+    seed(s, 'critical', 'critical', false);
+    seed(s, 'quiet', 'info', false);
+    seed(s, 'waiting', 'critical', true);
+    seed(s, 'long-ago', 'critical', true);
+    expect(s.recentlyHandled()).toEqual([]);
+
+    for (const key of ['notified', 'critical', 'quiet', 'long-ago']) s.setHandled(key, true);
+    const hoursAgo = (hours: number): string => new Date(Date.now() - hours * 3_600_000).toISOString();
+    rawRun(s, 'UPDATE seen SET handled_at = ? WHERE dedup_key = ?', hoursAgo(1), 'quiet');
+    rawRun(s, 'UPDATE seen SET handled_at = ? WHERE dedup_key = ?', hoursAgo(5), 'notified');
+    rawRun(s, 'UPDATE seen SET handled_at = ? WHERE dedup_key = ?', hoursAgo(50), 'critical');
+    // Dealt with more than a week ago: no longer something to stumble over.
+    rawRun(s, 'UPDATE seen SET handled_at = ? WHERE dedup_key = ?', hoursAgo(8 * 24), 'long-ago');
+
+    const done = s.recentlyHandled();
+    expect(done.map((entry) => entry.row.dedupKey)).toEqual(['quiet', 'notified', 'critical']);
+    // Mail that was only filed away would not come back to the queue; mail that was judged to matter would.
+    expect(done.map((entry) => entry.queued)).toEqual([false, true, true]);
+    expect(done[0]?.row.handledAt).toEqual(expect.any(String));
+    expect(s.recentlyHandled(2).map((entry) => entry.row.dedupKey)).toEqual(['quiet', 'notified']);
+
+    // Put back, it is in the queue again and no longer among what was done.
+    s.setHandled('notified', false);
+    expect(s.recentlyHandled().map((entry) => entry.row.dedupKey)).toEqual(['quiet', 'critical']);
+    expect(s.attention().map((row) => row.dedupKey).sort()).toEqual(['notified', 'waiting']);
+  });
+
   it('is not a place for codes, sign-in links, health alerts or digests', () => {
     // A code is gone in minutes, and mailsift's own notices are not mail.
     const s = store();

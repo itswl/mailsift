@@ -41,6 +41,7 @@ function rowByKey(key) {
     if (th.latest && rowKey(th.latest) === key) return th.latest;
     for (const m of th.messages || []) if (rowKey(m) === key) return m;
   }
+  for (const m of doneRecent) if (rowKey(m) === key) return m;
   return extraRows.get(key) || null;
 }
 // A row the server sent back after an action replaces every copy of it.
@@ -50,6 +51,7 @@ function applyRow(row) {
   const swap = (m) => { if (m && rowKey(m) === key) Object.assign(m, row); };
   for (const m of lastMail || []) swap(m);
   for (const m of attention || []) swap(m);
+  for (const m of doneRecent) swap(m);
   for (const th of lastThreads || []) { swap(th.latest); for (const m of th.messages || []) swap(m); }
   swap(extraRows.get(key));
 }

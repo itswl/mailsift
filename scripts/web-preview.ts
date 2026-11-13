@@ -275,6 +275,11 @@ function seed(): void {
     const key = `preview-${String(index + 1).padStart(2, '0')}`;
     backdate.run(new Date(Date.now() - fixture.age * 60_000).toISOString(), key);
   });
+  // Two were dealt with lately: one from yesterday, and one from last week
+  // that the day's list no longer shows, so the way back to it can be tried.
+  const dealtWith = db.prepare('UPDATE seen SET handled_at = ? WHERE dedup_key = ?');
+  dealtWith.run(new Date(Date.now() - 2 * H * 60_000).toISOString(), 'preview-13');
+  dealtWith.run(new Date(Date.now() - 1 * D * 60_000).toISOString(), 'preview-25');
   db.close();
 }
 
