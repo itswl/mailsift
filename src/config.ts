@@ -59,6 +59,22 @@ export interface Account {
   password?: string;
   folders: string[];
   useSsl: boolean;
+  /**
+   * Where this mailbox sends from, when that is not the provider's own
+   * submission server: MAIL_ACCOUNT_N_SMTP_HOST and MAIL_ACCOUNT_N_SMTP_PORT.
+   * Absent for most accounts, whose provider preset already names it; a
+   * custom-host account has to set the host before it can send at all.
+   */
+  smtpHost?: string;
+  smtpPort?: number;
+  /** The name mail is sent under (MAIL_ACCOUNT_N_FROM_NAME); the bare address when unset. */
+  fromName?: string;
+  /**
+   * What this mailbox's receiving server calls itself in Authentication-Results
+   * (MAIL_ACCOUNT_N_AUTHSERV_ID). Only needed for a provider the reader does
+   * not already know; `none` shows no sender verdict for this mailbox.
+   */
+  authservId?: string;
 }
 
 export interface Rules {
@@ -156,6 +172,16 @@ function normalizeAccount(parsed: ParsedAccountLine, index: number, varName: str
 
   const folders = splitList(env(prefix + 'FOLDERS'));
 
+  // Sending is optional, but a port that is not a number would only surface
+  // as a refused connection on the first reply; say so at startup instead.
+  const smtpHost = env(prefix + 'SMTP_HOST');
+  const smtpPortRaw = env(prefix + 'SMTP_PORT');
+  if (smtpPortRaw && !/^\d+$/.test(smtpPortRaw)) {
+    throw new ConfigError(`${prefix}SMTP_PORT must be numeric; got ${JSON.stringify(smtpPortRaw)}`);
+  }
+  const fromName = env(prefix + 'FROM_NAME');
+  const authservId = env(prefix + 'AUTHSERV_ID');
+
   return {
     name: env(prefix + 'NAME') ?? `${parsed.provider}-${parsed.username.split('@')[0]}`,
     provider: parsed.provider,
@@ -166,6 +192,10 @@ function normalizeAccount(parsed: ParsedAccountLine, index: number, varName: str
     ...(parsed.password ? { password: parsed.password } : {}),
     folders: folders.length ? folders : [...DEFAULT_FOLDERS],
     useSsl: !['false', '0', 'no', 'off'].includes((env(prefix + 'SSL') ?? '').toLowerCase()),
+    ...(smtpHost ? { smtpHost } : {}),
+    ...(smtpPortRaw ? { smtpPort: Number(smtpPortRaw) } : {}),
+    ...(fromName ? { fromName } : {}),
+    ...(authservId ? { authservId } : {}),
   };
 }
 
