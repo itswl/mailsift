@@ -11,7 +11,7 @@ import { findQuoteStart } from '../src/imap/body.js';
 import {
   addressed, attachmentCharset, attachmentContentType, attachmentFilename, attachmentLimitBytes, describeBytes, forwardEnvelope,
   isSendableAddress, replyEnvelope, savesSentCopy, scopeAllowsSending, SendError, sendingStatus, sendMail,
-  smtpTransportOptions, transferAllowanceMs, type ForwardOriginal, type OutgoingMail, type ReplyOriginal,
+  smtpTransportOptions, socketTimeoutMs, transferAllowanceMs, type ForwardOriginal, type OutgoingMail, type ReplyOriginal,
 } from '../src/smtp.js';
 
 /** One conversation with the pretend server: who signed in, the envelope, and the message as received. */
@@ -794,6 +794,30 @@ describe('carrying files', () => {
     for (const odd of ['', 'a b', 'x'.repeat(41), '"utf-8"', 'utf-8;x=1', undefined, 8]) {
       expect(attachmentCharset(odd), String(odd)).toBeUndefined();
     }
+  });
+
+  it('waits for the server to answer a large message as long as the message took to travel', async () => {
+    // A short letter keeps the half minute that finds a dead connection quickly.
+    expect(socketTimeoutMs()).toBe(30_000);
+    expect(socketTimeoutMs(2_000)).toBe(31_000);
+    // 28 MB on the wire, which a server may take a while to scan before it says it has it.
+    expect(socketTimeoutMs(28 * 1024 * 1024)).toBe(30_000 + 112_000);
+    process.env.MAIL_ACCOUNT_1 = 'gmail_pw|me@gmail.com|app-password';
+    expect(smtpTransportOptions(firstAccount(), undefined, 28 * 1024 * 1024).socketTimeout).toBe(142_000);
+    // sendMail gives the transport it makes the wait for the message it is sending.
+    const { port } = await serving();
+    const given: number[] = [];
+    const sized = (watch: { logger: unknown; socketTimeout: number }): unknown => {
+      given.push(watch.socketTimeout);
+      return createTransport({
+        host: '127.0.0.1', port, secure: false, ignoreTLS: true, logger: watch.logger,
+        auth: { user: 'me@example.com', pass: 'app-pw' }, connectionTimeout: 3_000, socketTimeout: 3_000,
+      } as Parameters<typeof createTransport>[0]);
+    };
+    const file = { filename: 'scan.pdf', content: Buffer.alloc(4 * 1024 * 1024, 1), contentType: 'application/pdf' };
+    const sent = await sendMail(mailbox(), letter({ attachments: [file] }), { transport: sized });
+    expect(given).toEqual([socketTimeoutMs(sent.raw.length)]);
+    expect(given[0]).toBeGreaterThan(30_000 + 20_000);
   });
 
   it('gives a message with files the time they take to travel, and one without, none', () => {

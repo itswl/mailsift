@@ -266,6 +266,23 @@ describe('images that travel inside the message', () => {
     expect(inlined.html.match(/cid:hero/g)).toHaveLength(3);
     expect(inlined.inlined).toBe(1);
   });
+
+  it('remembers which parts its markup shows, inlined or not, so a forward can tell its pictures from its files', async () => {
+    const message = await parseReadable(related(
+      '<img src="cid:Logo@X"><img src="cid:image001.png%4001DC"><img src="cid:absent@x"><img src="https://tracker.example/p.gif">',
+      part('logo@x', 'image/png', PNG),
+    ));
+    expect(message.inlineImages).toBe(1);
+    // Lowercased, in the forms a client writes them; a picture that could not be put in is one all the same.
+    expect(message.bodyCids).toEqual(expect.arrayContaining(['logo@x', 'image001.png%4001dc', 'image001.png@01dc', 'absent@x']));
+    // A message without markup shows no part of itself.
+    const plain = await parseReadable(eml(...HEAD, 'Content-Type: text/plain; charset=utf-8', '', 'Hello'));
+    expect(plain.bodyCids).toBeUndefined();
+    // Markup too large to send to the page is still read for what it shows.
+    const huge = await parseReadable(related(`<img src="cid:logo@x"><p>${'x'.repeat(MAX_HTML_BYTES)}</p>`, part('logo@x', 'image/png', PNG)));
+    expect(huge.htmlOmitted).toBe(true);
+    expect(huge.bodyCids).toEqual(['logo@x']);
+  });
 });
 
 describe('what the receiving server said about the sender', () => {

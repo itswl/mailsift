@@ -65,6 +65,13 @@ export interface ReadableMessage {
   /** First https URL in List-Unsubscribe, validated with new URL(); never fetched. */
   unsubscribe: string | null;
   inlineImages: number;
+  /**
+   * The Content-IDs the markup shows as pictures (`cid:` references),
+   * lowercased, whether or not they could be put into it. A forward tells the
+   * pictures of the body from files sent inline by these: absent when the
+   * message has no markup, or refers to no part of itself.
+   */
+  bodyCids?: string[];
 }
 
 /**
@@ -407,6 +414,27 @@ export function inlineCidImages(html: string, parsed: Pick<ParsedMail, 'attachme
   return { html: out, inlined: used.size };
 }
 
+/** More ids than a body shows pictures is not a body: past this, the rest are not looked for. */
+const MAX_BODY_CIDS = 200;
+
+/**
+ * The parts of the message its markup shows by `cid:`, each id lowercased and
+ * in both forms a client may write it (as written, and percent-decoded), as
+ * inlineCidImages looks them up. Read from the whole markup, before anything
+ * is put into it and whatever its size: an image too large to inline, or a
+ * body too large to show, is still a picture of the body and not a file.
+ */
+export function referencedCids(html: string): string[] {
+  const ids = new Set<string>();
+  for (const match of html.matchAll(/cid:([^"'\s<>()]+)/gi)) {
+    if (ids.size >= MAX_BODY_CIDS) break;
+    const raw = match[1]!.replace(/&amp;/gi, '&').toLowerCase();
+    ids.add(raw);
+    try { ids.add(decodeURIComponent(raw)); } catch { /* keep the raw form */ }
+  }
+  return [...ids];
+}
+
 /**
  * Split a body where the quoted history begins.
  *
@@ -511,6 +539,8 @@ export async function parseReadable(source: Buffer, options: { authserv?: Authse
 
     const html = typeof parsed.html === 'string' && parsed.html.trim() !== '' ? parsed.html : null;
     if (html !== null) {
+      const cids = referencedCids(html);
+      if (cids.length) readable.bodyCids = cids;
       if (Buffer.byteLength(html, 'utf8') > MAX_HTML_BYTES) readable.htmlOmitted = true;
       else {
         const inlined = inlineCidImages(html, parsed);

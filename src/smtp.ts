@@ -145,10 +145,11 @@ const MAX_REFERENCES = 20;
 export const MAX_ATTACHMENTS = 20;
 const DEFAULT_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 /**
- * Files grow by a third when they are encoded for mail, and providers refuse
- * a message over a size of their own, commonly about 25 MB as it travels.
- * 20 MiB of files is about 27 MB on the wire; past 35 MiB almost nobody
- * would take the message, so no setting goes further.
+ * Files grow by a third when they are encoded for mail. Most providers take
+ * about 25 MB of files on a message, which is about 35 MB as it travels, so
+ * the default of 20 MiB (about 28 MB on the wire) is within what they take.
+ * Past 35 MiB of files (about 49 MB on the wire) almost nobody would take the
+ * message, so no setting goes further.
  */
 const CEILING_ATTACHMENT_BYTES = 35 * 1024 * 1024;
 /** Long enough for any name a person gives a file, short enough for every client to show. */
@@ -156,6 +157,21 @@ const MAX_FILENAME_CHARS = 180;
 
 const CONNECTION_TIMEOUT_MS = 15_000;
 const SOCKET_TIMEOUT_MS = 30_000;
+
+/**
+ * How long the connection to the mail server may be silent while sending a
+ * message of this many bytes. The longest silence is after the last byte,
+ * while the server reads the whole message (a virus or content scan of 28 MB
+ * takes a while) before it answers. Given up on there, a message the server
+ * already has is reported as perhaps sent, no copy is filed, and the owner,
+ * finding none in Sent, sends it again: RFC 5321 asks clients to wait ten
+ * minutes at this point for that reason. So the wait grows with the message,
+ * by the time it takes to travel (transferAllowanceMs), and a short letter
+ * is given about the half minute that finds a dead connection quickly.
+ */
+export function socketTimeoutMs(bytes = 0): number {
+  return SOCKET_TIMEOUT_MS + transferAllowanceMs(bytes);
+}
 
 /**
  * SMTP_ENABLED=false switches sending off for every mailbox. DRY_RUN does the
@@ -336,9 +352,11 @@ export function savesSentCopy(account: Account): boolean {
  * Connection settings for a mailbox's submission server.
  *
  * `accessToken` is required for an OAuth mailbox and ignored for a password
- * one. Exported so the settings can be checked without a server to talk to.
+ * one; `bytes` is the size of the message to be sent, which sets how long the
+ * server may take to answer it (socketTimeoutMs). Exported so the settings can
+ * be checked without a server to talk to.
  */
-export function smtpTransportOptions(account: Account, accessToken?: string): SMTPTransportOptions {
+export function smtpTransportOptions(account: Account, accessToken?: string, bytes = 0): SMTPTransportOptions {
   const server = smtpServer(account);
   if (!server) throw new SendError('not_configured', 'no outgoing mail server is configured for this mailbox');
   const implicitTls = server.port === 465;
@@ -355,7 +373,7 @@ export function smtpTransportOptions(account: Account, accessToken?: string): SM
     connectionTimeout: CONNECTION_TIMEOUT_MS,
     greetingTimeout: CONNECTION_TIMEOUT_MS,
     dnsTimeout: CONNECTION_TIMEOUT_MS,
-    socketTimeout: SOCKET_TIMEOUT_MS,
+    socketTimeout: socketTimeoutMs(bytes),
     disableFileAccess: true,
     disableUrlAccess: true,
     auth: account.auth === 'password'
@@ -394,8 +412,11 @@ function handoverWatch(): { logger: Record<string, (entry?: unknown) => void>; h
   };
 }
 
-/** A transport handed in ready-made, or a way to make one that is given the watch above. */
-type TransportSource = MailTransport | ((watch: { logger: unknown }) => MailTransport);
+/**
+ * A transport handed in ready-made, or a way to make one that is given the
+ * watch above and the silence the message being sent may be allowed.
+ */
+type TransportSource = MailTransport | ((watch: { logger: unknown; socketTimeout: number }) => MailTransport);
 
 function invalid(message: string): SendError {
   return new SendError('invalid', message);
@@ -647,7 +668,7 @@ export async function sendMail(
   let transport = typeof injected === 'function' ? undefined : injected;
   const owned = transport === undefined;
   try {
-    if (typeof injected === 'function') transport = injected({ logger: watch.logger });
+    if (typeof injected === 'function') transport = injected({ logger: watch.logger, socketTimeout: socketTimeoutMs(raw.length) });
     if (!transport) {
       let accessToken: string | undefined;
       if (account.auth !== 'password') {
@@ -661,7 +682,7 @@ export async function sendMail(
         }
       }
       transport = createTransport({
-        ...smtpTransportOptions(account, accessToken), logger: watch.logger,
+        ...smtpTransportOptions(account, accessToken, raw.length), logger: watch.logger,
       } as SMTPTransportOptions) as unknown as MailTransport;
     }
     const info = await transport.sendMail({ envelope, raw });

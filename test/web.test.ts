@@ -893,10 +893,10 @@ describe('the composer', () => {
       t, fill, el: () => node(), composeSay: (text: string) => { note['textContent'] = text; },
       drawChips: () => undefined, showQuoted: () => undefined, showCopies: () => undefined, drawSignature: () => undefined,
       drawFiles: () => undefined, openSheet: () => undefined, growText: () => undefined, setTimeout: () => undefined,
-      signatureOf: () => '', fromOf: () => 'me@qq.com', saveDraft: () => undefined,
+      signatureOf: () => '', fromOf: () => 'me@qq.com', saveDraft: () => undefined, lang: 'en',
     };
     const page = lifted<{ openCompose: (state: Record<string, unknown>) => void; heldFiles: Map<string, unknown> }>(
-      ['homeId', 'heldFiles', 'choosesFrom', 'drawLost', 'openCompose'], '({ openCompose, heldFiles })', context,
+      ['homeId', 'draftId', 'heldFiles', 'choosesFrom', 'sentenceGap', 'drawLost', 'openCompose'], '({ openCompose, heldFiles })', context,
     );
     const report = { name: 'report.pdf', size: 10, file: {} };
     page.heldFiles.set('draft:k1', { state: {}, files: [report] });
@@ -984,6 +984,229 @@ describe('the composer', () => {
     expect(said.at(-1)).toBe(t('compose.forwardMissing'));
   });
 
+  /**
+   * The composer's own code for opening a letter, keeping its draft, sending
+   * it off and taking it back, run together over a stand-in page: storage in
+   * a map, and each element as much of one as that code touches.
+   */
+  function composer() {
+    const stored = new Map<string, string>();
+    const said: string[] = [];
+    const delivered: unknown[] = [];
+    const elements = new Map<string, Record<string, unknown>>();
+    const note = node();
+    const lost = node();
+    const form = {
+      ...node(), to: field(), cc: field(), bcc: field(), subject: field(), text: field(),
+      reset: () => { for (const name of ['to', 'cc', 'bcc', 'subject', 'text'] as const) form[name].value = ''; },
+    };
+    let ids = 0;
+    const context: Record<string, unknown> = {
+      $: (selector: string) => elements.get(selector) ?? elements.set(selector, node()).get(selector),
+      document: { createElement: () => node() }, Option: function Option() { return {}; },
+      composeForm: form, composeNote: note, composeLost: lost, composeSend: { disabled: false }, composeSheet: { open: true },
+      composeSig: { querySelector: () => null }, sendingNode: node(),
+      session: { assistant: false }, lastSummary: { accounts: [{ address: 'me@qq.com', name: 'Me', canSend: true }] },
+      writeStorage: (key: string, value: string) => stored.set(key, value),
+      readStorage: (key: string) => stored.get(key) ?? null,
+      localStorage: {
+        getItem: (key: string) => stored.get(key) ?? null,
+        setItem: (key: string, value: string) => stored.set(key, value),
+        removeItem: (key: string) => stored.delete(key),
+      },
+      t, fill, el: () => node(),
+      composeSay: (text: string) => { note['textContent'] = text; note['children'] = []; if (text) said.push(text); },
+      composeAdd: (text: string) => said.push(text),
+      drawChips: () => undefined, showQuoted: () => undefined, showCopies: () => undefined, drawSignature: () => undefined,
+      drawFiles: () => undefined, openSheet: () => undefined, growText: () => undefined, setTimeout: () => undefined,
+      takeSignature: () => undefined, signatureOf: () => '', fromOf: () => 'me@qq.com', fileProblem: () => '',
+      letterId: () => `letter${(ids += 1)}`, draftTimer: undefined, clearTimeout: () => undefined, setInterval: () => 1,
+      clearInterval: () => undefined, closeSheet: () => undefined, raiseToast: () => undefined, announce: () => undefined,
+      hideSending: () => undefined, deliver: (job: unknown) => delivered.push(job), pendingSend: null, composing: null,
+      lang: 'en',
+    };
+    const page = lifted<{
+      openCompose: (state: Record<string, unknown>) => void; saveDraft: () => void; sendCompose: () => void;
+      undoSend: (job: unknown) => void; fillForward: (d: Record<string, unknown>) => void;
+      heldFiles: Map<string, { files: unknown[] }>;
+    }>([
+      'homeId', 'draftId', 'heldFiles', 'isAnswer', 'choosesFrom', 'addresses', 'letterText', 'letterKey', 'saveDraft',
+      'sentenceGap', 'drawLost', 'missingWords', 'readDraft', 'isOn', 'sentOriginals', 'UNSHOWABLE', 'cleanFileName', 'reclaimDraft',
+      'undoSend', 'openCompose', 'fillForward', 'SEND_DELAY', 'sendCompose',
+    ], '({ openCompose, saveDraft, sendCompose, undoSend, fillForward, heldFiles })', context);
+    /** A letter written into the open composer, as a person types it. */
+    const write = (fields: { to?: string; subject?: string; text?: string }): void => {
+      if (fields.to !== undefined) form.to.value = fields.to;
+      if (fields.subject !== undefined) form.subject.value = fields.subject;
+      if (fields.text !== undefined) form.text.value = fields.text;
+    };
+    /** A new message opened, and what it opened with. */
+    const fresh = (): Record<string, unknown> => {
+      const state: Record<string, unknown> = { mode: 'new', key: '', titleKey: 'compose.new', files: [] };
+      page.openCompose(state);
+      return state;
+    };
+    const file = (name: string) => ({ id: name, name, type: 'text/plain', size: 10, at: 1, file: {} });
+    const names = (state: Record<string, unknown>): string[] => ((state['files'] ?? []) as Array<{ name: string }>).map((f) => f.name);
+    return { page, context, stored, said, delivered, form, lost, note, write, fresh, file, names };
+  }
+
+  it('never gives a letter begun during another\'s count that other letter\'s files when it comes back', () => {
+    for (const secondHasFiles of [true, false]) {
+      const { page, context, write, fresh, file, names, form, delivered } = composer();
+      // Letter one, to Alice with her contract, is sent off and counting.
+      const one = fresh();
+      write({ to: 'alice@example.org', subject: 'Contract', text: 'letter one' });
+      one['files'] = [file('alice-contract.pdf')];
+      page.sendCompose();
+      const job = context['pendingSend'];
+      expect(job).toBeTruthy();
+      // Meanwhile a new message to Bob is begun, and closed.
+      const two = fresh();
+      expect(names(two)).toEqual([]);
+      write({ to: 'bob@example.org', subject: 'Lunch', text: 'letter two for bob' });
+      if (secondHasFiles) two['files'] = [file('bob-notes.txt')];
+      page.saveDraft();
+      // Letter one comes back (undone, or refused), and is closed again.
+      page.undoSend(job);
+      expect(context['composing']).toBe(one);
+      expect(names(one)).toEqual(['alice-contract.pdf']);
+      page.saveDraft();
+      // The next new message is Bob's letter, with Bob's files and none of Alice's.
+      const three = fresh();
+      expect(form.to.value).toBe('bob@example.org');
+      expect(names(three)).toEqual(secondHasFiles ? ['bob-notes.txt'] : []);
+      expect(delivered).toEqual([]);
+    }
+  });
+
+  it('does not put back a file that was taken off a reopened letter, or a draft that was discarded', () => {
+    const { page, context, write, fresh, file, names, note } = composer();
+    const first = fresh();
+    write({ to: 'friend@example.org', text: 'with a file' });
+    first['files'] = [file('a.txt')];
+    page.saveDraft();
+    // Opened again it has the file, as it should; taken off, and closed.
+    const again = fresh();
+    expect(names(again)).toEqual(['a.txt']);
+    again['files'] = [];
+    page.saveDraft();
+    expect(names(fresh())).toEqual([]);
+    expect(page.heldFiles.size).toBe(0);
+    // Discarded from the restored draft, the file is gone with its words.
+    const third = context['composing'] as Record<string, unknown>;
+    write({ text: 'another try' });
+    third['files'] = [file('b.txt')];
+    page.saveDraft();
+    fresh();
+    const discard = (note['children'] as Array<{ onclick?: () => void }>).find((child) => child.onclick)!;
+    discard.onclick!();
+    page.saveDraft();
+    expect(names(fresh())).toEqual([]);
+  });
+
+  it('asks before a restored draft goes without the files it had, and sends it at the second press', () => {
+    const { page, context, stored, said, fresh } = composer();
+    stored.set('draft:new', JSON.stringify({ to: 'a@b.co', subject: 'Contract', text: 'See attached.', files: ['contract.pdf', 'scan.png'], at: 1 }));
+    const letter = fresh();
+    expect(letter['lost']).toEqual(['contract.pdf', 'scan.png']);
+    page.sendCompose();
+    expect(context['pendingSend']).toBeNull();
+    expect(said.at(-1)).toBe(`${fill('compose.sendWithoutFiles', { list: 'contract.pdf, scan.png' })} ${t('compose.sendAnyway')}`);
+    // A press right after the question is a double click, not an answer to it.
+    page.sendCompose();
+    expect(context['pendingSend']).toBeNull();
+    // Read, and answered.
+    letter['warnedAt'] = Date.now() - 1000;
+    page.sendCompose();
+    expect(context['pendingSend']).toMatchObject({ state: letter });
+  });
+
+  it('says which of the original\'s files cannot be forwarded, and asks before the forward goes without them', () => {
+    const { page, context, said, lost, write } = composer();
+    const forward: Record<string, unknown> = { mode: 'forward', key: 'k1', account: 'me@qq.com', titleKey: 'act.forward', files: [], originals: [] };
+    page.openCompose(forward);
+    page.fillForward({
+      forwarded: '---------- Forwarded message ----------', subject: 'Fwd: x', attachments: [],
+      notForwardable: [{ partId: '2', filename: 'Quarterly.pdf', contentType: 'multipart/appledouble' }],
+    });
+    expect(lost['hidden']).toBe(false);
+    expect(lost['textContent']).toBe(fill('compose.cannotForward', { list: 'Quarterly.pdf' }));
+    write({ to: 'colleague@example.org' });
+    page.sendCompose();
+    expect(context['pendingSend']).toBeNull();
+    expect(said.at(-1)).toBe(`${fill('compose.sendWithoutContainers', { list: 'Quarterly.pdf' })} ${t('compose.sendAnyway')}`);
+    forward['warnedAt'] = Date.now() - 1000;
+    page.sendCompose();
+    expect(context['pendingSend']).not.toBeNull();
+  });
+
+  it('keeps saying a forward\'s files could not be listed after an undo, and asks before it goes without them', () => {
+    const { page, context, said, lost, write } = composer();
+    const forward: Record<string, unknown> = { mode: 'forward', key: 'k1', account: 'me@qq.com', titleKey: 'act.forward', files: [], originals: [] };
+    page.openCompose(forward);
+    page.fillForward({ forwarded: '---------- Forwarded message ----------', subject: 'Fwd: x', attachments: [], attachmentsUnavailable: true });
+    expect(lost['hidden']).toBe(false);
+    expect(lost['textContent']).toBe(t('compose.forwardFilesUnavailable'));
+    write({ to: 'colleague@example.org' });
+    // The first press asks, as MCP refuses until it is told to send without them; the second sends.
+    page.sendCompose();
+    expect(context['pendingSend']).toBeNull();
+    expect(said.at(-1)).toBe(`${t('compose.sendWithoutOriginals')} ${t('compose.sendAnyway')}`);
+    forward['warnedAt'] = Date.now() - 1000;
+    page.sendCompose();
+    const job = context['pendingSend'] as { payload: { forwardAttachments: string[] } };
+    expect(job.payload.forwardAttachments).toEqual([]);
+    // Taken back, the letter still says so, under its files where an undo does not reach, and asks again.
+    page.undoSend(job);
+    expect(lost['textContent']).toBe(t('compose.forwardFilesUnavailable'));
+    page.sendCompose();
+    expect(context['pendingSend']).toBeNull();
+  });
+
+  it('moves the focus with a forward\'s file that is put back, to its own Remove', () => {
+    const focused: string[] = [];
+    const context: Record<string, unknown> = { filesChanged: () => undefined, announce: () => undefined, fill };
+    const page = lifted<{
+      fileItems: (state: unknown) => Array<{ filename: string }>; putBack: (state: unknown, item: unknown, at?: number) => void;
+    }>(['isOn', 'fileItems', 'chooseOriginal', 'putBack'], '({ fileItems, putBack })', context);
+    const invoice = { partId: '2', filename: 'invoice-4821.pdf', inline: false };
+    const receipt = { partId: '3', filename: 'receipt-october.png', inline: false };
+    const state: Record<string, unknown> = { originals: [invoice, receipt], files: [], choice: { 2: false } };
+    // As drawn: the receipt going, then the invoice taken off.
+    context['composeFiles'] = {
+      querySelectorAll: () => page.fileItems(state).map((item) => ({ focus: () => focused.push(item.filename) })),
+    };
+    expect(page.fileItems(state).map((item) => item.filename)).toEqual(['receipt-october.png', 'invoice-4821.pdf']);
+    page.putBack(state, invoice, 1);
+    expect(page.fileItems(state).map((item) => item.filename)).toEqual(['invoice-4821.pdf', 'receipt-october.png']);
+    expect(focused).toEqual(['invoice-4821.pdf']);
+  });
+
+  it('counts the message dealt with only when the server says the letter dealt with it', async () => {
+    const marked: string[] = [];
+    let answer: Record<string, unknown> = {};
+    const context: Record<string, unknown> = {
+      pendingSend: null, hideSending: () => undefined, toast: () => undefined, readFiles: async () => ({ attachments: [] }),
+      backToLetter: () => undefined, post: async () => ({ ok: true, status: 200, data: answer }), document: { hidden: false },
+      bytesOf: () => 10, KEEPALIVE_BYTES: 60000, localStorage: { removeItem: () => undefined }, t, fill,
+      attentionSet: new Set(['k1']), rowByKey: () => ({ handledAt: null }), markHandledLocal: (key: string) => marked.push(key),
+      attentionCount: 3, liveData: new Map(), renderList: () => undefined, renderLede: () => undefined,
+      renderBars: () => undefined, updateBadge: () => undefined,
+    };
+    const deliver = lifted<(job: unknown) => Promise<void>>(['homeId', 'draftId', 'heldFiles', 'deliver'], 'deliver', context);
+    const job = () => ({ payload: { forwardOf: 'k1' }, files: [], state: { mode: 'forward', key: 'k1', draftKey: 'draft:sending:x' } });
+    // Forwarded to another of the owner's own mailboxes: still to be dealt with.
+    answer = { sent: true, rejected: [], handled: false, attention: 3 };
+    await deliver(job());
+    expect(marked).toEqual([]);
+    expect(context['attentionCount']).toBe(3);
+    answer = { sent: true, rejected: [], handled: true, attention: 2 };
+    await deliver(job());
+    expect(marked).toEqual(['k1']);
+    expect(context['attentionCount']).toBe(2);
+  });
+
   it('says a proxy refused the size, or stopped waiting, rather than blaming the mail server', () => {
     const sendFailure = lifted<(d: unknown, status?: number) => string>(['sendFailure'], 'sendFailure', {
       t, fill, sizeLabel: (n: number) => `${n / (1024 * 1024)} MB`, letterLimits: () => ({ bytes: 20 * 1024 * 1024 }),
@@ -994,9 +1217,15 @@ describe('the composer', () => {
     expect(sendFailure({}, 504)).toBe(t('error.send_timeout'));
     expect(sendFailure({}, 524)).toBe(t('error.send_timeout'));
     expect(sendFailure({}, 0)).toBe(t('error.send_connection'));
+    // Cut off while it was still arriving: the upload took too long, and the mail server was never asked.
+    expect(sendFailure({}, 408)).toBe(t('compose.uploadTooSlow'));
+    expect(t('compose.uploadTooSlow')).toContain('took too long to upload');
     // mailsift's own refusals keep their own words.
     expect(sendFailure({ code: 'send_too_large', maxBytes: 5 }, 413)).toBe('failure:send_too_large');
-    for (const key of ['compose.proxyTooLarge', 'compose.forwardUnreadable', 'compose.sigUnsaved', 'compose.picturesOff', 'compose.putBackFile'] as const) {
+    for (const key of [
+      'compose.proxyTooLarge', 'compose.forwardUnreadable', 'compose.sigUnsaved', 'compose.picturesOff', 'compose.putBackFile',
+      'compose.uploadTooSlow', 'compose.sendWithoutFiles', 'compose.sendWithoutOriginals', 'compose.sendAnyway',
+    ] as const) {
       expect(STRINGS['zh-CN'][key], key).toBeTruthy();
       expect(STRINGS['zh-CN'][key]).not.toBe(STRINGS.en[key]);
     }

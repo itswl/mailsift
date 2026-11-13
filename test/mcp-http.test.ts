@@ -7,6 +7,7 @@ import { request as httpRequest } from 'node:http';
 import type { AddressInfo, Server } from 'node:net';
 import { startMcpHttp } from '../src/mcp.js';
 import { StateStore } from '../src/services/state.js';
+import { sendBodyLimit } from '../src/web-actions.js';
 
 /**
  * The credential split lives in the HTTP layer, not in createServer.
@@ -173,5 +174,22 @@ describe('a server with no token answers only to this machine’s names', () => 
     const { port } = server!.address() as AddressInfo;
     // Refused for the missing token, not for the name.
     expect((await under(port, 'mail.example.org')).status).toBe(401);
+  });
+});
+
+describe('a letter from the page is one large request', () => {
+  it('is given long enough to arrive over a slow uplink, not the five minutes Node gives every request', async () => {
+    process.env.MCP_TOKEN = READ;
+    await start();
+    // The largest letter at a modest 64 KiB a second (about half a megabit).
+    const need = Math.ceil(sendBodyLimit() / (64 * 1024)) * 1000;
+    expect(need).toBeGreaterThan(300_000);
+    expect((server as unknown as { requestTimeout: number }).requestTimeout).toBeGreaterThanOrEqual(need);
+    // Raised to its ceiling, the limit on files raises the time with it.
+    await new Promise<void>((resolve) => server!.close(() => resolve()));
+    process.env.SMTP_ATTACHMENT_MAX_BYTES = String(35 * 1024 * 1024);
+    await start();
+    expect((server as unknown as { requestTimeout: number }).requestTimeout).toBeGreaterThanOrEqual(Math.ceil(sendBodyLimit() / (64 * 1024)) * 1000);
+    expect(sendBodyLimit()).toBeGreaterThan(40 * 1024 * 1024);
   });
 });
