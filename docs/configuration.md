@@ -32,7 +32,7 @@ MAIL_ACCOUNT_2=imap|me@example.com|password|imap.example.com
 
 ## Sending mail
 
-Nothing in mailsift sends mail unless the [web view](web-view.md#writing) is on and a browser has signed in with `MCP_WRITE_TOKEN`. Then a reply or a new message leaves through the provider's own SMTP submission server, signed in with the credential that already reads the mailbox.
+Nothing in mailsift sends mail unless `MCP_WRITE_TOKEN` is set and something presents it: a browser signed in to the [web view](web-view.md#writing) with it, or an MCP client calling [`send_mail`](mcp.md#write-tools-and-the-write-token). Then a reply or a new message leaves through the provider's own SMTP submission server, signed in with the credential that already reads the mailbox.
 
 Every provider preset knows its server, so most mailboxes need no setting. The exceptions:
 

@@ -4,7 +4,7 @@ mailsift 统一监控你的所有 IMAP 邮箱，包括垃圾箱。它用你自�
 
 ![mailsift 的网页视图（桌面）：左边是待处理的邮件和当天的邮件，右边是选中邮件的原貌](docs/images/web-desktop-zh.png)
 
-> mailsift 只读取你的邮件，除非你另外给它一个写令牌，否则不会改动任何东西。有了写令牌，Web 视图可以归档、删除和回复邮件，MCP 可以把邮件标为已处理、加星和归档，每次操作都有审计。通过 MCP 不能发信，也不能删信。分类结果可能有误，请继续以邮箱服务商那里的邮件为准。
+> mailsift 只读取你的邮件，除非你另外给它一个写令牌，否则不会改动任何东西。有了写令牌，Web 视图可以归档、删除和回复邮件，持有它的 MCP 客户端也能做同样的事，每次操作都有审计。分类结果可能有误，请继续以邮箱服务商那里的邮件为准。
 
 English: [README.md](README.md)。详细文档在 [docs/](docs/) 目录，只有英文版。
 
@@ -110,7 +110,7 @@ Docker 只把端口发布在宿主机的回环地址上。要从手机访问，�
 
 ## MCP
 
-MCP 服务器运行在 mailsift 进程内，地址是 `http://127.0.0.1:8410/mcp`（Streamable HTTP，`Authorization: Bearer <MCP_TOKEN>`）。把它加到 MCP 客户端里，AI 助手就能看到哪些邮件等你处理，列出、搜索和阅读分诊过的邮件、预览日报、查看邮箱健康状况。它还以 prompt 的形式提供了这些工具该怎么配合用：盘点收件箱，或者排查某封邮件为什么没通知到你。它默认只读；另设一个 `MCP_WRITE_TOKEN` 后才能把邮件标为已处理、加星、归档和移动，每次操作都有审计。它不能发信，也不能删信。支持 skill 的 agent 可以加载 [.agents/skills/mailsift/SKILL.md](.agents/skills/mailsift/SKILL.md)。详见 [docs/mcp.md](docs/mcp.md)。
+MCP 服务器运行在 mailsift 进程内，地址是 `http://127.0.0.1:8410/mcp`（Streamable HTTP，`Authorization: Bearer <MCP_TOKEN>`）。把它加到 MCP 客户端里，AI 助手就能看到哪些邮件等你处理，列出、搜索和阅读分诊过的邮件、预览日报、查看邮箱健康状况。它还以 prompt 的形式提供了这些工具该怎么配合用：盘点收件箱，或者排查某封邮件为什么没通知到你。它默认只读；另设一个 `MCP_WRITE_TOKEN` 后，AI 助手就拥有 Web 视图里你自己的权限：把邮件标为已处理、归档、删除，以及发信，每次操作都有审计。写令牌只交给你愿意把邮箱托付给它的客户端。支持 skill 的 agent 可以加载 [.agents/skills/mailsift/SKILL.md](.agents/skills/mailsift/SKILL.md)。详见 [docs/mcp.md](docs/mcp.md)。
 
 ## 常用命令
 

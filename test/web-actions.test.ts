@@ -426,6 +426,25 @@ describe('remembering where a message is in its mailbox', () => {
 });
 
 describe('acting on a mailbox', () => {
+  it('moves a message to a named folder, and needs to be told which', async () => {
+    const store = seeded();
+    const fake = backend({
+      act: async (account, messageId, action, options) => {
+        fake.calls.act.push({ messageId, action, ...(options?.destination ? { folderHint: `to:${options.destination}` } : {}) });
+        return { action, account: account.username, messageId, sourceFolder: 'INBOX', destinationFolder: options?.destination ?? '', destinationIsSpam: false };
+      },
+    });
+    const moved = await post(store, '/api/action', { key: 'k1', action: 'move', destination: 'Projects/2026' }, {}, fake);
+    expect(moved.answer.status).toBe(200);
+    expect(fake.calls.act).toEqual([{ messageId: '<one@x>', action: 'move', folderHint: 'to:Projects/2026' }]);
+    expect(store.getMail('k1')).toMatchObject({ folder: 'Projects/2026', handledAt: null });
+    // Nowhere to go: refused before the mailbox is asked anything.
+    expect((await post(store, '/api/action', { key: 'k1', action: 'move' }, {}, fake)).answer.status).toBe(400);
+    expect(fake.calls.act).toHaveLength(1);
+    // And a reader's session moves nothing.
+    expect((await post(store, '/api/action', { key: 'k1', action: 'move', destination: 'Archive' }, { as: 'read' }, fake)).answer.status).toBe(403);
+  });
+
   it('files a message away, follows it to its new folder and counts it dealt with', async () => {
     const store = seeded();
     const fake = backend();
