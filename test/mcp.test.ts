@@ -689,7 +689,9 @@ describe('the review of what goes out', () => {
     nameless.readable = { ...nameless.readable, from: null, replyTo: [], to: [{ name: '', address: 'me@qq.com' }, { name: '', address: 'all-staff@vendor.com' }] };
     box.backend.read = async () => nameless;
     const client = await connect(state, true, box.backend);
-    expect(await call(client, 'prepare_reply', { messageId: '<one@x>' })).toMatchObject({ to: ['all-staff@vendor.com'], addressedTo: 'recipients' });
+    // A plain reply is left unaddressed; reply all addresses everyone, which is what it says.
+    expect(await call(client, 'prepare_reply', { messageId: '<one@x>' })).toMatchObject({ to: [], addressedTo: 'recipients' });
+    expect(await call(client, 'prepare_reply', { messageId: '<one@x>', mode: 'replyAll' })).toMatchObject({ to: ['all-staff@vendor.com'], addressedTo: 'recipients' });
     expect(await errorOf(client, 'send_mail', { replyTo: '<one@x>', text: 'To whom?' })).toMatchObject({ code: 'INVALID_ARGUMENT' });
     expect(box.sent).toEqual([]);
     // Told whom, it goes.
@@ -785,7 +787,7 @@ describe('the review of what goes out', () => {
     }
   });
 
-  it('acts on the message it was given, not on one whose Message-ID was made to look like the other\'s key', async () => {
+  it('refuses a string that is one record\'s key and a look-alike\'s Message-ID, and reaches each by its own name', async () => {
     const state = new StateStore(':memory:');
     // The look-alike is stored first. Its sender chose a Message-ID that spells the real message's key.
     state.markSeen('me@qq.com|me@qq.com|<real@x>', 'me@qq.com', 'look-alike');
@@ -794,24 +796,34 @@ describe('the review of what goes out', () => {
     state.recordOutcome('me@qq.com|<real@x>', 'critical', true, { messageId: '<real@x>', sender: 'boss@corp.example', folder: 'INBOX' });
     const box = mailbox(state);
     const client = await connect(state, true, box.backend);
+    const errorOf = async (name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      const answer = await client.callTool({ name, arguments: args });
+      expect(answer, name).toMatchObject({ isError: true });
+      return JSON.parse((answer.content as Array<{ text: string }>)[0]!.text) as Record<string, unknown>;
+    };
 
-    // Each by the Message-ID list_mail shows for it.
-    const listed = (await call(client, 'list_mail'))['mail'] as Array<{ messageId: string; sender: string }>;
-    const idOf = (sender: string): string => listed.find((m) => m.sender === sender)!.messageId;
-    expect(await call(client, 'get_mail', { messageId: idOf('attacker@evil.example') })).toMatchObject({ sender: 'attacker@evil.example' });
-    expect(await call(client, 'get_mail', { messageId: idOf('boss@corp.example') })).toMatchObject({ sender: 'boss@corp.example' });
-    const page = await client.readResource({ uri: `mailsift://mail/${encodeURIComponent(idOf('attacker@evil.example'))}` });
-    expect(String((page.contents[0] as { text: string }).text)).toContain('attacker@evil.example');
+    // The string both could mean is refused by every tool, whichever way it was meant.
+    const both = 'me@qq.com|<real@x>';
+    for (const [name, args] of [
+      ['get_mail', { messageId: both }], ['read_message', { messageId: both }], ['prepare_reply', { messageId: both }],
+      ['manage_mail', { messageId: both, action: 'trash' }], ['mark_handled', { messageId: both }],
+      ['record_feedback', { messageId: both, label: 'false_positive' }], ['send_mail', { replyTo: both, text: 'Which one?' }],
+    ] as const) {
+      expect(await errorOf(name, args), name).toMatchObject({ code: 'INVALID_ARGUMENT', message: expect.stringContaining('also the Message-ID') });
+    }
+    await expect(client.readResource({ uri: `mailsift://mail/${encodeURIComponent(both)}` })).rejects.toThrow();
+    expect(box.sent).toEqual([]);
+    expect(box.acted).toEqual([]);
 
-    await call(client, 'manage_mail', { messageId: idOf('attacker@evil.example'), action: 'trash' });
+    // Each is reached by a name only it has: the real one by its Message-ID, the look-alike by its key.
+    expect(await call(client, 'get_mail', { messageId: '<real@x>' })).toMatchObject({ sender: 'boss@corp.example' });
+    expect(await call(client, 'get_mail', { messageId: 'me@qq.com|me@qq.com|<real@x>' })).toMatchObject({ sender: 'attacker@evil.example' });
+    expect(await call(client, 'send_mail', { replyTo: '<real@x>', text: 'To the boss.' })).toMatchObject({ to: ['billing@vendor.com'] });
+    expect(box.sent[0]).toMatchObject({ inReplyTo: '<real@x>' });
+    await call(client, 'manage_mail', { messageId: 'me@qq.com|me@qq.com|<real@x>', action: 'trash' });
     expect(box.acted.at(-1)).toMatchObject({ messageId: 'me@qq.com|<real@x>', action: 'trash' });
     expect(state.getMail('me@qq.com|me@qq.com|<real@x>')?.handledAt).toBeTruthy();
-    expect(state.getMail('me@qq.com|<real@x>')?.handledAt).toBeNull();
-
-    await call(client, 'mark_handled', { messageId: idOf('boss@corp.example') });
-    expect(state.getMail('me@qq.com|<real@x>')?.handledAt).toBeTruthy();
-    await call(client, 'record_feedback', { messageId: idOf('attacker@evil.example'), label: 'false_positive' });
-    await call(client, 'record_feedback', { messageId: idOf('attacker@evil.example'), label: 'false_positive' });
+    await call(client, 'record_feedback', { messageId: 'me@qq.com|me@qq.com|<real@x>', label: 'false_positive' });
     expect(state.feedbackRuleHints(1).neverImportant).toEqual(['attacker@evil.example']);
   });
 
@@ -827,7 +839,7 @@ describe('the review of what goes out', () => {
     const client = await connect(state, true, box.backend);
     expect(await call(client, 'prepare_reply', { messageId: '<one@x>' })).toMatchObject({ to: ['attacker@evil.example'], addressedTo: 'ownRecipients' });
     const refused = await errorOf(client, 'send_mail', { replyTo: '<one@x>', text: 'Hm.' });
-    expect(refused).toMatchObject({ code: 'INVALID_ARGUMENT', hint: expect.stringContaining('prepare_reply') });
+    expect(refused).toMatchObject({ code: 'INVALID_ARGUMENT', hint: expect.stringContaining('read_message') });
     // What a sender wrote stays in the data fields; the server's own words do not repeat it.
     expect(JSON.stringify(refused)).not.toContain('attacker@evil.example');
     expect(box.sent).toEqual([]);

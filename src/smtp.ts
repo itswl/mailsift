@@ -620,7 +620,10 @@ export function replyEnvelope(
   // Answering a message the owner sent themselves continues it to the people it went to.
   if (to.length === 0) {
     addressedTo = isMine(original.from) ? 'ownRecipients' : 'recipients';
-    to = usable(original.to);
+    // A message that names nobody to answer is not a reason to answer everyone
+    // it went to: a plain reply leaves To for the person to fill. Reply all
+    // still addresses them all, which is what it says.
+    if (addressedTo === 'ownRecipients' || mode === 'replyAll') to = usable(original.to);
   }
   const cc = mode === 'replyAll' ? usable([...(original.to ?? []), ...(original.cc ?? [])]) : [];
 

@@ -355,7 +355,7 @@ export function createServer(
    * the caller says which mailbox.
    */
   const recordKey = (messageId: string, account?: string): string => {
-    const records = store.recordsFor(messageId);
+    const records = unambiguous(messageId);
     if (!records.length) throw new McpToolError('NOT_FOUND', 'mail record not found');
     if (account) {
       const mine = records.find((record) => record.account === account);
@@ -372,6 +372,22 @@ export function createServer(
     }
     return records[0]!.dedupKey;
   };
+  /**
+   * The records a string names, refusing one that is a record's key and
+   * another message's Message-ID at once: a sender can write a Message-ID
+   * that spells someone else's key, and guessing between them is how an
+   * answer reaches the wrong person.
+   */
+  function unambiguous(messageId: string): Array<{ dedupKey: string; account: string }> {
+    const records = store.recordsFor(messageId);
+    if (records.some((record) => record.by === 'key') && records.some((record) => record.by === 'messageId')) {
+      throw new McpToolError('INVALID_ARGUMENT',
+        'this is one record\'s key and also the Message-ID of another message',
+        'Pass the messageId that list_mail shows for the message you mean. The record whose dedupKey this is can be ' +
+        'reached by its own messageId.');
+    }
+    return records;
+  }
   /** The audit row for a call. Failing to write it must not turn what the call did into an error. */
   const audited = (name: string, ok: boolean, target: string | undefined): void => {
     try {
@@ -565,7 +581,7 @@ export function createServer(
       inputSchema: { messageId: z.string().min(1), account: z.string().min(3).max(320).optional() },
     },
     async (args) => {
-      const records = store.recordsFor(args.messageId);
+      const records = unambiguous(args.messageId);
       const chosen = args.account ? records.find((record) => record.account === args.account) : records[0];
       const found = chosen ? store.getMail(chosen.dedupKey) : undefined;
       if (!found) return json({ found: false, messageId: args.messageId, ...(args.account ? { account: args.account } : {}) });
@@ -750,7 +766,7 @@ export function createServer(
     async (uri, variables) => {
       const messageId = decodeVariable(variables['messageId']);
       // By Message-ID, as get_mail finds it: a key is taken only when no message carries the string as its id.
-      const first = messageId ? store.recordsFor(messageId)[0] : undefined;
+      const first = messageId ? unambiguous(messageId)[0] : undefined;
       const found = first ? store.getMail(first.dedupKey) : undefined;
       store.recordMcpAudit('resource:mail-record', client, Boolean(found), messageId);
       if (!found) throw new McpToolError('NOT_FOUND', 'mail record not found');
@@ -1046,7 +1062,8 @@ export function createServer(
           'Send one message from a monitored mailbox, as the web view\'s composer does. This really sends mail. ' +
           'To answer a stored message give replyTo (its Message-ID): the answer leaves from the mailbox that ' +
           'received it and continues its thread. Where to is left out it goes to whoever the original asks ' +
-          'answers to, or else its sender (replyAll=true adds the other recipients in copy; give cc to set the ' +
+          'answers to, or else its sender; a message that names neither, or that is from the owner\'s own address, ' +
+          'needs an explicit to (see prepare_reply\'s addressedTo). replyAll=true adds the other recipients in copy; give cc to set the ' +
           'copies yourself, [] for none), with "Re:" its subject and the original quoted under your text unless ' +
           'quote=false (language is the language of the line that introduces the quote). If one message is stored ' +
           'for more than one mailbox, account says which copy is being answered. If the original can no longer be ' +
@@ -1179,7 +1196,7 @@ export function createServer(
                   draft['addressedTo'] === 'recipients'
                     ? 'the message names no sender or reply address to answer, so an answer would go to everyone it was sent to'
                     : 'the message is from the owner\'s own address, so an answer would go on to everyone it was sent to',
-                  'Ask the user who the answer is for, and give to. prepare_reply shows who the message went to.');
+                  'Ask the user who the answer is for, and give to. read_message shows who the message went to (to and cc).');
               }
               to = list(draft['to']);
             }
