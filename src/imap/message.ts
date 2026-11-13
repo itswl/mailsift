@@ -200,9 +200,9 @@ export function extractAttachmentManifest(
   return { items, truncated };
 }
 
-/** Find a message's readable text body without descending into attached files. */
-export function findTextBodyPart(structure: MessageStructureObject | undefined): TextBodyPart | undefined {
-  if (!structure) return undefined;
+/** Every text part that is the message's own body, without descending into attached files. */
+function textBodyCandidates(structure: MessageStructureObject | undefined): TextBodyPart[] {
+  if (!structure) return [];
   const candidates: TextBodyPart[] = [];
 
   const visit = (node: MessageStructureObject, fallbackPartId?: string): void => {
@@ -234,9 +234,23 @@ export function findTextBodyPart(structure: MessageStructureObject | undefined):
   };
 
   visit(structure);
+  return candidates;
+}
+
+/** Find a message's readable text body without descending into attached files. */
+export function findTextBodyPart(structure: MessageStructureObject | undefined): TextBodyPart | undefined {
+  const candidates = textBodyCandidates(structure);
   return candidates.find((part) => part.contentType === 'text/plain')
     ?? candidates.find((part) => part.contentType === 'text/html')
     ?? candidates.find((part) => part.contentType === 'text/x-amp-html');
+}
+
+/** The plain body and the HTML body of a message, each where it has one. */
+export function findBodyParts(structure: MessageStructureObject | undefined): { plain?: TextBodyPart; html?: TextBodyPart } {
+  const candidates = textBodyCandidates(structure);
+  const plain = candidates.find((part) => part.contentType === 'text/plain');
+  const html = candidates.find((part) => part.contentType === 'text/html');
+  return { ...(plain ? { plain } : {}), ...(html ? { html } : {}) };
 }
 
 /** Phrases that identify a verification-code email without sending it to an LLM. */
