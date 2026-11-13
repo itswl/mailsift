@@ -101,6 +101,16 @@ function newClient(account: Account, auth: ImapAuth, extra: Record<string, unkno
   return client;
 }
 
+/**
+ * The mailbox could not be reached: its provider did not answer, or did not
+ * get as far as signing anyone in. It says nothing about the message asked
+ * for or about the account, and the page words it that way rather than
+ * showing the reader a socket error.
+ */
+export class MailboxUnreachableError extends Error {
+  override name = 'MailboxUnreachableError';
+}
+
 function hangUp(client: ImapFlow): void {
   try {
     client.close();
@@ -281,6 +291,7 @@ export async function connectInteractive(account: Account, timing: InteractiveTi
         const stalled = outOfTime || isTransientConnectError(error);
         if (!stalled) refusals += 1;
         if (stopped || refusals >= 2) {
+          // Refused, not unreachable: the server answered, and said no.
           settle();
           reject(new Error(imapErrorText(lastError), { cause: lastError }));
           return;
@@ -288,7 +299,9 @@ export async function connectInteractive(account: Account, timing: InteractiveTi
         if (started < maxAttempts) start();
         else if (running === 0) {
           settle();
-          reject(new Error(imapErrorText(lastError), { cause: lastError }));
+          reject(stalled
+            ? new MailboxUnreachableError(imapErrorText(lastError), { cause: lastError })
+            : new Error(imapErrorText(lastError), { cause: lastError }));
         }
       });
     };
@@ -384,7 +397,7 @@ async function bounded<T>(client: ImapFlow, work: (client: ImapFlow) => Promise<
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           hangUp(client);
-          reject(new Error('the mailbox did not answer in time | ETIMEDOUT'));
+          reject(new MailboxUnreachableError('the mailbox did not answer in time | ETIMEDOUT'));
         }, ms);
       }),
     ]);

@@ -172,7 +172,8 @@ const fake = vi.hoisted(() => {
 vi.mock('imapflow', () => ({ ImapFlow: fake.ImapFlow }));
 
 import {
-  closeSessions, connectInteractive, openSessions, resumeConnecting, stopConnecting, warmSession, withSession,
+  closeSessions, connectInteractive, MailboxUnreachableError, openSessions, resumeConnecting, stopConnecting,
+  warmSession, withSession,
 } from '../src/imap/connection.js';
 import {
   appendToSent, applyMessageAction, applyWebMailAction, connect, connectAttempts, fetchAttachmentManifestByMessageId,
@@ -810,7 +811,10 @@ describe('connecting for someone who is waiting', () => {
     // A password that really is wrong is presented twice, not once per attempt allowed.
     fake.server.connectPlan = [refused(), refused(), 'ok'];
     const before = fake.server.calls.length;
-    await expect(connectInteractive(ME, quick)).rejects.toThrow(/Login failed/);
+    const refusal = await connectInteractive(ME, quick).catch((error: unknown) => error);
+    expect(String(refusal)).toMatch(/Login failed/);
+    // The server answered and said no: that is not the same as not answering.
+    expect(refusal).not.toBeInstanceOf(MailboxUnreachableError);
     await new Promise((resolve) => setTimeout(resolve, 80));
     expect(fake.server.calls.slice(before).filter((call) => call === 'connect')).toHaveLength(2);
   });
@@ -819,7 +823,10 @@ describe('connecting for someone who is waiting', () => {
     // The library's timeouts cover reaching the server, not the sign-in after it.
     fake.server.connectPlan = ['hang', 'hang', 'hang'];
     const started = Date.now();
-    await expect(connectInteractive(ME, { attemptMs: 60, hedgeAfterMs: 15, attempts: 3 })).rejects.toThrow(/did not complete the sign-in in time/);
+    const failure = await connectInteractive(ME, { attemptMs: 60, hedgeAfterMs: 15, attempts: 3 }).catch((error: unknown) => error);
+    expect(String(failure)).toMatch(/did not complete the sign-in in time/);
+    // Said as what it is: the provider is not answering. Not a fault in the message or the account.
+    expect(failure).toBeInstanceOf(MailboxUnreachableError);
     expect(Date.now() - started).toBeLessThan(400);
     expect(fake.server.calls.filter((call) => call === 'connect')).toHaveLength(3);
     // All three were hung up on; none is left open behind the failure.
