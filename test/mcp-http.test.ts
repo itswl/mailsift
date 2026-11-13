@@ -3,6 +3,7 @@ import './setup.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { request as httpRequest } from 'node:http';
 import type { AddressInfo, Server } from 'node:net';
 import { startMcpHttp } from '../src/mcp.js';
 import { StateStore } from '../src/services/state.js';
@@ -126,5 +127,50 @@ describe('bearer credentials decide the tool set', () => {
     } finally {
       store.close();
     }
+  });
+});
+
+describe('a server with no token answers only to this machine’s names', () => {
+  /** A request under a chosen Host, which fetch does not let a caller set. */
+  function under(port: number, host: string, path = '/mcp'): Promise<{ status: number; body: string }> {
+    return new Promise((resolve, reject) => {
+      const req = httpRequest({
+        host: '127.0.0.1', port, path, method: 'POST',
+        headers: { host, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      }, (res) => {
+        let body = '';
+        res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+      });
+      req.on('error', reject);
+      req.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }));
+    });
+  }
+
+  it('turns away a request that arrived under another site’s name', async () => {
+    // What DNS rebinding looks like from here: a page elsewhere pointed a host
+    // name of its own at 127.0.0.1, and the browser sends that name in Host.
+    delete process.env.MCP_TOKEN;
+    delete process.env.MCP_WRITE_TOKEN;
+    delete process.env.MCP_ALLOWED_HOSTS;
+    await start();
+    const { port } = server!.address() as AddressInfo;
+    const rebound = await under(port, `evil.example:${port}`);
+    expect(rebound.status).toBe(421);
+    expect(rebound.body).not.toContain('list_mail');
+    expect((await under(port, 'evil.example', '/api/summary')).status).toBe(421);
+    const local = await under(port, `127.0.0.1:${port}`);
+    expect(local.status).toBe(200);
+    expect(local.body).toContain('list_mail');
+    expect((await under(port, `localhost:${port}`)).status).toBe(200);
+  });
+
+  it('does not ask about the name once a token is what is checked', async () => {
+    process.env.MCP_TOKEN = READ;
+    delete process.env.MCP_WRITE_TOKEN;
+    await start();
+    const { port } = server!.address() as AddressInfo;
+    // Refused for the missing token, not for the name.
+    expect((await under(port, 'mail.example.org')).status).toBe(401);
   });
 });

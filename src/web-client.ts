@@ -3,17 +3,29 @@
  *
  * Every value that came from a message is written with textContent and never
  * as markup: subjects, sender names and summaries are attacker-controlled, and
- * this is the one place in the service that renders them into a document.
+ * this is the one place in the service that renders them into a document. A
+ * message's own HTML is the exception that proves it: it is rebuilt element
+ * by element from an allowlist into a sandboxed frame (see the reader part).
  * Written without backticks of its own, so the server's template literal
  * interpolates only at its own marks.
  *
- * Shape of the page it drives: a sentence and a status line over one list of
- * judgements grouped by day; a fresh verification code lifted above the list;
- * a message opening in a bottom sheet on a phone and in a pane beside the list
- * on a desk. Filters live in the form under their names, so the query sent to
- * the server is still built from the form, and they are mirrored to the URL so
- * a reload, a shared link or a home-screen shortcut restores the view.
+ * Shape of the page it drives: a sentence saying how much needs the reader,
+ * over a queue of exactly that and then everything else grouped by day; a
+ * fresh verification code lifted above both; a message opening in a bottom
+ * sheet on a phone and in a pane beside the list on a desk, with the mail as
+ * it was written and the things that can be done to it. Filters live in the
+ * form under their names, so the query sent to the server is still built from
+ * the form, and they are mirrored to the URL so a reload, a shared link or a
+ * home-screen shortcut restores the view.
+ *
+ * The script is one scope assembled from parts: this file is the frame every
+ * other part stands on (words, time, filters, sheets, status), and the list,
+ * the reader, the composer and the live line each have a file of their own.
  */
+import { composePart } from './web-client-compose.js';
+import { listPart } from './web-client-list.js';
+import { livePart } from './web-client-live.js';
+import { readerPart } from './web-client-reader.js';
 import { LANGUAGES, STRINGS } from './web-strings.js';
 
 /**
@@ -33,13 +45,22 @@ export function storeLanguageScript(): string {
   return `function storeLanguage(l){document.cookie='${LANGUAGE_COOKIE}='+l+'; Path=/; Max-Age=${LANGUAGE_MAX_AGE}; SameSite=Lax'}`;
 }
 
+/** The whole script: the frame, then each part, then the lines that start it. */
 export function clientScript(): string {
+  return corePart() + listPart() + readerPart() + composePart() + livePart();
+}
+
+function corePart(): string {
   return `
 const $ = (s) => document.querySelector(s);
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const list = $('#list'), filters = $('#filters'), lane = $('#lane'), header = $('.app-header');
 const sheet = $('#sheet'), pane = $('#pane'), filterSheet = $('#filter-sheet'), installHelp = $('#install-help');
 const healthSheet = $('#health-sheet'), healthLine = $('#health');
+const notifySheet = $('#notify-sheet'), keysSheet = $('#keys-sheet'), menuSheet = $('#menu-sheet'), composeSheet = $('#compose');
+const queue = $('#queue'), answerBox = $('#answer');
+// The separators every line of supporting text is joined with.
+const DOT = ' \u00b7 ', NB = '\u00a0';
 const MAIL_PAGE_SIZE = 100;
 // A code is lifted above the list for ten minutes, and its digits go quiet after fifteen.
 const FRESH_CODE_MS = 10 * 60 * 1000;
@@ -275,27 +296,45 @@ searchInput.addEventListener('keydown', (e) => {
 });
 filters.addEventListener('submit', (e) => e.preventDefault());
 
-// ---- Sheets: one controller for the detail, the filters and the install steps. ----
+// ---- Sheets: one controller for every sheet on the page. ----
 // Opening pushes a history entry so the system back gesture closes the sheet
 // rather than the app; closing by any other means pops that entry again.
-let sheetReturnFocus = null;
+// Sheets stack: a reply opens over the message it answers, and back closes
+// only the one on top.
+const sheetStack = [];
+const topSheet = () => (sheetStack.length ? sheetStack[sheetStack.length - 1].dialog : null);
 // With here set, the current history entry becomes the sheet's instead of a new one:
 // the entry already exists when a link or the forward button brought us to it.
 function openSheet(dialog, state, here) {
   if (dialog.open) return;
-  sheetReturnFocus = document.activeElement;
+  sheetStack.push({ dialog, back: document.activeElement });
   dialog.classList.remove('closing');
   dialog.showModal();
   dialog.classList.add('opening');
   dialog.addEventListener('animationend', () => dialog.classList.remove('opening'), { once: true });
-  const url = location.pathname + location.search + (state && state.hash ? state.hash : '');
-  const entry = Object.assign({ sheet: dialog.id }, state || {});
+  rehomeToast();
+  const url = location.pathname + location.search + (state && state.hash ? state.hash : location.hash);
+  const entry = Object.assign({ sheet: dialog.id, depth: sheetStack.length }, state || {});
   if (here) history.replaceState(entry, '', url);
   else history.pushState(entry, '', url);
 }
+// Several sheets closed in one go leave the history in one step, not one each:
+// a second back() issued before the first has landed would be lost.
+let backsOwed = 0;
+function oweBack() {
+  backsOwed += 1;
+  if (backsOwed > 1) return;
+  Promise.resolve().then(() => {
+    const steps = backsOwed;
+    backsOwed = 0;
+    history.go(-steps);
+  });
+}
 function closeSheet(dialog, viaHistory) {
   if (!dialog.open || dialog.classList.contains('closing')) return;
-  const ours = history.state && history.state.sheet === dialog.id;
+  const at = sheetStack.findIndex((entry) => entry.dialog === dialog);
+  const entry = at === -1 ? null : sheetStack.splice(at, 1)[0];
+  rehomeToast();
   let done = false;
   const finish = () => {
     if (done) return;
@@ -304,8 +343,8 @@ function closeSheet(dialog, viaHistory) {
     dialog.style.transform = '';
     dialog.close();
     if (dialog === filterSheet) filtersOpen.setAttribute('aria-expanded', 'false');
-    const back = sheetReturnFocus;
-    sheetReturnFocus = null;
+    sheetClosed(dialog);
+    const back = entry ? entry.back : null;
     // A redraw while the sheet was open may have replaced the opener; its
     // successor carries the same identity or key.
     const identity = back && !back.isConnected && back.dataset
@@ -325,7 +364,7 @@ function closeSheet(dialog, viaHistory) {
     dialog.addEventListener('animationend', finish, { once: true });
     setTimeout(finish, 320);
   }
-  if (!viaHistory && ours) history.back();
+  if (!viaHistory && entry) oweBack();
 }
 // Drag the head down to dismiss; a short drag snaps back.
 function enableDrag(dialog) {
@@ -355,32 +394,37 @@ function enableDrag(dialog) {
   head.addEventListener('pointerup', end);
   head.addEventListener('pointercancel', end);
 }
-for (const dialog of [sheet, filterSheet, installHelp, healthSheet]) {
+for (const dialog of [sheet, filterSheet, installHelp, healthSheet, notifySheet, keysSheet, menuSheet, composeSheet]) {
   dialog.addEventListener('cancel', (e) => {
     e.preventDefault();
     if (dialog === filterSheet && dialog.classList.contains('popover')) closeFilters();
     else closeSheet(dialog, false);
   });
-  // A click on the dialog itself is a click on the backdrop: the content fills the box.
+  // A click on the dialog itself is a click on the backdrop: the content fills
+  // the box. A letter being written is not thrown away by a stray tap.
   dialog.addEventListener('click', (e) => {
-    if (e.target !== dialog || dialog.classList.contains('popover')) return;
+    if (e.target !== dialog || dialog.classList.contains('popover') || dialog === composeSheet) return;
     closeSheet(dialog, false);
   });
   enableDrag(dialog);
 }
-$('#sheet-done').onclick = () => closeSheet(sheet, false);
+$('#sheet-close').onclick = () => closeSheet(sheet, false);
 $('#install-close').onclick = () => closeSheet(installHelp, false);
 $('#install-done').onclick = () => closeSheet(installHelp, false);
 $('#health-done').onclick = () => closeSheet(healthSheet, false);
+$('#notify-done').onclick = () => closeSheet(notifySheet, false);
+$('#keys-done').onclick = () => closeSheet(keysSheet, false);
+$('#menu-done').onclick = () => closeSheet(menuSheet, false);
 window.addEventListener('popstate', () => {
-  const open = document.querySelector('dialog[open]');
-  if (open && open.classList.contains('popover')) closeFilters();
-  else if (open) closeSheet(open, true);
-  else {
+  // Close whatever is open above the entry we came back to.
+  const depth = history.state && history.state.sheet ? history.state.depth || 1 : 0;
+  while (sheetStack.length > depth) closeSheet(topSheet(), true);
+  if (filterSheet.open && filterSheet.classList.contains('popover')) closeFilters();
+  if (!sheetStack.length) {
     // A #m= link followed while the page is open, or the forward button back
     // onto a message: show it, on the entry we are already on.
     const key = keyFromHash(location.hash);
-    if (key) openFromLink(key, true);
+    if (key && key !== openKey) openFromLink(key, true);
   }
   // The entry we came back to predates any filter changed while a sheet was
   // open. The form is the truth, so put it back on the address.
@@ -482,14 +526,56 @@ function announce(text) {
   }, 50);
 }
 let toastTimer;
-function toast(text, failed) {
+// Shown in the browser's top layer where it can be, so an open sheet does not
+// cover it; elsewhere it is an ordinary fixed element.
+// A modal sheet makes everything outside it inert, a toast included, so the
+// toast lives inside whichever sheet is on top and moves when that changes.
+function toastHost() {
+  for (const id of ['lightbox', 'palette']) {
+    const dialog = document.getElementById(id);
+    if (dialog && dialog.open) return dialog;
+  }
+  return topSheet() || document.body;
+}
+function raiseToast(node) {
+  const host = toastHost();
+  try { if (node.matches(':popover-open')) node.hidePopover(); } catch (e) {}
+  if (node.parentNode !== host) host.appendChild(node);
+  // Clear of the reader's bar of actions when it is the reader that is open.
+  node.classList.toggle('lifted', host === sheet);
+  node.hidden = false;
+  if (!node.showPopover) return;
+  try { node.showPopover(); } catch (e) {}
+}
+function rehomeToast() {
+  // The line that says what happened, and the count of a letter on its way out.
+  for (const node of [$('#toast'), $('#sending')]) {
+    if (!node.hidden && node.parentNode !== toastHost()) raiseToast(node);
+  }
+}
+function hideToast() {
+  const node = $('#toast');
+  clearTimeout(toastTimer);
+  node.hidden = true;
+  if (node.hidePopover) { try { node.hidePopover(); } catch (e) {} }
+}
+// A line that says what just happened. With an action it also offers the one
+// way back (undo), and stays a little longer so there is time to take it.
+// A hold of zero keeps it until something replaces or hides it.
+function toast(text, failed, action, hold) {
   const node = $('#toast');
   announce(text);
-  node.textContent = text;
+  node.replaceChildren(el('span', null, text));
+  if (action) {
+    const b = el('button', 'toast-action', action.label);
+    b.type = 'button';
+    b.onclick = () => { hideToast(); action.run(); };
+    node.appendChild(b);
+  }
   node.classList.toggle('failed', Boolean(failed));
-  node.hidden = false;
+  raiseToast(node);
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { node.hidden = true; }, 4000);
+  if (hold !== 0) toastTimer = setTimeout(hideToast, hold || (action ? 6000 : 4000));
 }
 
 // ---- Data ----
@@ -503,6 +589,13 @@ let selectedKey = null, openKey = null;
 let washNext = false;
 const renderedKeys = new Set();
 const extraRows = new Map();
+// What needs the reader: the rows of the queue, how many there are in all,
+// and their keys, so any row anywhere knows whether it is one of them.
+let attention = null, attentionCount = 0, attentionSet = new Set();
+// What this session may do; the summary carries it.
+let session = { writable: false, writeConfigured: false, assistant: false, push: true, auth: false };
+// Whether the page is on the server's live line, and so hears of mail as it is judged.
+let live = false;
 let sinceAt = Date.parse(readStorage('seenAt') || '') || 0;
 let firstLoadDone = false;
 
@@ -521,6 +614,7 @@ function findItem(key) {
   for (const item of (filters.view.value === 'threads' ? lastThreads : lastMail) || []) if (keyOf(item) === key) return item;
   for (const item of lastMail || []) if (keyOf(item) === key) return item;
   for (const item of lastThreads || []) if (keyOf(item) === key) return item;
+  for (const item of attention || []) if (keyOf(item) === key) return item;
   return extraRows.get(key) || null;
 }
 function mergeMail(existing, incoming) {
@@ -586,13 +680,49 @@ function appendTemplate(node, key, vars, actions) {
   }
   if (last < template.length) node.appendChild(textNode(template.slice(last)));
 }
+// The sentence: how much needs the reader. Under it, the count of what arrived.
+function showQueue() {
+  clearFilters();
+  if (filters.view.value !== 'mail') setFilters({ view: 'mail' });
+  const first = queue.querySelector('.ring, .who');
+  if (first) { queue.scrollIntoView({ block: 'start' }); first.focus({ preventScroll: true }); }
+}
 function renderLede() {
   const node = $('#lede');
   const before = node.textContent;
   const fresh = el('p');
+  const known = attention !== null || Boolean(lastSummary);
+  node.classList.toggle('pending', !known);
+  if (!known) fresh.textContent = t('lede.loading');
+  else if (!attentionCount) fresh.textContent = t('lede.attention0') + t('lede.end');
+  else {
+    appendTemplate(fresh, attentionCount === 1 ? 'lede.attention1' : 'lede.attention', { n: attentionCount }, {
+      n: { run: showQueue, label: 'lede.showQueue' },
+    });
+    fresh.appendChild(textNode(t('lede.end')));
+  }
+  node.classList.toggle('clear', known && !attentionCount);
+  const focused = Array.from(node.querySelectorAll('.num')).indexOf(document.activeElement);
+  node.replaceChildren(...fresh.childNodes);
+  if (focused >= 0) {
+    const again = node.querySelectorAll('.num')[focused];
+    if (again) again.focus({ preventScroll: true });
+  }
+  // A sentence that changed fades in; one that did not is left alone.
+  if (before && before !== node.textContent && !reduceMotion()) {
+    node.style.transition = 'none';
+    node.style.opacity = '0';
+    void node.offsetWidth;
+    node.style.transition = '';
+    node.style.opacity = '';
+  }
+  renderTally();
+}
+function renderTally() {
+  const node = $('#tally');
+  const fresh = el('p');
   const s = lastSummary;
-  node.classList.toggle('pending', !s);
-  if (!s) fresh.textContent = t('lede.loading');
+  if (!s) fresh.textContent = '';
   else if (!s.total) fresh.textContent = fill('lede.none', { window: windowWord() });
   else {
     const critical = (s.byImportance && s.byImportance.critical) || 0;
@@ -619,14 +749,6 @@ function renderLede() {
     const again = node.querySelectorAll('.num')[focused];
     if (again) again.focus({ preventScroll: true });
   }
-  // A sentence that changed fades in; one that did not is left alone.
-  if (before && before !== node.textContent && !reduceMotion()) {
-    node.style.transition = 'none';
-    node.style.opacity = '0';
-    void node.offsetWidth;
-    node.style.transition = '';
-    node.style.opacity = '';
-  }
 }
 function renderStatus() {
   const [text, warn] = statusLine();
@@ -634,6 +756,10 @@ function renderStatus() {
   node.classList.toggle('warn', warn);
   // Writing the same words again would have the live region say them again.
   if (node.textContent !== text) node.textContent = text;
+  // A dot ahead of the words while the page is on the live line.
+  const on = live && !connectionProblem;
+  node.classList.toggle('live', on);
+  node.title = on ? t('status.liveHint') : '';
   renderHealthLine();
 }
 
@@ -732,7 +858,13 @@ function restoreIdentity(root, selector) {
 }
 healthLine.onclick = openHealth;
 function statusLine() {
-  if (connectionProblem) return [lastFetchAt ? fill('status.offline', { time: hhmm(lastFetchAt) }) : '', true];
+  if (connectionProblem) {
+    if (!lastFetchAt) return ['', true];
+    // What is shown may be days old; an hour alone would read as today's.
+    const today = new Date();
+    const time = dayKey(lastFetchAt) === dayKey(today) ? hhmm(lastFetchAt) : dayLabel(lastFetchAt, today) + ' ' + hhmm(lastFetchAt);
+    return [fill('status.offline', { time }), true];
+  }
   if (pollNarration) return [pollNarration.text, pollNarration.warn];
   const parts = [];
   let warn = false;
@@ -794,54 +926,6 @@ function codeButton(row, cls) {
   b.onclick = (e) => { e.stopPropagation(); copyCode(row.verificationCode, digits, verb); };
   return b;
 }
-function metaLine(m, thread) {
-  const meta = el('div', 'meta');
-  const add = (value, cls) => {
-    if (meta.childNodes.length) meta.appendChild(textNode(' \\u00b7 '));
-    meta.appendChild(cls ? el('span', cls, value) : textNode(value));
-  };
-  if (thread && thread.messageCount > 1) add(fill('thread.short', { count: thread.messageCount }), 'rescued');
-  if (level(m) !== 'info') add(word('level.', m.importance), 'lvl ' + level(m));
-  if (m.category) add(word('category.', m.category));
-  if (m.verificationCode) add(t('code.tag'));
-  if (m.inSpam) add(m.pushed ? t('row.rescued') : t('spam'), m.pushed ? 'rescued' : null);
-  else if (m.pushed) add(t('notified'));
-  if (m.deadline) add(t('detail.deadline') + ' ' + m.deadline, 'due');
-  return meta;
-}
-function rowOf(item, now) {
-  const thread = isThread(item) ? item : null;
-  const m = rowOfItem(item);
-  const key = keyOf(item);
-  const li = el('li', 'row ' + level(m));
-  li.dataset.key = key;
-  li.appendChild(el('span', 'mark ' + level(m)));
-  const who = el('a', 'who', m.senderName || m.sender || t('unknownSender'));
-  who.href = '#m=' + encodeURIComponent(key);
-  who.onclick = (e) => { e.preventDefault(); openDetail(key); };
-  if (key === selectedKey) { li.classList.add('selected'); who.setAttribute('aria-current', 'true'); }
-  li.appendChild(who);
-  li.appendChild(el('span', 'when', when(m, now)));
-  if (m.verificationCode) {
-    li.classList.add('has-code');
-    if (now - dateOf(m) > STALE_CODE_MS) li.classList.add('stale');
-    li.appendChild(codeButton(m, 'code-copy'));
-  } else {
-    li.appendChild(el('div', 'sum', thread ? (m.subject || m.summary || t('noSubject')) : (m.summary || m.subject || t('noSubject'))));
-  }
-  li.appendChild(metaLine(m, thread));
-  if (m.reason) li.appendChild(el('div', 'why', m.reason));
-  return li;
-}
-function markSelected() {
-  for (const li of list.querySelectorAll('li.row')) {
-    const on = li.dataset.key === selectedKey;
-    li.classList.toggle('selected', on);
-    const who = li.querySelector('.who');
-    if (who) { if (on) who.setAttribute('aria-current', 'true'); else who.removeAttribute('aria-current'); }
-  }
-}
-
 // ---- The lane: the newest code, when it is fresh ----
 let laneSender = '';
 function freshCode(rows, now) {
@@ -957,9 +1041,9 @@ function focusedListControl() {
   const a = document.activeElement;
   if (!a || a === document.body) return null;
   if (lane.contains(a)) return { lane: true };
-  if (!list.contains(a)) return null;
+  if (!list.contains(a) && !queue.contains(a)) return null;
   const li = a.closest('li.row');
-  if (li) return { key: li.dataset.key, code: a.classList.contains('code-copy') };
+  if (li) return { key: li.dataset.key, code: a.classList.contains('code-copy'), ring: a.classList.contains('ring') };
   if (a.dataset && a.dataset.focus) return { focus: a.dataset.focus };
   return a.classList.contains('load-more') ? { more: true } : null;
 }
@@ -968,10 +1052,10 @@ function restoreFocus(f) {
   let target = null;
   if (f.lane) target = lane.querySelector('.lane-copy');
   else if (f.more) target = list.querySelector('.load-more');
-  else if (f.focus) target = list.querySelector('[data-focus="' + CSS.escape(f.focus) + '"]');
+  else if (f.focus) target = document.querySelector('#queue [data-focus="' + CSS.escape(f.focus) + '"], #list [data-focus="' + CSS.escape(f.focus) + '"]');
   else {
-    const li = list.querySelector('li.row[data-key="' + CSS.escape(f.key) + '"]');
-    if (li) target = (f.code && li.querySelector('.code-copy')) || li.querySelector('.who');
+    const li = document.querySelector('#queue li.row[data-key="' + CSS.escape(f.key) + '"], #list li.row[data-key="' + CSS.escape(f.key) + '"]');
+    if (li) target = (f.code && li.querySelector('.code-copy')) || (f.ring && li.querySelector('.ring')) || li.querySelector('.who');
   }
   if (target) target.focus({ preventScroll: true });
 }
@@ -983,7 +1067,8 @@ function sinceLine(tag, count) {
 function renderList() {
   const focus = focusedListControl();
   const free = Boolean(codeWait) && mayMoveFocus();
-  buildList();
+  // Patched in place, and the reader's place in it kept.
+  keepPlace(buildList);
   // A code drawn while the lane waited for one ends the wait and takes the
   // focus the page was opened for, unless the reader is busy elsewhere.
   const arrived = codeWait && lane.querySelector('.lane-copy');
@@ -1035,65 +1120,8 @@ function mayMoveFocus() {
   const a = document.activeElement;
   if (!a || a === document.body) return true;
   if (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable) return false;
-  return lane.contains(a) || list.contains(a);
+  return lane.contains(a) || list.contains(a) || queue.contains(a);
 }
-function buildList() {
-  const now = new Date();
-  const threads = filters.view.value === 'threads';
-  const items = threads ? lastThreads : lastMail;
-  list.replaceChildren();
-  if (!items) { lane.hidden = true; lane.replaceChildren(); return; }
-  const laneKey = renderLane(items, now);
-  // Newest first by the date each row shows, so a day appears once even when a
-  // backfill filed old mail late. The loaded order is kept for paging.
-  const visible = items.filter((item) => keyOf(item) !== laneKey)
-    .map((item, index) => ({ item, index, at: dateOf(rowOfItem(item)).getTime() || 0 }))
-    .sort((a, b) => b.at - a.at || a.index - b.index)
-    .map((entry) => entry.item);
-  if (!visible.length && !laneKey) { list.appendChild(emptyBlock()); announceShown(0); return; }
-
-  // The since-you-last-looked line is drawn only when the new rows lead the list.
-  const isNew = (item) => sinceAt > 0 && Date.parse(rowOfItem(item).createdAt) > sinceAt;
-  const firstOld = visible.findIndex((item) => !isNew(item));
-  const divide = firstOld > 0 && !visible.slice(firstOld).some(isNew);
-  const frag = document.createDocumentFragment();
-  let group = null, groupKey = null, countNode = null, count = 0, groups = 0;
-  const wantInstall = installable && !standalone && !isWide() && !installDismissed();
-  visible.forEach((item, index) => {
-    const m = rowOfItem(item);
-    const d = dateOf(m);
-    const k = dayKey(d);
-    const dividerHere = divide && index === firstOld;
-    if (k !== groupKey) {
-      if (countNode) countNode.textContent = String(count);
-      if (groups === 1 && wantInstall) frag.appendChild(installLine());
-      // Where new and older mail meet at a day boundary, the line sits between
-      // the days rather than under the older day's header.
-      if (dividerHere) frag.appendChild(sinceLine('div', firstOld));
-      const head = el('h2', 'day');
-      head.appendChild(el('span', null, dayLabel(d, now)));
-      countNode = el('span', 'count');
-      head.appendChild(countNode);
-      frag.appendChild(head);
-      group = el('ul', 'group');
-      frag.appendChild(group);
-      groupKey = k; count = 0; groups += 1;
-    } else if (dividerHere) group.appendChild(sinceLine('li', firstOld));
-    const li = rowOf(item, now);
-    if (washNext && !renderedKeys.has(keyOf(item))) li.classList.add('arrived');
-    group.appendChild(li);
-    count += 1;
-  });
-  if (countNode) countNode.textContent = String(count);
-  if (groups === 1 && wantInstall) frag.appendChild(installLine());
-  list.appendChild(frag);
-  if (!threads && nextCursor) list.appendChild(loadMoreButton());
-  renderedKeys.clear();
-  for (const item of items) renderedKeys.add(keyOf(item));
-  washNext = false;
-  announceShown(visible.length);
-}
-
 // ---- Detail: the same content in the sheet and in the pane ----
 function linkLabel(row) {
   const name = STRINGS[lang]['provider.' + row.provider];
@@ -1232,6 +1260,8 @@ function renderAttachmentManifest(container, manifest, row) {
     };
     link.onclick = async (event) => {
       event.preventDefault();
+      // A picture is looked at, not saved: it opens over the page.
+      if (previewable(item)) { openLightbox(href, filename); return; }
       status.textContent = t('detail.downloadingAttachment');
       try {
         const response = await fetch(href);
@@ -1322,209 +1352,12 @@ function fetching(body, path, pending, render) {
     body.appendChild(retry);
   });
 }
-function attachmentSection(box, row) {
-  const manifest = row.attachmentManifest;
-  if (manifest && Array.isArray(manifest.items) && !manifest.items.length && !manifest.truncated) return;
-  const known = manifest && Array.isArray(manifest.items);
-  const label = known ? t('detail.attachments') + ' \\u00b7 ' + manifest.items.length : t('detail.attachments');
-  disclosure(box, label, (body) => {
-    if (manifest) { renderAttachmentManifest(body, manifest, row); return; }
-    fetching(body, '/api/attachments?id=' + encodeURIComponent(row.dedupKey || row.messageId), t('detail.loadingAttachments'),
-      (target, result) => renderAttachmentManifest(target, result, row));
-  });
-}
 function safetySection(box, row) {
   if (!row.messageId) return;
   disclosure(box, t('safety.title'), (body) => {
     fetching(body, '/api/safety?id=' + encodeURIComponent(row.dedupKey || row.messageId), t('safety.checking'), renderSafetyReport);
   });
 }
-function detail(row) {
-  const box = el('div', 'detail');
-  const now = new Date();
-  const d = dateOf(row);
-  // A verification code is the reason the message exists, so it comes before
-  // everything and can be copied in one tap.
-  if (row.verificationCode) {
-    const band = codeButton(row, 'code-band');
-    band.appendChild(el('span', 'caption', [t('detail.code'), row.senderName || row.sender || '', hhmm(d)].filter(Boolean).join(' \\u00b7 ')));
-    box.appendChild(band);
-  }
-  const title = el('h3', null, row.subject || t('noSubject'));
-  title.tabIndex = -1;
-  box.appendChild(title);
-  const from = row.sender ? (row.senderName ? row.senderName + ' ' : '') + '<' + row.sender + '>' : (row.senderName || '');
-  const where = [row.accountLabel || row.account, row.folder].filter(Boolean).join(' \\u00b7 ');
-  box.appendChild(el('p', 'byline', [from, where, dayLabel(d, now) + '\\u00a0' + hhmm(d)].filter(Boolean).join(' \\u00b7 ')));
-
-  const judgement = el('div', 'judgement');
-  const line = el('div', 'line');
-  line.appendChild(el('span', 'mark ' + level(row)));
-  const by = word('by.', row.decidedBy);
-  let judged = by ? fill('detail.judgedAs', { level: word('level.', row.importance), by }) : word('level.', row.importance);
-  if (row.pushed) judged += ' \\u00b7 ' + fill('detail.notifiedAt', { time: hhmm(new Date(row.createdAt)) });
-  line.appendChild(textNode(judged));
-  judgement.appendChild(line);
-  const dl = el('dl');
-  const add = (k, v, cls) => { if (!v) return; dl.appendChild(el('dt', null, t(k))); dl.appendChild(el('dd', cls, v)); };
-  add('detail.why', row.reason);
-  add('detail.deadline', row.deadline, 'due');
-  if (row.inSpam) {
-    const folder = row.folder || t('spam');
-    add('detail.mailbox', fill(row.pushed ? 'detail.rescued' : 'detail.foundIn', { folder }), row.pushed ? 'due' : null);
-  }
-  if (dl.childNodes.length) judgement.appendChild(dl);
-  box.appendChild(judgement);
-  if (row.summary) box.appendChild(el('p', 'summary', row.summary));
-
-  const actions = el('div', 'actions');
-  if (row.link && row.link.url && row.link.exact) {
-    const a = el('a', null, linkLabel(row));
-    a.href = row.link.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-    a.appendChild(icon('i-arrow'));
-    actions.appendChild(a);
-  }
-  const full = el('button', 'text-btn', t('detail.load'));
-  full.type = 'button';
-  const bodySection = el('section', 'body');
-  bodySection.hidden = true;
-  bodySection.appendChild(el('h4', 'section-label', t('detail.body')));
-  const liveBody = el('pre', 'live-body');
-  liveBody.setAttribute('aria-live', 'polite');
-  bodySection.appendChild(liveBody);
-  let slowTimer;
-  full.onclick = async () => {
-    full.disabled = true; full.textContent = t('detail.loading');
-    bodySection.hidden = false;
-    liveBody.className = 'live-body pending';
-    liveBody.textContent = t('detail.loading');
-    // A mailbox with poor search can take a while; say so rather than looking stuck.
-    slowTimer = setTimeout(() => { if (liveBody.classList.contains('pending')) liveBody.textContent = t('detail.loading') + ' ' + t('detail.slow'); }, 8000);
-    try {
-      const r = await fetch('/api/message?live=true&id=' + encodeURIComponent(row.messageId || row.dedupKey));
-      const d = await r.json();
-      clearTimeout(slowTimer);
-      if (r.ok) {
-        liveBody.className = 'live-body';
-        liveBody.textContent = d.body || t('detail.noBody');
-        full.remove();
-      } else {
-        liveBody.className = 'live-body inline-error';
-        liveBody.textContent = failure(d);
-        full.disabled = false; full.textContent = t('detail.retry');
-      }
-    } catch (e) {
-      clearTimeout(slowTimer);
-      liveBody.className = 'live-body inline-error';
-      liveBody.textContent = t('detail.networkFailed');
-      full.disabled = false; full.textContent = t('detail.load');
-    }
-  };
-  actions.appendChild(full);
-  box.appendChild(actions);
-  box.appendChild(bodySection);
-  attachmentSection(box, row);
-  safetySection(box, row);
-  return box;
-}
-function threadDetail(thread) {
-  const box = detail(thread.latest);
-  const older = (thread.messages || []).slice(1);
-  if (!older.length) return box;
-  const now = new Date();
-  const history = el('section', 'thread-history');
-  history.appendChild(el('h4', 'section-label', t('thread.earlier') + ' \\u00b7 ' + older.length));
-  const ul = el('ul', 'timeline');
-  for (const message of older) {
-    const li = el('li');
-    const d = dateOf(message);
-    li.appendChild(el('div', 'tl-head', (message.senderName || message.sender || t('unknownSender')) + ' \\u00b7 ' + dayLabel(d, now) + '\\u00a0' + hhmm(d)));
-    if (message.subject && message.subject !== thread.latest.subject) li.appendChild(el('div', 'tl-subject', message.subject));
-    if (message.summary) li.appendChild(el('div', 'tl-sum', message.summary));
-    ul.appendChild(li);
-  }
-  history.appendChild(ul);
-  box.appendChild(history);
-  return box;
-}
-const detailFor = (item) => (isThread(item) ? threadDetail(item) : detail(item));
-
-// ---- Opening a message: a sheet on a phone, the pane on a desk ----
-function openDetail(key, here) {
-  const item = findItem(key);
-  if (!item) return;
-  openKey = key;
-  if (isWide()) {
-    selectedKey = key;
-    markSelected();
-    renderPane();
-    history.replaceState(history.state, '', location.pathname + location.search + '#m=' + encodeURIComponent(key));
-    return;
-  }
-  const body = sheet.querySelector('.sheet-body');
-  const content = detailFor(item);
-  const title = content.querySelector('h3');
-  if (title) title.id = 'sheet-title';
-  body.replaceChildren(content);
-  body.scrollTop = 0;
-  openSheet(sheet, { key, hash: '#m=' + encodeURIComponent(key) }, here);
-  if (title) title.focus({ preventScroll: true });
-}
-// A message named by a link may lie outside the loaded window; it is fetched
-// on its own then, without its body.
-function openFromLink(key, here) {
-  if (findItem(key)) { openDetail(key, here); return; }
-  fetch('/api/message?id=' + encodeURIComponent(key)).then((r) => (r.ok ? r.json() : null)).then((row) => {
-    if (!row || row.error) return;
-    extraRows.set(key, row);
-    openDetail(key, here);
-  }).catch(() => {});
-}
-let paneKey;
-function renderPane(force) {
-  if (!isWide()) return;
-  const body = pane.querySelector('.pane-body');
-  const item = findItem(selectedKey);
-  const key = item ? selectedKey : null;
-  // The minute refresh must not throw away a body the reader loaded or a
-  // section they opened, so the pane is rebuilt only when its subject changes.
-  if (!force && key === paneKey && body.childNodes.length) return;
-  paneKey = key;
-  body.replaceChildren();
-  $('#pane-close').hidden = !item;
-  if (!item) {
-    const empty = el('div', 'pane-empty');
-    empty.appendChild(el('p', null, t('pane.empty')));
-    if (matchMedia('(pointer: fine)').matches) empty.appendChild(el('p', 'keys', t('keys.hint')));
-    body.appendChild(empty);
-    return;
-  }
-  body.appendChild(detailFor(item));
-}
-function clearSelection() {
-  selectedKey = null; openKey = null;
-  markSelected();
-  renderPane();
-  if (location.hash) history.replaceState(history.state, '', location.pathname + location.search);
-}
-$('#pane-close').onclick = clearSelection;
-matchMedia(WIDE).addEventListener('change', () => {
-  if (isWide()) {
-    if (sheet.open) { closeSheet(sheet, false); selectedKey = openKey; }
-    if (filterSheet.open) closeFilters();
-    controlLine.hidden = false;
-  } else {
-    if (filterSheet.open && filterSheet.classList.contains('popover')) closeFilters();
-    // On a phone the search line replaces the controls, so never show both; a
-    // query in progress stays as a token the controls can clear.
-    searchLine.hidden = true;
-    controlLine.hidden = false;
-  }
-  markSelected();
-  renderTokens();
-  renderPane(true);
-});
-
 // ---- Digest ----
 const LEVEL_RANK = { critical: 3, warning: 2, info: 1 };
 function digestItem(item) {
@@ -1662,151 +1495,6 @@ function renderDigest() {
   if (last) renderSentDigest(section, last);
 }
 
-// ---- Loading ----
-let timer;
-function onFiltersChanged() {
-  announceNextList = true;
-  markSegs();
-  renderTokens();
-  syncUrl();
-  loadMoreFailed = false;
-  clearTimeout(timer);
-  timer = setTimeout(() => { load(); chrome(); }, 250);
-}
-filters.addEventListener('input', onFiltersChanged);
-
-async function load(reset = true) {
-  if (loadingMail && !reset) return;
-  const cursor = reset ? null : nextCursor;
-  if (!reset && !cursor) return;
-  const requestId = ++mailRequestId;
-  const p = query();
-  p.set('limit', String(MAIL_PAGE_SIZE));
-  if (cursor) p.set('cursor', cursor);
-  loadingMail = true;
-  if (!reset) renderList();
-  try {
-    const r = await fetch(dataPath() + '?' + p.toString());
-    if (r.status === 401) { location.reload(); return; }
-    if (!r.ok) throw new Error('http ' + r.status);
-    const data = await r.json();
-    if (requestId !== mailRequestId) return;
-    if (filters.view.value === 'threads') {
-      lastThreads = Array.isArray(data.threads) ? data.threads : [];
-      lastMail = null;
-      nextCursor = null;
-    } else {
-      const page = Array.isArray(data.mail) ? data.mail : [];
-      lastMail = reset ? page : mergeMail(lastMail || [], page);
-      lastThreads = null;
-      nextCursor = data.nextCursor || null;
-    }
-    lastFetchAt = new Date();
-    loadFailed = false;
-    loadMoreFailed = false;
-    setNetworkIssue(false);
-  } catch (e) {
-    if (requestId === mailRequestId) {
-      if (reset) { loadFailed = true; setNetworkIssue(true); } else loadMoreFailed = true;
-    }
-  } finally {
-    if (requestId === mailRequestId) {
-      loadingMail = false;
-      renderList();
-      renderPane();
-      if (!firstLoadDone && !loadFailed) { firstLoadDone = true; afterFirstLoad(); }
-    }
-  }
-}
-
-// The minute refresh: fold the newest page into what is shown, and tint the
-// rows that were not there before.
-async function refresh() {
-  if (loadingMail) return;
-  if (filters.view.value === 'threads') { washNext = true; return load(true); }
-  if (!lastMail) return load(true);
-  const requestId = ++mailRequestId;
-  const previousCursor = nextCursor;
-  const p = query();
-  p.set('limit', String(MAIL_PAGE_SIZE));
-  loadingMail = true;
-  try {
-    const r = await fetch(dataPath() + '?' + p.toString());
-    if (r.status === 401) { location.reload(); return; }
-    if (!r.ok) throw new Error('http ' + r.status);
-    const data = await r.json();
-    if (requestId !== mailRequestId) return;
-    lastMail = mergeMail(lastMail || [], Array.isArray(data.mail) ? data.mail : []);
-    nextCursor = previousCursor;
-    lastFetchAt = new Date();
-    setNetworkIssue(false);
-  } catch (e) {
-    if (requestId === mailRequestId) setNetworkIssue(true);
-  } finally {
-    if (requestId === mailRequestId) { loadingMail = false; washNext = true; renderList(); renderPane(); }
-  }
-}
-
-async function chrome() {
-  try {
-    const p = new URLSearchParams();
-    p.set('hours', filters.hours.value);
-    const s = await (await fetch('/api/summary?' + p.toString())).json();
-    const hadSummary = Boolean(lastSummary);
-    const downBefore = failingMailboxes().map((m) => m.address).join();
-    lastSummary = s;
-    askForPoll();
-    // An empty list picks its words from the summary, which usually lands
-    // after the list: "quiet" is not to be said while a mailbox is unread.
-    if (list.querySelector('.empty') && (!hadSummary || failingMailboxes().map((m) => m.address).join() !== downBefore)) renderList();
-    if (!filters.category.dataset.filled) {
-      for (const c of s.categories || []) filters.category.appendChild(new Option(word('category.', c), c));
-      for (const a of s.accounts || []) filters.account.appendChild(new Option(a.name, a.address));
-      filters.category.dataset.filled = '1';
-      // Values a reload or a shortcut asked for before the options existed.
-      // The first query already carried them; one that no option offers is
-      // dropped, and the list asked for again without it.
-      let dropped = false;
-      for (const name in pendingPicks) {
-        const select = filters.elements.namedItem(name);
-        if (select && Array.from(select.options).some((o) => o.value === pendingPicks[name])) select.value = pendingPicks[name];
-        else dropped = true;
-      }
-      pendingPicks = {};
-      syncUrl();
-      if (dropped) load();
-    }
-    lastDigest = await (await fetch('/api/digest')).json();
-    renderLede();
-    renderStatus();
-    renderTokens();
-    drawDigest();
-    if (healthSheet.open) redrawHealth();
-  } catch (e) {
-    setNetworkIssue(true);
-  }
-}
-
-// What a reload or a home-screen shortcut asked for, once the list is here.
-let bootKey = keyFromHash(location.hash);
-const bootParams = new URLSearchParams(location.search);
-const wantsCode = bootParams.get('focus') === 'code';
-// Stripped even when it does not decode, so a broken link does not survive a reload.
-if (location.hash.indexOf('#m=') === 0) history.replaceState(null, '', location.pathname + location.search);
-function afterFirstLoad() {
-  if (bootKey) {
-    const key = bootKey;
-    bootKey = null;
-    openFromLink(key, false);
-  }
-  if (wantsCode) {
-    const target = lane.querySelector('.lane-copy');
-    if (target) { target.scrollIntoView({ block: 'center' }); target.focus({ preventScroll: true }); }
-    else startCodeWait();
-  }
-  syncUrl();
-}
-
 // ---- Waiting for a code that is on its way ----
 // The shortcut is usually pressed right after asking a site for a code, which
 // often has not arrived yet. Rather than say "no code" and stop, the lane
@@ -1909,10 +1597,25 @@ function applyTheme(choice) {
     button.setAttribute('aria-label', label);
   }
 }
-$('#theme').onclick = () => {
+$('#theme').onclick = (event) => {
   const next = readTheme() === 'dark' ? 'light' : 'dark';
-  try { localStorage.setItem('theme', next); } catch (e) {}
-  applyTheme(next);
+  const apply = () => {
+    try { localStorage.setItem('theme', next); } catch (e) {}
+    applyTheme(next);
+    themeChanged();
+  };
+  // Where the browser can, the other theme spreads out from the switch that
+  // asked for it. Elsewhere, and for anyone who prefers no motion, it just is.
+  if (!document.startViewTransition || reduceMotion()) { apply(); return; }
+  const r = event.currentTarget.getBoundingClientRect();
+  const x = r.left + r.width / 2, y = r.top + r.height / 2;
+  const radius = Math.hypot(Math.max(x, innerWidth - x), Math.max(y, innerHeight - y));
+  document.startViewTransition(apply).ready.then(() => {
+    document.documentElement.animate(
+      { clipPath: ['circle(0px at ' + x + 'px ' + y + 'px)', 'circle(' + radius + 'px at ' + x + 'px ' + y + 'px)'] },
+      { duration: 420, easing: 'cubic-bezier(.2,.7,.2,1)', pseudoElement: '::view-transition-new(root)' },
+    );
+  }).catch(() => {});
 };
 
 // ---- Language: reword the page in place from the last answers. ----
@@ -1923,6 +1626,7 @@ function renderAll() {
   renderList();
   drawDigest(true);
   renderPane(true);
+  renderBars();
 }
 function applyLanguage(next) {
   lang = next;
@@ -1941,15 +1645,7 @@ function applyLanguage(next) {
   applyTheme(readTheme());
   renderAll();
   if (healthSheet.open) redrawHealth();
-  if (sheet.open && openKey) {
-    const item = findItem(openKey);
-    if (item) {
-      const content = detailFor(item);
-      const title = content.querySelector('h3');
-      if (title) title.id = 'sheet-title';
-      sheet.querySelector('.sheet-body').replaceChildren(content);
-    }
-  }
+  languageChanged();
 }
 $('#lang').onclick = () => {
   const next = LANGUAGES[(LANGUAGES.indexOf(lang) + 1) % LANGUAGES.length];
@@ -2035,64 +1731,5 @@ async function pollNow() {
 }
 if (refreshButton) refreshButton.addEventListener('click', pollNow);
 
-// ---- Keyboard, where there is one ----
-if (matchMedia('(pointer: fine)').matches) {
-  document.addEventListener('keydown', (e) => {
-    if (e.isComposing || e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
-    const target = e.target;
-    const editable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable);
-    if (editable) return;
-    if (document.querySelector('dialog[open]')) return;
-    const keys = Array.from(list.querySelectorAll('li.row')).map((li) => li.dataset.key);
-    if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'j' || e.key === 'k') {
-      if (!keys.length) return;
-      e.preventDefault();
-      const step = e.key === 'ArrowDown' || e.key === 'j' ? 1 : -1;
-      const index = Math.min(keys.length - 1, Math.max(0, keys.indexOf(selectedKey) + step));
-      const key = keys[index];
-      if (isWide()) openDetail(key);
-      else { selectedKey = key; markSelected(); }
-      const li = list.querySelector('li.row[data-key="' + CSS.escape(key) + '"]');
-      if (li) li.scrollIntoView({ block: 'nearest' });
-    } else if (e.key === 'Enter' && selectedKey && !(target instanceof Element && target !== document.body
-      && target.closest('button, a[href], summary, [role="button"]'))) {
-      // Enter opens the selected message only from nowhere in particular; on
-      // a button or link it does what that control does.
-      e.preventDefault();
-      openDetail(selectedKey);
-    } else if (e.key === '/') {
-      e.preventDefault();
-      showSearch();
-    } else if (e.key === 'c') {
-      const button = lane.querySelector('.lane-copy') || list.querySelector('.has-code .code-copy');
-      if (button) button.click();
-    } else if (e.key === 'Escape' && selectedKey) {
-      clearSelection();
-    }
-  });
-}
-
-// ---- Ambient ----
-window.addEventListener('scroll', () => header.classList.toggle('scrolled', window.scrollY > 4), { passive: true });
-window.addEventListener('offline', () => setNetworkIssue(true));
-window.addEventListener('online', () => { setNetworkIssue(false); load(); chrome(); });
-// The since-you-last-looked line is drawn from the moment the page was last put away.
-function rememberSeen() { writeStorage('seenAt', new Date().toISOString()); }
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { rememberSeen(); return; }
-  sinceAt = Date.parse(readStorage('seenAt') || '') || sinceAt;
-  refresh(); chrome();
-});
-window.addEventListener('pagehide', rememberSeen);
-setInterval(() => { if (!document.hidden) { refresh(); chrome(); } }, 60000);
-setInterval(renderStatus, 30000);
-
-readUrl();
-markSegs();
-applyTheme(readTheme());
-if (connectionProblem) setNetworkIssue(true);
-renderAll();
-load();
-chrome();
 `;
 }

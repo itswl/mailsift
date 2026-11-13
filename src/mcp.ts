@@ -8,7 +8,7 @@
  * Disabled by default; see README for activation.
  */
 import './env.js'; // Must run first so .env is loaded.
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -31,7 +31,10 @@ import {
 } from './services/triage.js';
 import { retryAttempts } from './services/delivery.js';
 import { HEARTBEAT_KEY, IDLE_WAKE_KEY, type PollStats } from './services/watcher.js';
+import { PushDispatcher } from './services/push-dispatcher.js';
 import { routeWeb, webUiEnabled } from './web.js';
+import { webPushEnabled } from './web-actions.js';
+import { credentialMark, localHost, secretEquals } from './web-http.js';
 import { idleEnabled, idleFolderTokens } from './imap/idle.js';
 import {
   ACCOUNT_LAST_ERROR_KEY, ACCOUNT_LAST_FAILURE_KEY, ACCOUNT_LAST_SUCCESS_KEY,
@@ -80,17 +83,6 @@ export function allowMcpRequest(client: string, now = Date.now()): boolean {
 
 function clientFingerprint(value: string): string {
   return createHash('sha256').update(value || 'unknown').digest('hex').slice(0, 16);
-}
-
-/**
- * Constant-time comparison of a configured secret against what was presented.
- *
- * timingSafeEqual throws on unequal lengths, so the length is checked first;
- * that leaks the length of the expected secret and nothing about its content.
- */
-function secretMatches(expected: string, presented: string): boolean {
-  if (expected.length !== presented.length) return false;
-  return timingSafeEqual(Buffer.from(expected), Buffer.from(presented));
 }
 
 /**
@@ -952,23 +944,51 @@ export async function startMcpHttp(
         res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '60' }).end('{"error":"rate_limited"}');
         return;
       }
+      // With no token nothing identifies the caller, so the name the request
+      // came under has to be this machine's: that is what stops a page on
+      // another site from reaching this port through a host name of its own.
+      if (!token && !localHost(req.headers.host)) {
+        res.writeHead(421, { 'content-type': 'application/json' }).end('{"error":"host_not_allowed"}');
+        return;
+      }
       try {
         const url = new URL(req.url ?? '/', `http://${host}:${port}`);
         if (url.pathname !== '/mcp') {
-          // The read-only browser view shares this port and token, because it
-          // shares the trust boundary. Off unless explicitly enabled.
+          // The web view shares this port and both tokens, because it shares
+          // the trust boundary. Off unless explicitly enabled.
           if (!webUiEnabled()) {
             res.writeHead(404).end();
             return;
           }
           const webStore = new StateStore();
           try {
-            const answer = await routeWeb(req, url, token, webStore, client, { onRefresh: options.onRefresh });
+            const answer = await routeWeb(req, url, token, webStore, client, {
+              onRefresh: options.onRefresh,
+              // Signing in to the page with this credential is what lets a
+              // browser act on mail, the same split the MCP tools make.
+              writeToken,
+            });
             const headers: Record<string, string> = { 'content-type': answer.contentType };
             if (answer.cookie) headers['set-cookie'] = answer.cookie;
             if (answer.cacheControl) headers['cache-control'] = answer.cacheControl;
             Object.assign(headers, answer.headers);
             if (answer.status === 303) headers['location'] = '/';
+            if (answer.stream) {
+              // A response that stays open: the page's live line. It reads
+              // through the hub's own database handle, so the one opened for
+              // this request is released as usual.
+              res.writeHead(answer.status, headers);
+              res.flushHeaders();
+              answer.stream({
+                write: (chunk) => {
+                  if (res.writableEnded || res.destroyed) throw new Error('stream closed');
+                  res.write(chunk);
+                },
+                onClose: (listener) => { res.once('close', listener); },
+                close: () => { if (!res.writableEnded) res.end(); },
+              });
+              return;
+            }
             res.writeHead(answer.status, headers).end(answer.body);
           } finally {
             webStore.close();
@@ -980,8 +1000,8 @@ export async function startMcpHttp(
           : '';
         // A caller holding the write credential also gets everything the read
         // credential gets; the reverse is what must not happen.
-        const writable = writeToken !== '' && secretMatches(writeToken, presented);
-        const authorized = !token || writable || secretMatches(token, presented);
+        const writable = writeToken !== '' && secretEquals(writeToken, presented);
+        const authorized = !token || writable || secretEquals(token, presented);
         if (!authorized) {
           // Recorded so a rejected attempt is visible; the value presented is
           // never stored, only the fact and the caller fingerprint.
@@ -1039,6 +1059,28 @@ export async function startMcpHttp(
     httpServer.once('listening', onListening);
     httpServer.listen(port, host);
   });
+
+  // Notifications to installed copies of the page. The dispatcher watches the
+  // database rather than the poller, so it runs wherever the page is served
+  // and can neither delay triage nor fail it.
+  if (webUiEnabled() && webPushEnabled()) {
+    // A subscription belongs to the credential it was made under. One made
+    // under a token that has since been replaced is ended here, so rotating a
+    // token also stops mail being pushed to whoever held the old one.
+    const valid = [credentialMark(token), ...(writeToken ? [credentialMark(writeToken)] : [])];
+    const pruning = new StateStore();
+    try {
+      const ended = pruning.prunePushSubscriptions(valid);
+      if (ended > 0) console.error(`mailsift: ended ${ended} notification subscription(s) made under a replaced token.`);
+    } catch (error) {
+      console.error('mailsift: could not check notification subscriptions:', error);
+    } finally {
+      pruning.close();
+    }
+    const dispatcher = new PushDispatcher();
+    dispatcher.start();
+    httpServer.once('close', () => dispatcher.stop());
+  }
   return httpServer;
 }
 

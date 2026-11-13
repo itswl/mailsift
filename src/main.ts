@@ -154,8 +154,10 @@ async function checkConfig(): Promise<number> {
     const where = `${process.env.MCP_PUBLIC_HOST ?? '127.0.0.1'}:${process.env.MCP_PORT ?? 8410}`;
     console.log(
       webUiEnabled()
-        ? `   Web view: read-only, on http://${where}/ using the MCP token`
-        : '   Web view: disabled (set WEB_UI_ENABLED=true for a read-only browser view)',
+        ? `   Web view: on http://${where}/ · ${process.env.MCP_WRITE_TOKEN?.trim()
+          ? 'reads with MCP_TOKEN, acts on mail with MCP_WRITE_TOKEN'
+          : 'read-only (set MCP_WRITE_TOKEN to archive, reply and send from it)'}`
+        : '   Web view: disabled (set WEB_UI_ENABLED=true for the browser mail view)',
     );
   }
   const monitor = heartbeatUrl();
