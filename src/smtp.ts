@@ -609,18 +609,17 @@ export function replyEnvelope(
   let to = usable(original.replyTo);
   const isMine = (entry: MailAddress | null | undefined): boolean =>
     mine.has((typeof entry?.address === 'string' ? entry.address : '').trim().toLowerCase());
-  // Answers asked for only at the owner's address, on a message the owner was
-  // not sent: mail a service sent in the owner's name (an invoice to a
-  // customer). Answering it continues it to the people it went to.
-  const sentForOwner = to.length === 0 && (original.replyTo ?? []).length > 0 && (original.replyTo ?? []).every(isMine)
-    && ![...(original.to ?? []), ...(original.cc ?? [])].some(isMine);
-  if (to.length === 0 && !sentForOwner) {
+  // A Reply-To that names only the owner is answered to the sender. Whether
+  // the owner was named among the recipients says nothing reliable here: a
+  // list member, a Bcc and an alias are all unnamed, and answering such a
+  // message to everyone it went to is the mistake a private reply must not make.
+  if (to.length === 0) {
     addressedTo = 'sender';
     to = usable(original.from ? [original.from] : []);
   }
   // Answering a message the owner sent themselves continues it to the people it went to.
   if (to.length === 0) {
-    addressedTo = isMine(original.from) || sentForOwner ? 'ownRecipients' : 'recipients';
+    addressedTo = isMine(original.from) ? 'ownRecipients' : 'recipients';
     to = usable(original.to);
   }
   const cc = mode === 'replyAll' ? usable([...(original.to ?? []), ...(original.cc ?? [])]) : [];

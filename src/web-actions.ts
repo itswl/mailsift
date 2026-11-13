@@ -525,7 +525,8 @@ async function handleFeedback(req: IncomingMessage, store: StateStore, ctx: Acti
   if (!key || !FEEDBACK_LABELS.has(label)) return badRequest('key and a known label are required');
   const row = store.getMail(key);
   if (!row) return json(404, { error: 'not found', code: 'notFound' });
-  store.recordFeedback(row.messageId ?? row.dedupKey, label as 'false_positive' | 'missed' | 'correct');
+  // Against this record, by its key: its Message-ID alone could name another one.
+  store.recordFeedback(row.messageId ?? row.dedupKey, label as 'false_positive' | 'missed' | 'correct', '', row.dedupKey);
   store.recordMcpAudit('web:feedback', ctx.client, true, row.dedupKey);
   // Two messages from one sender marked the same way become a rule. Say so
   // when this vote was the one that made it, since that changes future mail.

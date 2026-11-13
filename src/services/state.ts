@@ -979,14 +979,18 @@ export class StateStore {
    * addressed to two of them), and getMail returns only one of those.
    */
   recordsFor(messageId: string): Array<{ dedupKey: string; account: string }> {
-    const rows = (this.db.prepare(
-      'SELECT dedup_key, account FROM seen WHERE message_id = ? OR dedup_key = ? ORDER BY created_at, dedup_key',
-    ).all(messageId, messageId) as Array<Record<string, unknown>>)
-      .map((row) => ({ dedupKey: String(row['dedup_key']), account: String(row['account'] ?? '') }));
-    // A key names exactly one record. A Message-ID that merely looks like that
-    // key was written by a sender, and does not get to share the name.
-    const exact = rows.find((row) => row.dedupKey === messageId);
-    return exact ? [exact] : rows;
+    // A Message-ID first: that is what a caller of this is given and told to
+    // pass. A record's own key is accepted only when no message carries the
+    // string as its Message-ID, since a sender can write a Message-ID that
+    // spells another record's key; the page, which only ever holds keys,
+    // finds records with getMail instead.
+    const byId = (this.db.prepare(
+      'SELECT dedup_key, account FROM seen WHERE message_id = ? ORDER BY created_at, dedup_key',
+    ).all(messageId) as Array<Record<string, unknown>>);
+    const rows = byId.length ? byId : (this.db.prepare(
+      'SELECT dedup_key, account FROM seen WHERE dedup_key = ?',
+    ).all(messageId) as Array<Record<string, unknown>>);
+    return rows.map((row) => ({ dedupKey: String(row['dedup_key']), account: String(row['account'] ?? '') }));
   }
 
   getMail(messageId: string): MailRow | undefined {

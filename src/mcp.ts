@@ -749,7 +749,9 @@ export function createServer(
     },
     async (uri, variables) => {
       const messageId = decodeVariable(variables['messageId']);
-      const found = messageId ? store.getMail(messageId) : undefined;
+      // By Message-ID, as get_mail finds it: a key is taken only when no message carries the string as its id.
+      const first = messageId ? store.recordsFor(messageId)[0] : undefined;
+      const found = first ? store.getMail(first.dedupKey) : undefined;
       store.recordMcpAudit('resource:mail-record', client, Boolean(found), messageId);
       if (!found) throw new McpToolError('NOT_FOUND', 'mail record not found');
       return {
@@ -1177,7 +1179,7 @@ export function createServer(
                   draft['addressedTo'] === 'recipients'
                     ? 'the message names no sender or reply address to answer, so an answer would go to everyone it was sent to'
                     : 'the message is from the owner\'s own address, so an answer would go on to everyone it was sent to',
-                  `Ask the user who the answer is for, and give to. prepare_reply shows who it went to: ${list(draft['to']).join(', ') || 'nobody usable'}.`);
+                  'Ask the user who the answer is for, and give to. prepare_reply shows who the message went to.');
               }
               to = list(draft['to']);
             }

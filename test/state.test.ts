@@ -453,11 +453,16 @@ describe('finding a stored message by its key or its Message-ID', () => {
     s.markSeen('me@qq.com|<real@x>', 'me@qq.com', 'the real one');
     s.recordOutcome('me@qq.com|<real@x>', 'critical', true, { messageId: '<real@x>', sender: 'boss@corp.example' });
 
+    // The page holds keys: a key names its own record.
     expect(s.getMail('me@qq.com|<real@x>')).toMatchObject({ dedupKey: 'me@qq.com|<real@x>', sender: 'boss@corp.example' });
-    expect(s.recordsFor('me@qq.com|<real@x>')).toEqual([{ dedupKey: 'me@qq.com|<real@x>', account: 'me@qq.com' }]);
+    // An MCP caller holds Message-IDs: the look-alike's own id names the look-alike, not the message it imitates.
+    expect(s.recordsFor('me@qq.com|<real@x>')).toEqual([{ dedupKey: 'me@qq.com|me@qq.com|<real@x>', account: 'me@qq.com' }]);
+    // A key with no message carrying it as an id is still found.
+    expect(s.recordsFor('me@qq.com|me@qq.com|<real@x>')).toEqual([{ dedupKey: 'me@qq.com|me@qq.com|<real@x>', account: 'me@qq.com' }]);
     expect(s.setHandled('me@qq.com|<real@x>', true)?.sender).toBe('boss@corp.example');
-    s.recordFeedback('me@qq.com|<real@x>', 'false_positive');
-    expect(s.feedbackRuleHints(1).neverImportant).toEqual(['boss@corp.example']);
+    // Feedback given with the record's own key lands on that record.
+    s.recordFeedback('me@qq.com|<real@x>', 'false_positive', '', 'me@qq.com|me@qq.com|<real@x>');
+    expect(s.feedbackRuleHints(1).neverImportant).toEqual(['attacker@evil.example']);
     // By its Message-ID it is found as well, and lists every mailbox it is stored for.
     expect(s.recordsFor('<real@x>')).toEqual([{ dedupKey: 'me@qq.com|<real@x>', account: 'me@qq.com' }]);
   });
