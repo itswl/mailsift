@@ -26,6 +26,8 @@ MCP_TOKEN=<random-long-token>
 
 A non-loopback `MCP_BIND` refuses to start without `MCP_TOKEN`, and Compose binds to `0.0.0.0` inside the container, so a Docker deployment always needs a token. Loopback with an empty token is unauthenticated by design. For public HTTP access, use a strong token and set `MCP_PUBLIC_HOST` deliberately.
 
+While no token is set, the server answers only to requests addressed to `localhost`, `127.0.0.1` or `[::1]` and refuses any other `Host` with 421. A browser can be made to reach a loopback port through a host name some other site controls; the name it sends is how that is told apart from you. A proxy on the same machine that forwards a different name needs it listed in `MCP_ALLOWED_HOSTS`.
+
 The endpoint is `/mcp`, uses stateless Streamable HTTP with `Authorization: Bearer <MCP_TOKEN>`, and applies `MCP_RATE_LIMIT_PER_MINUTE` (default `120`) per client. Use HTTPS through a reverse proxy or tunnel because MCP carries mailbox data and bearer tokens must not cross the public internet over plain HTTP. Behind a proxy, set `TRUSTED_PROXY=true` (see [Web view](web-view.md#behind-a-reverse-proxy)).
 
 For local stdio clients, point the command at `dist/src/mcp.js` (or `npm run mcp` in a checkout).
@@ -101,7 +103,9 @@ A Message-ID that was never seen is not an error: `get_mail` answers `found: fal
 
 `manage_mail`, `record_feedback`, and `retry_dead_letter` are write tools, and they are not registered at all unless `MCP_WRITE_TOKEN` is set. `manage_mail` supports `mark_read`, `mark_unread`, `star`, `unstar`, and `move`; it refuses delete/trash destinations and never sends mail. Every operation resolves the Message-ID again inside a writable IMAP lock and records an audit row. The separate token keeps a leaked read credential from changing either mailbox contents or future triage policy.
 
-Set `MCP_WRITE_TOKEN` to a second secret that differs from `MCP_TOKEN`; reusing one value for both is refused at startup. Present it as the bearer token to get the full surface. `MCP_TOKEN` then stays a read-only credential, which is what the browser view and any shared client should hold. Over stdio the caller can already read the env file, so setting `MCP_WRITE_TOKEN` alone enables the write tools there without a second presentation.
+Set `MCP_WRITE_TOKEN` to a second secret that differs from `MCP_TOKEN`; reusing one value for both is refused at startup. Present it as the bearer token to get the full surface. `MCP_TOKEN` then stays a read-only credential, which is what any shared client should hold. Over stdio the caller can already read the env file, so setting `MCP_WRITE_TOKEN` alone enables the write tools there without a second presentation.
+
+The [web view](web-view.md#signing-in-and-what-a-session-may-do) makes the same split: a browser that signs in with `MCP_WRITE_TOKEN` can act on mail, and one that signs in with `MCP_TOKEN` reads. The page can do two things the MCP tools deliberately cannot, move a message to the bin and send a reply, because there a person presses the button. An MCP client is a model following instructions that may have come from the mail it is reading, so `manage_mail` stays as narrow as it was. Both write to the same audit tables.
 
 `record_feedback` records `false_positive`, `missed`, `handled`, and `correct` labels for later rule and triage evaluation. Two `missed` or two `false_positive` records for one sender become a rule; see [Configuration](configuration.md#your-own-rules).
 
@@ -119,7 +123,7 @@ The `inspect_mail_safety` tool checks a message's configured folder, mailing-lis
 
 Link parsing reads at most `MCP_SAFETY_BODY_BYTES` (default 256 KiB, hard cap 1 MiB) from a selected text body part. It reports scheme, IP-host, punycode, userinfo, and common shortener clues while omitting URL paths and query values.
 
-These are clues, not a spam or malware verdict. Mailing-list headers do not prove spam; sender fields can be forged. mailsift does not verify SPF, DKIM or DMARC, resolve or reputation-check links, unpack attachments, or provide an antivirus verdict. It does not move, delete, flag, or otherwise change messages as part of these checks.
+These are clues, not a spam or malware verdict. Mailing-list headers do not prove spam; sender fields can be forged. mailsift does not verify SPF, DKIM or DMARC itself (the web view's reader shows what the mailbox's own provider reported, see [Reading a message](web-view.md#reading-a-message)), resolve or reputation-check links, unpack attachments, or provide an antivirus verdict. It does not move, delete, flag, or otherwise change messages as part of these checks.
 
 ## Health and recovery
 
@@ -129,4 +133,4 @@ The MCP recovery tools expose `recovery_status` always, and `retry_dead_letter` 
 
 ## Audit
 
-Every tool and live resource call is audited by name, outcome, caller fingerprint, and (where useful) a bounded account/message/part target; rejected authentication attempts are included. `list_audit` returns recent rows and mailbox-action audit, and `observability` groups the access audit by tool. Credentials, message bodies, and URL query strings are never stored in the audit.
+Every tool and live resource call is audited by name, outcome, caller fingerprint, and (where useful) a bounded account/message/part target; rejected authentication attempts are included. What the web view does is recorded the same way: its mailbox actions and each message it sends (as `send`, without recipients or text) in the mailbox-action audit, and marking done, feedback, questions, drafts and notification subscriptions as `web:*` rows in the access audit. `list_audit` returns recent rows and mailbox-action audit, and `observability` groups the access audit by tool. Credentials, message bodies, and URL query strings are never stored in the audit.
