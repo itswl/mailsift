@@ -575,6 +575,14 @@ describe('replying', () => {
     expect(replyEnvelope(message, self, 'reply')).toMatchObject({ to: ['boss@corp.example'], cc: [], addressedTo: 'sender' });
     // A reply to all still copies the others, and still never the owner.
     expect(replyEnvelope(message, self, 'replyAll')).toMatchObject({ to: ['boss@corp.example'], cc: ['all-staff@corp.example'] });
+    // Sent by a service in the owner's name (an invoice to a customer, the owner not among its
+    // recipients): answering it continues it to the customer, as it did before.
+    const forOwner = original({
+      from: { name: 'Billing', address: 'invoices@service.example' },
+      to: [{ name: '', address: 'customer@client.example' }], cc: [],
+      replyTo: [{ name: 'Me', address: 'me@example.com' }],
+    });
+    expect(replyEnvelope(forOwner, self, 'reply')).toMatchObject({ to: ['customer@client.example'], addressedTo: 'ownRecipients' });
     // A Reply-To that names nothing usable is no instruction either.
     expect(replyEnvelope(original({ replyTo: [{ name: '', address: 'undisclosed-recipients:;' }] }), self, 'reply').to).toEqual(['mia@example.org']);
   });

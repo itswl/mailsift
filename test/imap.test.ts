@@ -740,6 +740,15 @@ describe('acting on a message from the web view', () => {
       .toMatchObject({ destinationIsTrash: true });
     expect(await applyWebMailAction(ME, '<two@x>', 'inbox', { folderHint: 'Deleted Messages/kept' })).not.toHaveProperty('destinationIsTrash');
     expect(await applyWebMailAction(ME, '<two@x>', 'trash')).toMatchObject({ destinationIsTrash: true });
+
+    // Someone's own folder that happens to be called Bin is not the bin; one under INBOX is.
+    fake.server.folders.push({ path: 'Projects/Bin' }, { path: 'INBOX.Trash', delimiter: '.' });
+    // A kept connection remembers the folder list for a minute; this mailbox just grew two.
+    closeSessions();
+    put('INBOX', '<three@x>');
+    expect(await applyWebMailAction(ME, '<three@x>', 'move', { destination: 'Projects/Bin' })).not.toHaveProperty('destinationIsTrash');
+    expect(await applyWebMailAction(ME, '<three@x>', 'move', { destination: 'INBOX.Trash', folderHint: 'Projects/Bin' }))
+      .toMatchObject({ destinationIsTrash: true });
   });
 
   it('does an action on a new connection when the kept one is found dead before anything was changed', async () => {
