@@ -58,7 +58,8 @@ const fake = vi.hoisted(() => {
     close(): void {
       this.usable = false;
       server.closed += 1;
-      this.pending?.(new Error('Connection closed | ECONNRESET'));
+      // The library's own words for a connection closed on it before it was signed in.
+      this.pending?.(Object.assign(new Error('Unexpected close'), { code: 'ClosedAfterConnectTLS' }));
       this.pending = undefined;
     }
     async logout(): Promise<void> { this.usable = false; server.calls.push('logout'); }
@@ -171,7 +172,7 @@ const fake = vi.hoisted(() => {
 vi.mock('imapflow', () => ({ ImapFlow: fake.ImapFlow }));
 
 import {
-  closeSessions, connectInteractive, openSessions, resumeConnecting, stopConnecting, withSession,
+  closeSessions, connectInteractive, openSessions, resumeConnecting, stopConnecting, warmSession, withSession,
 } from '../src/imap/connection.js';
 import {
   appendToSent, applyMessageAction, applyWebMailAction, connect, connectAttempts, fetchAttachmentManifestByMessageId,
@@ -271,6 +272,9 @@ function put(
   });
   fake.server.mail.set(folder, list);
 }
+
+/** The server drops every kept connection, as an idle timeout would; what the client remembers stays. */
+const closeSessionsKeepingMemory = (): void => { for (const client of fake.server.clients) client.usable = false; };
 
 /** The reader's connection is kept between requests; closing it is when the goodbye is said. */
 const hungUp = (): string | undefined => { closeSessions(); return fake.server.calls.at(-1); };
@@ -704,6 +708,65 @@ describe('the reader\'s kept connection', () => {
   });
 });
 
+describe('when the mailbox cannot be reached', () => {
+  const refuse = (): Error => new Error('read ECONNRESET');
+  const quickly = { timing: { attemptMs: 200, hedgeAfterMs: 10, attempts: 3 } };
+
+  it('tells the requests that follow at once, instead of making each wait through the same attempts', async () => {
+    fake.server.connectPlan = [refuse(), refuse(), refuse()];
+    // The page asks for a message's text and its attachment list together.
+    const text = withSession(ME, async () => 'text', quickly);
+    const list = withSession(ME, async () => 'list', quickly);
+    await expect(text).rejects.toThrow(/ECONNRESET/);
+    await expect(list).rejects.toThrow(/ECONNRESET/);
+    expect(fake.server.calls.filter((call) => call === 'connect')).toHaveLength(3);
+    expect(openSessions()).toBe(0);
+  });
+});
+
+describe('having a connection ready before it is asked for', () => {
+  const connects = (): number => fake.server.calls.filter((call) => call === 'connect').length;
+
+  it('connects when the page is opened, so the first message does not pay for it', async () => {
+    put('INBOX', '<one@x>');
+    warmSession(ME);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(connects()).toBe(1);
+    expect(openSessions()).toBe(1);
+    await fetchReadableByMessageId(ME, '<one@x>', 'INBOX');
+    expect(connects()).toBe(1);
+  });
+
+  it('does nothing when a connection is already kept or being made, and tries at most once a minute', async () => {
+    const t0 = Date.now();
+    warmSession(ME, t0);
+    warmSession(ME, t0);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    warmSession(ME, t0 + 5_000);
+    expect(connects()).toBe(1);
+    // The connection went away and the page is still open: not again within the minute.
+    closeSessionsKeepingMemory();
+    warmSession(ME, t0 + 30_000);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(connects()).toBe(1);
+    warmSession(ME, t0 + 61_000);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(connects()).toBe(2);
+  });
+
+  it('is quiet about a mailbox that cannot be reached, and makes nothing once told to stop', async () => {
+    fake.server.connectPlan = Array.from({ length: 4 }, () => new Error('read ECONNRESET'));
+    warmSession(GMAIL);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(openSessions()).toBe(0);
+    stopConnecting();
+    const before = connects();
+    warmSession(ME);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(connects()).toBe(before);
+  });
+});
+
 describe('connecting for someone who is waiting', () => {
   const quick = { attemptMs: 400, hedgeAfterMs: 20, attempts: 3 };
 
@@ -737,12 +800,38 @@ describe('connecting for someone who is waiting', () => {
     await expect(connectInteractive(ME, quick)).rejects.toThrow(/ECONNRESET/);
   });
 
-  it('stops at once on a refusal another try would not change', async () => {
-    fake.server.connectPlan = [Object.assign(new Error('Command failed'), { responseText: 'AUTHENTICATE failed.' }), 'ok'];
+  it('tries a refused sign-in once more, and a wrong password never a third time', async () => {
+    const refused = (): Error => Object.assign(new Error('Command failed'), { responseText: 'Login failed.' });
+    // A provider in trouble says "Login failed" to a token it took a second ago.
+    fake.server.connectPlan = [refused(), 'ok'];
+    const client = await connectInteractive(ME, quick);
+    expect(client.usable).toBe(true);
+    client.close();
+    // A password that really is wrong is presented twice, not once per attempt allowed.
+    fake.server.connectPlan = [refused(), refused(), 'ok'];
     const before = fake.server.calls.length;
-    await expect(connectInteractive(ME, quick)).rejects.toThrow(/AUTHENTICATE failed/);
+    await expect(connectInteractive(ME, quick)).rejects.toThrow(/Login failed/);
     await new Promise((resolve) => setTimeout(resolve, 80));
-    expect(fake.server.calls.slice(before).filter((call) => call === 'connect')).toHaveLength(1);
+    expect(fake.server.calls.slice(before).filter((call) => call === 'connect')).toHaveLength(2);
+  });
+
+  it('keeps its own clock: a server that greets and then never signs anyone in is given up on', async () => {
+    // The library's timeouts cover reaching the server, not the sign-in after it.
+    fake.server.connectPlan = ['hang', 'hang', 'hang'];
+    const started = Date.now();
+    await expect(connectInteractive(ME, { attemptMs: 60, hedgeAfterMs: 15, attempts: 3 })).rejects.toThrow(/did not complete the sign-in in time/);
+    expect(Date.now() - started).toBeLessThan(400);
+    expect(fake.server.calls.filter((call) => call === 'connect')).toHaveLength(3);
+    // All three were hung up on; none is left open behind the failure.
+    expect(fake.server.closed).toBeGreaterThanOrEqual(3);
+    expect(fake.server.clients.filter((c) => c.usable)).toHaveLength(0);
+  });
+
+  it('counts an attempt it timed out as a stall, and still uses a later one that answers', async () => {
+    fake.server.connectPlan = ['hang', 'hang', 'ok'];
+    const client = await connectInteractive(ME, { attemptMs: 200, hedgeAfterMs: 15, attempts: 3 });
+    expect(client.usable).toBe(true);
+    client.close();
   });
 
   it('a slower twin that connects after the winner says goodbye instead of lingering', async () => {
@@ -776,7 +865,7 @@ describe('being told to stop', () => {
     const stuck = connect(ME);
     await new Promise((resolve) => setTimeout(resolve, 10));
     stopConnecting();
-    await expect(stuck).rejects.toThrow(/Connection closed/);
+    await expect(stuck).rejects.toThrow(/Unexpected close/);
     // No second attempt, no two-second pause before it.
     expect(fake.server.calls.filter((call) => call === 'connect')).toHaveLength(1);
     await expect(connect(ME)).rejects.toThrow(/shutting down/);

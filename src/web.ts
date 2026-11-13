@@ -14,7 +14,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
-import { loadConfig } from './config.js';
+import { loadConfig, type Account } from './config.js';
 import { escapeHtml } from './html.js';
 import {
   AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
@@ -95,6 +95,12 @@ export interface WebOptions {
   onRefresh?: (() => Promise<PollStats>) | undefined;
   writeToken?: string | undefined;
   backend?: Partial<WebBackend> | undefined;
+  /**
+   * Have a mailbox connection ready for the reader. Called when the page
+   * asks for its summary, which is when someone has just opened it. Given
+   * by the server that owns real mailboxes; absent, nothing is warmed.
+   */
+  warm?: ((account: Account) => void) | undefined;
 }
 
 /** Whether this request may see triage data: a bearer token or an established session. */
@@ -280,6 +286,13 @@ export async function handleApi(
     // The heartbeat is written after every poll, even one in which a mailbox
     // failed, so each mailbox's own state travels with it.
     const accounts = configuredAccounts();
+    // Someone is looking at the page: by the time they tap a message, the
+    // connection it will be read over should already be made.
+    if (context.options?.warm) {
+      for (const account of accounts) {
+        try { context.options.warm(account); } catch { /* warming is a courtesy */ }
+      }
+    }
     return json(200, {
       ...store.summarize(hours),
       categories: CATEGORIES,
