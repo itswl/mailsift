@@ -343,8 +343,12 @@ describe('what the receiving server said about the sender', () => {
     expect(authservTrust('imap.mail.yahoo.com')).toEqual({ id: 'yahoo.com', subdomains: true });
     expect(authservTrust('imap.mail.me.com')).toEqual({ id: 'icloud.com', subdomains: true, perCheck: true });
     expect(authservTrust('imap.fastmail.com')).toEqual({ id: 'messagingengine.com', subdomains: true });
+    // Read from a live QQ mailbox: its own header opens with exactly this name.
+    expect(authservTrust('imap.qq.com')).toEqual({ id: 'mx.qq.com' });
     // Unknown until the operator says: no verdict is better than a forgeable one.
-    expect(authservTrust('imap.qq.com')).toBeUndefined();
+    // QQ's business mail was not looked at, and a name that merely ends alike is not QQ.
+    expect(authservTrust('imap.exmail.qq.com')).toBeUndefined();
+    expect(authservTrust('imap.qq.com.example')).toBeUndefined();
     expect(authservTrust('mail.example.org')).toBeUndefined();
     expect(authservTrust('notgmail.com.example')).toBeUndefined();
     expect(authservTrust('mail.example.org', 'MX.Example.org.')).toEqual({ id: 'mx.example.org', subdomains: true });

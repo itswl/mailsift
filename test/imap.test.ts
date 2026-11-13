@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
 
 /**
@@ -26,6 +26,12 @@ const fake = vi.hoisted(() => {
     closed: 0,
     /** Every connection made, so a test can cut one from the server's side. */
     clients: [] as Array<{ usable: boolean }>,
+    /** How it answers a search for one Message-ID: properly, or as QQ does (no header search, text matches everything). */
+    searching: 'exact' as 'exact' | 'qq',
+    /** UIDVALIDITY per folder; 1 unless a test rebuilds the folder. */
+    validity: new Map<string, bigint>(),
+    /** Whether a move says where the message landed (UIDPLUS). */
+    saysWhereMoved: false,
     reset(): void {
       this.folders = [];
       this.mail = new Map();
@@ -36,6 +42,9 @@ const fake = vi.hoisted(() => {
       this.connectPlan = [];
       this.closed = 0;
       this.clients = [];
+      this.searching = 'exact';
+      this.validity = new Map();
+      this.saysWhereMoved = false;
     },
   };
 
@@ -79,6 +88,7 @@ const fake = vi.hoisted(() => {
         throw new Error(`NO [NONEXISTENT] Unknown Mailbox: ${path}`);
       }
       this.current = path;
+      this.mailbox = { uidValidity: server.validity.get(path) ?? 1n };
       server.calls.push(`lock ${path} ${options?.readOnly ? 'ro' : 'rw'}`);
       return { path, release: () => { server.calls.push(`release ${path}`); } };
     }
@@ -88,13 +98,20 @@ const fake = vi.hoisted(() => {
     }
 
     async search(query: { header?: Record<string, string>; text?: string }): Promise<number[]> {
-      if (query.header) return this.here().filter((m) => m.messageId === query.header!['message-id']).map((m) => m.uid);
-      if (query.text) return [];
-      return this.here().map((m) => m.uid);
+      server.calls.push(`search ${query.header ? 'header' : query.text ? 'text' : 'since'}`);
+      const everything = this.here().map((m) => m.uid);
+      if (query.header) {
+        return server.searching === 'qq' ? [] : this.here().filter((m) => m.messageId === query.header!['message-id']).map((m) => m.uid);
+      }
+      if (query.text) return server.searching === 'qq' ? everything : [];
+      return everything;
     }
 
     private shape(message: FakeMessage, query: { source?: unknown; flags?: boolean; headers?: unknown }): Record<string, unknown> {
       if (query.source) server.calls.push(`source ${message.messageId}`);
+      else server.calls.push(query.headers === true ? `headers ${message.messageId}` : `envelope ${message.messageId}`);
+      const limit = typeof query.source === 'object' && query.source !== null
+        ? (query.source as { maxLength?: number }).maxLength : undefined;
       const text = message.source.toString('latin1');
       const structure = message.parts
         ? {
@@ -115,7 +132,11 @@ const fake = vi.hoisted(() => {
         bodyStructure: structure,
         // Asked for whole, the header block as the message has it; otherwise none of the two named.
         headers: query.headers === true ? Buffer.from(`${text.slice(0, text.indexOf('\r\n\r\n'))}\r\n\r\n`, 'latin1') : Buffer.from(''),
-        ...(query.source ? { source: message.source } : {}),
+        // No more of the source than was asked for, as a server sends it. A message said to be
+        // larger than the few lines kept here is filled out to that size, up to what was asked for.
+        ...(query.source ? { source: !limit ? message.source : Buffer.concat([
+          message.source, Buffer.alloc(Math.max(0, Math.min(message.size ?? 0, limit) - message.source.length), 0x78),
+        ]).subarray(0, limit) } : {}),
         ...(query.flags ? { flags: new Set(message.flags) } : {}),
       };
     }
@@ -151,12 +172,23 @@ const fake = vi.hoisted(() => {
       return true;
     }
 
-    async messageMove(range: number[], destination: string): Promise<{ destination: string } | false> {
+    async messageMove(
+      range: number[], destination: string,
+    ): Promise<{ destination: string; uidMap?: Map<number, number>; uidValidity?: bigint } | false> {
       const moving = this.here().filter((m) => range.includes(m.uid));
       server.mail.set(this.current, this.here().filter((m) => !range.includes(m.uid)));
-      server.mail.set(destination, [...(server.mail.get(destination) ?? []), ...moving]);
+      const there = server.mail.get(destination) ?? [];
       server.calls.push(`move ${this.current} -> ${destination}`);
-      return { destination };
+      if (!server.saysWhereMoved) {
+        server.mail.set(destination, [...there, ...moving]);
+        return { destination };
+      }
+      // A moved message gets a new UID in the folder it lands in.
+      const uidMap = new Map<number, number>();
+      let next = Math.max(100, ...there.map((m) => m.uid)) + 1;
+      for (const message of moving) { uidMap.set(message.uid, next); message.uid = next; next += 1; }
+      server.mail.set(destination, [...there, ...moving]);
+      return { destination, uidMap, uidValidity: server.validity.get(destination) ?? 1n };
     }
 
     async append(path: string, raw: Buffer, flags: string[] = []): Promise<{ destination: string } | false> {
@@ -248,6 +280,8 @@ const ME: Account = {
   auth: 'password', password: 'x', folders: ['INBOX', 'spam'], useSsl: true,
 };
 const GMAIL: Account = { ...ME, name: 'work', provider: 'gmail_pw', username: 'me@gmail.com', host: 'imap.gmail.com' };
+/** The same mailbox on a server whose name for itself nobody has said. */
+const ELSEWHERE: Account = { ...ME, name: 'elsewhere', provider: 'custom', username: 'me@example.org', host: 'mail.example.org' };
 
 const entry = (path: string, specialUse?: string, flags: string[] = []): ListResponse => ({
   path, pathAsListed: path, name: path.split('/').at(-1) ?? path, delimiter: '/', flags: new Set(flags),
@@ -339,7 +373,7 @@ describe('reading one message live', () => {
   it('returns the message as a reader sees it, with its folder and flags, and changes nothing', async () => {
     put('INBOX', '<other@x>');
     put('INBOX', '<one@x>', { flags: ['\\Seen', '\\Answered'] });
-    const live = await fetchReadableByMessageId(ME, '<one@x>');
+    const live = await fetchReadableByMessageId(ELSEWHERE, '<one@x>');
     expect(live).toMatchObject({
       folder: 'INBOX',
       flags: { seen: true, flagged: false, answered: true },
@@ -361,10 +395,19 @@ describe('reading one message live', () => {
 
   it('takes the sender verdict once the account says what its receiving server is called', async () => {
     put('INBOX', '<one@x>');
-    const vouched = await fetchReadableByMessageId({ ...ME, authservId: 'mx.qq.com' }, '<one@x>');
+    const vouched = await fetchReadableByMessageId({ ...ELSEWHERE, authservId: 'mx.qq.com' }, '<one@x>');
     expect(vouched?.readable.auth).toMatchObject({ result: 'pass', signedBy: 'example.com' });
-    const elsewhere = await fetchReadableByMessageId({ ...ME, authservId: 'mx.other.example' }, '<one@x>');
+    const elsewhere = await fetchReadableByMessageId({ ...ELSEWHERE, authservId: 'mx.other.example' }, '<one@x>');
     expect(elsewhere?.readable.auth.result).toBe('none');
+  });
+
+  it('believes QQ\'s own header on a QQ mailbox without being told its name', async () => {
+    put('INBOX', '<one@x>');
+    const live = await fetchReadableByMessageId(ME, '<one@x>');
+    expect(live?.readable.auth).toMatchObject({ result: 'pass', signedBy: 'example.com' });
+    // What the operator says still decides: a name that is not on the header means no verdict.
+    const overridden = await fetchReadableByMessageId({ ...ME, authservId: 'mx.other.example' }, '<one@x>');
+    expect(overridden?.readable.auth.result).toBe('none');
   });
 
   it('finds a message that was archived, because it is told where to look first', async () => {
@@ -441,6 +484,142 @@ describe('reading one message live', () => {
     put('Archive', '<moved@x>');
     expect(await fetchAttachmentManifestByMessageId(ME, '<moved@x>')).toBeUndefined();
     expect(await fetchAttachmentManifestByMessageId(ME, '<moved@x>', 'Archive')).toMatchObject({ folder: 'Archive' });
+  });
+});
+
+describe('opening a message whose place in the mailbox is remembered', () => {
+  const searches = (): string[] => fake.server.calls.filter((call) => call.startsWith('search'));
+  const fetched = (): string[] => fake.server.calls.filter((call) => /^(source|headers|envelope) /.test(call));
+
+  it('says where it found a message, and fetches it there the next time without searching', async () => {
+    put('INBOX', '<other@x>');
+    put('INBOX', '<one@x>', { flags: ['\\Seen'] });
+    const first = await fetchReadableByMessageId(ME, '<one@x>');
+    expect(first).toMatchObject({ folder: 'INBOX', uid: 2, uidValidity: '1' });
+    expect(searches()).toEqual(['search header']);
+
+    fake.server.calls = [];
+    const again = await fetchReadableByMessageId(ME, '<one@x>', { folder: 'INBOX', uid: 2, uidValidity: '1' });
+    expect(again).toMatchObject({
+      folder: 'INBOX', uid: 2, uidValidity: '1', flags: { seen: true, flagged: false, answered: false },
+      readable: { text: 'Hello there.', messageId: '<one@x>', auth: { result: 'pass' } },
+    });
+    // One request brought the whole message; nothing was searched for.
+    expect(searches()).toEqual([]);
+    expect(fetched()).toEqual(['source <one@x>']);
+    expect(fake.server.calls.filter((call) => call.startsWith('lock'))).toEqual(['lock INBOX ro']);
+  });
+
+  it('checks that what is there is still the message, and searches when it is not', async () => {
+    put('INBOX', '<other@x>');
+    put('INBOX', '<one@x>');
+    // UID 1 is another message now: the remembered place is wrong.
+    const live = await fetchReadableByMessageId(ME, '<one@x>', { folder: 'INBOX', uid: 1, uidValidity: '1' });
+    expect(live).toMatchObject({ uid: 2, readable: { messageId: '<one@x>' } });
+    expect(searches()).toEqual(['search header']);
+    // And a UID nothing has any more is no different.
+    fake.server.calls = [];
+    expect(await fetchReadableByMessageId(ME, '<one@x>', { folder: 'INBOX', uid: 77, uidValidity: '1' })).toMatchObject({ uid: 2 });
+    expect(searches()).toEqual(['search header']);
+  });
+
+  it('does not use a UID from before the folder was rebuilt, or one that belongs to another folder', async () => {
+    put('INBOX', '<other@x>');
+    put('INBOX', '<one@x>');
+    fake.server.validity.set('INBOX', 7n);
+    const rebuilt = await fetchReadableByMessageId(ME, '<one@x>', { folder: 'INBOX', uid: 2, uidValidity: '1' });
+    expect(rebuilt).toMatchObject({ uid: 2, uidValidity: '7' });
+    // Not even looked at by its old number: the search is the first thing asked.
+    expect(fetched()[0]).toBe('headers <one@x>');
+    expect(searches()).toEqual(['search header']);
+
+    fake.server.calls = [];
+    put('Archive', '<filed@x>', { uid: 2 });
+    const filed = await fetchReadableByMessageId(ME, '<one@x>', { folder: 'Archive', uid: 2, uidValidity: '7' });
+    expect(filed).toMatchObject({ folder: 'INBOX', uid: 2 });
+  });
+
+  it('reads a larger message in a second request, and a huge one as its text alone', async () => {
+    const big = Buffer.concat([source('<big@x>'), Buffer.alloc(300 * 1024, 0x61)]);
+    fake.server.mail.set('INBOX', [{ uid: 5, messageId: '<big@x>', source: big, flags: new Set() }]);
+    const live = await fetchReadableByMessageId(ME, '<big@x>', { folder: 'INBOX', uid: 5, uidValidity: '1' });
+    expect(live?.readable.text.startsWith('Hello there.')).toBe(true);
+    // More than the first request brought, so the second one did read the rest (the reader then shows a bounded part of it).
+    expect(live?.readable.text.length).toBeGreaterThan(50_000);
+    expect(fetched()).toEqual(['source <big@x>', 'source <big@x>']);
+    expect(searches()).toEqual([]);
+
+    fake.server.calls = [];
+    put('INBOX', '<huge@x>', {
+      uid: 6, size: 20 * 1024 * 1024,
+      parts: {
+        '1': { type: 'text/plain', content: Buffer.from('See the scan attached.') },
+        '2': { type: 'application/pdf', content: Buffer.alloc(64), filename: 'scan.pdf' },
+      },
+    });
+    const huge = await fetchReadableByMessageId(ME, '<huge@x>', { folder: 'INBOX', uid: 6, uidValidity: '1' });
+    expect(huge?.readable).toMatchObject({ text: 'See the scan attached.', messageId: '<huge@x>', auth: { result: 'pass' } });
+    expect(fake.server.calls.filter((call) => call.startsWith('download'))).toEqual(['download 1']);
+    expect(searches()).toEqual([]);
+  });
+
+  it('uses the remembered place for the attachment list and for an action', async () => {
+    fake.server.searching = 'qq';
+    for (let n = 1; n <= 30; n += 1) put('INBOX', `<m${n}@x>`);
+    const place = { folder: 'INBOX', uid: 17, uidValidity: '1' };
+    expect(await fetchAttachmentManifestByMessageId(ME, '<m17@x>', place)).toMatchObject({ folder: 'INBOX' });
+    expect(await applyWebMailAction(ME, '<m17@x>', 'star', { hint: place })).toMatchObject({ sourceFolder: 'INBOX' });
+    expect(flagsOf('INBOX', '<m17@x>')).toEqual(['\\Flagged']);
+    expect(searches()).toEqual([]);
+    // Nothing but the one message was asked about.
+    expect(new Set(fetched().map((call) => call.split(' ')[1]))).toEqual(new Set(['<m17@x>']));
+  });
+});
+
+describe('a server that answers a search for one message with the whole folder', () => {
+  // QQ: no header search, and a text search that matches everything.
+  beforeEach(() => { fake.server.searching = 'qq'; });
+  afterEach(() => { delete process.env.MCP_LIVE_SEARCH_MAX_MESSAGES; });
+  const asked = (what: string): string[] => fake.server.calls.filter((call) => call.startsWith(`${what} `));
+
+  it('finds the one by reading envelopes, and fetches no other message', async () => {
+    for (let n = 1; n <= 40; n += 1) put('INBOX', `<m${n}@x>`);
+    const live = await fetchReadableByMessageId(ME, '<m17@x>');
+    expect(live).toMatchObject({ folder: 'INBOX', uid: 17, readable: { messageId: '<m17@x>', text: 'Hello there.' } });
+    expect(asked('envelope')).toHaveLength(40);
+    expect(asked('headers')).toEqual(['headers <m17@x>']);
+    expect(asked('source')).toEqual(['source <m17@x>']);
+  });
+
+  it('does the same for an attachment list and an action', async () => {
+    for (let n = 1; n <= 40; n += 1) put('INBOX', `<m${n}@x>`);
+    expect(await fetchAttachmentManifestByMessageId(ME, '<m9@x>')).toMatchObject({ folder: 'INBOX' });
+    expect(await applyWebMailAction(ME, '<m9@x>', 'mark_read')).toMatchObject({ sourceFolder: 'INBOX' });
+    expect(flagsOf('INBOX', '<m9@x>')).toEqual(['\\Seen']);
+    expect(flagsOf('INBOX', '<m8@x>')).toEqual([]);
+    expect(asked('source')).toEqual([]);
+    expect(asked('headers')).toEqual([]);
+  });
+
+  it('goes through the newest of a very large folder, and says so when the message is not among them', async () => {
+    process.env.MCP_LIVE_SEARCH_MAX_MESSAGES = '10';
+    for (let n = 1; n <= 40; n += 1) put('INBOX', `<m${n}@x>`);
+    expect(await fetchReadableByMessageId(ME, '<m35@x>')).toMatchObject({ uid: 35 });
+    expect(asked('envelope')).toHaveLength(10);
+    // Older than the ones looked at: not "gone", which nobody checked.
+    await expect(fetchReadableByMessageId(ME, '<m5@x>')).rejects.toThrow(/MCP_LIVE_SEARCH_MAX_MESSAGES/);
+    // Remembered, the same message is one fetch away however large the folder is.
+    fake.server.calls = [];
+    expect(await fetchReadableByMessageId(ME, '<m5@x>', { folder: 'INBOX', uid: 5, uidValidity: '1' })).toMatchObject({ uid: 5 });
+    expect(asked('envelope')).toEqual([]);
+  });
+
+  it('still takes a short answer from a text search as it is', async () => {
+    fake.server.searching = 'exact';
+    put('INBOX', '<one@x>');
+    // An honest server with no such message: nothing found, and no folder read through for it twice.
+    expect(await fetchReadableByMessageId(ME, '<absent@x>')).toBeUndefined();
+    expect(asked('source')).toEqual([]);
   });
 });
 
@@ -528,6 +707,20 @@ describe('acting on a message from the web view', () => {
     const back = await applyWebMailAction(ME, '<one@x>', 'inbox', { folderHint: 'Archive' });
     expect(back).toMatchObject({ sourceFolder: 'Archive', destinationFolder: 'INBOX', destinationIsSpam: false });
     expect(idsIn('INBOX')).toEqual(['<one@x>']);
+  });
+
+  it('reports where a moved message landed when the server says, so it can be found there directly', async () => {
+    fake.server.saysWhereMoved = true;
+    put('INBOX', '<one@x>');
+    const archived = await applyWebMailAction(ME, '<one@x>', 'archive', { hint: { folder: 'INBOX', uid: 1, uidValidity: '1' } });
+    expect(archived).toMatchObject({ destinationFolder: 'Archive', destinationUid: 101, destinationUidValidity: '1' });
+
+    fake.server.calls = [];
+    const place = { folder: 'Archive', uid: archived!.destinationUid!, uidValidity: archived!.destinationUidValidity! };
+    expect(await fetchReadableByMessageId(ME, '<one@x>', place)).toMatchObject({ folder: 'Archive', uid: 101 });
+    expect(fake.server.calls.filter((call) => call.startsWith('search'))).toEqual([]);
+    // The old place says nothing about the new folder.
+    expect(await applyWebMailAction(ME, '<one@x>', 'star', { hint: { folder: 'INBOX', uid: 1, uidValidity: '1' } })).toBeUndefined();
   });
 
   it('rescues a message from spam and can send one to the bin', async () => {

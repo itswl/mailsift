@@ -26,7 +26,8 @@ import { mailboxStatuses } from './services/health.js';
 import { CATEGORIES } from './services/triage.js';
 import { HEARTBEAT_KEY, type PollStats } from './services/watcher.js';
 import {
-  configuredAccounts, defaultBackend, forgetLive, liveMessage, mailboxFailure, routeActions, webPushEnabled,
+  configuredAccounts, defaultBackend, forgetLive, liveMessage, mailboxFailure, rememberWhereabouts, routeActions,
+  webPushEnabled, whereabouts,
   type ActionContext, type WebBackend,
 } from './web-actions.js';
 import { clientScript, LANGUAGE_COOKIE, storeLanguageScript } from './web-client.js';
@@ -353,9 +354,11 @@ export async function handleApi(
     // A retry asks the mailbox again rather than a copy read a moment ago.
     if (params.get('fresh') === 'true') forgetLive(found.dedupKey);
     try {
-      const live = await within(liveMessage(found, account, backend), LIVE_FETCH_TIMEOUT_MS);
+      const live = await within(liveMessage(found, account, backend, whereabouts(store, found)), LIVE_FETCH_TIMEOUT_MS);
       if (timedOut(live)) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
       if (!live) return json(404, { error: 'the message is no longer where it was filed', code: 'notInMailbox' });
+      // Where it was found is kept, so the next opening is a fetch and not a search.
+      rememberWhereabouts(store, found, live);
       const r = live.readable;
       return json(200, {
         ...stored,
@@ -420,7 +423,7 @@ async function handleAttachmentsApi(
   try {
     const timeout = Symbol('attachment lookup timeout');
     const found = await Promise.race([
-      fetchAttachmentManifestByMessageId(account, stored.messageId, stored.folder ?? undefined),
+      fetchAttachmentManifestByMessageId(account, stored.messageId, whereabouts(store, stored)),
       new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_ATTACHMENT_TIMEOUT_MS).unref()),
     ]);
     if (found === timeout) {
@@ -465,7 +468,7 @@ async function handleMailSafetyApi(
   try {
     const timeout = Symbol('mail safety lookup timeout');
     const report = await Promise.race([
-      inspectMailSafety(account, stored.messageId, stored.folder ?? undefined),
+      inspectMailSafety(account, stored.messageId, whereabouts(store, stored)),
       new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_SAFETY_TIMEOUT_MS).unref()),
     ]);
     if (report === timeout) {
@@ -509,7 +512,7 @@ async function handleAttachmentApi(
   try {
     const timeout = Symbol('attachment download timeout');
     const found = await Promise.race([
-      fetchAttachmentByMessageId(account, stored.messageId, partId, stored.folder ?? undefined),
+      fetchAttachmentByMessageId(account, stored.messageId, partId, whereabouts(store, stored)),
       new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_ATTACHMENT_TIMEOUT_MS).unref()),
     ]);
     if (found === timeout) {
@@ -570,7 +573,7 @@ async function handleAttachmentScanApi(
   try {
     const timeout = Symbol('attachment scan timeout');
     const report = await Promise.race([
-      scanAttachmentByMessageId(account, stored.messageId, partId, stored.folder ?? undefined),
+      scanAttachmentByMessageId(account, stored.messageId, partId, whereabouts(store, stored)),
       new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_ATTACHMENT_TIMEOUT_MS).unref()),
     ]);
     if (report === timeout) {

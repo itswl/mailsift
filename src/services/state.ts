@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS seen (
   importance TEXT, category TEXT, summary TEXT, reason TEXT, deadline TEXT,
   decided_by TEXT, pushed INTEGER NOT NULL DEFAULT 0,
   mail_date TEXT, snippet TEXT, attachments_json TEXT, verification_code TEXT, handled_at TEXT,
+  uid INTEGER, uid_validity TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS digest_queue (
@@ -99,6 +100,14 @@ export interface MailRecord {
   snippet?: string;
   verificationCode?: string;
   attachmentManifest?: AttachmentManifest;
+  /**
+   * Where the message is in its folder: its UID, and the folder's UIDVALIDITY
+   * that the UID belongs to. With these a message is fetched directly when it
+   * is opened. Without them it has to be searched for, and some servers
+   * answer a search for one message with the whole folder.
+   */
+  uid?: number;
+  uidValidity?: string;
 }
 
 export interface MailRow {
@@ -393,6 +402,7 @@ export class StateStore {
     const seenColumns = this.db.prepare('PRAGMA table_info(seen)').all() as Array<Record<string, unknown>>;
     for (const [name, definition] of [
       ['attachments_json', 'TEXT'], ['thread_key', 'TEXT'], ['verification_code', 'TEXT'], ['handled_at', 'TEXT'],
+      ['uid', 'INTEGER'], ['uid_validity', 'TEXT'],
     ] as const) {
       if (seenColumns.some((column) => column['name'] === name)) continue;
       try {
@@ -561,7 +571,7 @@ export class StateStore {
         `UPDATE seen SET importance = ?, pushed = ?, message_id = ?, thread_key = ?, account_label = ?,
            sender = ?, sender_name = ?, folder = ?, in_spam = ?, category = ?,
            summary = ?, reason = ?, deadline = ?, decided_by = ?, mail_date = ?, snippet = ?, attachments_json = ?,
-           verification_code = ?
+           verification_code = ?, uid = COALESCE(?, uid), uid_validity = COALESCE(?, uid_validity)
          WHERE dedup_key = ?`,
       )
       .run(
@@ -573,6 +583,9 @@ export class StateStore {
         fields.decidedBy ?? null, fields.mailDate ?? null, fields.snippet ?? null,
         fields.attachmentManifest ? JSON.stringify(fields.attachmentManifest) : null,
         fields.verificationCode ?? null,
+        // A second verdict is made from the stored row and knows no UID; what the poll recorded stays.
+        fields.uid && fields.uid > 0 && fields.uidValidity ? fields.uid : null,
+        fields.uid && fields.uid > 0 && fields.uidValidity ? fields.uidValidity : null,
         dedupKey,
       );
     // A second verdict for a row that already had one. Its counts may be the
@@ -1043,10 +1056,43 @@ export class StateStore {
   }
 
   /** Where a message lives now, after an action moved it at the provider. */
-  updateMailLocation(dedupKey: string, folder: string, inSpam: boolean): void {
-    const result = this.db.prepare('UPDATE seen SET folder = ?, in_spam = ? WHERE dedup_key = ?')
-      .run(folder.slice(0, 500), inSpam ? 1 : 0, dedupKey);
+  updateMailLocation(
+    dedupKey: string, folder: string, inSpam: boolean, at: { uid?: number; uidValidity?: string } = {},
+  ): void {
+    // A moved message has a new UID. When the server said which, it is kept;
+    // when it did not, the old one is forgotten rather than left to mislead.
+    const known = at.uid !== undefined && at.uid > 0 && Boolean(at.uidValidity);
+    const result = this.db.prepare('UPDATE seen SET folder = ?, in_spam = ?, uid = ?, uid_validity = ? WHERE dedup_key = ?')
+      .run(folder.slice(0, 500), inSpam ? 1 : 0, known ? at.uid! : null, known ? at.uidValidity! : null, dedupKey);
     if (Number(result.changes) > 0) this.bumpMailRevision();
+  }
+
+  /**
+   * Where a message is in its folder, when that is known (see MailRecord.uid).
+   *
+   * Asked for on its own rather than carried on MailRow: a row is what the
+   * page and MCP clients are sent, and this is of use to neither.
+   */
+  placeOf(dedupKey: string): { uid: number; uidValidity: string } | undefined {
+    const raw = this.db.prepare('SELECT uid, uid_validity FROM seen WHERE dedup_key = ?')
+      .get(dedupKey) as Record<string, unknown> | undefined;
+    const uid = raw?.['uid'];
+    const uidValidity = raw?.['uid_validity'];
+    return typeof uid === 'number' && uid > 0 && typeof uidValidity === 'string' && uidValidity
+      ? { uid, uidValidity } : undefined;
+  }
+
+  /**
+   * Note where a message was found, so the next time it is opened it is
+   * fetched and not searched for. Nothing the page shows changes, so nothing
+   * is announced; returns whether anything was written.
+   */
+  rememberUid(dedupKey: string, folder: string, uid: number, uidValidity: string): boolean {
+    if (!(uid > 0) || !uidValidity) return false;
+    return Number(this.db.prepare(
+      `UPDATE seen SET uid = ?, uid_validity = ?
+       WHERE dedup_key = ? AND folder IS ? AND (uid IS NOT ? OR uid_validity IS NOT ?)`,
+    ).run(uid, uidValidity, dedupKey, folder, uid, uidValidity).changes) > 0;
   }
 
   private bumpMailRevision(): void {

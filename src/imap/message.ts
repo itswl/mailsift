@@ -47,6 +47,8 @@ export interface MailMessage {
   folder: string;
   inSpam: boolean;
   uid: number;
+  /** The folder's UIDVALIDITY that `uid` belongs to, when the message was read from a mailbox. */
+  uidValidity?: string;
   messageId: string;
   /** Stable conversation key from In-Reply-To, or the message itself when absent. */
   threadKey?: string;

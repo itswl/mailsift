@@ -414,6 +414,83 @@ describe('the needs-you queue', () => {
   });
 });
 
+describe('where a message is in its folder', () => {
+  function seed(s: StateStore, key: string, fields: Record<string, unknown> = {}): void {
+    s.markSeen(key, 'me@qq.com', key);
+    s.recordOutcome(key, 'warning', true, { messageId: `<${key}@x>`, folder: 'INBOX', ...fields });
+  }
+
+  it('is kept from the poll, and is not part of the row that is sent out', () => {
+    const s = store();
+    seed(s, 'k1', { uid: 42, uidValidity: '1700000000' });
+    seed(s, 'k2');
+    expect(s.placeOf('k1')).toEqual({ uid: 42, uidValidity: '1700000000' });
+    expect(s.placeOf('k2')).toBeUndefined();
+    expect(s.placeOf('absent')).toBeUndefined();
+    // Half a place is no place.
+    seed(s, 'k3', { uid: 7 });
+    expect(s.placeOf('k3')).toBeUndefined();
+    const row = s.getMail('k1') as unknown as Record<string, unknown>;
+    expect(row).not.toHaveProperty('uid');
+    expect(row).not.toHaveProperty('uidValidity');
+  });
+
+  it('survives a second verdict, which is made from the stored row and knows no UID', () => {
+    const s = store();
+    seed(s, 'k1', { uid: 42, uidValidity: '9' });
+    s.recordOutcome('k1', 'critical', true, { messageId: '<k1@x>', folder: 'INBOX', summary: 'judged again' });
+    expect(s.placeOf('k1')).toEqual({ uid: 42, uidValidity: '9' });
+    expect(s.getMail('k1')).toMatchObject({ importance: 'critical', summary: 'judged again' });
+  });
+
+  it('is learned when a message is first read, without telling the page anything changed', () => {
+    const s = store();
+    seed(s, 'k1');
+    const before = s.changeSignature().mail;
+    expect(s.rememberUid('k1', 'INBOX', 12, '9')).toBe(true);
+    expect(s.placeOf('k1')).toEqual({ uid: 12, uidValidity: '9' });
+    // Already known: nothing is written.
+    expect(s.rememberUid('k1', 'INBOX', 12, '9')).toBe(false);
+    // Found in a folder the row does not say it is in: the row is not made to disagree with itself.
+    expect(s.rememberUid('k1', 'Archive', 3, '2')).toBe(false);
+    expect(s.rememberUid('k1', 'INBOX', 0, '9')).toBe(false);
+    expect(s.rememberUid('k1', 'INBOX', 12, '')).toBe(false);
+    expect(s.placeOf('k1')).toEqual({ uid: 12, uidValidity: '9' });
+    expect(s.changeSignature().mail).toBe(before);
+  });
+
+  it('moves with the message when the server said where it landed, and is forgotten when it did not', () => {
+    const s = store();
+    seed(s, 'k1', { uid: 42, uidValidity: '9' });
+    s.updateMailLocation('k1', 'Archive', false, { uid: 5, uidValidity: '3' });
+    expect(s.getMail('k1')).toMatchObject({ folder: 'Archive' });
+    expect(s.placeOf('k1')).toEqual({ uid: 5, uidValidity: '3' });
+    // A UID from the old folder would only mislead in the new one.
+    s.updateMailLocation('k1', 'Trash', false);
+    expect(s.getMail('k1')).toMatchObject({ folder: 'Trash' });
+    expect(s.placeOf('k1')).toBeUndefined();
+  });
+
+  it('is added to a database an older release created, with nothing known yet', async () => {
+    const { DatabaseSync } = await import('node:sqlite');
+    const path = await tempDb('mailsift-place-');
+    const first = new StateStore(path);
+    seed(first, 'old');
+    first.close();
+    const raw = new DatabaseSync(path);
+    raw.exec('ALTER TABLE seen DROP COLUMN uid');
+    raw.exec('ALTER TABLE seen DROP COLUMN uid_validity');
+    raw.close();
+
+    const upgraded = new StateStore(path);
+    expect(upgraded.getMail('old')).toMatchObject({ folder: 'INBOX' });
+    expect(upgraded.placeOf('old')).toBeUndefined();
+    expect(upgraded.rememberUid('old', 'INBOX', 8, '4')).toBe(true);
+    expect(upgraded.placeOf('old')).toEqual({ uid: 8, uidValidity: '4' });
+    upgraded.close();
+  });
+});
+
 describe('change tracking', () => {
   function seed(s: StateStore, key: string, importance = 'info', pushed = false): void {
     s.markSeen(key, 'me@qq.com', key);
