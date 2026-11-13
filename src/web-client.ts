@@ -1203,8 +1203,12 @@ function linkLabel(row) {
   return name ? fill(row.link.exact ? 'link.openIn' : 'link.open', { name }) : row.link.label;
 }
 function failure(d) {
+  // The numbers and the file a refusal names come with it, to be said in the page's own words.
   return STRINGS[lang]['error.' + d.code]
-    ? fill('error.' + d.code, { detail: d.detail || '', maxBytes: d.maxBytes ? sizeLabel(d.maxBytes) : '' })
+    ? fill('error.' + d.code, {
+      detail: d.detail || '', maxBytes: d.maxBytes ? sizeLabel(d.maxBytes) : '', maxFiles: d.maxFiles || '',
+      maxChars: d.maxChars || '', file: d.file || '',
+    })
     : (d.error || t('detail.failed'));
 }
 const SAFETY_FINDING_KEYS = {

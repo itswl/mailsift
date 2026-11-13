@@ -37,7 +37,7 @@ Which token you sign in with decides what the page may do, the same split MCP ma
 | Search, ask a question, get notifications | yes | yes |
 | Mark done | only when no write token is configured | yes |
 | Archive, bin, star, mark read, move out of spam | no | yes |
-| Reply and send | no | yes |
+| Reply, forward and send; change a signature | no | yes |
 | Correct a judgement, draft with the model | no | yes |
 
 With `MCP_WRITE_TOKEN` unset the page reads and never touches a mailbox; the one credential may still tick things off, because that is the page's own bookkeeping and the credential is the owner's. Once a write token exists, the read token is strictly read-only, so it can be given to something that should only look. The footer says which kind of session this is, and `/signin` signs in again with the other token without signing out first.
@@ -48,7 +48,7 @@ Pressing an action a session may not take explains this instead of failing.
 
 The page opens on a queue: the mail that was judged to matter (critical, or pushed) and that nobody has dealt with yet, most pressing first. A deadline that has passed or falls within three days comes first, then what was judged critical, then other deadlines this week, then the rest, newest first. The first sentence of the page counts it, and the number is also the badge on the installed app's icon.
 
-Each row has a ring. Pressing it, swiping the row to the right on a phone, or `e` on a desk marks the message done: it leaves the queue at once, and a toast offers Undo. With a write session the message is also marked read in its mailbox, so "done" here is done there. Archiving, binning and answering a message count as dealing with it too.
+Each row has a ring. Pressing it, swiping the row to the right on a phone, or `e` on a desk marks the message done: it leaves the queue at once, and a toast offers Undo. With a write session the message is also marked read in its mailbox, so "done" here is done there. Archiving, binning, answering and forwarding a message count as dealing with it too.
 
 Done moves nothing and deletes nothing, and there is a way back after the toast is gone. Under the queue a line reads "Done · 3": it opens what was dealt with in the last seven days, most recent first, including mail older than the list below is showing. A done row carries a check where its ring was, here and in the list, and pressing the check (or `e`, or "Not done" under the open message) puts the message back; one that was judged to matter returns to the queue.
 
@@ -93,7 +93,7 @@ Attachments are listed with download and a bounded local scan, images open in a 
 
 ## Acting on a message
 
-With a write session the bar under a message offers Done, Reply, Archive, and under "more": Reply all, Star, Mark unread, Not spam (for a message in the spam folder) and Bin.
+With a write session the bar under a message offers Done, Reply, Archive, and under "more": Reply all, Forward, Star, Mark unread, Not spam (for a message in the spam folder) and Bin.
 
 Each action is applied in the mailbox itself, to the message found by its Message-ID, and recorded in the same audit table the MCP write tools use. Archive and Bin go to the folder the server marks for that purpose (the special-use flag, then the well-known names); a mailbox that has no such folder is told so rather than given a new one. On Gmail, archiving removes the message from the inbox and leaves it in All Mail. The page follows a message to its new folder, so it can still be opened, answered, or brought back afterwards.
 
@@ -105,17 +105,21 @@ Under every judgement is a line that asks whether it was right. "Right" records 
 
 ## Writing
 
-Reply, Reply all and a new message (the pencil in the header, or `n`) open the composer. It is plain text on purpose: a reply does not need markup, and composing HTML would mean sanitising it on the way out.
+Reply, Reply all, Forward and a new message (the pencil in the header, or `n`) open the composer. It is plain text on purpose: a letter does not need markup, and composing HTML would mean sanitising it on the way out.
 
 - A reply leaves from the mailbox that received the original, addressed the way a mail client would address it: to the Reply-To address when there is one (to the sender when it names only you), never to yourself. A plain Reply to a message that names neither a usable sender nor a Reply-To is left unaddressed for you to fill, and the composer says why; Reply all goes to everyone it was sent to, and a message from your own address is continued to the people it went to, with Cc kept for Reply all. It is threaded under the original, which is quoted below what you write.
+- **Forward** (`f`) passes a message on to someone it never named, so To starts empty. The subject is "Fwd:" the original's, and under what you write comes the forwarded message: a header line each for who it was from, when, its subject and who it went to (in the page's language), then its text. The original's attachments come along as chips. One taken off stays in the row, crossed out, with Put back. Pictures shown within the original's body (logos, icons, a portrait in a signature) are left out, since a plain-text forward would carry each as a file nobody attached: one line under the chips counts them and includes them on request. They are sent by reference: the server reads them from the mailbox as the forward leaves, so they never pass through the browser, and if one of them cannot be read nothing is sent and the page says which. A forward starts a conversation of its own (it is not threaded under the original), leaves from the mailbox the original reached unless you pick another, and counts the original as dealt with without marking it answered. It may go without a word of your own.
 - A new message leaves from whichever of your mailboxes you pick.
-- **Draft with AI** writes a first version from the message being answered and, optionally, a line from you about what to say. It never sends; it fills the box, and you edit.
-- What you type is kept in the browser as a draft per message until it is sent or discarded.
-- **Send can be undone for five seconds.** The message leaves after that, and also at once if you close the page or put it away in the meantime (a locked phone stops its timers).
-- **A send is never silently repeated.** If the mail server takes longer than a minute, or the connection drops after the message was handed over, the page says the message was not confirmed and to look in Sent first. A send that finishes late is still recorded and filed, and pressing send again on the same unchanged letter reports that it went instead of sending a second copy.
-- Once sent, the original is marked answered in the mailbox and done in the queue. Where the provider does not file a copy in Sent by itself, mailsift appends one, with its Bcc line.
+- **Cc / Bcc** at the end of the To line shows both copy lines. Blind-copied addresses are not in the message the recipients get; the copy filed in Sent keeps them.
+- **Attachments**: the paperclip at the end of the subject line opens a file picker, and files or pictures pasted into the text or dropped on the composer are attached too. A pasted picture with no name of its own becomes `image-1.png`, `image-2.png` and so on, by its type. Each is a chip with its name and size and a way to take it off. A letter carries at most twenty files and `SMTP_ATTACHMENT_MAX_BYTES` (20 MiB by default) in all, the forwarded ones included; the page refuses what would go over before it sends, and says which limit. Files are read only when the letter leaves, under each file's own name without any path. The page holds them while it is open, so a letter closed and opened again still has them; they are not kept on the device, so a draft restored in a new page lists their names and says, in a line of its own under the files, which to add again until every one is back (or the draft is discarded).
+- **Signature**: each mailbox has one, plain text of at most 2,000 characters, kept on the server and shown muted under the text of a letter from that mailbox. Edit (or Add a signature, while there is none) changes it in place for every letter from that mailbox; Leave out drops it from this letter only. Switching the mailbox a new message or a forward leaves from switches the signature. While the signature is open for editing, Send asks for it to be saved or cancelled first, since the letter would otherwise carry a signature that is not on show. A letter is put together as the composer shows it: your text, then `-- ` on a line of its own and the signature, then the quoted original or the forwarded message. MCP's `send_mail` signs the same way, and `set_signature` changes the same text.
+- **Draft with AI** writes a first version from the message being answered and, optionally, a line from you about what to say (for a forward or a new message, from that line and the subject alone). It never sends; it fills the box, and you edit.
+- What you type is kept in the browser as a draft per message (an answer and a forward of the same message are two drafts) until it is sent or discarded.
+- **Send can be undone for five seconds.** The message leaves after that, and also at once if you put the page away in the meantime (a locked phone stops its timers). Closing the page outright sends it too when it is small enough to leave with the page; a larger letter, or one with files, goes back to being a draft.
+- **A send is never silently repeated.** If the mail server takes longer than a minute (plus the time a letter's files take to travel, about a second for every 256 KB, there and again to Sent), or the connection drops after the message was handed over, the page says the message was not confirmed and to look in Sent first. So does a proxy in front of mailsift that stops waiting first. A send that finishes late is still recorded and filed, and pressing send again on the same unchanged letter reports that it went instead of sending a second copy.
+- Once sent, an answered original is marked answered in the mailbox, and an answered or forwarded one is done in the queue. Where the provider does not file a copy in Sent by itself, mailsift appends one, with its Bcc line and its attachments.
 
-Mail is sent over the provider's own SMTP submission server, always encrypted, signed in with the same credential that reads the mailbox. The presets cover every listed provider; a mailbox on a custom host needs `MAIL_ACCOUNT_N_SMTP_HOST`. What is recorded about a sent message is that one left, from which mailbox and when; never the recipients or the text.
+Mail is sent over the provider's own SMTP submission server, always encrypted, signed in with the same credential that reads the mailbox. The presets cover every listed provider; a mailbox on a custom host needs `MAIL_ACCOUNT_N_SMTP_HOST`. What is recorded about a sent message is that one left, from which mailbox and when; never the recipients, the text or the names of its files. Changing a signature is recorded as that, for which mailbox, never what it says.
 
 Two cases need a step first:
 
@@ -162,6 +166,7 @@ The bell turns on Web Push for the device you are holding: a verification code o
 | `Enter` | open |
 | `e` | done |
 | `r` `a` | reply, reply all |
+| `f` | forward |
 | `y` | archive |
 | `s` | star |
 | `#` | bin |
@@ -229,3 +234,15 @@ location /api/events {
 ```
 
 The page works without it, a minute behind.
+
+A letter with files is one large request: up to about 28 MB with the default `SMTP_ATTACHMENT_MAX_BYTES` of 20 MiB (the files in base64, which is a third larger, and the letter), and up to about 48 MB with the 35 MiB ceiling. nginx refuses anything over 1 MB unless told otherwise, and on a slow link to the mail server the answer can take a few minutes, so give `/api/send` room for both:
+
+```nginx
+location /api/send {
+    proxy_pass http://127.0.0.1:8410;
+    client_max_body_size 30m;   # 48m if SMTP_ATTACHMENT_MAX_BYTES is raised to its ceiling
+    proxy_read_timeout 10m;
+}
+```
+
+Without it, any letter with more than about 750 KB of files is refused by the proxy before mailsift sees it, and the page says that the server in front of mailsift refused a letter that large. A proxy that stops waiting before the letter is confirmed (Cloudflare does after 100 seconds) makes the page say the message was not confirmed and to look in Sent before sending it again; pressing send again on the same letter is answered with what became of the first attempt.

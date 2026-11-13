@@ -70,6 +70,20 @@ describe('stripQuotes', () => {
     expect(stripQuotes(text)).toContain('due on the 30th');
   });
 
+  it('keeps a forward mailsift wrote in Chinese, under its own marker', () => {
+    const text = [
+      '请看下面。',
+      '---------- 转发的邮件 ----------',
+      '发件人：Ada <ada@example.com>',
+      '日期：2026年11月3日 10:00',
+      '主题：发票 42',
+      '收件人：me@example.com',
+      '',
+      '发票本月 30 日到期。',
+    ].join('\n');
+    expect(stripQuotes(text)).toBe(text);
+  });
+
   it('removes quoted lines that appear above the cut', () => {
     expect(stripQuotes('New text.\n> old line\nMore new text.')).toBe('New text.\nMore new text.');
   });

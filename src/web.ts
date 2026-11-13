@@ -25,9 +25,10 @@ import { nextDigestAt, renderDigest, type DigestItem } from './services/digest.j
 import { mailboxStatuses } from './services/health.js';
 import { CATEGORIES } from './services/triage.js';
 import { HEARTBEAT_KEY, type PollStats } from './services/watcher.js';
+import { attachmentLimitBytes, MAX_ATTACHMENTS } from './smtp.js';
 import {
   configuredAccounts, defaultBackend, forgetLive, liveMessage, mailboxFailure, rememberWhereabouts, routeActions,
-  webPushEnabled, whereabouts,
+  SIGNATURE_MAX_CHARS, signatureOf, webPushEnabled, whereabouts,
   type ActionContext, type WebBackend,
 } from './web-actions.js';
 import { clientScript, LANGUAGE_COOKIE, storeLanguageScript } from './web-client.js';
@@ -306,8 +307,14 @@ export async function handleApi(
       categories: CATEGORIES,
       accounts: accounts.map((a) => {
         const sending = backend.sending(a);
-        return { address: a.username, name: a.name, canSend: sending.available, ...(sending.reason ? { sendReason: sending.reason } : {}) };
+        return {
+          address: a.username, name: a.name, canSend: sending.available, ...(sending.reason ? { sendReason: sending.reason } : {}),
+          // What goes under a letter from this mailbox, for the session that may send one ('' when none).
+          ...(session === 'write' ? { signature: signatureOf(store, a.username) } : {}),
+        };
       }),
+      // What a letter may carry and a signature may say, so the page refuses what the server would.
+      limits: { attachmentBytes: attachmentLimitBytes(), attachmentFiles: MAX_ATTACHMENTS, signatureChars: SIGNATURE_MAX_CHARS },
       lastPollAt: store.getMeta(HEARTBEAT_KEY) ?? null,
       pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 300),
       mailboxes: mailboxStatuses(store, accounts),
@@ -677,6 +684,7 @@ const ICONS: Record<string, string> = {
   down: '<path d="M6 9l6 6 6-6"/>',
   reply: '<path d="M10 8l-5 5 5 5"/><path d="M5 13h9a5 5 0 0 1 5 5v1"/>',
   'reply-all': '<path d="M7 8l-5 5 5 5"/><path d="M13 8l-5 5 5 5"/><path d="M8 13h8a5 5 0 0 1 5 5v1"/>',
+  forward: '<path d="M14 8l5 5-5 5"/><path d="M19 13h-9a5 5 0 0 0-5 5v1"/>',
   archive: '<path d="M4 5h16v4H4z"/><path d="M6 9v9a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V9"/><path d="M10 13h4"/>',
   star: '<path d="M12 4l2.5 5.1 5.6.8-4 4 1 5.6-5.1-2.7-5.1 2.7 1-5.6-4-4 5.6-.8z"/>',
   trash: '<path d="M5 7h14"/><path d="M10 7V5h4v2"/><path d="M7 7l1 12h8l1-12"/>',
@@ -818,14 +826,20 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
       <div class="sheet-body">
         <form id="compose-form" autocomplete="off">
           <div id="compose-from" class="cfield" hidden>${worded('span', 'compose.from', 'class="label"')}<span id="compose-from-value" class="cvalue"></span></div>
-          <label class="cfield">${worded('span', 'compose.to', 'class="label"')}<input name="to" type="text" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false"><button id="compose-cc-toggle" type="button" class="text-btn quiet" data-i18n="compose.cc">${s('compose.cc')}</button></label>
+          <label class="cfield">${worded('span', 'compose.to', 'class="label" id="compose-to-label"')}<input name="to" type="text" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false" aria-labelledby="compose-to-label"><button id="compose-cc-toggle" type="button" class="text-btn quiet" data-i18n="compose.ccBcc">${s('compose.ccBcc')}</button></label>
           <label id="compose-cc-row" class="cfield" hidden>${worded('span', 'compose.cc', 'class="label"')}<input name="cc" type="text" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
-          <label class="cfield">${worded('span', 'compose.subject', 'class="label"')}<input name="subject" type="text"></label>
+          <label id="compose-bcc-row" class="cfield" hidden>${worded('span', 'compose.bcc', 'class="label"')}<input name="bcc" type="text" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+          <label class="cfield">${worded('span', 'compose.subject', 'class="label" id="compose-subject-label"')}<input name="subject" type="text" aria-labelledby="compose-subject-label">${iconButton('compose-attach', 'clip', 'compose.attach')}</label>
+          <input id="compose-file" type="file" multiple hidden>
           <div id="compose-ai" class="compose-ai" hidden>
             <div class="ai-line">${icon('sparkle')}<input name="instruction" type="text" placeholder="${s('compose.aiHint')}" aria-label="${s('compose.aiHint')}" data-i18n-label="compose.aiHint" enterkeyhint="go"><button id="compose-draft" type="button" class="text-btn" data-i18n="compose.draft">${s('compose.draft')}</button></div>
             <div id="compose-chips" class="chips"></div>
           </div>
           <textarea name="text" rows="9" placeholder="${s('compose.body')}" aria-label="${s('compose.body')}" data-i18n-label="compose.body"></textarea>
+          <div id="compose-sig" class="compose-sig" hidden></div>
+          <ul id="compose-files" class="compose-files" aria-label="${s('compose.files')}" data-i18n-label="compose.files" hidden></ul>
+          <p id="compose-pictures" class="compose-pictures" hidden></p>
+          <p id="compose-lost" class="compose-lost" hidden></p>
           <details id="compose-quoted" class="quoted" hidden><summary data-i18n="compose.quoted">${s('compose.quoted')}</summary><pre></pre></details>
           <p id="compose-note" class="compose-note" role="status"></p>
         </form>

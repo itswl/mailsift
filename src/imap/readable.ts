@@ -51,6 +51,9 @@ export interface ReadableMessage {
   from: ReadableAddress | null;
   to: ReadableAddress[];
   cc: ReadableAddress[];
+  /** Set when the message went to more people in To, or in copy, than are listed (at most 50 each). */
+  toTruncated?: boolean;
+  ccTruncated?: boolean;
   replyTo: ReadableAddress[];
   subject: string;
   /** ISO 8601, or null when the message carries no usable Date. */
@@ -99,23 +102,32 @@ function emptyReadable(): ReadableMessage {
   };
 }
 
-/** Flatten address headers, groups included, to the mailboxes they name. */
-function addresses(input: AddressObject | AddressObject[] | undefined): ReadableAddress[] {
+/**
+ * Flatten address headers, groups included, to the mailboxes they name.
+ * `cut` says there were more than are listed, so that whatever repeats the
+ * list (a forward's header) can say it is not everyone.
+ */
+function addressList(input: AddressObject | AddressObject[] | undefined): { list: ReadableAddress[]; cut: boolean } {
   const out: ReadableAddress[] = [];
+  let cut = false;
   const visit = (entry: EmailAddress): void => {
-    if (out.length >= MAX_ADDRESSES) return;
+    if (cut) return;
     if (entry.group) {
       for (const member of entry.group) visit(member);
       return;
     }
     const address = (entry.address ?? '').trim().toLowerCase();
-    if (address) out.push({ name: (entry.name ?? '').trim(), address });
+    if (!address) return;
+    if (out.length >= MAX_ADDRESSES) { cut = true; return; }
+    out.push({ name: (entry.name ?? '').trim(), address });
   };
   for (const object of Array.isArray(input) ? input : input ? [input] : []) {
     for (const entry of object.value ?? []) visit(entry);
   }
-  return out;
+  return { list: out, cut };
 }
+
+const addresses = (input: AddressObject | AddressObject[] | undefined): ReadableAddress[] => addressList(input).list;
 
 function domainOf(address: string): string {
   const at = address.lastIndexOf('@');
@@ -477,8 +489,12 @@ export async function parseReadable(source: Buffer, options: { authserv?: Authse
   try {
     const from = addresses(parsed.from)[0] ?? null;
     readable.from = from;
-    readable.to = addresses(parsed.to);
-    readable.cc = addresses(parsed.cc);
+    const to = addressList(parsed.to);
+    const cc = addressList(parsed.cc);
+    readable.to = to.list;
+    readable.cc = cc.list;
+    if (to.cut) readable.toTruncated = true;
+    if (cc.cut) readable.ccTruncated = true;
     readable.replyTo = addresses(parsed.replyTo);
     readable.subject = (parsed.subject ?? '').trim();
     readable.date = isoDate(parsed.date);

@@ -26,6 +26,7 @@ import {
 } from '../security.js';
 import type { Account } from '../config.js';
 import { getLogger } from '../logger.js';
+import { transferAllowanceMs } from '../smtp.js';
 
 // Getting a connection lives in connection.ts; these names are still offered from here.
 export {
@@ -348,6 +349,8 @@ export interface MailSafetyReport {
 export interface DownloadedAttachment {
   metadata: AttachmentInfo;
   content: Buffer;
+  /** Fetched as stored: the character set a text part's bytes are in, as its headers say. */
+  charset?: string;
 }
 
 interface DownloadedPrefix {
@@ -1098,15 +1101,27 @@ export async function inspectMailSafety(
  * Fetch one attachment body part on demand. The MIME part is checked against
  * BODYSTRUCTURE before downloading, so callers cannot use this path to fetch
  * arbitrary message sections. Nothing is persisted.
+ *
+ * `limit` replaces MCP_ATTACHMENT_MAX_BYTES for a caller bound by a limit of
+ * its own: a forward is held to what one outgoing message may carry, and
+ * stops reading as soon as the file would take it past that.
+ *
+ * `asStored` is for a caller that sends the file on. A text part that is not
+ * marked as an attachment is otherwise turned into UTF-8 and its flowed lines
+ * joined, which suits reading it here; sent on like that, under its old type,
+ * it would no longer be the file the sender attached. Asked for as stored, it
+ * comes as its bytes, with the character set they are in.
  */
 export async function fetchAttachmentByMessageId(
   account: Account,
   messageId: string,
   partId: string,
   hint?: LookupHint,
+  options: { limit?: number; asStored?: boolean } = {},
 ): Promise<DownloadedAttachment | undefined> {
   if (!/^\d+(?:\.\d+)*$/.test(partId)) throw new AttachmentNotFoundError(partId);
-  const maxBytes = attachmentMaxBytes();
+  const { limit, asStored = false } = options;
+  const maxBytes = limit !== undefined && Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : attachmentMaxBytes();
   return withSession(account, async (client) => {
     const folders = await lookupFolders(client, account, hint);
     for (const folder of folders) {
@@ -1124,7 +1139,9 @@ export async function fetchAttachmentByMessageId(
           if (!raw || raw.envelope?.messageId?.trim() !== messageId) continue;
           const metadata = extractAttachmentManifest(raw.bodyStructure).items.find((part) => part.partId === partId);
           if (!metadata) throw new AttachmentNotFoundError(partId);
-          const download = await client.download(uid, partId, { uid: true, maxBytes: maxBytes + 1 });
+          const download = await client.download(uid, partId, {
+            uid: true, maxBytes: maxBytes + 1, ...(asStored ? { decodeText: false } : {}),
+          });
           if (!download.content) throw new AttachmentNotFoundError(partId);
           const chunks: Buffer[] = [];
           let size = 0;
@@ -1137,7 +1154,8 @@ export async function fetchAttachmentByMessageId(
             }
             chunks.push(buffer);
           }
-          return { metadata, content: Buffer.concat(chunks, size) };
+          const charset = asStored && typeof download.meta?.charset === 'string' ? download.meta.charset : '';
+          return { metadata, content: Buffer.concat(chunks, size), ...(charset ? { charset } : {}) };
         }
       } finally {
         lock.release();
@@ -1386,6 +1404,8 @@ export function sentFolderPath(entries: readonly ListResponse[]): string | undef
  * mailbox has no Sent folder to put it in, which is not an error.
  */
 export async function appendToSent(account: Account, raw: Buffer): Promise<string | undefined> {
+  // A letter with files is many megabytes going up the line, and is given the time that takes.
+  const timeoutMs = 60_000 + transferAllowanceMs(raw.length);
   return withSession(account, async (client) => {
     const path = sentFolderPath(await listFolders(client));
     if (!path) return undefined;
@@ -1394,5 +1414,5 @@ export async function appendToSent(account: Account, raw: Buffer): Promise<strin
       throw new Error(`IMAP server rejected the append to ${path}`);
     }
     return path;
-  }, { repeatable: false, timeoutMs: 60_000 });
+  }, { repeatable: false, timeoutMs });
 }

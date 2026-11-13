@@ -32,7 +32,7 @@ MAIL_ACCOUNT_2=imap|me@example.com|password|imap.example.com
 
 ## Sending mail
 
-Nothing in mailsift sends mail unless `MCP_WRITE_TOKEN` is set and something presents it: a browser signed in to the [web view](web-view.md#writing) with it, or an MCP client calling [`send_mail`](mcp.md#write-tools-and-the-write-token). A local MCP client started over stdio presents nothing: it can already read the env file, so with `MCP_WRITE_TOKEN` set it has `send_mail` too. Then a reply or a new message leaves through the provider's own SMTP submission server, signed in with the credential that already reads the mailbox.
+Nothing in mailsift sends mail unless `MCP_WRITE_TOKEN` is set and something presents it: a browser signed in to the [web view](web-view.md#writing) with it, or an MCP client calling [`send_mail`](mcp.md#write-tools-and-the-write-token). A local MCP client started over stdio presents nothing: it can already read the env file, so with `MCP_WRITE_TOKEN` set it has `send_mail` too. Then a reply, a forward or a new message leaves through the provider's own SMTP submission server, signed in with the credential that already reads the mailbox.
 
 Every provider preset knows its server, so most mailboxes need no setting. The exceptions:
 
@@ -44,6 +44,8 @@ Every provider preset knows its server, so most mailboxes need no setting. The e
 Gmail, Outlook and QQ file a copy of what was sent into Sent by themselves. For every other provider mailsift appends the copy over IMAP.
 
 `SMTP_ENABLED=false` switches sending off for every mailbox, and so does `DRY_RUN=true`.
+
+`SMTP_ATTACHMENT_MAX_BYTES` is how many bytes of files one message may carry, decoded, counting the files added in the web view and those a forward carries on from the original: 20 MiB (`20971520`) by default, and never more than 35 MiB however it is set. Files grow by a third when they are encoded for mail, and most providers refuse a message of about 25 MB as it travels, so raise it only for a provider known to take more. A message also carries at most twenty files. The web view refuses what would go over before it sends, and the server refuses it again with `send_too_large` and the limit. Behind a reverse proxy, the proxy has to accept a request of that size for `/api/send` (the files in base64 and the letter: `client_max_body_size 30m` in nginx for the default, `48m` for the ceiling), or it refuses the letter before mailsift sees it; see [Behind a reverse proxy](web-view.md#behind-a-reverse-proxy).
 
 `MAIL_ACCOUNT_N_AUTHSERV_ID` is unrelated to sending but lives beside these: it names the server that receives this mailbox's mail, so the reader can tell a provider's verdict on a sender from one the sender wrote. See [Reading a message](web-view.md#reading-a-message).
 

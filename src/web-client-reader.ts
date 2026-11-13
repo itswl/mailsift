@@ -737,6 +737,7 @@ function openMenu(key) {
     body.appendChild(b);
   };
   item('i-reply-all', t('act.replyAll'), () => { closeSheet(menuSheet, false); startReply(key, 'replyAll'); });
+  item('i-forward', t('act.forward'), () => { closeSheet(menuSheet, false); startForward(key); });
   item('i-star', t(flags.flagged ? 'act.unstar' : 'act.star'), () => mailAction(key, flags.flagged ? 'unstar' : 'star'));
   item('i-read', t(flags.seen === false ? 'act.markRead' : 'act.markUnread'), () => mailAction(key, flags.seen === false ? 'mark_read' : 'mark_unread'));
   if (row.inSpam) item('i-inbox', t('act.notSpam'), () => mailAction(key, 'inbox'));

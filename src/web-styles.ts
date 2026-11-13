@@ -217,7 +217,7 @@ dialog.sheet:focus{outline:none}
   button.digest-item:hover .gist,.health-line:hover{text-decoration:underline;text-decoration-color:var(--line-strong)}
   .icon-btn:hover,.word-btn:hover{background:var(--fill);color:var(--text)}
   .num:hover{color:var(--accent);text-decoration-color:var(--accent)}
-  .token.clear:hover,.text-btn.quiet:hover,.login .lang:hover{color:var(--text)}
+  .token.clear:hover,.text-btn.quiet:hover,.login .lang:hover,.file-remove:hover{color:var(--text)}
 }
 .row.selected{background:var(--surface)}
 .mark{grid-area:mark;width:8px;height:8px;margin:7px 0 0 4px;border-radius:50%;background:var(--critical)}
@@ -471,7 +471,36 @@ a.primary-action{display:inline-flex;align-items:center;justify-content:center;t
 #compose-form textarea::placeholder,.cfield input::placeholder,.ai-line input::placeholder,.palette-field input::placeholder{color:var(--muted)}
 .compose .quoted pre{margin:4px 0 0;padding-left:12px;border-left:2px solid var(--line-strong);max-height:38vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:inherit;font-size:13px;line-height:1.5;color:var(--muted)}
 .compose-note{display:flex;flex-wrap:wrap;align-items:center;gap:0 4px;margin:8px 0 0;min-height:1.5em;font-size:13px;color:var(--muted)}
-.compose-note.failed{color:var(--critical-text)}
+.compose-note.failed,.compose-why.failed{color:var(--critical-text)}
+/* Attach sits at the end of the subject line, as Cc / Bcc does on To: there when wanted, quiet otherwise. */
+.cfield .icon-btn{min-width:40px;min-height:40px;margin-right:-4px}
+.cfield .icon-btn svg{width:18px;height:18px}
+/* The signature is part of the letter, so it reads as text under the body, muted: not a box. */
+.compose-sig{margin:12px 0 0;font-size:14px;line-height:1.5;color:var(--muted)}
+.compose-sig pre{margin:0;white-space:pre-wrap;word-break:break-word;font:inherit}
+.sig-line{display:flex;flex-wrap:wrap;align-items:center;gap:0 2px;margin:0 0 0 -8px}
+.sig-off,.sig-said{padding:0 4px 0 8px}
+.sig-said{color:var(--critical-text)}.sig-said:empty{display:none}
+.compose-sig textarea{display:block;width:100%;min-height:76px;margin:0;padding:8px 10px;border:0;border-radius:10px;background:var(--fill);color:var(--text);font:inherit;font-size:15px;line-height:1.5;resize:vertical;outline:none}
+.compose-sig textarea:focus-visible{outline:2px solid var(--accent);outline-offset:0}
+.sig-hint{margin:6px 0 0;font-size:12px}
+/* What the letter carries: a name and a size each, and a way to take it off. */
+.compose-files{display:flex;flex-wrap:wrap;gap:6px;margin:14px 0 0;padding:0;list-style:none}
+.compose-file{display:inline-flex;align-items:center;gap:6px;max-width:100%;min-height:34px;padding:0 0 0 10px;border-radius:8px;background:var(--fill);font-size:13px}
+.compose-file>.icon{flex:none;width:14px;height:14px;color:var(--muted)}
+.compose-file .name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.compose-file .size{flex:none;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.file-remove{appearance:none;display:grid;place-items:center;flex:none;width:32px;height:34px;margin:0;padding:0;border:0;border-radius:0 8px 8px 0;background:none;color:var(--muted);cursor:pointer}
+.file-remove .icon{width:14px;height:14px}
+/* One of the original's files taken off a forward: still there, crossed out, with the way to put it back. */
+.compose-file.off{background:none;box-shadow:inset 0 0 0 1px var(--line);color:var(--muted)}
+.compose-file.off .name{text-decoration:line-through;text-decoration-color:var(--line-strong)}
+.compose-file .file-back{min-height:34px;padding:0 10px;border-radius:0 8px 8px 0}
+/* Lines about what the letter carries, under it: muted, and kept until they no longer hold. */
+.compose-pictures,.compose-lost{display:flex;flex-wrap:wrap;align-items:center;gap:0 4px;margin:8px 0 0;font-size:13px;color:var(--muted)}
+/* A file held over the composer: the page answers that it will take it. */
+#compose .sheet-body{transition:background-color .12s}
+#compose.dropping .sheet-body{background:var(--accent-tint)}
 
 /* ---- The palette and the lightbox: the two things that open in the middle ---- */
 .palette{position:fixed;inset:12vh 0 auto;margin:0 auto;width:min(560px,calc(100vw - 24px));max-height:min(66vh,540px);padding:0;border:1px solid var(--line);border-radius:14px;background:var(--surface);color:var(--text);box-shadow:var(--shadow-pop);overflow:hidden;flex-direction:column}
