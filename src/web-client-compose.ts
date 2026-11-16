@@ -212,6 +212,175 @@ composeForm.addEventListener('input', (e) => {
 });
 composeForm.addEventListener('submit', (e) => e.preventDefault());
 
+// ---- Addresses: suggested for the one being typed in To, Cc or Bcc ----
+// One list, anchored under the field it serves and laid over what is below,
+// so nothing moves. It offers the people written to most and most lately,
+// then people who wrote (see /api/contacts). Accepting puts the bare address
+// in place of what was being typed, with a separator after it: the send path
+// takes addresses alone (see addresses() above).
+const suggestList = $('#compose-suggest');
+const ADDRESS_FIELDS = ['to', 'cc', 'bcc'];
+const suggest = { field: null, items: [], active: 0, seq: 0, timer: null, escapedAt: 0 };
+// The address being typed: what lies between the separators around the caret.
+function tokenAround(value, caret) {
+  const text = String(value || '');
+  const at = Math.max(0, Math.min(typeof caret === 'number' ? caret : text.length, text.length));
+  const before = text.slice(0, at);
+  const start = Math.max(before.lastIndexOf(','), before.lastIndexOf(';'), before.lastIndexOf('\n')) + 1;
+  const next = text.slice(at).search(/[,;\n]/);
+  const end = next === -1 ? text.length : at + next;
+  return { start, end, text: text.slice(start, end).trim() };
+}
+// The field with an address in place of the one being typed, a separator
+// after it, and the caret after that, ready for the next one.
+function acceptAddress(value, caret, address) {
+  const text = String(value || '');
+  const token = tokenAround(text, caret);
+  const head = text.slice(0, token.start).replace(/\s+$/, '');
+  const tail = text.slice(token.end).replace(/^[\s,;]+/, '');
+  const lead = (head ? head + ' ' : '') + address + ', ';
+  return { value: lead + tail, caret: lead.length };
+}
+// What a key does with the list open or shut: { act, active }. act is
+// 'move', 'accept', 'close', 'open', or '' when the key is the field's own.
+// Enter accepts and never sends; text being composed (an IME) keeps its keys.
+function suggestKey(key, open, count, active, composing) {
+  if (composing) return { act: '', active };
+  if (!open || !count) return { act: key === 'ArrowDown' ? 'open' : '', active: 0 };
+  if (key === 'ArrowDown') return { act: 'move', active: (active + 1) % count };
+  if (key === 'ArrowUp') return { act: 'move', active: (active - 1 + count) % count };
+  if (key === 'Enter' || key === 'Tab') return { act: 'accept', active };
+  if (key === 'Escape') return { act: 'close', active };
+  return { act: '', active };
+}
+// Addresses already on the letter, but for the one being typed.
+function takenAddresses(field, token) {
+  const out = new Set();
+  for (const name of ADDRESS_FIELDS) {
+    const input = composeForm[name];
+    const value = input === field ? input.value.slice(0, token.start) + input.value.slice(token.end) : input.value;
+    for (const a of addresses(value)) out.add(a.toLowerCase());
+  }
+  return out;
+}
+function lookUpAddresses(field, now) {
+  clearTimeout(suggest.timer);
+  const token = tokenAround(field.value, field.selectionStart);
+  const q = token.text;
+  // Nothing typed, or a name and address written out by hand: nothing to offer.
+  if (!q || /[<>"]/.test(q)) { closeSuggest(); return; }
+  const seq = ++suggest.seq;
+  suggest.timer = setTimeout(async () => {
+    let d = null;
+    try {
+      const r = await fetch('/api/contacts?limit=8&q=' + encodeURIComponent(q));
+      if (r.ok) d = await r.json();
+    } catch (e) {}
+    // Only the answer to what is in the field now: a later keystroke has asked again.
+    if (!d || seq !== suggest.seq || document.activeElement !== field) return;
+    const current = tokenAround(field.value, field.selectionStart);
+    if (current.text !== q) return;
+    const taken = takenAddresses(field, current);
+    const items = (Array.isArray(d.contacts) ? d.contacts : []).filter((c) => c && c.address && !taken.has(String(c.address).toLowerCase()));
+    // What is typed is already one of them, whole: there is nothing to add, and Enter must not change it.
+    if (items.some((c) => String(c.address).toLowerCase() === q.toLowerCase())) { closeSuggest(); return; }
+    showSuggest(field, items);
+  }, now ? 0 : 160);
+}
+function showSuggest(field, items) {
+  suggest.items = items.slice(0, 8);
+  if (!suggest.items.length) { closeSuggest(); return; }
+  suggest.field = field;
+  suggest.active = 0;
+  suggestList.replaceChildren();
+  suggest.items.forEach((c, i) => {
+    const li = el('li', 'suggest-item');
+    li.id = 'suggest-' + i;
+    li.setAttribute('role', 'option');
+    const name = c.name && String(c.name).toLowerCase() !== String(c.address).toLowerCase() ? c.name : '';
+    if (name) li.appendChild(el('span', 'suggest-name', name));
+    li.appendChild(el('span', 'suggest-address', c.address));
+    // A press on the list keeps the focus in the field it serves.
+    li.addEventListener('pointerdown', (e) => e.preventDefault());
+    li.addEventListener('mousedown', (e) => e.preventDefault());
+    li.onclick = () => acceptSuggestion(i);
+    li.onpointermove = () => { if (suggest.active !== i) { suggest.active = i; markSuggest(false); } };
+    suggestList.appendChild(li);
+  });
+  // Under the field's own line, from where its text starts.
+  const row = field.closest('.cfield');
+  suggestList.style.top = (row.offsetTop + row.offsetHeight) + 'px';
+  suggestList.style.left = field.offsetLeft + 'px';
+  suggestList.hidden = false;
+  for (const name of ADDRESS_FIELDS) composeForm[name].setAttribute('aria-expanded', String(composeForm[name] === field));
+  markSuggest(false);
+}
+function markSuggest(reveal) {
+  suggestList.querySelectorAll('.suggest-item').forEach((li, i) => {
+    const on = i === suggest.active;
+    li.classList.toggle('on', on);
+    li.setAttribute('aria-selected', String(on));
+    if (on && reveal) li.scrollIntoView({ block: 'nearest' });
+  });
+  if (suggest.field) suggest.field.setAttribute('aria-activedescendant', 'suggest-' + suggest.active);
+}
+// Shut the list; says whether it was open. An answer still on its way is for nothing now.
+function closeSuggest() {
+  clearTimeout(suggest.timer);
+  suggest.seq += 1;
+  const was = !suggestList.hidden;
+  suggestList.hidden = true;
+  suggestList.replaceChildren();
+  suggest.items = [];
+  suggest.field = null;
+  for (const name of ADDRESS_FIELDS) {
+    composeForm[name].setAttribute('aria-expanded', 'false');
+    composeForm[name].removeAttribute('aria-activedescendant');
+  }
+  return was;
+}
+// Escape on the list shuts the list and leaves the letter open, in a browser
+// that would close the sheet on that Escape as well (see the sheets' cancel).
+function suggestionsTookEscape() {
+  return closeSuggest() || Date.now() - suggest.escapedAt < 400;
+}
+function acceptSuggestion(i) {
+  const field = suggest.field, item = suggest.items[i];
+  if (!field || !item) return;
+  const next = acceptAddress(field.value, field.selectionStart, String(item.address));
+  closeSuggest();
+  field.value = next.value;
+  field.focus();
+  field.setSelectionRange(next.caret, next.caret);
+  // Kept with the draft, as anything typed is.
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(saveDraft, 400);
+}
+function suggestKeydown(e) {
+  const field = e.target;
+  if (e.isComposing || e.keyCode === 229) return;
+  // Ctrl or Cmd with Enter sends the letter, and Shift+Tab goes back: neither is the list's.
+  if (e.metaKey || e.ctrlKey || e.altKey || (e.shiftKey && e.key === 'Tab')) { closeSuggest(); return; }
+  const said = suggestKey(e.key, suggest.field === field && !suggestList.hidden, suggest.items.length, suggest.active, false);
+  if (!said.act) return;
+  // Down in an empty field is the field's own: there is nothing to look up.
+  if (said.act === 'open' && !tokenAround(field.value, field.selectionStart).text) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (said.act === 'move') { suggest.active = said.active; markSuggest(true); }
+  else if (said.act === 'accept') acceptSuggestion(said.active);
+  else if (said.act === 'close') { suggest.escapedAt = Date.now(); closeSuggest(); }
+  else if (said.act === 'open') lookUpAddresses(field, true);
+}
+for (const name of ADDRESS_FIELDS) {
+  const field = composeForm[name];
+  field.addEventListener('keydown', suggestKeydown);
+  field.addEventListener('input', (e) => { if (!e.isComposing) lookUpAddresses(field, false); });
+  field.addEventListener('compositionend', () => lookUpAddresses(field, false));
+  field.addEventListener('blur', () => setTimeout(() => { if (suggest.field === field && document.activeElement !== field) closeSuggest(); }, 150));
+}
+composeSheet.addEventListener('close', closeSuggest);
+
 // ---- Cc and Bcc: one switch for both ----
 function showCopies() {
   $('#compose-cc-row').hidden = false;
@@ -587,6 +756,7 @@ function showQuoted(state) {
 }
 function openCompose(state) {
   composing = state;
+  closeSuggest();
   composeForm.reset();
   $('#compose-title').textContent = t(state.titleKey);
   composeSay('');
@@ -1082,6 +1252,8 @@ async function deliver(job) {
   renderLede();
   renderBars();
   updateBadge();
+  // The letter is in its conversation now, under the message it answers.
+  refreshConversations();
 }
 // Putting the page away during the count sends the letter rather than leaving
 // it to a timer that may never run again: a phone that is locked, or an app

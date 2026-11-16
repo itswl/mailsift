@@ -4,6 +4,7 @@ Every setting is an environment variable read from `.env`. [`.env.example`](../.
 
 - [Mailboxes and folders](#mailboxes-and-folders)
 - [Sending mail](#sending-mail)
+- [Your sent mail](#your-sent-mail)
 - [Outputs](#outputs)
 - [What gets pushed](#what-gets-pushed)
 - [Your own rules](#your-own-rules)
@@ -48,6 +49,16 @@ Gmail, Outlook and QQ file a copy of what was sent into Sent by themselves. For 
 `SMTP_ATTACHMENT_MAX_BYTES` is how many bytes of files one message may carry, decoded, counting the files added in the web view and those a forward carries on from the original: 20 MiB (`20971520`) by default, and never more than 35 MiB however it is set. Files grow by a third when they are encoded for mail, and most providers take about 25 MB of files on a message (about 35 MB as the message travels): the default, about 28 MB as it travels, is within that, so raise it only for a provider known to take more. A message also carries at most twenty files. The web view refuses what would go over before it sends, and the server refuses it again with `send_too_large` and the limit. Behind a reverse proxy, the proxy has to accept a request of that size for `/api/send` (the files in base64 and the letter: `client_max_body_size 30m` in nginx for the default, `48m` for the ceiling), or it refuses the letter before mailsift sees it; see [Behind a reverse proxy](web-view.md#behind-a-reverse-proxy).
 
 `MAIL_ACCOUNT_N_AUTHSERV_ID` is unrelated to sending but lives beside these: it names the server that receives this mailbox's mail, so the reader can tell a provider's verdict on a sender from one the sender wrote. See [Reading a message](web-view.md#reading-a-message).
+
+## Your sent mail
+
+`SENT_MAIL_ENABLED` (default `true`) has the poll read each mailbox's Sent folder, after the folders it monitors, and store what you sent, so that a conversation in the web view and in MCP has both sides, a message you answered from another mail client leaves the queue, and the composer can suggest the people you write to. What is sent from the web view or through `send_mail` is stored the moment it leaves. It is one switch for every mailbox.
+
+A sent message is stored locally, in the state database, like the snippets of the mail you receive: who it went to (Bcc included), its subject and date, the names of its files, and the text you wrote without the quoted history below it, at most 8,000 characters. It is used for the conversation only. It is never judged, never sent to the model, never notified, never in a digest, and never in the queue, the list or the search. It is removed with everything else after `STATE_RETENTION_DAYS`, counted from the day it was sent.
+
+`SENT_LOOKBACK_DAYS` (default `30`, at most `365`, and never more than `STATE_RETENTION_DAYS`) is how far back the first look at a Sent folder reaches. That look reads the newest messages first, 500 at most, and spreads them over polls: each poll reads at most 50 sent messages per mailbox, new ones before the rest of the look back, on a budget of its own outside `MAX_MESSAGES_PER_POLL_TOTAL`. Of each message it reads the envelope, the References line and the first 64 KB, never a whole attachment. A mailbox without a Sent folder is normal, and one whose Sent folder cannot be read is logged and read again on the next poll; neither makes the mailbox look unhealthy.
+
+`SENT_MAIL_ENABLED=false` stops reading Sent and stops storing what is sent from mailsift. What was stored before stays, and still shows in its conversations, until retention removes it; delete the rows from the `sent_mail` table to remove it sooner.
 
 ## Outputs
 
@@ -98,7 +109,7 @@ Up to 0.1.97 the "already sent today" check used the UTC date, which got any hou
 
 `POLL_INTERVAL_SECONDS` (default `300`) is the time between polls. The first scan uses `INITIAL_LOOKBACK_DAYS` (default `3`). If a fresh folder or a folder whose UIDVALIDITY changed returns more than `MAX_MESSAGES_PER_LOOKBACK` messages (default `500`), mailsift processes the oldest bounded chunk and continues the backfill on later polls. It never advances past an unprocessed backlog just to avoid repeated work.
 
-Each folder is limited to `MAX_MESSAGES_PER_POLL` (default `200`). All accounts and folders share `MAX_MESSAGES_PER_POLL_TOTAL` (default `500`). When the ordinary total cap is reached, unprocessed folders keep their cursors and continue on the next poll. Selected UIDs are processed oldest-first so a cap does not skip older mail.
+Each folder is limited to `MAX_MESSAGES_PER_POLL` (default `200`). All accounts and folders share `MAX_MESSAGES_PER_POLL_TOTAL` (default `500`); reading Sent has a budget of its own (see [Your sent mail](#your-sent-mail)). When the ordinary total cap is reached, unprocessed folders keep their cursors and continue on the next poll. Selected UIDs are processed oldest-first so a cap does not skip older mail.
 
 Messages up to `MAX_MESSAGE_SOURCE_BYTES` (default `5 MiB`) use the normal MIME parser. For larger messages, mailsift reads only the selected `text/plain` body part, falling back to HTML, so a large attachment is not pulled into triage. If that text body alone exceeds the limit, the message is recorded as a dead letter and can be inspected through `list_dead_letters`; `list_attachments` can still look up its files by account and Message-ID.
 

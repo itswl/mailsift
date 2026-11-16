@@ -641,35 +641,155 @@ function detail(row) {
   box.appendChild(message);
   attachmentSection(box, row);
   safetySection(box, row);
+  // Last, under everything: when it arrives it moves nothing already on the screen.
+  const conversation = conversationSection(box, row);
   loadMessage(row, message, { trust, to, actions }, false);
+  // After the message's own read has started; at once when it is already known.
+  if (!showKnownConversation(conversation)) setTimeout(() => loadConversation(conversation, false), 300);
   return box;
 }
-function threadDetail(thread) {
-  const box = detail(thread.latest);
-  const older = (thread.messages || []).slice(1);
-  if (!older.length) return box;
-  const now = new Date();
-  const history = el('section', 'thread-history');
-  history.appendChild(el('h4', 'section-label', t('thread.earlier') + DOT + older.length));
-  const ul = el('ul', 'timeline');
-  for (const message of older) {
-    const li = el('li');
-    const d = dateOf(message);
-    // Each earlier message opens as itself, with its own text and actions.
-    const open = el('button', 'tl-open');
-    open.type = 'button';
-    open.onclick = () => { extraRows.set(rowKey(message), message); openDetail(rowKey(message)); };
-    open.appendChild(el('div', 'tl-head', (message.senderName || message.sender || t('unknownSender')) + DOT + dayLabel(d, now) + NB + hhmm(d)));
-    if (message.subject && message.subject !== thread.latest.subject) open.appendChild(el('div', 'tl-subject', message.subject));
-    if (message.summary) open.appendChild(el('div', 'tl-sum', message.summary));
-    li.appendChild(open);
-    ul.appendChild(li);
+// A thread opens on its latest message; the rest of it is its conversation.
+const detailFor = (item) => detail(isThread(item) ? item.latest : item);
+
+// ---- The conversation: the rest of the thread, the reader's own messages in it ----
+// Read from the store, never the mailbox: received messages open as
+// themselves, and the reader's own (from Sent, or sent from here) open in
+// place to what they wrote. Kept a minute per message, so drawing the reader
+// again (another language, a refresh) does not flicker.
+const conversations = new Map();
+const openConversations = new Set();
+const sentOpen = new Set();
+function conversationSection(box, row) {
+  const section = el('section', 'conversation');
+  section.hidden = true;
+  box.appendChild(section);
+  for (const known of Array.from(openConversations)) if (!known.section.isConnected) openConversations.delete(known);
+  const entry = { section, row, key: rowKey(row) };
+  openConversations.add(entry);
+  return entry;
+}
+function showKnownConversation(entry) {
+  const kept = conversations.get(entry.key);
+  if (!kept || Date.now() - kept.at > 60000) return false;
+  drawConversation(entry, kept.data);
+  return true;
+}
+function loadConversation(entry, fresh) {
+  if (!fresh && showKnownConversation(entry)) return;
+  if (!fresh && entry.loading) return;
+  entry.loading = true;
+  fetch('/api/conversation?key=' + encodeURIComponent(entry.key)).then(async (r) => {
+    if (!r.ok) return;
+    const d = await r.json();
+    conversations.delete(entry.key);
+    conversations.set(entry.key, { at: Date.now(), data: d });
+    while (conversations.size > 24) conversations.delete(conversations.keys().next().value);
+    drawConversation(entry, d);
+  }).catch(() => {}).finally(() => { entry.loading = false; });
+}
+// What changed in the store (a reply sent from here, one found in Sent) is drawn in the open reader.
+function refreshConversations() {
+  conversations.clear();
+  for (const entry of Array.from(openConversations)) {
+    if (!entry.section.isConnected) openConversations.delete(entry);
+    else loadConversation(entry, true);
   }
-  history.appendChild(ul);
-  box.appendChild(history);
-  return box;
 }
-const detailFor = (item) => (isThread(item) ? threadDetail(item) : detail(item));
+function drawConversation(entry, d) {
+  const section = entry.section;
+  const messages = Array.isArray(d && d.messages) ? d.messages : [];
+  section.replaceChildren();
+  // Nothing at all when the thread holds only this message.
+  if (!messages.some((m) => !(m.direction === 'in' && m.current))) { section.hidden = true; return; }
+  section.hidden = false;
+  const omitted = Number(d.omitted) || 0;
+  section.appendChild(el('h4', 'section-label', t('conv.title') + DOT + (messages.length + omitted)));
+  if (omitted) section.appendChild(el('p', 'conv-omitted', fill('conv.omitted', { count: omitted })));
+  const ul = el('ul', 'timeline');
+  const now = new Date();
+  for (const m of messages) ul.appendChild(m.direction === 'out' ? sentItem(m, entry.row, now) : receivedItem(m, entry.row, now));
+  section.appendChild(ul);
+}
+// A subject is worth a line of its own only where it says something new, not "Re:" the same again.
+function bareSubject(value) {
+  let s = String(value || '').trim();
+  for (let i = 0; i < 5; i += 1) {
+    const next = s.replace(/^(re|fwd?|fw|aw|wg|sv|vs|回复|答复|回覆|转发|轉發)\s*(\[\d+\])?\s*[:：]\s*/i, '');
+    if (next === s) break;
+    s = next;
+  }
+  return s.toLowerCase();
+}
+const newSubject = (subject, current) => Boolean(subject) && bareSubject(subject) !== bareSubject(current.subject);
+function whenLine(at, now) {
+  const d = new Date(at);
+  return isNaN(d) ? '' : dayLabel(d, now) + NB + hhmm(d);
+}
+function receivedItem(m, current, now) {
+  const li = el('li');
+  if (m.current) {
+    // Where the message being read sits in its conversation.
+    li.className = 'tl-current';
+    li.setAttribute('aria-current', 'true');
+    li.appendChild(el('div', 'tl-head', [t('conv.this'), whenLine(m.at, now)].filter(Boolean).join(DOT)));
+    return li;
+  }
+  // Each received message opens as itself, with its own text and actions.
+  const open = el('button', 'tl-open');
+  open.type = 'button';
+  open.onclick = () => { extraRows.set(rowKey(m), m); openDetail(rowKey(m)); };
+  open.appendChild(el('div', 'tl-head', [m.senderName || m.sender || t('unknownSender'), whenLine(m.at, now)].filter(Boolean).join(DOT)));
+  if (newSubject(m.subject, current)) open.appendChild(el('div', 'tl-subject', m.subject));
+  const gist = m.summary || m.snippet;
+  if (gist) open.appendChild(el('div', 'tl-sum', gist));
+  li.appendChild(open);
+  return li;
+}
+// Names, or addresses where there is no name: two, then how many more.
+function peopleLine(list) {
+  const names = (list || []).map((p) => p.name || p.address).filter(Boolean);
+  return names.slice(0, 2).join(', ') + (names.length > 2 ? ' +' + (names.length - 2) : '');
+}
+function sentItem(m, current, now) {
+  const li = el('li', 'tl-yours');
+  const whom = peopleLine((m.to || []).concat(m.cc || []).length ? (m.to || []).concat(m.cc || []) : m.bcc);
+  const head = el('div', 'tl-head');
+  head.appendChild(el('span', 'tl-you', t('conv.you')));
+  head.appendChild(textNode([whom ? fill('conv.to', { list: whom }) : '', whenLine(m.at, now)].filter(Boolean).map((s) => DOT + s).join('')));
+  const open = el('button', 'tl-open');
+  open.type = 'button';
+  open.appendChild(head);
+  if (newSubject(m.subject, current)) open.appendChild(el('div', 'tl-subject', m.subject));
+  const first = el('div', 'tl-sum', m.excerpt || t('conv.noText'));
+  open.appendChild(first);
+  const full = el('div', 'tl-full');
+  const id = String(m.id);
+  const show = (on) => {
+    full.hidden = !on;
+    first.hidden = on;
+    open.setAttribute('aria-expanded', String(on));
+    if (on && !full.childNodes.length) fillSent(full, m);
+    if (on) sentOpen.add(id); else sentOpen.delete(id);
+  };
+  open.onclick = () => show(full.hidden);
+  li.appendChild(open);
+  li.appendChild(full);
+  show(sentOpen.has(id));
+  return li;
+}
+// One of the reader's own messages opened in place: what they wrote, then whom it went to and what it carried.
+function fillSent(box, m) {
+  box.appendChild(textBody(m.text || t('conv.noText'), ''));
+  const meta = el('dl', 'tl-meta');
+  const add = (label, value) => { if (!value) return; meta.appendChild(el('dt', null, label)); meta.appendChild(el('dd', null, value)); };
+  const all = (list) => (list || []).map((p) => (p.name ? p.name + ' <' + p.address + '>' : p.address)).join(', ');
+  add(t('compose.to'), all(m.to));
+  add(t('compose.cc'), all(m.cc));
+  add(t('compose.bcc'), all(m.bcc));
+  const files = m.attachments || {};
+  if (files.count) add(t('detail.attachments'), (files.names || []).length ? files.names.join(', ') : String(files.count));
+  box.appendChild(meta);
+}
 
 // ---- Acting on a message ----
 function requireWrite() {

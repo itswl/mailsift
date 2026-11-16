@@ -70,6 +70,7 @@ const NOT_STORED: readonly string[] = [
   'Attachment contents. Only names, MIME types, part ids and sizes are stored; list_attachments fetches a file on demand.',
   'Verification codes and sign-in links from mail that was judged locally. Those are deliberately kept out of stored text.',
   'Anything older than STATE_RETENTION_DAYS, which defaults to 90 days.',
+  'The owner\'s own sent mail, as far as these tools go: it is stored for the conversation only, so the thread resource and list_threads include it and find_contacts reads it, and no filter here ever returns it.',
 ];
 
 export function renderSearchSyntax(): string {

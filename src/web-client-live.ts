@@ -23,7 +23,8 @@ let stream = null, liveSeen = null, liveTimer, liveRetry = 3000, liveAgain;
 function liveRefresh() {
   // Several events in a breath are one refresh.
   clearTimeout(liveTimer);
-  liveTimer = setTimeout(() => { refresh(); chrome(); }, 150);
+  // An open conversation is drawn again too: a reply found in Sent belongs in it.
+  liveTimer = setTimeout(() => { refresh(); chrome(); refreshConversations(); }, 150);
 }
 function closeStream() {
   clearTimeout(liveAgain);

@@ -150,7 +150,7 @@ describe('tool surface', () => {
     const client = await connect(new StateStore(':memory:'));
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
-      'feedback_rules', 'get_mail', 'health', 'inspect_mail_safety', 'list_accounts', 'list_attachments', 'list_audit', 'list_dead_letters',
+      'feedback_rules', 'find_contacts', 'get_mail', 'health', 'inspect_mail_safety', 'list_accounts', 'list_attachments', 'list_audit', 'list_dead_letters',
       'list_digest', 'list_folders', 'list_mail', 'list_threads', 'mail_summary', 'needs_you', 'observability',
       'prepare_forward', 'prepare_reply', 'read_message', 'recovery_status', 'scan_attachment', 'search_mail',
     ]);
@@ -1758,5 +1758,78 @@ describe('rate limiting', () => {
     const start = Date.parse('2026-09-28T00:00:00Z');
     expect(Array.from({ length: 120 }, (_, n) => allowMcpRequest('default', start + n)).every(Boolean)).toBe(true);
     expect(allowMcpRequest('default', start + 121)).toBe(false);
+  });
+});
+
+describe('the owner\'s own mail', () => {
+  beforeEach(() => { process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw'; });
+
+  it('stores what send_mail sent as the owner\'s, in the conversation it answers', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    await call(client, 'send_mail', { replyTo: '<one@x>', text: 'Confirmed, thank you.', bcc: ['books@qq.com'] });
+    const thread = state.sentInThread('me@qq.com|<root@x>');
+    expect(thread).toHaveLength(1);
+    expect(thread[0]).toMatchObject({
+      source: 'mcp', answers: '<one@x>', text: 'Confirmed, thank you.', bcc: [{ name: '', address: 'books@qq.com' }],
+    });
+  });
+
+  it('reads a thread with the owner\'s messages in it, marked as theirs, with whom each went to and what it said', async () => {
+    const state = seeded();
+    state.markSeen('t1', 'me@qq.com', 'Lunch?');
+    state.recordOutcome('t1', 'info', false, {
+      messageId: '<lunch@example.org>', threadKey: 'me@qq.com|<lunch@example.org>', sender: 'ann@example.org', senderName: 'Ann',
+      summary: 'Ann asks about lunch.', mailDate: '2026-11-16T10:00:00.000Z',
+    });
+    state.recordSent({
+      account: 'me@qq.com', messageId: '<r@qq.com>', threadKey: 'me@qq.com|<lunch@example.org>', answers: '<lunch@example.org>',
+      subject: 'Re: Lunch?', fromAddr: 'me@qq.com', to: [{ name: 'Ann', address: 'ann@example.org' }], cc: [],
+      bcc: [{ name: '', address: 'books@qq.com' }], date: '2026-11-16T11:00:00.000Z', text: 'Thursday works.',
+      attachmentCount: 1, attachmentNames: ['menu.pdf'], folder: 'Sent', source: 'poll',
+    });
+    // A conversation the owner began, that nobody has answered yet.
+    state.recordSent({
+      account: 'me@qq.com', messageId: '<new@qq.com>', threadKey: 'me@qq.com|<new@qq.com>', subject: 'Hello',
+      fromAddr: 'me@qq.com', to: [{ name: '', address: 'bob@example.org' }], cc: [], bcc: [], date: '2026-11-16T12:00:00.000Z',
+      text: 'Hi Bob.', attachmentCount: 0, attachmentNames: [], source: 'page',
+    });
+    const client = await connect(state);
+    const page = String(((await client.readResource({ uri: `mailsift://thread/${encodeURIComponent('me@qq.com|<lunch@example.org>')}` }))
+      .contents[0] as { text: string }).text);
+    expect(page).toContain('- Messages: 2 (1 sent by the owner)');
+    expect(page.indexOf('## 1. From Ann on')).toBeLessThan(page.indexOf('## 2. From the owner to Ann <ann@example.org>'));
+    expect(page).toContain('- Bcc: books@qq.com');
+    expect(page).toContain('- Files: menu.pdf');
+    expect(page).toContain('### What the owner wrote\n\nThursday works.');
+    const begun = String(((await client.readResource({ uri: `mailsift://thread/${encodeURIComponent('me@qq.com|<new@qq.com>')}` }))
+      .contents[0] as { text: string }).text);
+    expect(begun).toContain('# Hello');
+    expect(begun).toContain('Hi Bob.');
+
+    // The thread list counts them, and stays the received mail's.
+    const threads = (await call(client, 'list_threads', { hours: 24 * 365 * 5 }))['threads'] as Array<Record<string, unknown>>;
+    expect(threads.find((t) => t['threadKey'] === 'me@qq.com|<lunch@example.org>')).toMatchObject({ sentCount: 1, lastWordYours: true });
+    expect(threads.some((t) => t['threadKey'] === 'me@qq.com|<new@qq.com>')).toBe(false);
+    // And the tools about received mail never return it.
+    expect((await call(client, 'search_mail', { query: 'Thursday' }))['count']).toBe(0);
+    expect((await call(client, 'get_mail', { messageId: '<r@qq.com>' }))['found']).toBe(false);
+  });
+
+  it('turns a name into addresses with the read credential alone', async () => {
+    const state = seeded();
+    state.recordSent({
+      account: 'me@qq.com', messageId: '<r@qq.com>', threadKey: 'me@qq.com|<r@qq.com>', subject: 's', fromAddr: 'me@qq.com',
+      to: [{ name: 'Alice Chen', address: 'alice@acme.example' }], cc: [], bcc: [], date: new Date().toISOString(), text: '',
+      attachmentCount: 0, attachmentNames: [], source: 'poll',
+    });
+    const client = await connect(state);
+    expect(await call(client, 'find_contacts', { query: 'alice' })).toEqual({
+      query: 'alice',
+      contacts: [expect.objectContaining({ address: 'alice@acme.example', name: 'Alice Chen', sent: 1, source: 'sent' })],
+    });
+    expect(await client.callTool({ name: 'find_contacts', arguments: { query: 'alice', limit: 21 } })).toMatchObject({ isError: true });
+    expect(await client.callTool({ name: 'find_contacts', arguments: { query: '' } })).toMatchObject({ isError: true });
   });
 });

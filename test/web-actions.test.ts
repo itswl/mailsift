@@ -1756,3 +1756,89 @@ describe('the page’s own protection', () => {
     expect(script).not.toContain('${');
   });
 });
+
+describe('the conversation and the owner\'s own mail', () => {
+  /** A received message in a thread of its own key, as the poll keys one. */
+  function threaded(): StateStore {
+    const store = seeded();
+    store.markSeen('t1', 'me@qq.com', 'Lunch?');
+    store.recordOutcome('t1', 'critical', true, {
+      messageId: '<lunch@example.org>', threadKey: 'me@qq.com|<lunch@example.org>', sender: 'ann@example.org',
+      senderName: 'Ann', summary: 'Ann asks about lunch.', folder: 'INBOX', mailDate: new Date(Date.now() - 3_600_000).toISOString(),
+    });
+    return store;
+  }
+
+  it('stores a reply from the page at once, with its recipients (Bcc too) and its words, in the conversation it answers', async () => {
+    const store = threaded();
+    const sent = await post(store, '/api/send', {
+      replyTo: 't1', to: ['ann@example.org'], bcc: ['boss@qq.com'], subject: 'Re: Lunch?',
+      text: 'Thursday works.\n\nOn Mon, Ann <ann@example.org> wrote:\n> Lunch?', references: [],
+    });
+    expect(sent.answer.status).toBe(200);
+    const thread = store.sentInThread('me@qq.com|<lunch@example.org>');
+    expect(thread).toHaveLength(1);
+    expect(thread[0]).toMatchObject({
+      source: 'page', messageId: '<sent@x>', answers: '<lunch@example.org>', text: 'Thursday works.',
+      to: [{ name: '', address: 'ann@example.org' }], bcc: [{ name: '', address: 'boss@qq.com' }],
+    });
+    // The page dealt with the original itself; the poll's copy later neither doubles the row nor deals with it again.
+    expect(store.getMail('t1')!.handledAt).not.toBeNull();
+    store.setHandled('t1', false);
+    // The copy in Sent, as the poll reads it: no Bcc line, and where it is.
+    store.recordSent({
+      account: 'me@qq.com', messageId: '<sent@x>', threadKey: 'me@qq.com|<lunch@example.org>', answers: '<lunch@example.org>',
+      subject: 'Re: Lunch?', fromAddr: 'me@qq.com', to: [{ name: 'Ann', address: 'ann@example.org' }], cc: [], bcc: [],
+      date: new Date().toISOString(), text: 'Thursday works.', attachmentCount: 0, attachmentNames: [],
+      folder: 'Sent', uid: 12, uidValidity: '4', source: 'poll',
+    });
+    expect(store.sentCount()).toBe(1);
+    expect(store.sentInThread('me@qq.com|<lunch@example.org>')[0]).toMatchObject({
+      source: 'page', folder: 'Sent', bcc: [{ name: '', address: 'boss@qq.com' }],
+    });
+    expect(store.answerFromSent(['me@qq.com'])).toEqual([]);
+    expect(store.getMail('t1')!.handledAt).toBeNull();
+
+    const conversation = await call(store, '/api/conversation?key=t1', { as: 'read' });
+    expect(conversation.answer.status).toBe(200);
+    expect(conversation.answer.cacheControl).toBe('no-store');
+    const messages = conversation.json['messages'] as Array<Record<string, unknown>>;
+    expect(messages.map((m) => m['direction'])).toEqual(['in', 'out']);
+    expect(messages[0]).toMatchObject({ dedupKey: 't1', current: true, summary: 'Ann asks about lunch.' });
+    expect(messages[1]).toMatchObject({ excerpt: 'Thursday works.', text: 'Thursday works.', bcc: [{ address: 'boss@qq.com' }] });
+  });
+
+  it('stores nothing about what was sent once Sent is switched off, and sends all the same', async () => {
+    process.env.SENT_MAIL_ENABLED = 'false';
+    const store = threaded();
+    const sent = await post(store, '/api/send', { replyTo: 't1', to: ['ann@example.org'], subject: 'Re: Lunch?', text: 'Yes.' });
+    expect(sent.answer.status).toBe(200);
+    expect(store.sentCount()).toBe(0);
+  });
+
+  it('serves the conversation to any session that may read, and nothing to one that may not', async () => {
+    const store = threaded();
+    expect((await call(store, '/api/conversation?key=t1', { as: 'none' })).answer.status).toBe(401);
+    expect((await call(store, '/api/conversation?key=t1', { as: 'write' })).answer.status).toBe(200);
+    expect((await call(store, '/api/conversation', { as: 'read' })).answer.status).toBe(400);
+    expect((await call(store, '/api/conversation?key=nothing-here', { as: 'read' })).json).toMatchObject({ code: 'notFound' });
+    const alone = await call(store, '/api/conversation?key=k1', { as: 'read' });
+    expect(alone.json).toMatchObject({ count: 1, omitted: 0 });
+  });
+
+  it('suggests addresses to a session that may read, bounded, and nothing for nothing typed', async () => {
+    const store = threaded();
+    for (let n = 0; n < 25; n += 1) {
+      store.recordSent({
+        account: 'me@qq.com', messageId: `<s${n}@qq.com>`, threadKey: `me@qq.com|<s${n}@qq.com>`, subject: 's', fromAddr: 'me@qq.com',
+        to: [{ name: `Team ${n}`, address: `team${n}@acme.example` }], cc: [], bcc: [], date: new Date().toISOString(), text: '',
+        attachmentCount: 0, attachmentNames: [], source: 'poll',
+      });
+    }
+    expect((await call(store, '/api/contacts?q=team', { as: 'none' })).answer.status).toBe(401);
+    expect(((await call(store, '/api/contacts?q=team', { as: 'read' })).json['contacts'] as unknown[])).toHaveLength(8);
+    expect(((await call(store, '/api/contacts?q=team&limit=100', { as: 'read' })).json['contacts'] as unknown[])).toHaveLength(20);
+    expect((await call(store, '/api/contacts?q=%20%20', { as: 'read' })).json).toEqual({ contacts: [] });
+    expect((await call(store, '/api/contacts', { as: 'read' })).json).toEqual({ contacts: [] });
+  });
+});

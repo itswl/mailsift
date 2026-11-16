@@ -893,7 +893,7 @@ describe('the composer', () => {
       t, fill, el: () => node(), composeSay: (text: string) => { note['textContent'] = text; },
       drawChips: () => undefined, showQuoted: () => undefined, showCopies: () => undefined, drawSignature: () => undefined,
       drawFiles: () => undefined, openSheet: () => undefined, growText: () => undefined, setTimeout: () => undefined,
-      signatureOf: () => '', fromOf: () => 'me@qq.com', saveDraft: () => undefined, lang: 'en',
+      signatureOf: () => '', fromOf: () => 'me@qq.com', saveDraft: () => undefined, lang: 'en', closeSuggest: () => false,
     };
     const page = lifted<{ openCompose: (state: Record<string, unknown>) => void; heldFiles: Map<string, unknown> }>(
       ['homeId', 'draftId', 'heldFiles', 'choosesFrom', 'sentenceGap', 'drawLost', 'openCompose'], '({ openCompose, heldFiles })', context,
@@ -1023,7 +1023,7 @@ describe('the composer', () => {
       letterId: () => `letter${(ids += 1)}`, draftTimer: undefined, clearTimeout: () => undefined, setInterval: () => 1,
       clearInterval: () => undefined, closeSheet: () => undefined, raiseToast: () => undefined, announce: () => undefined,
       hideSending: () => undefined, deliver: (job: unknown) => delivered.push(job), pendingSend: null, composing: null,
-      lang: 'en',
+      lang: 'en', closeSuggest: () => false,
     };
     const page = lifted<{
       openCompose: (state: Record<string, unknown>) => void; saveDraft: () => void; sendCompose: () => void;
@@ -1192,8 +1192,9 @@ describe('the composer', () => {
       bytesOf: () => 10, KEEPALIVE_BYTES: 60000, localStorage: { removeItem: () => undefined }, t, fill,
       attentionSet: new Set(['k1']), rowByKey: () => ({ handledAt: null }), markHandledLocal: (key: string) => marked.push(key),
       attentionCount: 3, liveData: new Map(), renderList: () => undefined, renderLede: () => undefined,
-      renderBars: () => undefined, updateBadge: () => undefined,
+      renderBars: () => undefined, updateBadge: () => undefined, refreshConversations: () => { redrawn += 1; },
     };
+    let redrawn = 0;
     const deliver = lifted<(job: unknown) => Promise<void>>(['homeId', 'draftId', 'heldFiles', 'deliver'], 'deliver', context);
     const job = () => ({ payload: { forwardOf: 'k1' }, files: [], state: { mode: 'forward', key: 'k1', draftKey: 'draft:sending:x' } });
     // Forwarded to another of the owner's own mailboxes: still to be dealt with.
@@ -1205,6 +1206,8 @@ describe('the composer', () => {
     await deliver(job());
     expect(marked).toEqual(['k1']);
     expect(context['attentionCount']).toBe(2);
+    // Each letter that left is drawn into the conversation open in the reader at once.
+    expect(redrawn).toBe(2);
   });
 
   it('says a proxy refused the size, or stopped waiting, rather than blaming the mail server', () => {
@@ -1229,6 +1232,181 @@ describe('the composer', () => {
       expect(STRINGS['zh-CN'][key], key).toBeTruthy();
       expect(STRINGS['zh-CN'][key]).not.toBe(STRINGS.en[key]);
     }
+  });
+});
+
+describe('suggesting addresses while one is typed', () => {
+  it('offers them under To, Cc and Bcc as a list a screen reader can follow', async () => {
+    const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
+    for (const name of ['to', 'cc', 'bcc']) {
+      expect(page).toMatch(new RegExp(`<input name="${name}"[^>]*role="combobox" aria-autocomplete="list" aria-controls="compose-suggest" aria-expanded="false"`));
+    }
+    expect(page).toContain('<ul id="compose-suggest" class="suggest" role="listbox" aria-label="Suggested addresses" data-i18n-label="compose.suggestions" hidden></ul>');
+    const chinese = String((await routeWeb(request({ headers: { 'accept-language': 'zh-CN' } }), url('/'), '', seeded())).body);
+    expect(chinese).toContain('aria-label="建议的地址"');
+    // Escape on the list shuts the list, not the letter.
+    expect(clientScript()).toContain('if (dialog === composeSheet && suggestionsTookEscape()) return;');
+  });
+
+  it('puts the address in place of what is being typed, with a separator after it', () => {
+    const page = lifted<{
+      tokenAround: (value: string, caret: number) => { start: number; end: number; text: string };
+      acceptAddress: (value: string, caret: number, address: string) => { value: string; caret: number };
+    }>(['tokenAround', 'acceptAddress'], '({ tokenAround, acceptAddress })');
+    expect(page.tokenAround('bob@x.org, an', 13)).toEqual({ start: 10, end: 13, text: 'an' });
+    expect(page.acceptAddress('an', 2, 'ann@acme.example')).toEqual({ value: 'ann@acme.example, ', caret: 18 });
+    expect(page.acceptAddress('bob@x.org, an', 13, 'ann@acme.example'))
+      .toEqual({ value: 'bob@x.org, ann@acme.example, ', caret: 29 });
+    // In the middle of the line only the address typed there is replaced, whatever separates them.
+    const middle = 'a@b.co; jo, c@d.co';
+    expect(page.acceptAddress(middle, middle.indexOf('jo') + 2, 'john@x.org'))
+      .toEqual({ value: 'a@b.co; john@x.org, c@d.co', caret: 20 });
+    // What the send path makes of it: the bare addresses, each once.
+    const addresses = lifted<(value: string) => string[]>(['addresses'], 'addresses');
+    expect(addresses(page.acceptAddress(middle, 10, 'john@x.org').value)).toEqual(['a@b.co', 'john@x.org', 'c@d.co']);
+  });
+
+  it('moves with the arrows, accepts with Enter or Tab, shuts with Escape, and leaves an IME its keys', () => {
+    const decide = lifted<(key: string, open: boolean, count: number, active: number, composing: boolean) => { act: string; active: number }>(
+      ['suggestKey'], 'suggestKey',
+    );
+    expect(decide('ArrowDown', true, 3, 0, false)).toEqual({ act: 'move', active: 1 });
+    expect(decide('ArrowDown', true, 3, 2, false)).toEqual({ act: 'move', active: 0 });
+    expect(decide('ArrowUp', true, 3, 0, false)).toEqual({ act: 'move', active: 2 });
+    expect(decide('Enter', true, 3, 1, false)).toEqual({ act: 'accept', active: 1 });
+    expect(decide('Tab', true, 3, 2, false)).toEqual({ act: 'accept', active: 2 });
+    expect(decide('Escape', true, 3, 0, false)).toEqual({ act: 'close', active: 0 });
+    expect(decide('a', true, 3, 0, false).act).toBe('');
+    // Shut, the keys are the field's own; ArrowDown asks for the list.
+    expect(decide('Enter', false, 0, 0, false).act).toBe('');
+    expect(decide('Escape', false, 0, 0, false).act).toBe('');
+    expect(decide('ArrowDown', false, 0, 0, false).act).toBe('open');
+    for (const key of ['Enter', 'ArrowDown', 'Escape', 'Tab']) expect(decide(key, true, 3, 0, true).act, key).toBe('');
+  });
+
+  it('never lets Enter on the list send the letter or reach the form', () => {
+    const done: string[] = [];
+    const field = { name: 'to', value: 'an', selectionStart: 2 };
+    const context: Record<string, unknown> = {
+      suggest: { field, items: [{ address: 'ann@acme.example' }, { address: 'anand@acme.example' }], active: 0, escapedAt: 0 },
+      suggestList: { hidden: false },
+      acceptSuggestion: (i: number) => done.push(`accept ${i}`),
+      closeSuggest: () => { done.push('close'); return true; },
+      markSuggest: () => done.push('mark'),
+      lookUpAddresses: () => done.push('look up'),
+    };
+    const keydown = lifted<(e: Record<string, unknown>) => void>(['tokenAround', 'suggestKey', 'suggestKeydown'], 'suggestKeydown', context);
+    const press = (key: string, extra: Record<string, unknown> = {}) => {
+      const said = { prevented: 0, stopped: 0 };
+      keydown({ key, target: field, preventDefault: () => { said.prevented += 1; }, stopPropagation: () => { said.stopped += 1; }, ...extra });
+      return said;
+    };
+    done.length = 0;
+    expect(press('Enter')).toEqual({ prevented: 1, stopped: 1 });
+    expect(done).toEqual(['accept 0']);
+    // Text being composed with an IME: Enter is the IME's, and nothing is taken.
+    done.length = 0;
+    expect(press('Enter', { isComposing: true })).toEqual({ prevented: 0, stopped: 0 });
+    expect(press('Enter', { keyCode: 229 })).toEqual({ prevented: 0, stopped: 0 });
+    expect(done).toEqual([]);
+    // Ctrl or Cmd with Enter is the send shortcut, and goes on to the form; the list shuts.
+    expect(press('Enter', { ctrlKey: true })).toEqual({ prevented: 0, stopped: 0 });
+    expect(press('Enter', { metaKey: true })).toEqual({ prevented: 0, stopped: 0 });
+    expect(done).toEqual(['close', 'close']);
+    done.length = 0;
+    expect(press('ArrowDown')).toEqual({ prevented: 1, stopped: 1 });
+    expect((context['suggest'] as { active: number }).active).toBe(1);
+    expect(press('Tab')).toEqual({ prevented: 1, stopped: 1 });
+    expect(done).toEqual(['mark', 'accept 1']);
+    done.length = 0;
+    expect(press('Tab', { shiftKey: true })).toEqual({ prevented: 0, stopped: 0 });
+    expect(press('Escape')).toEqual({ prevented: 1, stopped: 1 });
+    expect(done).toEqual(['close', 'close']);
+    expect((context['suggest'] as { escapedAt: number }).escapedAt).toBeGreaterThan(0);
+    // With the list shut, Enter is left alone (the form never submits) and ArrowDown asks again.
+    (context['suggestList'] as { hidden: boolean }).hidden = true;
+    done.length = 0;
+    expect(press('Enter')).toEqual({ prevented: 0, stopped: 0 });
+    expect(press('ArrowDown')).toEqual({ prevented: 1, stopped: 1 });
+    expect(done).toEqual(['look up']);
+    // Nothing typed: Down is the field's own.
+    field.value = '';
+    field.selectionStart = 0;
+    expect(press('ArrowDown')).toEqual({ prevented: 0, stopped: 0 });
+    expect(done).toEqual(['look up']);
+  });
+
+  it('keeps the letter open on the Escape that shut the list, and only on that one', () => {
+    const context: Record<string, unknown> = { suggest: { escapedAt: 0 }, closeSuggest: () => false, Date };
+    const took = lifted<() => boolean>(['suggestionsTookEscape'], 'suggestionsTookEscape', context);
+    expect(took()).toBe(false);
+    (context['suggest'] as { escapedAt: number }).escapedAt = Date.now();
+    expect(took()).toBe(true);
+    context['closeSuggest'] = () => true;
+    (context['suggest'] as { escapedAt: number }).escapedAt = 0;
+    expect(took()).toBe(true);
+  });
+});
+
+describe('the conversation in the reader', () => {
+  it('says nothing when the thread holds only the message, and marks the reader\'s own messages as theirs', () => {
+    const t = (key: string): string => STRINGS.en[key as StringKey] ?? key;
+    const fill = (key: string, vars: Record<string, unknown> = {}): string =>
+      Object.entries(vars).reduce((text, [name, value]) => text.split(`{${name}}`).join(String(value)), t(key));
+    /** As much of an element as the conversation's code touches. */
+    function node(tag = 'div', cls?: string, text?: string): Record<string, unknown> {
+      const self: Record<string, unknown> = {
+        tag, className: cls ?? '', textContent: text ?? '', hidden: false, children: [] as unknown[], attrs: {} as Record<string, string>,
+        appendChild: (child: unknown) => { (self['children'] as unknown[]).push(child); return child; },
+        replaceChildren: () => { self['children'] = []; },
+        setAttribute: (name: string, value: string) => { (self['attrs'] as Record<string, string>)[name] = value; },
+      };
+      Object.defineProperty(self, 'childNodes', { get: () => self['children'] });
+      return self;
+    }
+    const text = (n: Record<string, unknown>): string =>
+      String(n['textContent'] ?? '') + (n['children'] as Array<Record<string, unknown>>).map(text).join('');
+    const context: Record<string, unknown> = {
+      t, fill, DOT: ' · ', NB: ' ', el: (tag: string, cls?: string, value?: string) => node(tag, cls, value),
+      textNode: (value: string) => node('#text', undefined, value), dayLabel: () => 'Today', hhmm: () => '10:00',
+      textBody: (value: string) => node('div', 'mail-text', value), extraRows: new Map(), openDetail: () => undefined,
+      rowKey: (m: { dedupKey?: string }) => m.dedupKey ?? '', sentOpen: new Set(),
+    };
+    const draw = lifted<(entry: unknown, d: unknown) => void>(
+      ['bareSubject', 'newSubject', 'whenLine', 'receivedItem', 'peopleLine', 'sentItem', 'fillSent', 'drawConversation'], 'drawConversation', context,
+    );
+    const current = { dedupKey: 'k2', subject: 'Lunch?' };
+    const alone = { section: node('section'), row: current };
+    draw(alone, { messages: [{ direction: 'in', current: true, dedupKey: 'k2', at: '2026-11-17T10:00:00Z' }] });
+    expect(alone.section['hidden']).toBe(true);
+
+    const entry = { section: node('section'), row: current };
+    draw(entry, {
+      omitted: 0,
+      messages: [
+        { direction: 'in', current: true, dedupKey: 'k2', at: '2026-11-17T09:00:00Z' },
+        {
+          direction: 'out', id: 7, at: '2026-11-17T10:00:00Z', subject: 'Re: Lunch?', excerpt: 'Thursday works.', text: 'Thursday works.',
+          to: [{ name: 'Ann', address: 'ann@example.org' }], cc: [], bcc: [{ name: '', address: 'boss@qq.com' }], attachments: { count: 0 },
+        },
+      ],
+    });
+    expect(entry.section['hidden']).toBe(false);
+    const said = text(entry.section);
+    expect(said).toContain('Conversation · 2');
+    expect(said).toContain('This message');
+    expect(said).toContain('You · to Ann · Today 10:00');
+    expect(said).toContain('Thursday works.');
+    // "Re:" the same subject is not said again.
+    expect(said).not.toContain('Re: Lunch?');
+    const yours = ((entry.section['children'] as Array<Record<string, unknown>>)[1]!['children'] as Array<Record<string, unknown>>)[1]!;
+    expect(yours['className']).toBe('tl-yours');
+    const button = (yours['children'] as Array<Record<string, unknown>>)[0]!;
+    expect((button['attrs'] as Record<string, string>)['aria-expanded']).toBe('false');
+    // Opened in place: what was written, and whom it went to, Bcc included.
+    (button['onclick'] as () => void)();
+    expect((button['attrs'] as Record<string, string>)['aria-expanded']).toBe('true');
+    expect(text((yours['children'] as Array<Record<string, unknown>>)[1]!)).toContain('boss@qq.com');
   });
 });
 

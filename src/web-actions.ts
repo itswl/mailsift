@@ -30,6 +30,7 @@ import { createHash } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { loadConfig, type Account } from './config.js';
 import { MailboxUnreachableError } from './imap/connection.js';
+import { outgoingRecord, sentMailEnabled } from './imap/sent.js';
 import {
   appendToSent, applyWebMailAction, AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
   fetchAttachmentManifestByMessageId, fetchReadableByMessageId, MAIL_ACTIONS, MailActionError,
@@ -1296,6 +1297,14 @@ export async function sendMessage(
     quietly('A sent message', () => record(ctx, store, life, (db) => db.recordMailAction(
       { ...audit, messageId: sent.messageId, success: true },
     )));
+    // The letter itself joins its conversation at once, with its exact
+    // recipients and text, rather than when a poll next reads Sent. Stored
+    // like the mail that arrives, and for the conversation only.
+    if (sentMailEnabled()) {
+      quietly('A sent message for its conversation', () => record(ctx, store, life, (db) => {
+        db.recordSent(outgoingRecord(account, mail, sent, ctx.origin === 'mcp' ? 'mcp' : 'page'));
+      }));
+    }
 
     // Where the provider does not file its own copy, put one in Sent, or the
     // reply exists only in the other person's mailbox.

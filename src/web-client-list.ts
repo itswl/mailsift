@@ -124,7 +124,13 @@ function metaLine(m, thread, now) {
     if (meta.childNodes.length) meta.appendChild(textNode(DOT));
     meta.appendChild(cls ? el('span', cls, value) : textNode(value));
   };
-  if (thread && thread.messageCount > 1) add(fill('thread.short', { count: thread.messageCount }), 'rescued');
+  if (thread) {
+    // The reader's own messages count in the thread, and say so when theirs is the latest word.
+    const total = thread.messageCount + (thread.sentCount || 0);
+    if (total > 1) add(fill('thread.short', { count: total }), 'rescued');
+    if (thread.lastWordYours) add(t('thread.youLast'));
+    else if (thread.sentCount) add(fill('thread.yours', { count: thread.sentCount }));
+  }
   if (level(m) !== 'info') add(word('level.', m.importance), 'lvl ' + level(m));
   if (m.category) add(word('category.', m.category));
   if (m.verificationCode) add(t('code.tag'));
@@ -227,6 +233,7 @@ function rowSignature(item, now, queued) {
     m.importance, m.pushed ? 1 : 0, m.inSpam ? 1 : 0, m.summary, m.subject, m.senderName, m.sender, m.category,
     m.reason, m.verificationCode || '', m.verificationCode && now - dateOf(m) > STALE_CODE_MS ? 1 : 0,
     m.deadline || '', m.deadline ? dayKey(now) : '', isThread(item) ? item.messageCount : 0, filters.q.value.trim(),
+    isThread(item) ? (item.sentCount || 0) + ':' + (item.lastWordYours ? 1 : 0) : '',
     m.snoozedUntil || '', isSnoozed(m) ? dayKey(now) : '',
   ].join('\u0001');
 }

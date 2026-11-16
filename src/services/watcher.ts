@@ -10,11 +10,14 @@ import { IMPORTANCE_RANK, type Account, type Importance, type Rules, type WatchC
 import {
   connect,
   fetchNew,
+  listFolders,
+  sentFolderPath,
   targetFolders,
   type FetchFailure,
   type FolderCursor,
   type MessageBudget,
 } from '../imap/client.js';
+import { fetchSent, sentMailEnabled } from '../imap/sent.js';
 import type { Folder } from '../imap/folders.js';
 import {
   dedupKey, SENSITIVE_WORDS, sensitiveKindOf, snippet, type MailMessage,
@@ -27,7 +30,7 @@ import {
 import * as digest from './digest.js';
 import * as health from './health.js';
 import type { Sink } from './sink.js';
-import type { StateStore } from './state.js';
+import type { SentCursorRow, SentRecord, StateStore } from './state.js';
 import { getLogger } from '../logger.js';
 import { metrics } from '../metrics.js';
 
@@ -78,17 +81,28 @@ export function summarizeStats(stats: PollStats): string {
 }
 
 type PendingCursor = [account: string, folder: string, uidValidity: string, lastUid: number];
+/** What one poll read from one mailbox's Sent folder, and where its cursor goes once it is stored. */
+export interface SentBatch {
+  account: string;
+  accountName: string;
+  folder: string;
+  messages: SentRecord[];
+  cursor: SentCursorRow;
+}
 type CollectAccountResult = {
   messages: MailMessage[];
   cursors: PendingCursor[];
   failures?: string[];
   deadLetters?: FetchFailure[];
+  sent?: SentBatch;
 };
 /** Everything fetched and ready for the deduplicate -> triage -> deliver stage. */
 interface Collected {
   messages: MailMessage[];
   cursors: PendingCursor[];
   deadLetters?: Array<FetchFailure & { account: string }>;
+  /** The owner's own mail, stored apart and never judged. */
+  sent?: SentBatch[];
 }
 
 export class Watcher {
@@ -161,11 +175,32 @@ export class Watcher {
           log.error(`[${account.name}/${folder.path}] fetch failed: ${error}`);
         }
       }
+      // After the inbound folders, on the same connection, with a budget of its own.
+      const sent = await this.collectSent(client, account);
+      return { messages, cursors, failures, deadLetters, ...(sent ? { sent } : {}) };
     } finally {
       await client.logout().catch(() => undefined);
     }
+  }
 
-    return { messages, cursors, failures, deadLetters };
+  /**
+   * Read what is new in the mailbox's Sent folder, for the conversation.
+   *
+   * Never a failure of the poll: a mailbox without a Sent folder is normal,
+   * and one whose Sent folder cannot be read is logged and stays healthy, as
+   * the mail it has to deliver does not depend on it.
+   */
+  private async collectSent(client: ImapFlow, account: Account): Promise<SentBatch | undefined> {
+    if (!sentMailEnabled()) return undefined;
+    try {
+      const folder = sentFolderPath(await listFolders(client));
+      if (!folder) return undefined;
+      const result = await fetchSent(client, account, folder, this.state.getSentCursor(account.username));
+      return { account: account.username, accountName: account.name, folder, messages: result.messages, cursor: result.cursor };
+    } catch (error) {
+      log.warn(`[${account.name}] the Sent folder could not be read this time (the poll goes on): ${String(error).slice(0, 200)}`);
+      return undefined;
+    }
   }
 
   async collectAll(stats: PollStats): Promise<Collected> {
@@ -177,6 +212,7 @@ export class Watcher {
     const messages: MailMessage[] = [];
     const cursors: PendingCursor[] = [];
     const deadLetters: Array<FetchFailure & { account: string }> = [];
+    const sent: SentBatch[] = [];
     const queue = [...this.config.accounts];
 
     const worker = async (): Promise<void> => {
@@ -193,6 +229,7 @@ export class Watcher {
           }
           messages.push(...result.messages);
           cursors.push(...result.cursors);
+          if (result.sent) sent.push(result.sent);
           metrics.addCounter('mailsift.accounts.processed', 1, {
             provider: account.provider,
             outcome: failures.length === 0 ? 'success' : 'partial_failure',
@@ -219,7 +256,7 @@ export class Watcher {
 
     await Promise.all(Array.from({ length: Math.min(limit, queue.length) }, worker));
     stats.fetched = messages.length;
-    return { messages, cursors, deadLetters };
+    return { messages, cursors, deadLetters, ...(sent.length ? { sent } : {}) };
   }
 
   /**
@@ -527,7 +564,13 @@ export class Watcher {
       // below-threshold branch, so a spam bonus or PUSH_MIN_IMPORTANCE=info
       // let the second notification through after all.
       const forwardedCopy = Boolean(isSelfForward(message, rules));
-      if (!forwardedCopy && effectiveRank(message, result) >= pushLimit) {
+      const wouldPush = !forwardedCopy && effectiveRank(message, result) >= pushLimit;
+      // Already answered from another mail client (the answer is in Sent):
+      // stored as dealt with, and not notified. Only mail that would have
+      // been put before the owner is looked at; see StateStore.answerOnArrival.
+      const answered = !forwardedCopy && (wouldPush || result.importance === 'critical')
+        && this.answeredOnArrival(key, message);
+      if (wouldPush && !answered) {
         // Persist a bounded, resendable copy before the external write. The
         // outbox is at-least-once: a crash after provider acceptance and before
         // the delivered mark can still duplicate a notification, so adapters
@@ -600,6 +643,60 @@ export class Watcher {
     }
   }
 
+  /** The owner's own addresses: an answer that went only to these answered nobody. */
+  private ownAddresses(): string[] {
+    return this.config.accounts.map((account) => account.username.trim().toLowerCase());
+  }
+
+  /** Whether a message being stored was answered already; a failure to tell is a no, and is logged. */
+  private answeredOnArrival(key: string, message: MailMessage): boolean {
+    try {
+      const answered = this.state.answerOnArrival(key, message.account, message.messageId, message.date, this.ownAddresses());
+      if (answered) log.info(`[${message.accountLabel}] already answered from another client; stored as dealt with: ${message.subject}`);
+      return answered;
+    } catch (error) {
+      log.warn(`Checking for an answer in Sent failed (the message is handled as usual): ${String(error).slice(0, 160)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Store what the poll read from each Sent folder, and move its cursor.
+   *
+   * Before the received mail of the same poll is dispatched, so that a
+   * message answered from another client before the poll saw it is stored
+   * as dealt with rather than notified. Each mailbox on its own: one that
+   * fails is logged and read again next time, and the poll goes on.
+   */
+  private storeSent(batches: readonly SentBatch[]): void {
+    for (const batch of batches) {
+      try {
+        let stored = 0;
+        for (const message of batch.messages) if (this.state.recordSent(message).inserted) stored += 1;
+        this.state.saveSentCursor(batch.account, batch.cursor);
+        if (batch.messages.length) {
+          log.info(`[${batch.accountName}/${batch.folder}] read ${batch.messages.length} sent messages, ${stored} new`);
+        }
+      } catch (error) {
+        log.warn(`[${batch.accountName}/${batch.folder}] storing sent mail failed (the poll goes on): ${String(error).slice(0, 200)}`);
+      }
+    }
+  }
+
+  /**
+   * Hold the sent mail stored so far against the queue: after the received
+   * mail of the same poll is stored, so an answer to a message that arrived
+   * in this very poll is found too.
+   */
+  private answerFromSent(): void {
+    try {
+      const handled = this.state.answerFromSent(this.ownAddresses());
+      if (handled.length) log.info(`Answered from another client: ${handled.length} message(s) taken off the queue`);
+    } catch (error) {
+      log.warn(`Holding sent mail against the queue failed (the poll goes on): ${String(error).slice(0, 200)}`);
+    }
+  }
+
   /** Prune old seen records once per day. */
   private maybePrune(): void {
     const keepDays = Number(process.env.STATE_RETENTION_DAYS ?? 90);
@@ -617,11 +714,13 @@ export class Watcher {
 
   /** Deduplicate, triage, deliver, then advance cursors. Call inside exclusive(). */
   private async commit(collected: Collected, stats: PollStats, quietWhenEmpty = false): Promise<void> {
+    this.storeSent(collected.sent ?? []);
     const fresh = this.filterFresh(collected.messages);
     stats.fresh = fresh.length;
 
     if (fresh.length) await this.dispatch(fresh, stats);
     else if (!quietWhenEmpty) log.info('No new messages in this poll.');
+    this.answerFromSent();
 
     for (const dead of collected.deadLetters ?? []) {
       this.state.recordDeadLetter({

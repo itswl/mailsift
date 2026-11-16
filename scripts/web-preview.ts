@@ -146,6 +146,7 @@ const FIXTURES: Fixture[] = [
       reason: 'A direct request with a date attached.', deadline: ymd(1), decidedBy: 'llm' } },
   { age: 5 * H, ...QQ, importance: 'info', pushed: false, subject: '周六聚餐？',
     fields: { sender: 'club@example.com', senderName: '读书会', folder: 'INBOX', category: 'Personal',
+      threadKey: 'me@qq.com|<preview-07@preview>',
       summary: '读书会周六晚上聚餐，问你是否参加，地点待定。', reason: '社交邀约，需要回复。', decidedBy: 'llm' } },
   { age: 6 * H, ...GMAIL, importance: 'critical', pushed: true, subject: 'Your domain my-site.example expires in 3 days',
     fields: { sender: 'renewals@registrar.example', senderName: 'Registrar', folder: '[Gmail]/Spam', inSpam: true,
@@ -236,6 +237,42 @@ const DIGEST: DigestItem[] = [
     actionRequired: false, threadCount: 1, date: new Date(Date.now() - 3 * H * 60_000).toISOString() },
 ];
 
+/**
+ * What "you" sent, as the poll would have read it from Sent: a reply in the
+ * PR thread between its two messages, an answer to the dinner invitation
+ * after it (so the thread says you replied last), and a few letters to
+ * people, so the composer has someone to suggest. Every name is made up.
+ */
+interface SentFixture {
+  age: number;
+  account: { account: string; accountLabel: string };
+  threadKey: string;
+  answers?: string;
+  subject: string;
+  to: Array<{ name: string; address: string }>;
+  cc?: Array<{ name: string; address: string }>;
+  text: string;
+  files?: string[];
+}
+const SENT: SentFixture[] = [
+  { age: 2 * D + 4 * H, account: GMAIL, threadKey: '<thread-pr61@github.com>', answers: '<preview-20@preview>',
+    subject: 'Re: PR #61 needs your review before the release', to: [{ name: 'Mia Chen', address: 'mia.chen@team.example' }],
+    text: 'Thanks, Mia. I will go through it tonight and leave comments on the two open threads.\n\nOne question before I start: is the migration in this PR meant to run before or after the release?\n\n-- \nAlex' },
+  { age: 4 * H + 30, account: QQ, threadKey: 'me@qq.com|<preview-07@preview>', answers: '<preview-07@preview>',
+    subject: 'Re: 周六聚餐？', to: [{ name: '读书会', address: 'club@example.com' }],
+    text: '周六晚上可以，七点以后都行。地点定了告诉我一声。' },
+  { age: 1 * D + 3 * H, account: GMAIL, threadKey: 'me@gmail.com|<slides-thursday@preview>',
+    subject: 'Slides for Thursday', to: [{ name: 'Ann Lee', address: 'ann.lee@studio.example' }],
+    cc: [{ name: 'Bob Stone', address: 'bob@acme.example' }],
+    text: 'Hi Ann,\n\nHere are the slides for Thursday. The numbers on page 6 are from last quarter; I will update them on Wednesday.\n\nAlex',
+    files: ['slides-v3.pdf'] },
+  { age: 3 * D, account: QQ, threadKey: 'me@qq.com|<hike@preview>', subject: '周末爬山',
+    to: [{ name: '王小明', address: 'xiaoming@example.cn' }], text: '小明，周末一起去爬山吗？周六早上八点出发。' },
+  { age: 6 * D, account: GMAIL, threadKey: 'me@gmail.com|<budget@preview>', subject: 'Budget review',
+    to: [{ name: 'Ann Lee', address: 'ann.lee@studio.example' }, { name: 'Anand Rao', address: 'anand@acme.example' }],
+    text: 'Ann, Anand: the budget review moves to Monday at 10.' },
+];
+
 const dir = mkdtempSync(join(tmpdir(), 'mailsift-preview-'));
 const dbPath = join(dir, 'preview.db');
 // The live line opens its own handle on the configured database: point it here.
@@ -254,6 +291,17 @@ function seed(): void {
       ...fixture.fields,
     });
   });
+  SENT.forEach((sent, index) => {
+    store.recordSent({
+      account: sent.account.account, accountLabel: sent.account.accountLabel, messageId: `<preview-sent-${index + 1}@preview>`,
+      threadKey: sent.threadKey, ...(sent.answers ? { inReplyTo: sent.answers, answers: sent.answers } : {}),
+      subject: sent.subject, fromAddr: sent.account.account, to: sent.to, cc: sent.cc ?? [], bcc: [],
+      date: new Date(Date.now() - sent.age * 60_000).toISOString(), text: sent.text,
+      attachmentCount: sent.files?.length ?? 0, attachmentNames: sent.files ?? [], folder: 'Sent', source: 'poll',
+    });
+  });
+  // As the poll would have: held against the queue (nothing in it here is answered after it arrived but the dinner).
+  store.answerFromSent([QQ.account, GMAIL.account]);
   DIGEST.forEach((item, index) => store.queueDigest(`preview-digest-${index}`, item));
   // This morning's digest, already sent, listing three of the fixtures.
   const sentAt = new Date();
@@ -469,8 +517,15 @@ const backend: Partial<WebBackend> = {
     console.log(`[preview] pretended to send from ${account.username} to ${mail.to.join(', ')}${copies}: ${mail.subject}${files}`);
     // The letter as it would leave, so what the composer put together can be read back.
     console.log(mail.text.split('\n').slice(0, 40).map((line) => `  | ${line}`).join('\n'));
-    const raw = Buffer.from(mail.text);
-    return { messageId: `<sent-${Date.now()}@preview>`, raw, copy: raw, accepted: mail.to, rejected: [] };
+    // Its headers as a real send carries them, so the reply joins its conversation.
+    const messageId = `<sent-${Date.now()}@preview>`;
+    const head = [
+      `Message-ID: ${messageId}`,
+      ...(mail.inReplyTo ? [`In-Reply-To: ${mail.inReplyTo}`] : []),
+      ...(mail.references?.length ? [`References: ${mail.references.join(' ')}`] : []),
+    ].join('\r\n');
+    const raw = Buffer.from(`${head}\r\n\r\n${mail.text}`);
+    return { messageId, raw, copy: raw, accepted: mail.to, rejected: [] };
   },
   // A forward lists the original's files and carries them: here, the list triage
   // stored with the fixture, and made-up bytes of about the size it gives.

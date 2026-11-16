@@ -427,6 +427,8 @@ function enableDrag(dialog) {
 for (const dialog of [sheet, filterSheet, installHelp, healthSheet, notifySheet, keysSheet, menuSheet, composeSheet, snoozeSheet]) {
   dialog.addEventListener('cancel', (e) => {
     e.preventDefault();
+    // Escape on the composer's list of addresses shuts the list, not the letter.
+    if (dialog === composeSheet && suggestionsTookEscape()) return;
     if (dialog === filterSheet && dialog.classList.contains('popover')) closeFilters();
     else if (popovers.has(dialog)) closePopover(dialog, false);
     else closeSheet(dialog, false);

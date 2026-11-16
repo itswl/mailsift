@@ -10,7 +10,7 @@
  * Pure. Everything stored is mail-derived text, so it is written as-is; a model
  * reads this, and escaping would only make the content harder to follow.
  */
-import type { MailRow } from './services/state.js';
+import type { MailRow, SentAddress, SentRow } from './services/state.js';
 
 /** A field is omitted entirely rather than rendered as an empty bullet. */
 function line(label: string, value: string | null | undefined): string | null {
@@ -86,26 +86,59 @@ export function mailRecordToMarkdown(row: MailRow): string {
   return `${lines.join('\n')}\n`;
 }
 
-/** Oldest first, so a conversation reads top to bottom. */
-function byDate(a: MailRow, b: MailRow): number {
-  const key = (row: MailRow) => Date.parse(row.mailDate ?? row.createdAt) || 0;
-  return key(a) - key(b);
+/** When a stored message is dated, received or sent. */
+const dateOf = (entry: { kind: 'in'; row: MailRow } | { kind: 'out'; sent: SentRow }): string =>
+  entry.kind === 'in' ? entry.row.mailDate ?? entry.row.createdAt : entry.sent.date ?? entry.sent.createdAt;
+
+const people = (list: readonly SentAddress[]): string =>
+  list.map((p) => (p.name ? `${p.name} <${p.address}>` : p.address)).join(', ');
+
+/** One of the owner's own messages, as a section of the thread page. */
+function sentToMarkdown(sent: SentRow): string {
+  const lines = [
+    '- Sent by: the owner (this is their own message)',
+    line('Mailbox', sent.accountLabel ? `${sent.accountLabel} (${sent.account})` : sent.account),
+    line('To', people(sent.to)),
+    line('Cc', people(sent.cc)),
+    line('Bcc', people(sent.bcc)),
+    line('Date', sent.date ?? sent.createdAt),
+    line('Subject', sent.subject),
+    line('Files', sent.attachmentCount ? (sent.attachmentNames.length ? sent.attachmentNames.join(', ') : String(sent.attachmentCount)) : null),
+    line('Message id', `\`${sent.messageId}\``),
+  ].filter((l): l is string => l !== null);
+  lines.push('', '### What the owner wrote', '', sent.text.trim() || '_(nothing of their own: the message only quoted or forwarded)_');
+  lines.push('', '_Stored text, without the quoted history, bounded. Kept for the conversation only._');
+  return lines.join('\n');
 }
 
-/** A whole conversation as one page: the thread key, then each judgement in turn. */
-export function threadToMarkdown(threadKey: string, rows: readonly MailRow[]): string {
-  const ordered = [...rows].sort(byDate);
+/**
+ * A whole conversation as one page: the thread key, then each message in
+ * turn, oldest first. The owner's own messages, stored from Sent and from
+ * what was sent through mailsift, are among them and say so.
+ */
+export function threadToMarkdown(threadKey: string, rows: readonly MailRow[], sent: readonly SentRow[] = []): string {
+  const ordered = [
+    ...rows.map((row) => ({ kind: 'in' as const, row })),
+    ...sent.map((s) => ({ kind: 'out' as const, sent: s })),
+  ].sort((a, b) => (Date.parse(dateOf(a)) || 0) - (Date.parse(dateOf(b)) || 0));
+  const first = ordered.find((entry) => entry.kind === 'in') as { kind: 'in'; row: MailRow } | undefined;
+  const subject = first?.row.subject ?? (ordered[0]?.kind === 'out' ? ordered[0].sent.subject : null) ?? null;
   const head = [
-    title(ordered[0]?.subject ?? null),
+    title(subject),
     '',
     `- Thread key: \`${threadKey}\``,
-    `- Messages: ${ordered.length}`,
+    `- Messages: ${ordered.length}${sent.length ? ` (${sent.length} sent by the owner)` : ''}`,
   ];
   if (ordered.length === 0) return `${[...head, '', '_(no messages)_'].join('\n')}\n`;
 
-  const sections = ordered.map((row, index) => {
+  const sections = ordered.map((entry, index) => {
+    const when = dateOf(entry);
+    if (entry.kind === 'out') {
+      const to = people(entry.sent.to) || people(entry.sent.cc) || people(entry.sent.bcc) || 'nobody named';
+      return `\n## ${index + 1}. From the owner to ${to} on ${when}\n\n${sentToMarkdown(entry.sent)}`;
+    }
+    const row = entry.row;
     const sender = row.senderName || row.sender || 'unknown sender';
-    const when = row.mailDate ?? row.createdAt;
     // The per-message title is already in the heading, so the record's own is dropped.
     const body = mailRecordToMarkdown(row).split('\n').slice(1).join('\n').trim();
     return `\n## ${index + 1}. From ${sender} on ${when}\n\n${body}`;
