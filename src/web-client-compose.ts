@@ -264,8 +264,10 @@ function listFits(field) {
 }
 // Whether an address offered still fits what is typed, as far as the page can
 // tell: it only narrows a list the server drew, until the server answers again.
-function fitsQuery(c, q) {
-  const address = String(c.address || '').toLowerCase(), name = String(c.name || '').toLowerCase();
+function fitsQuery(c, query) {
+  // In one Unicode form, as the server matches: full-width letters and half-width kana as they look.
+  const plain = (value) => String(value || '').normalize('NFKC').toLowerCase();
+  const q = plain(query), address = plain(c.address), name = plain(c.name);
   return address.indexOf(q) === 0 || address.split(/[@._+-]+/).some((p) => p.indexOf(q) === 0)
     || name.indexOf(q) === 0 || name.split(/[\s,.;:'"()<>@_\/-]+/).some((w) => w.indexOf(q) === 0)
     || (/[^\x00-\x7f]/.test(q) && name.indexOf(q) !== -1);
@@ -277,10 +279,18 @@ function narrowSuggest(field) {
   const token = tokenAround(field.value, field.selectionStart);
   const q = token.text.toLowerCase();
   if (!suggest.token || token.start !== suggest.token.start || !q || /[<>"]/.test(q)) { closeSuggest(); return; }
-  const active = suggest.items[suggest.active];
   const keep = suggest.items.filter((c) => fitsQuery(c, q));
   if (!keep.length || keep.some((c) => String(c.address).toLowerCase() === q)) { closeSuggest(); return; }
-  showSuggest(field, keep, token, Math.max(0, keep.indexOf(active)));
+  showSuggest(field, keep, token, highlightIn(keep));
+}
+// Where the person highlighted now is in a list drawn again, by address, so
+// a list redrawn under the keyboard or the pointer keeps the one picked; the
+// first when they are not in it.
+function highlightIn(items) {
+  const picked = suggest.items[suggest.active];
+  if (!picked) return 0;
+  const at = items.findIndex((c) => String(c.address).toLowerCase() === String(picked.address).toLowerCase());
+  return at === -1 ? 0 : at;
 }
 // Addresses already on the letter, but for the one being typed.
 function takenAddresses(field, token) {
@@ -313,7 +323,9 @@ function lookUpAddresses(field, now) {
     const items = (Array.isArray(d.contacts) ? d.contacts : []).filter((c) => c && c.address && !taken.has(String(c.address).toLowerCase()));
     // What is typed is already one of them, whole: there is nothing to add, and Enter must not change it.
     if (items.some((c) => String(c.address).toLowerCase() === q.toLowerCase())) { closeSuggest(); return; }
-    showSuggest(field, items, current, 0);
+    // The answer for what is typed redraws a list that may be showing already,
+    // with someone picked in it: they stay picked, so Enter inserts them.
+    showSuggest(field, items, current, suggest.field === field && !suggestList.hidden ? highlightIn(items) : 0);
   }, now ? 0 : 160);
 }
 function showSuggest(field, items, token, active) {

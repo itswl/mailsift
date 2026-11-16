@@ -586,16 +586,17 @@ describe('re-triage after an LLM outage', () => {
     const pushed = sink.pushed.map(([m]) => m.messageId);
     expect(pushed).not.toContain('<put-off@x>');
     expect(pushed).not.toContain('<done@x>');
-    // The verdict is kept, and the digest carries both as usual.
+    // The verdict is kept. The one dealt with was owed a notification it is not sent: withheld, as one
+    // answered elsewhere is, so it is not listed in the digest and comes back to the queue if put back.
     expect(state.getMail('put-off')).toMatchObject({ importance: 'critical', pushed: false, snoozedUntil: later });
-    expect(state.getMail('done')).toMatchObject({ importance: 'critical', pushed: false });
+    expect(state.getMail('done')).toMatchObject({ importance: 'critical', pushed: false, withheld: true });
     // The one put off waits for the time chosen, for the outputs without reminders of their own,
     // and that is its only way out: no digest lists it meanwhile.
     const waiting = state.pendingNotifications(50, false);
     expect(waiting.map((e) => e.notificationKey)).toEqual(['put-off']);
     expect(waiting[0]).toMatchObject({ attempts: 0, nextAttemptAt: later });
     expect(state.pendingNotifications(50, true)).toEqual([]);
-    expect(state.digestPending()).toBe(1);
+    expect(state.digestPending()).toBe(0);
   });
 
   it('decides on the message as it is after the model answers, not as it was before', async () => {
@@ -775,7 +776,9 @@ describe('the Sent folder', () => {
     state.enqueueNotification('me@qq.com|<q@x>', makeMessage({ messageId: '<q@x>' }), makeResult({ importance: 'warning' }));
     state.queueDigest('me@qq.com|<q@x>', { subject: 'Invoice' });
     state.recordSent(reply());
-    expect(state.answerFromSent([])).toEqual([]);
+    // Looked at already (by a release before the Sent pass knew notifications owed): the retry still finds it.
+    (state as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db
+      .prepare('UPDATE sent_mail SET checked_at = ?').run(new Date().toISOString());
     vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [], cursors: [] });
     await w.pollOnce();
     expect(sink.pushed).toEqual([]);
@@ -785,6 +788,59 @@ describe('the Sent folder', () => {
     // It was owed that notification, so putting it back puts it in the queue.
     state.setHandled('me@qq.com|<q@x>', false);
     expect(state.attentionCount()).toBe(1);
+  });
+
+  it('marks a message notified when its notification is delivered on a retry, so it is in the queue', async () => {
+    process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    const outcomes: Array<'failed' | 'delivered'> = ['failed', 'delivered'];
+    const sink = new RecordingSink();
+    sink.push = async (message, result) => { sink.pushed.push([message, result]); return outcomes.shift() ?? 'delivered'; };
+    const state = new StateStore(':memory:');
+    const w = new Watcher(CONFIG, state, sink);
+    stubTriage({ '<q@x>': makeResult({ importance: 'warning' }) });
+    vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [makeMessage({ messageId: '<q@x>' })], cursors: [] });
+    await w.pollOnce();
+    expect(state.getMail('me@qq.com|<q@x>')!.pushed).toBe(false);
+    expect(state.attentionCount()).toBe(0);
+    // Its retry is due.
+    (state as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db
+      .prepare('UPDATE notification_outbox SET next_attempt_at = ?').run(new Date(Date.now() - 1000).toISOString());
+    vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [], cursors: [] });
+    await w.pollOnce();
+    expect(sink.pushed).toHaveLength(2);
+    expect(state.getMail('me@qq.com|<q@x>')).toMatchObject({ pushed: true, withheld: false });
+    expect(state.attentionCount()).toBe(1);
+    expect(state.digestPending()).toBe(0);
+  });
+
+  it('withholds a retried notification for a message marked done while it waited, as for one answered elsewhere', async () => {
+    const { w, state, sink } = polling();
+    state.markSeen('me@qq.com|<q@x>', 'me@qq.com', 'Invoice');
+    state.recordOutcome('me@qq.com|<q@x>', 'warning', false, { messageId: '<q@x>', folder: 'INBOX' });
+    state.enqueueNotification('me@qq.com|<q@x>', makeMessage({ messageId: '<q@x>' }), makeResult({ importance: 'warning' }));
+    state.queueDigest('me@qq.com|<q@x>', { subject: 'Invoice' });
+    state.setHandled('me@qq.com|<q@x>', true);
+    vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [], cursors: [] });
+    await w.pollOnce();
+    expect(sink.pushed).toEqual([]);
+    expect(state.notificationOutboxPending()).toBe(0);
+    expect(state.digestPending()).toBe(0);
+    expect(state.getMail('me@qq.com|<q@x>')!.withheld).toBe(true);
+    state.setHandled('me@qq.com|<q@x>', false);
+    expect(state.attentionCount()).toBe(1);
+  });
+
+  it('checks an answered warning on arrival whatever the push threshold, so no device is told of it', async () => {
+    process.env.PUSH_MIN_IMPORTANCE = 'critical';
+    const { w, state, sink } = polling();
+    stubTriage({ '<q@x>': makeResult({ importance: 'warning' }) });
+    vi.spyOn(w, 'collectAll').mockResolvedValue({
+      messages: [makeMessage({ messageId: '<q@x>', date: at(-60 * 60_000) })], cursors: [], sent: [batch([reply()])],
+    });
+    await w.pollOnce();
+    expect(sink.pushed).toEqual([]);
+    // Handled before it was judged: Web Push, which tells a device of warnings, leaves it alone.
+    expect(state.getMail('me@qq.com|<q@x>')).toMatchObject({ handledAt: expect.any(String), withheld: false });
   });
 
   it('never writes a code\'s subject to the log when a code mail was answered already', async () => {

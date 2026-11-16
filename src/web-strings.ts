@@ -147,9 +147,14 @@ const en = {
   // Under the conversation's heading when it holds more than the timeline shows: the newest are shown.
   'conv.omitted': '{count} more messages in this conversation are not shown',
   'conv.omitted1': '1 more message in this conversation is not shown',
+  // In the timeline, under an older message opened: what lies between it and the newest.
+  'conv.between': '{count} messages after this one are not shown',
+  'conv.between1': '1 message after this one is not shown',
   'search': 'search subject, sender, summary, attachments',
   'spam': 'spam',
   'notified': 'notified',
+  // In a row's details: owed a notification, not sent because it was answered or done already.
+  'row.withheld': 'dealt with before notified',
   'row.rescued': 'rescued from spam',
 
   'empty': 'Nothing matches these filters.',
@@ -196,6 +201,7 @@ const en = {
   'detail.mailbox': 'Mailbox',
   'detail.judgedAs': '{level} by {by}',
   'detail.notifiedAt': 'notified {time}',
+  'detail.withheld': 'not notified: you had already answered it or marked it done',
   'detail.rescued': 'Rescued from {folder}',
   'detail.foundIn': 'Found in {folder}',
   'detail.why': 'Why',
@@ -741,9 +747,12 @@ const zhCN: Record<StringKey, string> = {
   'conv.noText': '没有写正文：只有引用、转发或附件',
   'conv.omitted': '这个会话还有 {count} 封未显示',
   'conv.omitted1': '这个会话还有 1 封未显示',
+  'conv.between': '这封之后有 {count} 封未显示',
+  'conv.between1': '这封之后有 1 封未显示',
   'search': '搜索主题、发件人、摘要、附件',
   'spam': '垃圾箱',
   'notified': '已推送',
+  'row.withheld': '推送前已处理',
   'row.rescued': '从垃圾箱救回',
 
   'empty': '没有符合这些筛选条件的邮件。',
@@ -790,6 +799,7 @@ const zhCN: Record<StringKey, string> = {
   'detail.mailbox': '邮箱',
   'detail.judgedAs': '{level} · {by}判定',
   'detail.notifiedAt': '{time} 已推送',
+  'detail.withheld': '未推送：你已回复或标为完成',
   'detail.rescued': '从 {folder} 救回',
   'detail.foundIn': '位于 {folder}',
   'detail.why': '原因',

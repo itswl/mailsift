@@ -136,6 +136,7 @@ function metaLine(m, thread, now) {
   if (m.verificationCode) add(t('code.tag'));
   if (m.inSpam) add(m.pushed ? t('row.rescued') : t('spam'), m.pushed ? 'rescued' : null);
   else if (m.pushed) add(t('notified'));
+  else if (m.withheld) add(t('row.withheld'));
   const due = dueInfo(m.deadline, now);
   // A deadline on something already dealt with is a fact, not a call to act.
   if (due) add(due.text, m.handledAt ? null : (due.late ? 'due late' : 'due'));
@@ -230,7 +231,7 @@ function rowSignature(item, now, queued) {
   const m = rowOfItem(item);
   return [
     lang, keyOf(item) === selectedKey ? 1 : 0, queued ? whenQueued(m, now) : when(m, now), m.handledAt || '', needsYou(m) ? 1 : 0,
-    m.importance, m.pushed ? 1 : 0, m.inSpam ? 1 : 0, m.summary, m.subject, m.senderName, m.sender, m.category,
+    m.importance, m.pushed ? 1 : 0, m.withheld ? 1 : 0, m.inSpam ? 1 : 0, m.summary, m.subject, m.senderName, m.sender, m.category,
     m.reason, m.verificationCode || '', m.verificationCode && now - dateOf(m) > STALE_CODE_MS ? 1 : 0,
     m.deadline || '', m.deadline ? dayKey(now) : '', isThread(item) ? item.messageCount : 0, filters.q.value.trim(),
     isThread(item) ? (item.sentCount || 0) + ':' + (item.lastWordYours ? 1 : 0) : '',

@@ -297,12 +297,14 @@ export async function handleApi(
     if (!key) return json(400, { error: 'key is required', code: 'badRequest' });
     const row = store.getMail(key);
     if (!row) return json(404, { error: 'not found', code: 'notFound' });
-    const { entries, omitted } = store.conversation(row);
+    const { entries, omitted, between } = store.conversation(row);
     return json(200, {
       key: row.dedupKey,
       threadKey: row.threadKey,
       count: entries.length,
+      // Left out in all, and of those how many lie between this message and the next one shown.
       omitted,
+      between,
       messages: entries.map((entry) => entry.direction === 'in'
         ? { ...decorate(entry.row), direction: 'in', at: entry.at, current: entry.row.dedupKey === row.dedupKey }
         : sentView(entry.sent, entry.at)),

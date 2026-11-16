@@ -515,7 +515,9 @@ export function createServer(
     'needs_you',
     {
       description:
-        'The queue the web view opens on: mail that was judged critical or was notified, and that nobody has ' +
+        'The queue the web view opens on: mail that was judged critical or was notified (pushed), or was due a ' +
+        'notification that was withheld because the owner had already answered it from another client or marked it ' +
+        'done (withheld), and that nobody has ' +
         'dealt with yet, whatever its age within the last 30 days. Start here for "what needs me" or "what is ' +
         'still open"; count is the whole queue even when mail is cut at limit. Verification codes, sign-in links ' +
         'and mailsift\'s own notices are not in it unless the owner put one off and its time has come. A message ' +
@@ -585,7 +587,7 @@ export function createServer(
       description:
         'List recent conversation-like mail threads. Messages with References/In-Reply-To share a thread key; ' +
         'the latest message is exposed separately and the messages array is ordered newest first. The list is ' +
-        'the received mail in the window; sentCount says how many of the owner\'s own messages the thread holds ' +
+        'the received mail in the window; sentCount says how many of the owner\'s own messages the thread holds in that same window ' +
         'and lastWordYours whether the latest of them came after its latest received message. Read ' +
         'mailsift://thread/{threadKey} for the whole conversation, the owner\'s messages included.',
       inputSchema: {

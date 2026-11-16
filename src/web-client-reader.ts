@@ -571,7 +571,9 @@ function feedbackLine(row) {
     line.appendChild(b);
   };
   vote(t('fb.right'), 'correct');
-  vote(t(row.pushed ? 'fb.wrongPushed' : 'fb.wrongQuiet'), row.pushed ? 'false_positive' : 'missed');
+  // Withheld was judged worth a notification, and only not sent because it was answered: the call to question is that one.
+  const notifiable = row.pushed || row.withheld;
+  vote(t(notifiable ? 'fb.wrongPushed' : 'fb.wrongQuiet'), notifiable ? 'false_positive' : 'missed');
   return line;
 }
 
@@ -612,6 +614,7 @@ function detail(row) {
   const by = word('by.', row.decidedBy);
   let judged = by ? fill('detail.judgedAs', { level: word('level.', row.importance), by }) : word('level.', row.importance);
   if (row.pushed) judged += DOT + fill('detail.notifiedAt', { time: hhmm(new Date(row.createdAt)) });
+  else if (row.withheld) judged += DOT + t('detail.withheld');
   line.appendChild(textNode(judged));
   judgement.appendChild(line);
   const dl = el('dl');
@@ -699,7 +702,7 @@ function refreshConversations() {
 }
 // What a drawn conversation shows, to tell an answer that changes nothing on screen from one that does.
 function conversationSignature(d, messages) {
-  return JSON.stringify([lang, Number(d && d.omitted) || 0, messages.map((m) => [
+  return JSON.stringify([lang, Number(d && d.omitted) || 0, Number(d && d.between) || 0, messages.map((m) => [
     m.direction, m.dedupKey || m.id, m.at, m.current ? 1 : 0, m.subject || '', m.summary || m.snippet || '', m.excerpt || '', m.senderName || m.sender || '',
     (m.to || []).concat(m.cc || [], m.bcc || []).map((p) => p.address).join(','),
   ])]);
@@ -720,11 +723,17 @@ function drawConversation(entry, d) {
   if (!messages.some((m) => !(m.direction === 'in' && m.current))) { section.hidden = true; return; }
   section.hidden = false;
   const omitted = Number(d.omitted) || 0;
+  // Left out between an older message opened and the newest, which are marked where they are missing.
+  const between = Math.min(Number(d.between) || 0, omitted);
+  const before = omitted - between;
   section.appendChild(el('h4', 'section-label', t('conv.title') + DOT + (messages.length + omitted)));
-  if (omitted) section.appendChild(el('p', 'conv-omitted', omitted === 1 ? t('conv.omitted1') : fill('conv.omitted', { count: omitted })));
+  if (before) section.appendChild(el('p', 'conv-omitted', before === 1 ? t('conv.omitted1') : fill('conv.omitted', { count: before })));
   const ul = el('ul', 'timeline');
   const now = new Date();
-  for (const m of messages) ul.appendChild(m.direction === 'out' ? sentItem(m, entry.row, now) : receivedItem(m, entry.row, now));
+  for (const m of messages) {
+    ul.appendChild(m.direction === 'out' ? sentItem(m, entry.row, now) : receivedItem(m, entry.row, now));
+    if (between && m.direction === 'in' && m.current) ul.appendChild(el('li', 'tl-gap', between === 1 ? t('conv.between1') : fill('conv.between', { count: between })));
+  }
   section.appendChild(ul);
   if (focused) {
     const again = section.querySelector('[data-conv="' + CSS.escape(focused) + '"]');

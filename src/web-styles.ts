@@ -353,6 +353,8 @@ body.offline #refresh,body.offline .load-more{opacity:.4;pointer-events:none}
 /* A message's conversation, under it: the reader's own messages carry the accent's dot, this one a hollow one. */
 .conversation{margin-top:8px;border-top:1px solid var(--line);padding-top:4px}
 .conv-omitted{margin:0 0 6px;font-size:12px;color:var(--muted)}
+/* Where the timeline skips from an older message opened to the newest: a quiet line, not an entry. */
+.timeline li.tl-gap{padding:0 0 8px;font-size:12px;color:var(--muted)}.timeline li.tl-gap::before{display:none}
 .tl-open{display:block;width:100%;margin:0;padding:0;border:0;border-radius:6px;background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
 .timeline{list-style:none;margin:0;padding:0 0 0 14px;border-left:1px solid var(--line)}
 .timeline li{position:relative;padding:6px 0 10px;font-size:13px}

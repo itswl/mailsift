@@ -27,7 +27,9 @@ function title(subject: string | null): string {
 function flags(row: MailRow): string | null {
   const set: string[] = [];
   if (row.inSpam) set.push('filed as spam');
-  set.push(row.pushed ? 'notified in real time' : 'not notified, carried by the daily digest');
+  set.push(row.pushed ? 'notified in real time'
+    : row.withheld ? 'not notified: it was due a notification, withheld because the owner had already answered it from another client or marked it done'
+      : 'not notified, carried by the daily digest');
   if (row.verificationCode) set.push('carries a verification code');
   return `- Delivery: ${set.join('; ')}`;
 }
