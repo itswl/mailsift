@@ -135,7 +135,7 @@ function metaLine(m, thread, now) {
   if (due) add(due.text, m.handledAt ? null : (due.late ? 'due late' : 'due'));
   // When it comes back, wherever a message that is put off is shown; and in
   // the queue, why a message that was not judged to matter is there.
-  if (isSnoozed(m)) add(fill('snooze.meta', { when: whenLabel(new Date(m.snoozedUntil), now, true) }));
+  if (isSnoozed(m)) add(fill('snooze.meta', { when: whenLabel(new Date(m.snoozedUntil), now, true) }), 'whole');
   else if (m.snoozedUntil && needsYou(m)) add(t('snooze.woke'));
   return meta;
 }
@@ -442,6 +442,16 @@ function openSnooze(key, anchor) {
     closePopover(snoozeSheet, false);
     if (again) return;
   }
+  // A panel just closed by this same press still owes its step back, and a
+  // panel that takes an entry of its own must open after it, or the step
+  // back lands on the new entry and closes it at once.
+  if ((backsOwed || backPending) && !isWide()) {
+    afterBack(() => { if (anchor.isConnected && !snoozeSheet.open) showSnooze(row, anchor); });
+    return;
+  }
+  showSnooze(row, anchor);
+}
+function showSnooze(row, anchor) {
   snoozeKey = rowKey(row);
   drawSnooze(row);
   const host = anchor.closest('dialog.sheet:not(.popover)') || document.body;
@@ -483,7 +493,8 @@ function drawSnooze(row) {
   const latest = new Date(now.getTime() + 365 * 86400000);
   input.min = localInput(new Date(now.getTime() + 60000));
   input.max = localInput(latest);
-  input.value = localInput(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 9, 0, 0, 0));
+  // The same morning the choices above call the next one: before five, the one to come today.
+  input.value = localInput(new Date(now.getFullYear(), now.getMonth(), now.getDate() + (now.getHours() < 5 ? 0 : 1), 9, 0, 0, 0));
   const set = el('button', 'text-btn strong', t('snooze.set'));
   set.type = 'submit';
   const note = el('p', 'snooze-note');
@@ -516,6 +527,26 @@ function snoozeUndoTo(before) {
   if (!before) return null;
   return Date.parse(before) > Date.now() + 1000 ? new Date(before) : 'now';
 }
+// After a choice in the panel: its control if it is still there, or the one
+// drawn in its place; else the row, where it is still listed in the same
+// list; else, when it has left that list, the row that took its place.
+function refocusAfterSnooze(key, back, find) {
+  const rowIn = (list, k) => (list && list.isConnected ? list.querySelector('li.row[data-key="' + CSS.escape(k) + '"]') : null);
+  const li = document.querySelector('#queue li.row[data-key="' + CSS.escape(key) + '"], #list li.row[data-key="' + CSS.escape(key) + '"]');
+  const list = li ? li.parentElement : null;
+  const near = li && (li.nextElementSibling || li.previousElementSibling);
+  const nearKey = near && near.dataset ? near.dataset.key : null;
+  const land = () => {
+    if (document.activeElement && document.activeElement !== document.body) return;
+    let target = back && back.isConnected ? back : (find ? find() : null);
+    if (target && target.matches('li')) target = target.querySelector('.mark, .who');
+    if (!target) { const same = rowIn(list, key); target = same && same.querySelector('.mark, .who'); }
+    if (!target) { const next = nearKey && rowIn(list, nearKey); target = next && next.querySelector('.who'); }
+    if (target) target.focus({ preventScroll: true });
+  };
+  land();
+  setTimeout(land, 420);
+}
 // The way a message is put off, from the panel, the key and the list alike.
 // Optimistic, as marking done is: it leaves the queue at once, and comes
 // back if the server refuses. 'at' is a time; 'now', to bring the message
@@ -523,9 +554,14 @@ function snoozeUndoTo(before) {
 // which only Undo asks for, of a message that had none. Undoing is quiet.
 async function snooze(key, at, undoing) {
   if (session.canMark === false) { requireWrite(); return; }
-  if (popovers.has(snoozeSheet)) closePopover(snoozeSheet, false);
+  // Chosen from the panel: the focus goes back near where it was, not to the top of the page.
+  const fromPanel = popovers.has(snoozeSheet) && snoozeSheet.contains(document.activeElement);
+  const panel = popovers.get(snoozeSheet);
+  const back = panel ? anchorOf(panel) : null;
+  if (panel) closePopover(snoozeSheet, false);
   const row = rowByKey(key) || (findItem(key) && rowOfItem(findItem(key)));
   if (!row) return;
+  if (fromPanel) refocusAfterSnooze(key, back, panel && panel.find);
   const before = row.snoozedUntil || null;
   const woken = at === 'now';
   const until = woken ? 'now' : at ? at.toISOString() : null;
@@ -726,7 +762,7 @@ function renderQueue(items, done, later, now, arriving) {
     const foot = cached('queue-foot', 'f', () => el('div', 'queue-foot'));
     const toggles = [];
     if (later.length) {
-      toggles.push(footToggle('later-toggle', fill('snooze.later', { count: later.length }), laterExpanded, () => {
+      toggles.push(footToggle('later-toggle', fill('snooze.later', { count: later.length + laterExtra }), laterExpanded, () => {
         laterExpanded = !laterExpanded;
         if (laterExpanded) doneExpanded = false;
         renderList();
@@ -989,11 +1025,14 @@ async function refresh() {
   }
 }
 
-function setAttention(rows, count, done, later) {
+function setAttention(rows, count, done, later, laterCount) {
   attention = Array.isArray(rows) ? rows : [];
   // A server that does not say (an older one, during an upgrade) leaves what is known.
   if (Array.isArray(done)) doneRecent = done;
-  if (Array.isArray(later)) snoozedRows = later;
+  if (Array.isArray(later)) {
+    snoozedRows = later;
+    laterExtra = typeof laterCount === 'number' ? Math.max(0, laterCount - later.length) : 0;
+  }
   attentionCount = typeof count === 'number' ? count : attention.length;
   attentionSet = new Set(attention.map(rowKey));
   // The queue as the server had it before it heard of a row just completed,
@@ -1019,7 +1058,7 @@ async function loadAttention() {
     const r = await fetch('/api/attention');
     if (!r.ok) return;
     const d = await r.json();
-    setAttention(d.mail, d.count, d.done, d.snoozed);
+    setAttention(d.mail, d.count, d.done, d.snoozed, d.snoozedCount);
   } catch (e) {}
 }
 
@@ -1093,6 +1132,7 @@ function saveSnapshot() {
         attention: (attention || []).slice(0, 40).map(plain),
         done: doneRecent.slice(0, 20).map(plain),
         later: snoozedRows.slice(0, 20).map(plain),
+        laterCount: snoozedRows.filter(isSnoozed).length + laterExtra,
         attentionCount, summary: lastSummary, digest: lastDigest,
       }));
     } catch (e) {}
@@ -1110,6 +1150,7 @@ function restoreSnapshot() {
     attention = Array.isArray(snap.attention) ? snap.attention : [];
     doneRecent = Array.isArray(snap.done) ? snap.done : [];
     snoozedRows = Array.isArray(snap.later) ? snap.later : [];
+    laterExtra = Math.max(0, (Number(snap.laterCount) || 0) - snoozedRows.filter(isSnoozed).length);
     attentionCount = Number(snap.attentionCount) || 0;
     attentionSet = new Set(attention.map(rowKey));
     lastFetchAt = new Date(snap.at);

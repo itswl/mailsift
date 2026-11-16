@@ -280,6 +280,8 @@ export const REJUDGED_KEY = 'web_push_rejudged';
  * message back by hand reads it too (see wakeNow).
  */
 export const SNOOZE_CHECKED_KEY = 'snooze_checked_at';
+/** A mark no older than this says a dispatcher is keeping the time: it looks once a minute. */
+const FRESH_WAKE_MARK_MS = 3 * 60_000;
 /** Nobody may be reading the list (notifications off); it must not grow without end. */
 const MAX_REJUDGED = 200;
 /** How far back the change signature looks; a little past the widest window the page offers. */
@@ -807,6 +809,13 @@ export class StateStore {
     ).run(attempts, String(error).slice(0, 500), nextAttemptAt, notificationKey);
   }
 
+  /** Hold a notification until a time, without counting an attempt: the owner put its message off until then. */
+  deferNotification(notificationKey: string, until: string): void {
+    this.db.prepare(
+      'UPDATE notification_outbox SET next_attempt_at = ? WHERE notification_key = ? AND delivered_at IS NULL',
+    ).run(until, notificationKey);
+  }
+
   notificationOutboxPending(): number {
     const row = this.db.prepare(
       'SELECT COUNT(*) AS n FROM notification_outbox WHERE delivered_at IS NULL',
@@ -1231,19 +1240,22 @@ export class StateStore {
    * the page is served is less than a minute ago, rather than this moment.
    * The dispatcher announces only what came after its last look, so a message
    * brought back by hand is not announced again a minute later: the owner is
-   * the one who asked. When nobody has been keeping the time (the page was
-   * not served for a while) that look is older, and the message counts as
-   * having come then, which keeps the same promise at the cost of a shorter
-   * month in the queue. It is this moment only when there is no look to use:
-   * none yet (a dispatcher that starts later begins from its own start), one
-   * ahead of the clock (the dispatcher waits for the clock to pass it), or
-   * one so old that a reminder counted from it would be out of the queue.
+   * the one who asked. That look is used only while it is recent, which is
+   * what says a dispatcher is keeping the time. An older one (the page has
+   * not been served for a while, and MCP is answering on its own) would
+   * count the month in the queue from then: the message would sort below
+   * everything that came since, past the queue's first page, and leave it
+   * early. So it is this moment whenever the look is not recent, or ahead of
+   * the clock, or missing. A dispatcher that resumes later from its old look
+   * may then remind of it once, within the day, which is the smaller harm
+   * than a message asked back and quietly gone again.
    */
   wakeNow(idOrKey: string): MailRow | undefined {
     const at = now();
     const raw = this.getMeta(SNOOZE_CHECKED_KEY);
     const mark = raw && Number.isFinite(Date.parse(raw)) ? new Date(Date.parse(raw)).toISOString() : undefined;
-    const usable = mark !== undefined && mark <= at && mark >= this.queueStart(at);
+    const recent = new Date(Date.parse(at) - FRESH_WAKE_MARK_MS).toISOString();
+    const usable = mark !== undefined && mark <= at && mark >= recent;
     return this.setSnoozed(idOrKey, usable ? mark : at);
   }
 
@@ -1261,6 +1273,13 @@ export class StateStore {
          ORDER BY snoozed_until ASC, dedup_key ASC LIMIT ?`,
       ).all(now(), Math.max(1, Math.min(Math.floor(limit), 200))) as Array<Record<string, unknown>>
     ).map(toRow);
+  }
+
+  /** How many are put off and still to come: all of them, where snoozed() lists a page. */
+  snoozedCount(): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM seen WHERE snoozed_until > ? AND handled_at IS NULL')
+      .get(now()) as Record<string, unknown> | undefined;
+    return Number(row?.['n'] ?? 0);
   }
 
   /**

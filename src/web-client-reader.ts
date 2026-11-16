@@ -722,7 +722,7 @@ async function mailAction(key, action) {
 // close it again; nor open while the sheet is still on its way out, whose
 // end hands the focus back to whatever opened it.
 function afterBack(run) {
-  let stepped = !backsOwed, ran = false;
+  let stepped = !backsOwed && !backPending, ran = false;
   const onPop = () => { stepped = true; };
   if (!stepped) window.addEventListener('popstate', onPop, { once: true });
   // Within about half a second whatever happens, so the panel is never lost.

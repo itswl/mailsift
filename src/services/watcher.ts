@@ -302,6 +302,20 @@ export class Watcher {
     // Failed deliveries carry a durable next_attempt_at timestamp. Only due
     // entries are sent here; recovery_status still exposes delayed entries.
     for (const entry of this.state.pendingNotifications(50, true)) {
+      // The owner saw this message in the page while its notification waited
+      // for a retry. Put off: it waits for the time they chose, when the
+      // reminder comes too. Dealt with: telling them now would be noise; the
+      // digest keeps it, as for a notification every output declines.
+      const row = this.state.getMail(entry.notificationKey);
+      if (row?.handledAt) {
+        this.state.upsertDigest(entry.notificationKey, digest.toDigestItem(entry.message, entry.result));
+        this.state.dropNotification(entry.notificationKey);
+        continue;
+      }
+      if (row?.snoozedUntil && Date.parse(row.snoozedUntil) > Date.now()) {
+        this.state.deferNotification(entry.notificationKey, row.snoozedUntil);
+        continue;
+      }
       const outcome = await this.sink.push(entry.message, entry.result);
       if (outcome === 'delivered') {
         this.state.markNotificationDelivered(entry.notificationKey);
@@ -406,7 +420,14 @@ export class Watcher {
         ? { ...message, subject: SENSITIVE_WORDS[result.sensitiveKind ?? 'code'].subject, body: '' }
         : message;
       const forwardedCopy = Boolean(isSelfForward(message, rules));
-      const shouldPush = !forwardedCopy && effectiveRank(message, result) >= pushLimit;
+      // Seen in the page meanwhile: a message put off is not announced before
+      // its time, by any output, and one already dealt with not at all. Its
+      // new verdict is kept, and the digest carries it as usual.
+      const row = rows[index]!;
+      const putOffUntil = !row.handledAt && row.snoozedUntil && Date.parse(row.snoozedUntil) > Date.now()
+        ? row.snoozedUntil : undefined;
+      const wouldPush = !forwardedCopy && effectiveRank(message, result) >= pushLimit;
+      const shouldPush = wouldPush && !row.handledAt && !putOffUntil;
       const fields = this.outcomeFields(safeMessage, result);
 
       metrics.addCounter('mailsift.messages.triaged', 1, {
@@ -449,6 +470,12 @@ export class Watcher {
         continue;
       }
 
+      // Waits in the outbox for the time the owner chose, and goes out then
+      // on the outputs that have no reminder of their own.
+      if (wouldPush && putOffUntil) {
+        this.state.enqueueNotification(key, { ...safeMessage, body: snippet(safeMessage) }, result);
+        this.state.deferNotification(key, putOffUntil);
+      }
       this.state.recordOutcome(key, result.importance, false, fields);
       if (message.inSpam || rank(result) >= digestThreshold) {
         this.state.upsertDigest(key, digest.toDigestItem(safeMessage, result));

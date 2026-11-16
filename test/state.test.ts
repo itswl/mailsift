@@ -610,7 +610,9 @@ describe('putting a message off until later', () => {
   it('brings back now at this moment when there is no recent look to stand on', () => {
     const s = store();
     seed(s, 'k1', 'info', false);
-    for (const mark of [undefined, at(10), at(-40 * 24 * 60), 'not a time']) {
+    // Missing; ahead of the clock; older than the queue; days old (nobody has been
+    // keeping the time, so the month would be counted from then); not a time.
+    for (const mark of [undefined, at(10), at(-40 * 24 * 60), at(-5 * 24 * 60), at(-10), 'not a time']) {
       if (mark === undefined) rawRun(s, 'DELETE FROM meta WHERE key = ?', SNOOZE_CHECKED_KEY);
       else s.setMeta(SNOOZE_CHECKED_KEY, mark);
       s.setSnoozed('k1', at(60));
@@ -620,6 +622,16 @@ describe('putting a message off until later', () => {
       expect(until, String(mark)).toBeLessThanOrEqual(Date.now());
       expect(s.inAttention('k1'), String(mark)).toBe(true);
     }
+  });
+
+  it('counts everything put off, where the list stops at its limit', () => {
+    const s = store();
+    for (const key of ['a', 'b', 'c']) { seed(s, key, 'info', false); s.setSnoozed(key, at(60)); }
+    seed(s, 'd', 'info', false);
+    s.setSnoozed('d', at(60));
+    s.setHandled('d', true);
+    expect(s.snoozed(2)).toHaveLength(2);
+    expect(s.snoozedCount()).toBe(3);
   });
 
   it('reads the queue through its indexes rather than every row kept', () => {
