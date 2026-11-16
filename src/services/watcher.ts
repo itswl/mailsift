@@ -352,6 +352,9 @@ export class Watcher {
         this.state.deferNotification(entry.notificationKey, row.snoozedUntil);
         continue;
       }
+      // Answered from another client while its notification waited: dealt
+      // with, and the notification dropped with its digest line.
+      if (row && this.answeredAlready(entry.notificationKey, entry.message.subject, true)) continue;
       const outcome = await this.sink.push(entry.message, entry.result);
       if (outcome === 'delivered') {
         this.state.markNotificationDelivered(entry.notificationKey);
@@ -479,6 +482,15 @@ export class Watcher {
         continue;
       }
 
+      // Answered from another client while it waited for its verdict: a reply
+      // read from Sent while it was out of the queue was not held against it
+      // then, so it is now, before anything is said about it.
+      if (!row.handledAt && (wouldPush || result.importance === 'critical')
+        && this.answeredAlready(key, safeMessage.subject, wouldPush)) {
+        this.state.recordOutcome(key, result.importance, false, fields);
+        continue;
+      }
+
       if (shouldPush) {
         const outboxMessage = { ...safeMessage, body: snippet(safeMessage) };
         this.state.enqueueNotification(key, outboxMessage, result);
@@ -566,11 +578,15 @@ export class Watcher {
       const forwardedCopy = Boolean(isSelfForward(message, rules));
       const wouldPush = !forwardedCopy && effectiveRank(message, result) >= pushLimit;
       // Already answered from another mail client (the answer is in Sent):
-      // stored as dealt with, and not notified. Only mail that would have
-      // been put before the owner is looked at; see StateStore.answerOnArrival.
-      const answered = !forwardedCopy && (wouldPush || result.importance === 'critical')
-        && this.answeredOnArrival(key, message);
-      if (wouldPush && !answered) {
+      // stored as dealt with, never notified and not listed in the digest,
+      // and still eligible for the queue if it is put back. Only mail that
+      // would have been put before the owner is looked at; see StateStore.answerStored.
+      if (!forwardedCopy && (wouldPush || result.importance === 'critical')
+        && this.answeredAlready(key, safeMessage.subject, wouldPush, message.messageId)) {
+        this.state.recordOutcome(key, result.importance, false, fields);
+        continue;
+      }
+      if (wouldPush) {
         // Persist a bounded, resendable copy before the external write. The
         // outbox is at-least-once: a crash after provider acceptance and before
         // the delivered mark can still duplicate a notification, so adapters
@@ -648,11 +664,16 @@ export class Watcher {
     return this.config.accounts.map((account) => account.username.trim().toLowerCase());
   }
 
-  /** Whether a message being stored was answered already; a failure to tell is a no, and is logged. */
-  private answeredOnArrival(key: string, message: MailMessage): boolean {
+  /**
+   * Whether a message about to be put before the owner was answered already
+   * (see StateStore.answerStored); if so it is dealt with and nothing more is
+   * said about it. A failure to tell is a no, and is logged. `subject` is the
+   * one safe to log: a code's is hidden.
+   */
+  private answeredAlready(key: string, subject: string, withheld: boolean, messageId?: string): boolean {
     try {
-      const answered = this.state.answerOnArrival(key, message.account, message.messageId, message.date, this.ownAddresses());
-      if (answered) log.info(`[${message.accountLabel}] already answered from another client; stored as dealt with: ${message.subject}`);
+      const answered = this.state.answerStored(key, this.ownAddresses(), withheld, messageId);
+      if (answered) log.info(`Already answered from another client; dealt with, not notified: ${subject}`);
       return answered;
     } catch (error) {
       log.warn(`Checking for an answer in Sent failed (the message is handled as usual): ${String(error).slice(0, 160)}`);

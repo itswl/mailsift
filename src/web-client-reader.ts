@@ -645,7 +645,8 @@ function detail(row) {
   const conversation = conversationSection(box, row);
   loadMessage(row, message, { trust, to, actions }, false);
   // After the message's own read has started; at once when it is already known.
-  if (!showKnownConversation(conversation)) setTimeout(() => loadConversation(conversation, false), 300);
+  // Not at all for a reader already left (arrowing down a list).
+  if (!showKnownConversation(conversation)) setTimeout(() => { if (conversation.section.isConnected) loadConversation(conversation, false); }, 300);
   return box;
 }
 // A thread opens on its latest message; the rest of it is its conversation.
@@ -675,6 +676,7 @@ function showKnownConversation(entry) {
   return true;
 }
 function loadConversation(entry, fresh) {
+  if (!entry.section.isConnected) return;
   if (!fresh && showKnownConversation(entry)) return;
   if (!fresh && entry.loading) return;
   entry.loading = true;
@@ -695,20 +697,39 @@ function refreshConversations() {
     else loadConversation(entry, true);
   }
 }
+// What a drawn conversation shows, to tell an answer that changes nothing on screen from one that does.
+function conversationSignature(d, messages) {
+  return JSON.stringify([lang, Number(d && d.omitted) || 0, messages.map((m) => [
+    m.direction, m.dedupKey || m.id, m.at, m.current ? 1 : 0, m.subject || '', m.summary || m.snippet || '', m.excerpt || '', m.senderName || m.sender || '',
+    (m.to || []).concat(m.cc || [], m.bcc || []).map((p) => p.address).join(','),
+  ])]);
+}
 function drawConversation(entry, d) {
   const section = entry.section;
   const messages = Array.isArray(d && d.messages) ? d.messages : [];
+  // A live event about other mail changes nothing here: the timeline, and the
+  // focus or the selection in it, stay as they are.
+  const drawn = conversationSignature(d, messages);
+  if (entry.drawn === drawn) return;
+  entry.drawn = drawn;
+  // Where the keyboard was in it, to be put back after it is drawn again.
+  const active = document.activeElement;
+  const focused = active && section.contains(active) && active.dataset ? active.dataset.conv : '';
   section.replaceChildren();
   // Nothing at all when the thread holds only this message.
   if (!messages.some((m) => !(m.direction === 'in' && m.current))) { section.hidden = true; return; }
   section.hidden = false;
   const omitted = Number(d.omitted) || 0;
   section.appendChild(el('h4', 'section-label', t('conv.title') + DOT + (messages.length + omitted)));
-  if (omitted) section.appendChild(el('p', 'conv-omitted', fill('conv.omitted', { count: omitted })));
+  if (omitted) section.appendChild(el('p', 'conv-omitted', omitted === 1 ? t('conv.omitted1') : fill('conv.omitted', { count: omitted })));
   const ul = el('ul', 'timeline');
   const now = new Date();
   for (const m of messages) ul.appendChild(m.direction === 'out' ? sentItem(m, entry.row, now) : receivedItem(m, entry.row, now));
   section.appendChild(ul);
+  if (focused) {
+    const again = section.querySelector('[data-conv="' + CSS.escape(focused) + '"]');
+    if (again) again.focus({ preventScroll: true });
+  }
 }
 // A subject is worth a line of its own only where it says something new, not "Re:" the same again.
 function bareSubject(value) {
@@ -737,6 +758,7 @@ function receivedItem(m, current, now) {
   // Each received message opens as itself, with its own text and actions.
   const open = el('button', 'tl-open');
   open.type = 'button';
+  open.dataset.conv = 'in:' + rowKey(m);
   open.onclick = () => { extraRows.set(rowKey(m), m); openDetail(rowKey(m)); };
   open.appendChild(el('div', 'tl-head', [m.senderName || m.sender || t('unknownSender'), whenLine(m.at, now)].filter(Boolean).join(DOT)));
   if (newSubject(m.subject, current)) open.appendChild(el('div', 'tl-subject', m.subject));
@@ -758,6 +780,7 @@ function sentItem(m, current, now) {
   head.appendChild(textNode([whom ? fill('conv.to', { list: whom }) : '', whenLine(m.at, now)].filter(Boolean).map((s) => DOT + s).join('')));
   const open = el('button', 'tl-open');
   open.type = 'button';
+  open.dataset.conv = 'out:' + m.id;
   open.appendChild(head);
   if (newSubject(m.subject, current)) open.appendChild(el('div', 'tl-subject', m.subject));
   const first = el('div', 'tl-sum', m.excerpt || t('conv.noText'));

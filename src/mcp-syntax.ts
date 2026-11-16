@@ -70,7 +70,6 @@ const NOT_STORED: readonly string[] = [
   'Attachment contents. Only names, MIME types, part ids and sizes are stored; list_attachments fetches a file on demand.',
   'Verification codes and sign-in links from mail that was judged locally. Those are deliberately kept out of stored text.',
   'Anything older than STATE_RETENTION_DAYS, which defaults to 90 days.',
-  'The owner\'s own sent mail, as far as these tools go: it is stored for the conversation only, so the thread resource and list_threads include it and find_contacts reads it, and no filter here ever returns it.',
 ];
 
 export function renderSearchSyntax(): string {
@@ -105,6 +104,10 @@ export function renderSearchSyntax(): string {
     '## What is not in the store',
     '',
     ...NOT_STORED.map((line) => `- ${line}`),
+    '',
+    '## The owner\'s own mail: stored, but not searched here',
+    '',
+    'What the owner sent (read from each mailbox\'s Sent folder, and stored as it leaves through mailsift) is kept for the conversation only. The mailsift://thread/{threadKey} resource shows it marked as theirs, list_threads counts it (sentCount, lastWordYours), and find_contacts turns a name into an address from it. None of the filters above returns it: they cover the mail the owner received.',
     '',
     '## Worked examples',
     '',

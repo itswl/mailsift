@@ -904,19 +904,21 @@ export function createServer(
     {
       mimeType: 'text/markdown',
       description:
-        'Read one conversation as a markdown page, oldest first. Thread keys come from list_threads. The owner\'s own ' +
-        'messages in it are included and marked as theirs, with whom each went to (Bcc included) and the text they ' +
-        'wrote, without the quoted history.',
+        'Read one conversation as a markdown page, oldest first: its newest 50 messages, with a line saying how many ' +
+        'older ones are left out. Thread keys come from list_threads. The owner\'s own messages in it are included and ' +
+        'marked as theirs, with whom each went to (Bcc included) and the text they wrote, without the quoted history.',
     },
     async (uri, variables) => {
       const threadKey = decodeVariable(variables['threadKey']);
-      const rows = threadKey ? store.getThreadMail(threadKey) : [];
-      // The owner's own messages in it, from Sent and from what was sent through mailsift.
-      const sent = threadKey ? store.sentInThread(threadKey, CONVERSATION_LIMIT) : [];
-      store.recordMcpAudit('resource:mail-thread', client, rows.length + sent.length > 0, threadKey);
-      if (rows.length + sent.length === 0) throw new McpToolError('NOT_FOUND', 'no stored messages for that thread key');
+      // The newest of the thread, the owner's own messages (from Sent and from
+      // what was sent through mailsift) among them, and how many older ones are left out.
+      const window = threadKey ? store.threadWindow(threadKey, CONVERSATION_LIMIT) : { entries: [], omitted: 0 };
+      const rows = window.entries.flatMap((entry) => (entry.direction === 'in' ? [entry.row] : []));
+      const sent = window.entries.flatMap((entry) => (entry.direction === 'out' ? [entry.sent] : []));
+      store.recordMcpAudit('resource:mail-thread', client, window.entries.length > 0, threadKey);
+      if (window.entries.length === 0) throw new McpToolError('NOT_FOUND', 'no stored messages for that thread key');
       return {
-        contents: [{ uri: uri.href, mimeType: 'text/markdown', text: threadToMarkdown(threadKey!, rows, sent) }],
+        contents: [{ uri: uri.href, mimeType: 'text/markdown', text: threadToMarkdown(threadKey!, rows, sent, window.omitted) }],
       };
     },
   );

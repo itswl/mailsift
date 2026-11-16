@@ -447,6 +447,8 @@ const BULK_CATEGORIES = new Set(['Marketing', 'Social', 'System', 'Forwarded cop
 /** The local part of an address that writes for a machine, not a person. */
 const AUTOMATED_LOCAL =
   /^(?:do[-_.]?not[-_.]?reply|mailer[-_.]?daemon|postmaster|bounces?|notifications?|notify|alerts?|newsletters?|news|marketing|updates?|digest|automated|system|info|support|hello|reports?|billing|receipts?|orders?|notices?|statements?)(?:[-_.+].*)?$|no[-_.]?reply/;
+/** A received row that is a copy of one of the owner's own sent messages: the same mailbox and Message-ID. */
+const OWN_COPY = 'EXISTS (SELECT 1 FROM sent_mail o WHERE o.account = seen.account AND o.message_id = seen.message_id)';
 /** Han, kana and hangul: a name in these is matched anywhere in it, not by its words. */
 const CJK = /[぀-ヿ㐀-鿿豈-﫿가-힯]/;
 
@@ -653,6 +655,8 @@ function toPushSubscription(raw: Record<string, unknown>): PushSubscriptionRow {
 }
 
 const LOCAL_LABEL_MIGRATION_KEY = 'migrated_local_labels';
+/** Set once the owner's earlier decisions have been read from the audit into seen.kept_at. */
+const KEPT_BACKFILL_KEY = 'migrated_kept_at';
 
 export class StateStore {
   private readonly db: DatabaseSync;
@@ -673,7 +677,8 @@ export class StateStore {
     const seenColumns = this.db.prepare('PRAGMA table_info(seen)').all() as Array<Record<string, unknown>>;
     for (const [name, definition] of [
       ['attachments_json', 'TEXT'], ['thread_key', 'TEXT'], ['verification_code', 'TEXT'], ['handled_at', 'TEXT'],
-      ['uid', 'INTEGER'], ['uid_validity', 'TEXT'], ['snoozed_until', 'TEXT'], ['put_back_at', 'TEXT'],
+      ['uid', 'INTEGER'], ['uid_validity', 'TEXT'], ['snoozed_until', 'TEXT'],
+      ['kept_at', 'TEXT'], ['withheld', 'INTEGER NOT NULL DEFAULT 0'],
     ] as const) {
       if (seenColumns.some((column) => column['name'] === name)) continue;
       try {
@@ -727,6 +732,12 @@ export class StateStore {
     // the queue starts at the upgrade rather than at the first visit after it.
     // Read first: this constructor runs for every web request, and a write
     // that changes nothing would still queue behind the poller's lock.
+    // The owner's decisions about a message from before kept_at existed are in
+    // the audit: read once, so a reply in Sent dated before one of them (the
+    // first look back reads a month) never overrides it.
+    if (this.getMeta(KEPT_BACKFILL_KEY) === undefined && this.casMeta(KEPT_BACKFILL_KEY, undefined, now())) {
+      this.backfillKeptAt();
+    }
     if (this.getMeta(ATTENTION_SINCE_KEY) === undefined) {
       this.db.prepare('INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)').run(ATTENTION_SINCE_KEY, now());
     }
@@ -1364,11 +1375,12 @@ export class StateStore {
   setHandled(idOrKey: string, handled: boolean): MailRow | undefined {
     const key = this.keyOf(idOrKey);
     if (key === undefined) return undefined;
-    // Putting a message back is remembered, so that a reply found in Sent
-    // later (one sent before it was put back) does not take it away again.
+    // Putting a message back is the owner's decision that it is still to deal
+    // with, and is remembered (kept_at), so that a reply found in Sent later,
+    // one written before that decision, does not take it away again.
     const result = handled
       ? this.db.prepare('UPDATE seen SET handled_at = ? WHERE dedup_key = ? AND handled_at IS NULL').run(now(), key)
-      : this.db.prepare('UPDATE seen SET handled_at = NULL, put_back_at = ? WHERE dedup_key = ? AND handled_at IS NOT NULL').run(now(), key);
+      : this.db.prepare('UPDATE seen SET handled_at = NULL, kept_at = ? WHERE dedup_key = ? AND handled_at IS NOT NULL').run(now(), key);
     if (Number(result.changes) > 0) this.bumpMailRevision();
     return this.getMail(key);
   }
@@ -1406,6 +1418,10 @@ export class StateStore {
    * queue's month is counted from the reminder rather than from the day the
    * message came, which may be long before.
    *
+   * Notified means pushed, or withheld: due a notification that was not
+   * sent because the owner had already answered the message from another
+   * client (see handleAnswered), so that putting it back returns it here.
+   *
    * The two cases are written as two halves of an OR, each bounded by a
    * column of its own, rather than as one CASE: SQLite then reads the first
    * half through the created_at index and the second through the index of
@@ -1418,7 +1434,7 @@ export class StateStore {
       clause:
         `((snoozed_until IS NULL
            AND importance IS NOT NULL
-           AND (pushed = 1 OR importance = 'critical')
+           AND (pushed = 1 OR withheld = 1 OR importance = 'critical')
            AND (verification_code IS NULL OR verification_code = '')
            AND (summary IS NULL OR (summary NOT LIKE ? AND summary NOT LIKE ?))
            AND (decided_by IS NULL OR decided_by NOT IN ('health', 'digest'))
@@ -1498,13 +1514,15 @@ export class StateStore {
   setSnoozed(idOrKey: string, until: string | null): MailRow | undefined {
     const key = this.keyOf(idOrKey);
     if (key === undefined) return undefined;
+    // Every reminder set, moved, brought forward or taken away is the owner
+    // deciding about the message now, after any reply already in Sent: kept_at
+    // remembers when, as for a message put back (see setHandled).
     const result = until
       ? this.db.prepare(
-        `UPDATE seen SET snoozed_until = ?, handled_at = NULL,
-           put_back_at = CASE WHEN handled_at IS NOT NULL THEN ? ELSE put_back_at END
+        `UPDATE seen SET snoozed_until = ?, handled_at = NULL, kept_at = ?
          WHERE dedup_key = ? AND (snoozed_until IS NOT ? OR handled_at IS NOT NULL)`,
       ).run(until, now(), key, until)
-      : this.db.prepare('UPDATE seen SET snoozed_until = NULL WHERE dedup_key = ? AND snoozed_until IS NOT NULL').run(key);
+      : this.db.prepare('UPDATE seen SET snoozed_until = NULL, kept_at = ? WHERE dedup_key = ? AND snoozed_until IS NOT NULL').run(now(), key);
     // Open pages move the row out of the queue, or back into it.
     if (Number(result.changes) > 0) {
       this.bumpMailRevision();
@@ -1861,8 +1879,14 @@ export class StateStore {
 
     // The list stays the received mail's: a thread is in it for its received
     // messages in the window, and the owner's own only add to what it says.
+    // A received copy of one of the owner's own messages (a list sending a
+    // post back to its poster, a Bcc to themselves) is the owner's message,
+    // counted once, as sent.
+    const own = this.ownCopies([...groups.keys()]);
     const threads = [...groups.entries()]
-      .map(([threadKey, messages]) => {
+      .map(([threadKey, all]) => {
+        const messages = all.filter((row) => !own.has(`${row.account}|${row.messageId ?? ''}`));
+        if (!messages.length) return undefined;
         messages.sort((a, b) =>
           b.createdAt.localeCompare(a.createdAt) || b.dedupKey.localeCompare(a.dedupKey));
         const latest = messages[0]!;
@@ -1878,11 +1902,15 @@ export class StateStore {
           lastWordYours: false,
         } as MailThread;
       })
+      .filter((thread): thread is MailThread => thread !== undefined)
       .sort((a, b) =>
         b.latest.createdAt.localeCompare(a.latest.createdAt)
         || b.latest.dedupKey.localeCompare(a.latest.dedupKey))
       .slice(0, requested);
-    const sent = this.sentByThread(threads.map((thread) => thread.threadKey));
+    // Counted in the same window as the received messages, so "N messages" means one thing.
+    const since = options.sinceHours !== undefined
+      ? new Date(Date.now() - options.sinceHours * 3_600_000).toISOString() : undefined;
+    const sent = this.sentByThread(threads.map((thread) => thread.threadKey), since);
     for (const thread of threads) {
       const mine = sent.get(thread.threadKey);
       if (!mine) continue;
@@ -1896,16 +1924,34 @@ export class StateStore {
     return threads;
   }
 
-  /** How many of the owner's messages each thread holds, and when the latest was sent. */
-  private sentByThread(threadKeys: readonly string[]): Map<string, { count: number; lastAt: string | null }> {
+  /** `account|Message-ID` of every sent message in these threads: what a received copy of one is matched on. */
+  private ownCopies(threadKeys: readonly string[]): Set<string> {
+    const out = new Set<string>();
+    const keys = [...new Set(threadKeys)].filter(Boolean);
+    for (let at = 0; at < keys.length; at += 200) {
+      const chunk = keys.slice(at, at + 200);
+      for (const row of this.db.prepare(
+        `SELECT account, message_id FROM sent_mail WHERE thread_key IN (${chunk.map(() => '?').join(', ')})`,
+      ).all(...chunk) as Array<Record<string, unknown>>) out.add(`${String(row['account'])}|${String(row['message_id'])}`);
+    }
+    return out;
+  }
+
+  /**
+   * How many of the owner's messages each thread holds (since `since`, when
+   * given, as the received messages it is shown with), and when the latest
+   * of them all was sent.
+   */
+  private sentByThread(threadKeys: readonly string[], since?: string): Map<string, { count: number; lastAt: string | null }> {
     const out = new Map<string, { count: number; lastAt: string | null }>();
     const keys = [...new Set(threadKeys)].filter(Boolean);
     for (let at = 0; at < keys.length; at += 200) {
       const chunk = keys.slice(at, at + 200);
       const rows = this.db.prepare(
-        `SELECT thread_key, COUNT(*) AS n, MAX(COALESCE(mail_date, created_at)) AS last_at
+        `SELECT thread_key, COUNT(CASE WHEN COALESCE(mail_date, created_at) >= ? THEN 1 END) AS n,
+                MAX(COALESCE(mail_date, created_at)) AS last_at
          FROM sent_mail WHERE thread_key IN (${chunk.map(() => '?').join(', ')}) GROUP BY thread_key`,
-      ).all(...chunk) as Array<Record<string, unknown>>;
+      ).all(since ?? '', ...chunk) as Array<Record<string, unknown>>;
       for (const row of rows) {
         out.set(String(row['thread_key']), { count: Number(row['n'] ?? 0), lastAt: (row['last_at'] as string) ?? null });
       }
@@ -1913,10 +1959,11 @@ export class StateStore {
     return out;
   }
 
-  /** When the newest received message of a thread is dated. */
+  /** When the newest received message of a thread is dated; a copy of the owner's own is not one. */
   private latestReceivedIn(threadKey: string): string | undefined {
-    const row = this.db.prepare('SELECT MAX(COALESCE(mail_date, created_at)) AS at FROM seen WHERE thread_key = ?')
-      .get(threadKey) as Record<string, unknown> | undefined;
+    const row = this.db.prepare(
+      `SELECT MAX(COALESCE(mail_date, created_at)) AS at FROM seen WHERE thread_key = ? AND NOT ${OWN_COPY}`,
+    ).get(threadKey) as Record<string, unknown> | undefined;
     return (row?.['at'] as string) ?? undefined;
   }
 
@@ -1934,10 +1981,12 @@ export class StateStore {
    * row is never held against the queue again (see answerFromSent).
    */
   recordSent(record: SentRecord): { id: number; inserted: boolean } {
+    // Names in one Unicode form (NFKC: full-width letters, half-width kana and
+    // accents written apart become what they look like), so a search for the
+    // name finds them however the sender's client wrote it.
+    const person = (kind: string) => (r: SentAddress) => ({ kind, name: r.name.normalize('NFKC'), address: r.address });
     const recipients = JSON.stringify([
-      ...record.to.map((r) => ({ kind: 'to', ...r })),
-      ...record.cc.map((r) => ({ kind: 'cc', ...r })),
-      ...record.bcc.map((r) => ({ kind: 'bcc', ...r })),
+      ...record.to.map(person('to')), ...record.cc.map(person('cc')), ...record.bcc.map(person('bcc')),
     ].slice(0, 300));
     const names = JSON.stringify(record.attachmentNames.slice(0, 50).map((name) => name.slice(0, 300)));
     const fromPoll = record.source === 'poll';
@@ -2007,60 +2056,100 @@ export class StateStore {
   }
 
   /**
-   * One stored message's conversation: its thread's received messages and the
-   * owner's own, oldest first. At most `limit`: the message itself and the
-   * newest of the rest, with `omitted` saying how many older ones are left out.
+   * The newest part of a thread: its received messages and the owner's own,
+   * oldest first, at most `limit`, with `omitted` the true number of the
+   * thread's stored messages left out. With `current`, that message is always
+   * in it, with the newest of the rest. A received copy of one of the owner's
+   * own messages is the owner's message: shown once, as sent, unless it is
+   * the one being read.
+   */
+  threadWindow(threadKey: string, limit = CONVERSATION_LIMIT, current?: MailRow): { entries: ConversationEntry[]; omitted: number } {
+    const bound = Math.max(1, Math.min(Math.floor(limit), CONVERSATION_LIMIT));
+    const at = (value: string | null, fallback: string): string => value || fallback;
+    // The newest of each table, which together hold the newest of the thread.
+    const received: ConversationEntry[] = (
+      this.db.prepare(
+        `SELECT ${ROW_COLUMNS.join(', ')}, snippet FROM seen WHERE thread_key = ? AND NOT ${OWN_COPY}
+         ORDER BY COALESCE(mail_date, created_at) DESC, created_at DESC LIMIT ?`,
+      ).all(threadKey, bound) as Array<Record<string, unknown>>
+    ).map(toRow).map((r) => ({ direction: 'in' as const, at: at(r.mailDate, r.createdAt), row: r }));
+    let sent: ConversationEntry[] = this.sentInThread(threadKey, bound)
+      .map((s) => ({ direction: 'out' as const, at: at(s.date, s.createdAt), sent: s }));
+    const count = (sql: string): number => Number((this.db.prepare(sql).get(threadKey) as Record<string, unknown>)['n'] ?? 0);
+    const total = count(`SELECT COUNT(*) AS n FROM seen WHERE thread_key = ? AND NOT ${OWN_COPY}`)
+      + count('SELECT COUNT(*) AS n FROM sent_mail WHERE thread_key = ?');
+    const isCurrent = (entry: ConversationEntry): boolean => Boolean(current) && entry.direction === 'in' && entry.row.dedupKey === current!.dedupKey;
+    if (current && !received.some(isCurrent)) {
+      // Read from a copy of the owner's own message: it stands for that message, which is not shown twice.
+      sent = sent.filter((entry) => !(entry.direction === 'out' && entry.sent.account === current.account && entry.sent.messageId === current.messageId));
+      received.push({ direction: 'in', at: at(current.mailDate, current.createdAt), row: current });
+    }
+    const all = [...received, ...sent].sort((a, b) => a.at.localeCompare(b.at));
+    const others = all.filter((entry) => !isCurrent(entry));
+    const kept = new Set<ConversationEntry>([...all.filter(isCurrent), ...others.slice(-(bound - all.filter(isCurrent).length))]);
+    const entries = all.filter((entry) => kept.has(entry));
+    return { entries, omitted: Math.max(0, total - entries.length) };
+  }
+
+  /**
+   * One stored message's conversation, as the reader shows it under the
+   * message: the message itself and the newest of the rest of its thread.
    */
   conversation(row: MailRow, limit = CONVERSATION_LIMIT): { entries: ConversationEntry[]; omitted: number } {
-    const bound = Math.max(2, Math.min(Math.floor(limit), CONVERSATION_LIMIT));
-    const at = (value: string | null, fallback: string): string => value || fallback;
-    const received: ConversationEntry[] = row.threadKey
-      ? this.getThreadMail(row.threadKey, 200).map((r) => ({ direction: 'in' as const, at: at(r.mailDate, r.createdAt), row: r }))
-      : [];
-    if (!received.some((entry) => entry.direction === 'in' && entry.row.dedupKey === row.dedupKey)) {
-      received.push({ direction: 'in', at: at(row.mailDate, row.createdAt), row });
-    }
-    const sent: ConversationEntry[] = row.threadKey
-      ? this.sentInThread(row.threadKey, 200).map((s) => ({ direction: 'out' as const, at: at(s.date, s.createdAt), sent: s }))
-      : [];
-    const all = [...received, ...sent].sort((a, b) => a.at.localeCompare(b.at));
-    if (all.length <= bound) return { entries: all, omitted: 0 };
-    const isCurrent = (entry: ConversationEntry): boolean => entry.direction === 'in' && entry.row.dedupKey === row.dedupKey;
-    const others = all.filter((entry) => !isCurrent(entry));
-    const kept = new Set<ConversationEntry>([all.find(isCurrent)!, ...others.slice(-(bound - 1))]);
-    return { entries: all.filter((entry) => kept.has(entry)), omitted: all.length - kept.size };
+    if (!row.threadKey) return { entries: [{ direction: 'in', at: row.mailDate || row.createdAt, row }], omitted: 0 };
+    return this.threadWindow(row.threadKey, limit, row);
   }
 
   // ---- Answered elsewhere ----
 
+  /** An answer that went only to the owner's own addresses answers nobody. */
+  private answersSomeone(sent: SentRow, own: readonly string[]): boolean {
+    return !toOwnOnly([...sent.to, ...sent.cc, ...sent.bcc], own);
+  }
+
+  /**
+   * Whether an answer counts against the owner's latest decision about the
+   * message (put back, put off, its reminder changed; see kept_at): only one
+   * written after it does. The message's own date is not compared: an
+   * answer names it by Message-ID, so it cannot be older than it, and a
+   * sender's clock that runs ahead would only make a real answer miss.
+   */
+  private afterDecision(sentDate: string | null, keptAt: unknown): boolean {
+    if (typeof keptAt !== 'string' || !keptAt) return true;
+    return Boolean(sentDate) && sentDate! > keptAt;
+  }
+
   /**
    * The stored received message a sent one takes off the queue, if any: of
    * the same mailbox, the message it answers, still to be dealt with (in the
-   * queue, or put off), dated before the answer, and not put back by the
-   * owner after the answer was written. An answer that went only to the
-   * owner's own addresses answers nobody.
+   * queue, or put off), and not decided on by the owner after the answer was
+   * written.
    */
-  private answeredBy(sent: { account: string; answers: string | null; date: string | null; to: SentAddress[]; cc: SentAddress[]; bcc: SentAddress[] },
-    own: readonly string[]): { key: string; messageId: string; folder: string | null } | undefined {
-    if (!sent.answers || !sent.date) return undefined;
-    if (toOwnOnly([...sent.to, ...sent.cc, ...sent.bcc], own)) return undefined;
+  private answeredBy(sent: SentRow, own: readonly string[]): { key: string; messageId: string; folder: string | null } | undefined {
+    if (!sent.answers || !this.answersSomeone(sent, own)) return undefined;
     const rule = this.queueRule();
     const raw = this.db.prepare(
-      `SELECT dedup_key, message_id, folder, mail_date, created_at, put_back_at FROM seen
+      `SELECT dedup_key, message_id, folder, kept_at FROM seen
        WHERE account = ? AND message_id = ? AND handled_at IS NULL AND (${rule.clause} OR snoozed_until > ?)
        ORDER BY created_at LIMIT 1`,
     ).get(sent.account, sent.answers, ...rule.params, now()) as Record<string, unknown> | undefined;
-    if (!raw) return undefined;
-    const received = String(raw['mail_date'] ?? raw['created_at'] ?? '');
-    if (!(sent.date > received)) return undefined;
-    const putBack = raw['put_back_at'] as string | null;
-    if (putBack && !(sent.date > putBack)) return undefined;
+    if (!raw || !this.afterDecision(sent.date, raw['kept_at'])) return undefined;
     return { key: String(raw['dedup_key']), messageId: String(raw['message_id'] ?? ''), folder: (raw['folder'] as string) ?? null };
   }
 
-  /** Take a received message off the queue because of an answer found in Sent, on record as that. */
-  private handleAnswered(target: { key: string; messageId: string; folder: string | null }, account: string, sentId: number): void {
+  /**
+   * Take a received message off the queue because the owner answered it
+   * elsewhere, as answering it in the page does, and say nothing more about
+   * it: a notification still owed is dropped and its digest line removed.
+   * `withheld` (or a notification found owed) keeps it eligible for the
+   * queue as a notified message is, so putting it back returns it there.
+   */
+  private handleAnswered(target: { key: string; messageId: string; folder: string | null }, account: string, sentId: number, withheld: boolean): void {
     this.setHandled(target.key, true);
+    const owed = Number(this.db.prepare('DELETE FROM notification_outbox WHERE notification_key = ? AND delivered_at IS NULL')
+      .run(target.key).changes) > 0;
+    if (withheld || owed) this.db.prepare('UPDATE seen SET withheld = 1 WHERE dedup_key = ?').run(target.key);
+    this.db.prepare('DELETE FROM digest_queue WHERE dedup_key = ?').run(target.key);
     this.db.prepare('UPDATE sent_mail SET answered_key = ? WHERE id = ?').run(target.key, sentId);
     this.recordMailAction({
       account, messageId: target.messageId, action: 'handled', success: true, client: SENT_FOLDER_CLIENT,
@@ -2085,7 +2174,7 @@ export class StateStore {
     for (const sent of rows) {
       const target = this.answeredBy(sent, own);
       if (target) {
-        this.handleAnswered(target, sent.account, sent.id);
+        this.handleAnswered(target, sent.account, sent.id, false);
         handled.push(target.key);
       }
       checked.run(now(), sent.id);
@@ -2094,22 +2183,59 @@ export class StateStore {
   }
 
   /**
-   * For a received message being stored: whether the owner already answered
-   * it from elsewhere. If so it is stored as dealt with, before it is judged,
-   * so nothing reading judged rows (the notifications above all) sees it
-   * waiting. `key` is its row, already filed by markSeen.
+   * Before a message is put before the owner (stored and about to be
+   * notified, judged again after an outage, or a notification retried):
+   * whether a stored answer to it says the owner dealt with it already. If
+   * so it is taken off as answerFromSent does and true is returned, and the
+   * caller notifies nothing. Called before a new row is judged, so nothing
+   * reading judged rows (web push above all) sees it waiting. `withheld`:
+   * the caller was about to notify it. `messageId`: for a row just filed,
+   * whose Message-ID is written with its verdict.
    */
-  answerOnArrival(key: string, account: string, messageId: string, date: string, own: readonly string[]): boolean {
-    const candidates = (this.db.prepare(
-      `SELECT * FROM sent_mail WHERE account = ? AND answers = ? AND mail_date > ?
-       ORDER BY mail_date LIMIT 20`,
-    ).all(account, messageId, date) as Array<Record<string, unknown>>).map(toSentRow);
-    const answer = candidates.find((sent) => !toOwnOnly([...sent.to, ...sent.cc, ...sent.bcc], own));
+  answerStored(key: string, own: readonly string[], withheld = false, messageId?: string): boolean {
+    const raw = this.db.prepare('SELECT account, message_id, folder, handled_at, kept_at FROM seen WHERE dedup_key = ?')
+      .get(key) as Record<string, unknown> | undefined;
+    const id = (raw?.['message_id'] as string | null) || messageId;
+    if (!raw || raw['handled_at'] || !id) return false;
+    const account = String(raw['account']);
+    const answer = (this.db.prepare(
+      'SELECT * FROM sent_mail WHERE account = ? AND answers = ? ORDER BY COALESCE(mail_date, created_at) DESC LIMIT 20',
+    ).all(account, id) as Array<Record<string, unknown>>).map(toSentRow)
+      .find((sent) => this.answersSomeone(sent, own) && this.afterDecision(sent.date, raw['kept_at']));
     if (!answer) return false;
-    const raw = this.db.prepare('SELECT folder, handled_at FROM seen WHERE dedup_key = ?').get(key) as Record<string, unknown> | undefined;
-    if (!raw || raw['handled_at']) return false;
-    this.handleAnswered({ key, messageId, folder: (raw['folder'] as string) ?? null }, account, answer.id);
+    this.handleAnswered({ key, messageId: id, folder: (raw['folder'] as string) ?? null }, account, answer.id, withheld);
     return true;
+  }
+
+  /**
+   * Read the owner's decisions about each message from before kept_at was
+   * kept, from the audit: putting a message back, and every reminder set,
+   * brought back or taken away, in the page (whose rows name the record's
+   * key) and through MCP (whose rows name a Message-ID or a key, and maybe
+   * the mailbox). An MCP mark_handled row may have marked a message done
+   * rather than put it back; counted all the same, it can only keep a reply
+   * written before it from taking off a message the owner had just looked at.
+   */
+  private backfillKeptAt(): void {
+    this.db.prepare(
+      `UPDATE seen SET kept_at = decided.at FROM (
+         SELECT key, MAX(at) AS at FROM (
+           SELECT target AS key, created_at AS at FROM mcp_audit
+           WHERE success = 1 AND target IS NOT NULL AND action IN ('web:unhandled', 'web:snooze', 'web:wake', 'web:unsnooze')
+           UNION ALL
+           SELECT s.dedup_key AS key, m.at AS at FROM (
+             -- Read as JSON only where it is JSON, whatever order SQLite tests these in:
+             -- the page's own rows name a key in plain text.
+             SELECT created_at AS at,
+                    json_extract(CASE WHEN json_valid(target) THEN target ELSE '{}' END, '$.messageId') AS mid,
+                    json_extract(CASE WHEN json_valid(target) THEN target ELSE '{}' END, '$.account') AS mailbox
+             FROM mcp_audit WHERE success = 1 AND action IN ('mark_handled', 'snooze')
+           ) m JOIN seen s
+             ON m.mid IS NOT NULL AND (s.dedup_key = m.mid OR (s.message_id = m.mid AND (m.mailbox IS NULL OR s.account = m.mailbox)))
+         ) GROUP BY key
+       ) AS decided
+       WHERE seen.dedup_key = decided.key AND (seen.kept_at IS NULL OR seen.kept_at < decided.at)`,
+    ).run();
   }
 
   // ---- Where the poll is in each Sent folder ----
@@ -2199,12 +2325,23 @@ export class StateStore {
       written.add(address);
     }
 
-    const seenRows = this.db.prepare(
-      `SELECT sender, sender_name, COALESCE(mail_date, created_at) AS at, category, in_spam, decided_by,
-              verification_code, summary
-       FROM seen WHERE sender LIKE '%@%' AND (${like('sender')} OR ${like('sender_name')})
-       ORDER BY created_at DESC LIMIT ?`,
-    ).all(...variants, ...variants, CONTACT_SCAN_ROWS) as Array<Record<string, unknown>>;
+    const seenColumns = `sender, sender_name, COALESCE(mail_date, created_at) AS at, category, in_spam, decided_by,
+              verification_code, summary`;
+    const seenRows = [
+      ...this.db.prepare(
+        `SELECT ${seenColumns} FROM seen WHERE sender LIKE '%@%' AND (${like('sender')} OR ${like('sender_name')})
+         ORDER BY created_at DESC LIMIT ?`,
+      ).all(...variants, ...variants, CONTACT_SCAN_ROWS) as Array<Record<string, unknown>>,
+      // A received name stored in another Unicode form than the query's
+      // (full-width Latin, half-width kana, an accent written apart) slips past
+      // LIKE, which compares bytes: any name with a character outside ASCII
+      // that the filter above left out is matched here instead, after NFKC.
+      ...this.db.prepare(
+        `SELECT ${seenColumns} FROM seen WHERE sender LIKE '%@%' AND sender_name GLOB '*[^ -~]*'
+           AND NOT (${like('sender')} OR ${like('sender_name')})
+         ORDER BY created_at DESC LIMIT ?`,
+      ).all(...variants, ...variants, CONTACT_SCAN_ROWS) as Array<Record<string, unknown>>,
+    ];
     const readers = new Map<string, Seen & { personal: number; score: number }>();
     for (const row of seenRows) {
       const address = String(row['sender'] ?? '').trim().toLowerCase();
@@ -2219,9 +2356,13 @@ export class StateStore {
         || ['health', 'digest'].includes(String(row['decided_by'] ?? ''));
       // Whoever was written to keeps the name they were last seen under, from either side.
       if (written.has(address)) {
-        const entry = person(address);
-        if (!bulk) entry.received += 1;
-        named(entry, name, at);
+        // Spam or bulk mail from an address the owner writes to (a forged From
+        // line, say) neither counts for it nor renames it.
+        if (!bulk) {
+          const entry = person(address);
+          entry.received += 1;
+          named(entry, name, at);
+        }
         continue;
       }
       if (mine.has(address)) continue;

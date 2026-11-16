@@ -1817,6 +1817,77 @@ describe('the owner\'s own mail', () => {
     expect((await call(client, 'get_mail', { messageId: '<r@qq.com>' }))['found']).toBe(false);
   });
 
+  it('reads a long thread\'s newest messages, says how many older ones are left out, and shows a copy of the owner\'s message once', async () => {
+    const state = seeded();
+    const thread = 'me@qq.com|<root@list.example>';
+    const day = Date.parse('2026-11-01T00:00:00.000Z');
+    for (let n = 1; n <= 60; n += 1) {
+      state.markSeen(`m${n}`, 'me@qq.com', 'Release planning');
+      state.recordOutcome(`m${n}`, 'info', false, {
+        messageId: `<m${n}@list.example>`, threadKey: thread, sender: `user${n}@list.example`, senderName: `User${n}`,
+        mailDate: new Date(day + n * 3_600_000).toISOString(),
+      });
+    }
+    state.recordSent({
+      account: 'me@qq.com', messageId: '<mine@qq.com>', threadKey: thread, answers: '<m55@list.example>',
+      subject: 'Re: Release planning', fromAddr: 'me@qq.com', to: [{ name: '', address: 'list@list.example' }], cc: [], bcc: [],
+      date: new Date(day + 55.5 * 3_600_000).toISOString(), text: 'Friday works for me.', attachmentCount: 0, attachmentNames: [], source: 'poll',
+    });
+    // The list sends the post back to its poster.
+    state.markSeen('echo', 'me@qq.com', 'Re: Release planning');
+    state.recordOutcome('echo', 'info', false, {
+      messageId: '<mine@qq.com>', threadKey: thread, sender: 'me@qq.com', mailDate: new Date(day + 55.6 * 3_600_000).toISOString(),
+    });
+    const client = await connect(state);
+    const page = String(((await client.readResource({ uri: `mailsift://thread/${encodeURIComponent(thread)}` }))
+      .contents[0] as { text: string }).text);
+    expect(page).toContain('- Messages: 50 (1 sent by the owner)');
+    expect(page).toContain('- Older messages not shown: 11 (this page holds the newest)');
+    // The newest are there, in order, the owner's reply among them and not last.
+    expect(page.indexOf('From User55')).toBeLessThan(page.indexOf('From the owner to list@list.example'));
+    expect(page.indexOf('From the owner to list@list.example')).toBeLessThan(page.indexOf('From User56'));
+    expect(page).toContain('From User60');
+    expect(page).not.toContain('From User11 ');
+    // The copy that came back is the owner's message, shown once.
+    expect(page.match(/Friday works for me\./g)).toHaveLength(1);
+    expect(page).not.toContain('From me@qq.com');
+    // "Re:" the thread's own subject is not said again.
+    expect(page).not.toContain('- Subject: Re: Release planning');
+    const threads = (await call(client, 'list_threads', { hours: 24 * 365 * 5 }))['threads'] as Array<Record<string, unknown>>;
+    expect(threads.find((t) => t['threadKey'] === thread)).toMatchObject({ messageCount: 60, sentCount: 1, lastWordYours: false });
+  });
+
+  it('names a sent message\'s subject on the thread page when it says something new', async () => {
+    const state = seeded();
+    state.markSeen('t1', 'me@qq.com', 'Lunch?');
+    state.recordOutcome('t1', 'info', false, { messageId: '<lunch@example.org>', threadKey: 'me@qq.com|<lunch@example.org>', mailDate: '2026-11-16T10:00:00.000Z' });
+    state.recordSent({
+      account: 'me@qq.com', messageId: '<r@qq.com>', threadKey: 'me@qq.com|<lunch@example.org>', subject: 'Change of plan: dinner instead',
+      fromAddr: 'me@qq.com', to: [{ name: '', address: 'ann@example.org' }], cc: [], bcc: [], date: '2026-11-16T11:00:00.000Z',
+      text: 'Dinner?', attachmentCount: 0, attachmentNames: [], source: 'poll',
+    });
+    state.recordSent({
+      account: 'me@qq.com', messageId: '<r2@qq.com>', threadKey: 'me@qq.com|<lunch@example.org>', subject: 'Re: Lunch?',
+      fromAddr: 'me@qq.com', to: [{ name: '', address: 'ann@example.org' }], cc: [], bcc: [], date: '2026-11-16T12:00:00.000Z',
+      text: 'Or lunch after all.', attachmentCount: 0, attachmentNames: [], source: 'poll',
+    });
+    const client = await connect(state);
+    const page = String(((await client.readResource({ uri: `mailsift://thread/${encodeURIComponent('me@qq.com|<lunch@example.org>')}` }))
+      .contents[0] as { text: string }).text);
+    expect(page).toContain('- Subject: Change of plan: dinner instead');
+    // "Re:" the thread's own subject is not said again.
+    expect(page).not.toContain('- Subject: Re: Lunch?');
+    expect(page).not.toContain('Older messages not shown');
+  });
+
+  it('says in the search syntax that sent mail is stored, apart from what is not in the store', async () => {
+    const client = await connect(seeded());
+    const text = String(((await client.readResource({ uri: 'mailsift://search-syntax' })).contents[0] as { text: string }).text);
+    const notStored = text.slice(text.indexOf('## What is not in the store'), text.indexOf('## The owner\'s own mail'));
+    expect(notStored).not.toContain('sent');
+    expect(text).toContain('## The owner\'s own mail: stored, but not searched here');
+  });
+
   it('turns a name into addresses with the read credential alone', async () => {
     const state = seeded();
     state.recordSent({
