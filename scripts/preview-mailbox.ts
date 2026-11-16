@@ -260,10 +260,12 @@ export class PreviewMailbox {
     }
     const folders = this.folders.get(account.username) ?? [];
     const byRole = (role: MailboxFolder['role']): PreviewFolder | undefined => folders.find((f) => f.role === role && f.selectable);
+    if (action === 'not_spam' && folder.role !== 'junk') throw new MailActionError('not_applicable', 'the message is not in a spam folder');
     const target = action === 'move' ? folders.find((f) => f.path === options.destination && f.selectable)
       : action === 'archive' ? byRole('archive') ?? byRole('all')
         : action === 'trash' ? byRole('trash')
-          : action === 'inbox' ? byRole('inbox') : undefined;
+          : action === 'spam' ? byRole('junk')
+            : action === 'inbox' || action === 'not_spam' ? byRole('inbox') : undefined;
     if (!target) throw new MailActionError('invalid_destination', action === 'archive' ? 'this mailbox has no archive folder' : 'destination folder not found');
     if (target === folder) throw new MailActionError('invalid_destination', 'message is already in the destination folder');
     folder.messages = folder.messages.filter((m) => m !== message);

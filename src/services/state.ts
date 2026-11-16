@@ -352,7 +352,13 @@ export interface NotificationOutboxRow {
   createdAt: string;
 }
 
-export type FeedbackLabel = 'false_positive' | 'missed' | 'handled' | 'correct';
+/**
+ * What the owner said about a message. `spam` and `not_spam` are said by
+ * moving a message into the spam folder or out of it; a sender's spam counts
+ * towards a never-important rule as a false positive does, unless the owner
+ * has since said one of that sender's messages is not spam.
+ */
+export type FeedbackLabel = 'false_positive' | 'missed' | 'handled' | 'correct' | 'spam' | 'not_spam';
 
 /** One browser that asked to be notified, and what it asked to be told. */
 export interface PushSubscriptionRow {
@@ -1173,19 +1179,25 @@ export class StateStore {
   feedbackRuleHints(minSamples = 2): { alwaysImportant: string[]; neverImportant: string[] } {
     const rows = this.db.prepare(
       // Counted in messages, not labels: one message marked twice is one
-      // vote, or a single misjudged mail could mute its sender for good.
-      `SELECT s.sender, f.label, COUNT(DISTINCT f.dedup_key) AS n
+      // vote, or a single misjudged mail could mute its sender for good. A
+      // message put in the spam folder is a vote that the sender does not
+      // matter, as a false positive is, until the owner takes one of the
+      // sender's messages out of spam again.
+      `SELECT s.sender, CASE WHEN f.label = 'spam' THEN 'false_positive' ELSE f.label END AS vote, COUNT(DISTINCT f.dedup_key) AS n
        FROM feedback f JOIN seen s ON s.dedup_key = f.dedup_key
        WHERE s.sender IS NOT NULL AND s.sender != ''
-         AND f.label IN ('missed', 'false_positive')
-       GROUP BY s.sender, f.label HAVING COUNT(DISTINCT f.dedup_key) >= ?`,
+         AND (f.label IN ('missed', 'false_positive')
+           OR (f.label = 'spam' AND NOT EXISTS (
+             SELECT 1 FROM feedback g JOIN seen t ON t.dedup_key = g.dedup_key
+             WHERE g.label = 'not_spam' AND lower(t.sender) = lower(s.sender) AND g.id > f.id)))
+       GROUP BY s.sender, vote HAVING COUNT(DISTINCT f.dedup_key) >= ?`,
     ).all(Math.max(1, minSamples)) as Array<Record<string, unknown>>;
     const alwaysImportant: string[] = [];
     const neverImportant: string[] = [];
     for (const row of rows) {
       const sender = String(row['sender']).toLowerCase();
-      if (row['label'] === 'missed') alwaysImportant.push(sender);
-      if (row['label'] === 'false_positive') neverImportant.push(sender);
+      if (row['vote'] === 'missed') alwaysImportant.push(sender);
+      if (row['vote'] === 'false_positive' && !neverImportant.includes(sender)) neverImportant.push(sender);
     }
     return { alwaysImportant, neverImportant };
   }

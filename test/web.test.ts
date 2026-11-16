@@ -1686,7 +1686,8 @@ describe('putting a message off until later', () => {
     // A reminder that had come: putting it back means bringing it back, never taking the reminder away.
     expect(undoTo(new Date(Date.now() - 20 * 60_000).toISOString())).toBe('now');
     const script = clientScript();
-    expect(script).toContain("choice(t('snooze.now'), null, () => snooze(key, 'now'))");
+    expect(script).toContain("if (row && isSnoozed(row)) choice(t('snooze.now'), null, () => go('now'));");
+    expect(script).toContain("const go = run || ((at) => snooze(key, at));");
     expect(script).toContain('run: () => snooze(key, snoozeUndoTo(before), true)');
     expect(words('en').t('snooze.back')).toBe('Back in Needs you');
     expect(words('zh-CN').t('snooze.back')).toBe('已放回待你处理');
@@ -1901,5 +1902,51 @@ describe('the parts of the page script', () => {
       expect(body.includes('${'), name).toBe(false);
     }
     expect(() => new Script(clientScript())).not.toThrow();
+  });
+});
+
+describe('picking many messages in the page', () => {
+  it('picks the rows between two with Shift, in the list\'s order, either way', () => {
+    const range = lifted<(keys: string[], from: string, to: string) => string[]>(['pickRange'], 'pickRange');
+    const keys = ['a', 'b', 'c', 'd', 'e'];
+    expect(range(keys, 'b', 'd')).toEqual(['b', 'c', 'd']);
+    expect(range(keys, 'd', 'b')).toEqual(['b', 'c', 'd']);
+    // From a row no longer listed: only the one pressed.
+    expect(range(keys, 'gone', 'c')).toEqual(['c']);
+  });
+
+  it('offers for a selection only what at least one of it can take', () => {
+    const context = { folderLists: new Map([['me@qq.com', { folders: [{ path: 'Archive', role: 'archive' }, { path: 'Junk', role: 'junk' }] }]]) };
+    const choices = lifted<(rows: Array<Record<string, unknown>>) => string[]>(['folderInfo', 'folderRoleOf', 'liveIn', 'bulkChoices'], 'bulkChoices', context);
+    const storedOpen = { account: 'me@qq.com', folder: 'INBOX', handledAt: null };
+    const storedDone = { account: 'me@qq.com', folder: 'INBOX', handledAt: '2026-11-01T00:00:00Z' };
+    const liveInArchive = { account: 'me@qq.com', folder: 'Archive', live: true, stored: false };
+    const liveSpam = { account: 'me@qq.com', folder: 'Junk', live: true, stored: false, inSpam: true };
+    expect(choices([storedOpen, liveInArchive])).toEqual(['done', 'archive', 'trash', 'mark_read', 'mark_unread', 'star', 'unstar', 'move', 'spam', 'snooze']);
+    // Nothing stored: no Done, no later. All in the archive: no Archive. All in spam: Not spam only.
+    expect(choices([liveInArchive])).not.toEqual(expect.arrayContaining(['done']));
+    expect(choices([liveInArchive])).not.toContain('archive');
+    expect(choices([liveSpam])).toEqual(expect.arrayContaining(['not_spam']));
+    expect(choices([liveSpam])).not.toContain('spam');
+    // All done: the way back; two mailboxes: no move.
+    expect(choices([storedDone])[0]).toBe('not_done');
+    expect(choices([storedOpen, { ...storedOpen, account: 'me@gmail.com' }])).not.toContain('move');
+  });
+
+  it('has the bar in the controls\' place, x to pick, Escape and Back to put the selection down, and one request per press', async () => {
+    const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
+    expect(page).toMatch(/<form id="filters" class="controls" autocomplete="off">\s*<div id="pick-bar" class="pick-bar" hidden>/);
+    expect(page).toContain('<dialog id="bulk-sheet" class="sheet bare" aria-labelledby="bulk-title" tabindex="-1">');
+    const script = clientScript();
+    expect(script).toContain("['x', 'keys.pick']");
+    expect(script).toContain("} else if (e.key === 'Escape' && picked.size) {");
+    expect(script).toContain('if (picked.size && !(history.state && history.state.picking)) clearPicks(true);');
+    expect(script).toContain("post('/api/bulk', Object.assign({ items: Array.from(refs.keys()), action, id: bulkId() }, extra || {}))");
+    expect(script).toContain("if (done.length && action === 'done') undo = { label: t('undo'), run: () => bulkAgain(done, 'not_done') };");
+    for (const lang of ['en', 'zh-CN'] as const) {
+      for (const key of ['pick.count', 'bulk.archive', 'bulk.move', 'bulk.skipped', 'act.moveTo', 'act.spam', 'folders.recent']) {
+        expect(STRINGS[lang][key as StringKey], `${lang} ${key}`).toBeTruthy();
+      }
+    }
   });
 });

@@ -145,7 +145,7 @@ const fake = vi.hoisted(() => {
 
 vi.mock('imapflow', () => ({ ImapFlow: fake.ImapFlow }));
 
-import { applyWebMailAction, fetchAttachmentManifestByMessageId, fetchReadableByMessageId, LiveMailError } from '../src/imap/client.js';
+import { applyMailActions, applyWebMailAction, fetchAttachmentManifestByMessageId, fetchReadableByMessageId, LiveMailError } from '../src/imap/client.js';
 import { closeSessions, resumeConnecting, setSignInGap } from '../src/imap/connection.js';
 import {
   browseFolder, envelopeMatches, forgetScans, handleShaped, liveHandle, mailboxFolders, parseLiveHandle, searchMailbox,
@@ -443,5 +443,56 @@ describe('searching the mailbox', () => {
     expect(envelopeMatches(item, 'vendor.example')).toBe(true);
     expect(envelopeMatches(item, 'invoice november')).toBe(false);
     expect(envelopeMatches(item, '   ')).toBe(false);
+  });
+});
+
+describe('one action on many messages', () => {
+  const at = (folder: string, uid: number, id: string) => ({ messageId: id, hint: { folder, uid, uidValidity: '1', exact: true } });
+
+  it('acts on each over one connection, each with an outcome of its own', async () => {
+    put('INBOX', 'one'); put('INBOX', 'two'); put('Projects/2026', 'three');
+    const outcomes = await applyMailActions(ME, [
+      at('INBOX', 1, '<inbox-1@x>'),
+      at('INBOX', 2, '<someone-else@x>'),
+      { messageId: '<projects2026-1@x>', folderHint: 'Projects/2026' },
+      { messageId: '<nowhere@x>' },
+    ], 'star');
+    expect(outcomes[0]).toMatchObject({ done: { sourceFolder: 'INBOX' } });
+    expect((outcomes[1] as { error: unknown }).error).toMatchObject({ code: 'moved' });
+    expect(outcomes[2]).toMatchObject({ done: { sourceFolder: 'Projects/2026' } });
+    expect(outcomes[3]).toEqual({ missing: true });
+    expect(fake.server.calls.filter((call) => call === 'list')).toHaveLength(1);
+    expect([...fake.server.mail.get('INBOX')![0]!.flags]).toEqual(['\\Flagged']);
+    expect([...fake.server.mail.get('INBOX')![1]!.flags]).toEqual([]);
+  });
+
+  it('files spam in the spam folder, says where each landed, and moves only spam back with not_spam', async () => {
+    put('INBOX', 'offer'); put('INBOX', 'prize');
+    const told: number[] = [];
+    const spam = await applyMailActions(ME, [at('INBOX', 1, '<inbox-1@x>'), at('INBOX', 2, '<inbox-2@x>')], 'spam', {}, (index) => told.push(index));
+    expect(told).toEqual([0, 1]);
+    expect(spam.map((o) => (o as { done: { destinationFolder: string; destinationIsSpam: boolean } }).done)).toMatchObject([
+      { destinationFolder: 'Junk', destinationIsSpam: true, destinationUid: 1 }, { destinationFolder: 'Junk', destinationUid: 2 },
+    ]);
+    put('Archive', 'kept');
+    const back = await applyMailActions(ME, [at('Junk', 1, '<inbox-1@x>'), at('Archive', 1, '<archive-1@x>')], 'not_spam');
+    expect(back[0]).toMatchObject({ done: { sourceFolder: 'Junk', destinationFolder: 'INBOX' } });
+    expect((back[1] as { error: unknown }).error).toMatchObject({ code: 'not_applicable' });
+    expect(fake.server.mail.get('Archive')).toHaveLength(1);
+  });
+
+  it('says a mailbox has no spam folder rather than guessing one, for every message', async () => {
+    fake.server.folders = fake.server.folders.filter((f) => f.path !== 'Junk');
+    put('INBOX', 'offer');
+    const outcomes = await applyMailActions(ME, [at('INBOX', 1, '<inbox-1@x>')], 'spam');
+    expect((outcomes[0] as { error: unknown }).error).toMatchObject({ code: 'invalid_destination', message: 'this mailbox has no spam folder' });
+    expect(fake.server.mail.get('INBOX')).toHaveLength(1);
+  });
+
+  it('refuses a move to nowhere for every message without touching any', async () => {
+    put('INBOX', 'one');
+    const outcomes = await applyMailActions(ME, [at('INBOX', 1, '<inbox-1@x>')], 'move', { destination: 'Nowhere' });
+    expect((outcomes[0] as { error: unknown }).error).toMatchObject({ code: 'invalid_destination' });
+    expect((await applyMailActions(ME, [at('INBOX', 1, '<inbox-1@x>')], 'move'))[0]).toMatchObject({ error: { code: 'invalid_destination' } });
   });
 });

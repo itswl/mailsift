@@ -59,7 +59,7 @@ const list = $('#list'), filters = $('#filters'), lane = $('#lane'), header = $(
 const sheet = $('#sheet'), pane = $('#pane'), filterSheet = $('#filter-sheet'), installHelp = $('#install-help');
 const healthSheet = $('#health-sheet'), healthLine = $('#health');
 const notifySheet = $('#notify-sheet'), keysSheet = $('#keys-sheet'), menuSheet = $('#menu-sheet'), composeSheet = $('#compose');
-const snoozeSheet = $('#snooze-sheet'), folderSheet = $('#folder-sheet');
+const snoozeSheet = $('#snooze-sheet'), folderSheet = $('#folder-sheet'), bulkSheet = $('#bulk-sheet');
 const queue = $('#queue'), answerBox = $('#answer');
 // The separators every line of supporting text is joined with.
 const DOT = ' \u00b7 ', NB = '\u00a0';
@@ -433,7 +433,7 @@ function enableDrag(dialog) {
   head.addEventListener('pointerup', end);
   head.addEventListener('pointercancel', end);
 }
-for (const dialog of [sheet, filterSheet, installHelp, healthSheet, notifySheet, keysSheet, menuSheet, composeSheet, snoozeSheet, folderSheet]) {
+for (const dialog of [sheet, filterSheet, installHelp, healthSheet, notifySheet, keysSheet, menuSheet, composeSheet, snoozeSheet, folderSheet, bulkSheet]) {
   dialog.addEventListener('cancel', (e) => {
     e.preventDefault();
     // Escape on the composer's list of addresses shuts the list, not the letter.
@@ -456,6 +456,7 @@ $('#install-done').onclick = () => closeSheet(installHelp, false);
 $('#health-done').onclick = () => closePopover(healthSheet, false);
 $('#notify-done').onclick = () => closePopover(notifySheet, false);
 $('#snooze-done').onclick = () => closePopover(snoozeSheet, false);
+$('#bulk-done').onclick = () => closePopover(bulkSheet, false);
 $('#keys-done').onclick = () => closeSheet(keysSheet, false);
 $('#menu-done').onclick = () => closeSheet(menuSheet, false);
 window.addEventListener('popstate', () => {
@@ -467,6 +468,8 @@ window.addEventListener('popstate', () => {
   for (const [open, p] of [...popovers]) {
     if (p.history && !(history.state && history.state.popover === open.id)) closePopover(open, true);
   }
+  // Back puts down what is picked before it leaves anything else.
+  if (picked.size && !(history.state && history.state.picking)) clearPicks(true);
   // Back from a folder or a search to the triaged view, or forward onto one again.
   if (!sheetStack.length) liveFromHistory();
   if (!sheetStack.length) {
@@ -1241,6 +1244,8 @@ function renderList() {
   const free = Boolean(codeWait) && mayMoveFocus();
   // Patched in place, and the reader's place in it kept.
   keepPlace(buildList);
+  // What is picked stays picked, wherever its rows were drawn again.
+  if (picked.size) { markPicked(); renderPickBar(); }
   // A code drawn while the lane waited for one ends the wait and takes the
   // focus the page was opened for, unless the reader is busy elsewhere.
   const arrived = codeWait && lane.querySelector('.lane-copy');
@@ -1801,6 +1806,7 @@ function renderAll() {
   renderTokens();
   renderLiveHead();
   renderMailboxSearch();
+  renderPickBar();
   renderList();
   drawDigest(true);
   renderPane(true);

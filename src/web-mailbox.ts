@@ -1,6 +1,7 @@
 /**
  * The whole mailbox in the page, and through MCP: any folder, a page at a
- * time, and a search in it, read live from IMAP.
+ * time, and a search in it, read live from IMAP; and one action on many
+ * messages at once.
  *
  * What triage stored is the rest of the view. This is the mailbox around it:
  * nothing here is stored, judged, queued or sent to the model. A message
@@ -13,11 +14,17 @@
  */
 import type { IncomingMessage } from 'node:http';
 import type { Account } from './config.js';
-import { LiveMailError } from './imap/client.js';
+import { LiveMailError, MAIL_ACTIONS, MailActionError, type BulkTarget, type WebMailAction } from './imap/client.js';
 import { SearchCancelled, LIVE_PAGE_MAX, type LiveItem } from './imap/mailbox.js';
 import type { MailRow, StateStore } from './services/state.js';
-import { configuredAccounts, mailboxFailure, type ActionContext } from './web-actions.js';
-import { json, text, timedOut, within, type WebResponse } from './web-http.js';
+import { getLogger } from './logger.js';
+import {
+  configuredAccounts, keepBooks, mailAudit, mailboxFailure, quietly, readOnly, record, resolveTarget, snoozeTime,
+  type ActionContext, type Life, type MailTarget,
+} from './web-actions.js';
+import { json, readJson, text, timedOut, within, type WebResponse } from './web-http.js';
+
+const log = getLogger('web');
 
 /** As long as the page waits for a message; a folder or a search of one is the same kind of request. */
 const BROWSE_TIMEOUT_MS = 25_000;
@@ -184,16 +191,256 @@ export async function mailboxSearch(
   }
 }
 
+// ---- Many messages at once ----
+
+/** A selection is what a person picks from a list, not a sweep of a mailbox. */
+export const BULK_MAX = 100;
+/** The queue's own: only a message mailsift stored has a place in it. */
+const QUEUE_ACTIONS = new Set(['done', 'not_done', 'snooze']);
+const BULK_ACTIONS = new Set<string>([...QUEUE_ACTIONS, ...MAIL_ACTIONS]);
+export type BulkAction = 'done' | 'not_done' | 'snooze' | WebMailAction;
+
+/** What became of one message of a batch. A skipped one is one the action does not apply to; nothing was done to it. */
+interface BulkResult {
+  key: string;
+  status: 'done' | 'skipped' | 'failed';
+  code?: string;
+  error?: string;
+  row?: Record<string, unknown>;
+  moved?: { folder: string; handle?: string };
+}
+
+/**
+ * Batches asked for by name, so that a second press of the same button, or
+ * a request repeated after a dropped answer, is given the first one's
+ * outcome rather than acting again.
+ */
+const BULK_MEMORY_MS = 10 * 60_000;
+const bulkJobs = new Map<string, { at: number; outcome: Promise<WebResponse> }>();
+
+/** For tests: no batch remembered. */
+export function forgetBulk(): void {
+  bulkJobs.clear();
+}
+
+/** How long a batch is waited for: a mailbox action's time, and a little more for each message. */
+const bulkWait = (count: number): number => 30_000 + count * 1_500;
+
+/** A refusal of one message's name, as its result. */
+function refusedResult(key: string, answer: WebResponse): BulkResult {
+  let said: Record<string, unknown> = {};
+  try { said = JSON.parse(String(answer.body)) as Record<string, unknown>; } catch { /* not JSON */ }
+  return { key, status: 'failed', code: String(said['code'] ?? 'failed'), error: String(said['error'] ?? 'refused') };
+}
+
+/** A mailbox's refusal of one message of a batch: skipped when the action does not apply to it, failed otherwise. */
+function outcomeResult(key: string, error: unknown): BulkResult {
+  if (error instanceof LiveMailError) {
+    return { key, status: 'failed', code: 'liveStale', error: 'the message is no longer where its folder listed it' };
+  }
+  if (error instanceof MailActionError && error.code === 'not_applicable') return { key, status: 'skipped', code: 'notApplicable', error: error.message };
+  if (error instanceof MailActionError && /already in the destination/.test(error.message)) {
+    return { key, status: 'skipped', code: 'alreadyThere', error: error.message };
+  }
+  if (error instanceof MailActionError) return { key, status: 'failed', code: `action_${error.code}`, error: error.message };
+  return { key, status: 'failed', code: 'actionFailed', error: String(error).slice(0, 200) };
+}
+
+/**
+ * One action on many messages. `body`: items (keys of stored messages or
+ * live handles, at most 100), action (done, not_done, snooze, or one of the
+ * mailbox actions: mark_read, mark_unread, star, unstar, archive, trash,
+ * inbox, move, spam, not_spam), destination for a move, until for snooze
+ * (as /api/snooze takes it), and id, a name for this batch under which
+ * asking again gives the first answer instead of acting twice.
+ *
+ * Each message is checked as it would be alone, and has a result of its own.
+ * The mailbox is reached over one connection per mailbox. Done, not done and
+ * snooze apply only to messages mailsift stored; a message an action does
+ * not apply to is skipped, not failed. Each is audited as one action alone is.
+ */
+export async function bulkAct(
+  body: Record<string, unknown> | undefined, store: StateStore, ctx: ActionContext, life: Life,
+): Promise<WebResponse> {
+  const action = text(body?.['action'], 40);
+  if (!BULK_ACTIONS.has(action)) return json(400, { error: 'a supported action is required', code: 'badRequest' });
+  const queue = QUEUE_ACTIONS.has(action);
+  if (queue ? !ctx.mayMark : ctx.session !== 'write') return readOnly();
+  const given = body?.['items'];
+  if (!Array.isArray(given) || !given.length) return json(400, { error: 'items are required', code: 'badRequest' });
+  if (given.length > BULK_MAX) {
+    return json(400, { error: `at most ${BULK_MAX} messages at once`, code: 'bulk_too_many', max: BULK_MAX });
+  }
+  const keys = [...new Set(given.filter((item): item is string => typeof item === 'string').map((item) => item.trim().slice(0, 5000)).filter(Boolean))];
+  if (!keys.length) return json(400, { error: 'items are required', code: 'badRequest' });
+  const destination = action === 'move' ? text(body?.['destination'], 500) : '';
+  if (action === 'move' && !destination) return json(400, { error: 'a move needs a destination folder', code: 'badRequest' });
+  let until: string | null | undefined;
+  if (action === 'snooze') {
+    if (!body || !('until' in body)) return json(400, { error: 'until is required', code: 'badRequest' });
+    const asked = body['until'];
+    if (asked === 'now' || asked === null) until = asked;
+    else {
+      const parsed = snoozeTime(asked);
+      if ('refused' in parsed) return json(400, { error: parsed.refused, code: parsed.code });
+      until = parsed.at;
+    }
+  }
+  const named = text(body?.['id'], 80);
+  const id = /^[A-Za-z0-9_-]{8,64}$/.test(named) ? `${ctx.origin ?? 'page'}|${named}` : '';
+  if (id) {
+    for (const [known, job] of bulkJobs) if (Date.now() - job.at > BULK_MEMORY_MS || bulkJobs.size > 200) bulkJobs.delete(known);
+    const earlier = bulkJobs.get(id);
+    if (earlier) {
+      const answer = await within(earlier.outcome, bulkWait(keys.length));
+      if (!timedOut(answer)) return { ...answer };
+      return json(504, { error: 'the same batch is still under way', code: 'actionTimeout' });
+    }
+  }
+
+  const results: BulkResult[] = keys.map((key) => ({ key, status: 'failed', code: 'actionTimeout', error: 'not known yet' }));
+  const answer = (): WebResponse => {
+    const count = (status: BulkResult['status']): number => results.filter((result) => result.status === status).length;
+    let attention: number | undefined;
+    try { attention = store.attentionCount(); } catch { /* the handle may be closed by now */ }
+    return json(200, {
+      action, results: results.map((result) => ({ ...result })), done: count('done'), skipped: count('skipped'), failed: count('failed'),
+      ...(attention !== undefined ? { attention } : {}),
+    });
+  };
+  const work = (async (): Promise<WebResponse> => {
+    const targets: Array<MailTarget | undefined> = keys.map((key, index) => {
+      const resolved = resolveTarget(store, key);
+      if ('refused' in resolved) { results[index] = refusedResult(key, resolved.refused); return undefined; }
+      return resolved.target;
+    });
+    if (queue) bulkQueue(action as 'done' | 'not_done' | 'snooze', until, keys, targets, results, store, ctx, life);
+    else await bulkMailbox(action as WebMailAction, destination, keys, targets, results, store, ctx, life);
+    return answer();
+  })();
+  if (id) bulkJobs.set(id, { at: Date.now(), outcome: work });
+  const done = await within(work.catch((error: unknown) => {
+    log.warn(`A batch failed: ${String(error).slice(0, 160)}`);
+    return answer();
+  }), bulkWait(keys.length));
+  // What is not known yet is said as that; it is recorded when the mailbox answers.
+  return timedOut(done) ? answer() : done;
+}
+
+/** Done, not done and later, for every stored message of a batch; the queue's own books. */
+function bulkQueue(
+  action: 'done' | 'not_done' | 'snooze', until: string | null | undefined, keys: string[], targets: Array<MailTarget | undefined>,
+  results: BulkResult[], store: StateStore, ctx: ActionContext, life: Life,
+): void {
+  // Done here is done there, as for one message: marked read in its mailbox, in the background.
+  const reading = new Map<string, { account: Account; targets: BulkTarget[]; audits: Array<ReturnType<typeof mailAudit>> }>();
+  for (const [index, target] of targets.entries()) {
+    if (!target) continue;
+    const key = keys[index]!;
+    const row = target.row;
+    if (!row) {
+      results[index] = { key, status: 'skipped', code: 'notStored', error: 'mailsift has not stored this message' };
+      continue;
+    }
+    let after: MailRow | undefined;
+    let audit: string;
+    if (action === 'snooze') {
+      after = until === 'now' ? store.wakeNow(row.dedupKey) : store.setSnoozed(row.dedupKey, until ?? null);
+      audit = until === 'now' ? 'web:wake' : until === null ? 'web:unsnooze' : 'web:snooze';
+    } else {
+      const handled = action === 'done';
+      if (Boolean(row.handledAt) === handled) {
+        results[index] = { key, status: 'skipped', code: 'unchanged', row: ctx.decorate(row) };
+        continue;
+      }
+      after = store.setHandled(row.dedupKey, handled);
+      audit = handled ? 'web:handled' : 'web:unhandled';
+      if (handled && ctx.session === 'write' && (target.messageId || target.handle)) {
+        const group = reading.get(target.account.username) ?? { account: target.account, targets: [], audits: [] };
+        group.targets.push({ messageId: target.messageId, ...target.place });
+        group.audits.push(mailAudit(target, 'mark_read', ctx.client));
+        reading.set(target.account.username, group);
+      }
+    }
+    if (!after) {
+      results[index] = { key, status: 'failed', code: 'notFound', error: 'not found' };
+      continue;
+    }
+    if (ctx.origin !== 'mcp') store.recordMcpAudit(audit, ctx.client, true, after.dedupKey);
+    results[index] = { key, status: 'done', row: ctx.decorate(after) };
+  }
+  for (const group of reading.values()) {
+    void ctx.backend.bulk(group.account, group.targets, 'mark_read', {}, (index, outcome) => {
+      const audit = group.audits[index]!;
+      quietly('Marking a handled message read', () => record(ctx, store, life, (db) => db.recordMailAction(
+        'done' in outcome ? { ...audit, success: true, sourceFolder: outcome.done.sourceFolder }
+          : { ...audit, success: false, error: 'missing' in outcome ? 'not found' : String(outcome.error).slice(0, 300) },
+      )));
+    }).catch((error: unknown) => log.warn(`Marking handled messages read failed: ${String(error).slice(0, 160)}`));
+  }
+}
+
+/** A mailbox action on every message of a batch: one connection per mailbox, the mailboxes side by side. */
+async function bulkMailbox(
+  action: WebMailAction, destination: string, keys: string[], targets: Array<MailTarget | undefined>,
+  results: BulkResult[], store: StateStore, ctx: ActionContext, life: Life,
+): Promise<void> {
+  const groups = new Map<string, { account: Account; indexes: number[] }>();
+  for (const [index, target] of targets.entries()) {
+    if (!target) continue;
+    if (!target.messageId && !target.handle) {
+      results[index] = { key: keys[index]!, status: 'failed', code: 'notFound', error: 'not found' };
+      continue;
+    }
+    const group = groups.get(target.account.username) ?? { account: target.account, indexes: [] };
+    group.indexes.push(index);
+    groups.set(target.account.username, group);
+  }
+  await Promise.all([...groups.values()].map(async (group) => {
+    const audits = group.indexes.map((index) => mailAudit(targets[index]!, action, ctx.client, destination));
+    await ctx.backend.bulk(
+      group.account,
+      group.indexes.map((index) => ({ messageId: targets[index]!.messageId, ...targets[index]!.place })),
+      action, destination ? { destination } : {},
+      (at, outcome) => {
+        const index = group.indexes[at]!;
+        const target = targets[index]!;
+        const key = keys[index]!;
+        const audit = audits[at]!;
+        quietly('One action of a batch', () => record(ctx, store, life, (db) => {
+          if ('done' in outcome) {
+            const kept = keepBooks(db, target, action, outcome.done, audit);
+            results[index] = { key, status: 'done', ...(kept.after ? { row: ctx.decorate(kept.after) } : {}), ...(kept.moved ? { moved: kept.moved } : {}) };
+            return;
+          }
+          if ('missing' in outcome) {
+            db.recordMailAction({ ...audit, success: false, error: 'not found' });
+            results[index] = { key, status: 'failed', code: 'actionNotFound', error: 'message not found in the mailbox' };
+            return;
+          }
+          db.recordMailAction({ ...audit, success: false, error: String(outcome.error).slice(0, 300) });
+          results[index] = outcomeResult(key, outcome.error);
+        }));
+      },
+    );
+  }));
+}
+
 /**
  * Answer one of this file's routes, or undefined when the path is not one.
- * Reading a folder is reading mail: any session may.
+ * Reading a folder is reading mail: any session may. Acting on many
+ * messages is acting on each: the session must be one that may.
  */
 export async function routeMailbox(
   req: IncomingMessage, url: URL, store: StateStore, ctx: ActionContext,
 ): Promise<WebResponse | undefined> {
   const path = url.pathname;
   const p = url.searchParams;
+  // Work a batch starts may outlast its answer; from then on it records on a handle of its own.
+  const life: Life = { over: false };
   const answer = await (async (): Promise<WebResponse | undefined> => {
+    // A hundred handles, each a few hundred characters.
+    if (req.method === 'POST' && path === '/api/bulk') return bulkAct(await readJson(req, 256 * 1024), store, ctx, life);
     if (req.method !== 'GET') return undefined;
     if (path === '/api/folders') return folderList({ account: text(p.get('account'), 320) }, store, ctx);
     if (path === '/api/folder') {
@@ -208,7 +455,7 @@ export async function routeMailbox(
       }, store, ctx);
     }
     return undefined;
-  })();
+  })().finally(() => { life.over = true; });
   if (answer) answer.cacheControl = 'no-store';
   return answer;
 }

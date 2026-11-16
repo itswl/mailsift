@@ -9,6 +9,7 @@ import { liveHandle, type LiveItem } from '../src/imap/mailbox.js';
 import { StateStore } from '../src/services/state.js';
 import { SendError, type OutgoingMail } from '../src/smtp.js';
 import { forgetLive, forgetSends, type WebBackend } from '../src/web-actions.js';
+import { forgetBulk } from '../src/web-mailbox.js';
 import { IMPORTANCE } from '../src/config.js';
 import { CATEGORIES } from '../src/services/triage.js';
 import { makeMessage, makeResult } from './helpers.js';
@@ -186,7 +187,7 @@ describe('tool surface', () => {
   it('gives the write credential what the page has, the bin and sending included, and a reader none of it', async () => {
     const writer = (await (await connect(new StateStore(':memory:'), true)).listTools()).tools;
     const actions = (writer.find((t) => t.name === 'manage_mail')?.inputSchema.properties as Record<string, { enum?: string[] }>)['action']?.enum;
-    expect(actions).toEqual(['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox', 'trash']);
+    expect(actions).toEqual(['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox', 'trash', 'spam', 'not_spam']);
     expect(writer.find((t) => t.name === 'send_mail')?.description).toContain('really sends mail');
 
     const state = seeded();
@@ -2024,5 +2025,70 @@ describe('the rest of the mailbox, live', () => {
     expect(sent).not.toHaveProperty('originalHandled');
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(box.acted).toContainEqual(expect.objectContaining({ messageId: '<old@x>', action: 'answered', hint: expect.objectContaining({ exact: true }) }));
+  });
+});
+
+describe('several messages at once, and spam', () => {
+  beforeEach(() => { process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|secret'; forgetBulk(); });
+  function batching(state: StateStore): Mailbox & { batches: Array<{ action: string; ids: string[] }> } {
+    const box = mailbox(state) as Mailbox & { batches: Array<{ action: string; ids: string[] }> };
+    box.batches = [];
+    box.backend.bulk = async (account, targets, action, _options, each) => {
+      box.batches.push({ action, ids: targets.map((target) => target.messageId) });
+      return targets.map((target, index) => {
+        const outcome = {
+          done: {
+            action, account: account.username, messageId: target.messageId, sourceFolder: 'INBOX',
+            ...(action === 'spam' ? { destinationFolder: 'Junk', destinationIsSpam: true } : {}),
+          },
+        };
+        each?.(index, outcome);
+        return outcome;
+      });
+    };
+    return box;
+  }
+
+  it('acts on several ids in one call, with a result for each, the unknown one failing on its own', async () => {
+    const state = seeded();
+    const box = batching(state);
+    const client = await connect(state, true, box.backend);
+    const answer = await call(client, 'manage_mail', { messageIds: ['<one@x>', '<two@x>', '<absent@x>'], action: 'spam' });
+    expect(answer).toMatchObject({ action: 'spam', done: 2, failed: 1 });
+    expect(answer['results']).toEqual([
+      expect.objectContaining({ messageId: '<one@x>', status: 'done', folder: 'Junk' }),
+      expect.objectContaining({ messageId: '<two@x>', status: 'done', folder: 'Junk' }),
+      expect.objectContaining({ messageId: '<absent@x>', status: 'failed', code: 'NOT_FOUND' }),
+    ]);
+    expect(box.batches).toEqual([{ action: 'spam', ids: ['<one@x>', '<two@x>'] }]);
+    expect(state.getMail('k1')?.handledAt).not.toBeNull();
+    expect(state.feedbackSummary()['spam']).toBe(2);
+    const none = await client.callTool({ name: 'manage_mail', arguments: { action: 'star' } });
+    expect(none).toMatchObject({ isError: true });
+    const both = await client.callTool({ name: 'manage_mail', arguments: { messageId: '<one@x>', messageIds: ['<two@x>'], action: 'star' } });
+    expect(both).toMatchObject({ isError: true });
+  });
+
+  it('marks several done and puts several off, skipping what is already so', async () => {
+    const state = seeded();
+    const box = batching(state);
+    const client = await connect(state, true, box.backend);
+    state.setHandled('k2', true);
+    const done = await call(client, 'mark_handled', { messageIds: ['<one@x>', '<two@x>'] });
+    expect(done).toMatchObject({ action: 'done', done: 1, skipped: 1 });
+    const later = '2027-01-04T09:00:00+08:00';
+    const snoozed = await call(client, 'snooze', { messageIds: ['<one@x>', '<three@x>'], until: later });
+    expect(snoozed).toMatchObject({ action: 'snooze', done: 2 });
+    expect(state.getMail('k3')?.snoozedUntil).toBe(new Date(later).toISOString());
+  });
+
+  it('records spam and not_spam feedback, and offers both actions', async () => {
+    const state = seeded();
+    const client = await connect(state, true, batching(state).backend);
+    expect(await call(client, 'record_feedback', { messageId: '<three@x>', label: 'spam' })).toMatchObject({ recorded: true, label: 'spam' });
+    const { tools } = await client.listTools();
+    const manage = tools.find((tool) => tool.name === 'manage_mail')!;
+    const actions = ((manage.inputSchema.properties as Record<string, { enum?: string[] }>)['action']!.enum ?? []);
+    expect(actions).toEqual(expect.arrayContaining(['spam', 'not_spam']));
   });
 });
