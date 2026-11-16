@@ -792,6 +792,8 @@ describe('the Sent folder', () => {
 
   it('marks a message notified when its notification is delivered on a retry, so it is in the queue', async () => {
     process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    // The digest would go out through the same sink after DIGEST_HOUR, and be counted as a push.
+    process.env.DIGEST_ENABLED = 'false';
     const outcomes: Array<'failed' | 'delivered'> = ['failed', 'delivered'];
     const sink = new RecordingSink();
     sink.push = async (message, result) => { sink.pushed.push([message, result]); return outcomes.shift() ?? 'delivered'; };
