@@ -330,10 +330,12 @@ if ('serviceWorker' in navigator) {
 // ---- Asking the mail a question ----
 const askButton = $('#ask');
 function updateAsk() {
-  askButton.hidden = !session.assistant || !filters.q.value.trim();
+  // The model answers about what was judged; a folder listed live is the mailbox's own.
+  askButton.hidden = !session.assistant || !filters.q.value.trim() || Boolean(liveView);
 }
 function wordPlaceholders() {
-  filters.q.placeholder = t(session.assistant ? 'ask.placeholder' : 'search.short');
+  filters.q.placeholder = liveView ? t(liveView.folder ? 'live.searchFolder' : 'live.searchMailbox')
+    : t(session.assistant ? 'ask.placeholder' : 'search.short');
   $('#palette-input').placeholder = t('palette.hint');
   composeForm.instruction.placeholder = t('compose.aiHint');
   composeForm.text.placeholder = t('compose.body');
@@ -433,6 +435,16 @@ function commands() {
   }
   for (const a of (lastSummary && lastSummary.accounts) || []) add('goto', 'i-inbox', a.name, () => setFilters({ account: a.address }));
   for (const c of (lastSummary && lastSummary.categories) || []) add('goto', 'i-chevron', word('category.', c), () => setFilters({ category: c }));
+  // The rest of the mailbox: the folders, any folder already listed, and a search of the mailbox itself.
+  add('goto', 'i-folder', t('cmd.folders'), () => openFolders(liveView ? $('#live-where') : $('#folders-open')));
+  for (const a of summaryAccounts()) {
+    const known = folderLists.get(a.address);
+    for (const f of (known && known.folders) || []) {
+      if (!f.selectable) continue;
+      add('goto', 'i-folder', fill('cmd.folder', { folder: folderName(a.address, f.path), account: a.name }),
+        () => openLive({ mode: 'folder', account: a.address, folder: f.path }, liveView ? 'replace' : 'push'));
+    }
+  }
   add('actions', 'i-compose', t('compose.new'), startCompose);
   if (refreshButton) add('actions', 'i-arrow', t('refresh.label'), pollNow);
   add('actions', 'i-check', t('cmd.copyCode'), copyNewestCode);
@@ -460,7 +472,14 @@ function drawPalette() {
     section: 'messages', glyph: 'i-read', label: (m.senderName || m.sender || t('unknownSender')) + ' — ' + (m.summary || m.subject || ''),
     run: () => { extraRows.set(rowKey(m), m); openDetail(rowKey(m)); },
   }));
-  const search = q ? [{ section: 'messages', glyph: 'i-search', label: fill('palette.search', { q }), run: () => { setFilters({ q }); showSearch(); } }] : [];
+  const search = q ? [{ section: 'messages', glyph: 'i-search', label: fill('palette.search', { q }), run: () => { if (liveView) exitLive(false); setFilters({ q }); showSearch(); } }] : [];
+  // And the mailbox itself, for mail mailsift never kept.
+  if (q) {
+    for (const a of summaryAccounts()) {
+      search.push({ section: 'messages', glyph: 'i-folder', label: fill('palette.searchMailbox', { q, name: a.name }),
+        run: () => openLive({ mode: 'search', account: a.address, folder: null, q }, liveView ? 'replace' : 'push') });
+    }
+  }
   // A question goes to the model first; a name goes to what it names.
   if (q && QUESTION.test(q)) items.push(...asks, ...mail, ...found, ...search);
   else items.push(...found.slice(0, q ? 8 : 40), ...mail, ...search, ...asks);
@@ -557,7 +576,7 @@ const fineKeys = matchMedia('(pointer: fine)').matches;
 const macKeys = /Mac|iPhone|iPad/.test(navigator.platform || '');
 const KEY_LIST = [
   ['j k', 'keys.move'], ['⏎', 'keys.open'], ['e', 'keys.done'], ['r a', 'keys.reply'], ['f', 'keys.forward'], ['y', 'keys.archive'],
-  ['s', 'keys.star'], ['#', 'keys.trash'], ['b', 'keys.snooze'], ['n', 'keys.compose'], ['c', 'keys.code'], ['/', 'keys.search'],
+  ['s', 'keys.star'], ['#', 'keys.trash'], ['b', 'keys.snooze'], ['g', 'keys.folders'], ['n', 'keys.compose'], ['c', 'keys.code'], ['/', 'keys.search'],
   [macKeys ? '⌘K' : 'Ctrl K', 'keys.palette'], ['.', 'keys.check'], ['esc', 'keys.close'], ['?', 'keys.help'],
 ];
 function openKeys() {
@@ -619,8 +638,13 @@ document.addEventListener('keydown', (e) => {
     startCompose();
   } else if (e.key === '.') {
     if (refreshButton) pollNow();
+  } else if (e.key === 'g') {
+    e.preventDefault();
+    openFolders(liveView ? $('#live-where') : $('#folders-open'));
   } else if (e.key === 'Escape' && current) {
     clearSelection();
+  } else if (e.key === 'Escape' && liveView) {
+    exitLive(false);
   } else if (current) {
     // These act on the selected message from wherever the focus is: after a
     // click it rests on the row's own link, and that must not switch them off.
@@ -628,14 +652,16 @@ document.addEventListener('keydown', (e) => {
     const row = rowByKey(current) || (findItem(current) && rowOfItem(findItem(current)));
     if (!row) return;
     const key = rowKey(row);
-    if (e.key === 'e') { e.preventDefault(); complete(key, document.querySelector('li.row[data-key="' + CSS.escape(current) + '"]'), Boolean(row.handledAt)); }
+    // Done and later are the queue's: a message listed live that was never stored has neither.
+    const markable = !row.live || row.stored;
+    if (e.key === 'e') { if (!markable) return; e.preventDefault(); complete(key, document.querySelector('li.row[data-key="' + CSS.escape(current) + '"]'), Boolean(row.handledAt)); }
     else if (e.key === 'r') { e.preventDefault(); startReply(key, 'reply'); }
     else if (e.key === 'a') { e.preventDefault(); startReply(key, 'replyAll'); }
     else if (e.key === 'f') { e.preventDefault(); startForward(key); }
     else if (e.key === 'y') { e.preventDefault(); mailAction(key, 'archive'); }
     else if (e.key === 's') { e.preventDefault(); mailAction(key, (flagsByKey.get(key) || {}).flagged ? 'unstar' : 'star'); }
     else if (e.key === '#') { e.preventDefault(); mailAction(key, 'trash'); }
-    else if (e.key === 'b' && !row.handledAt) {
+    else if (e.key === 'b' && !row.handledAt && markable) {
       // Under the reader's clock on a desk, under the row itself in a narrow window.
       e.preventDefault();
       const anchor = (isWide() && document.querySelector('#pane-bar [data-act="snooze"]'))
@@ -712,5 +738,7 @@ load();
 chrome();
 openStream();
 readPush();
+// A folder or a search the address asked for, over the triaged view it returns to.
+if (bootLive) { const view = bootLive; bootLive = null; openLive(view, 'restore'); }
 `;
 }

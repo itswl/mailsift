@@ -1360,6 +1360,27 @@ export class StateStore {
     return [...byId, ...byKey];
   }
 
+  /**
+   * The stored records of one mailbox for these Message-IDs, by Message-ID:
+   * what a folder listed live from that mailbox already knows about. A record
+   * is one mailbox's, so a message stored for another mailbox is not one of them.
+   */
+  storedFor(account: string, messageIds: readonly string[]): Map<string, MailRow> {
+    const found = new Map<string, MailRow>();
+    const wanted = [...new Set(messageIds.filter((id) => typeof id === 'string' && id.length > 0 && id.length <= 1000))];
+    for (let at = 0; at < wanted.length; at += 200) {
+      const chunk = wanted.slice(at, at + 200);
+      const rows = this.db.prepare(
+        `SELECT ${ROW_COLUMNS.join(', ')}, snippet FROM seen WHERE account = ? AND message_id IN (${chunk.map(() => '?').join(', ')})`,
+      ).all(account, ...chunk) as Array<Record<string, unknown>>;
+      for (const raw of rows) {
+        const row = toRow(raw);
+        if (row.messageId && !found.has(row.messageId)) found.set(row.messageId, row);
+      }
+    }
+    return found;
+  }
+
   getMail(messageId: string): MailRow | undefined {
     const key = this.keyOf(messageId);
     if (key === undefined) return undefined;

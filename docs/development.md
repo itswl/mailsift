@@ -23,9 +23,9 @@ To work on the page without a mailbox, `npx tsx scripts/web-preview.ts` serves i
 | `--arrive N` | File a new message every N seconds, to watch the live line bring it in. |
 | `--failing` | Leave one mailbox failing to sign in. |
 
-Its refresh button files one more verification code each time it is pressed.
+Its refresh button files one more verification code each time it is pressed. Behind the stored mail is a made-up mailbox (`scripts/preview-mailbox.ts`): each pretend account has folders with counts (the Gmail one with nested labels, enough for the folder panel's filter box), older mail to page through, a search (Gmail's over subject, sender and text, QQ's limited to subject and sender, as the real one is), and actions that move messages between its folders and refuse a live handle once its message has moved.
 
-The page script is assembled from five parts (`src/web-client.ts` and `src/web-client-*.ts`) into one inline `<script>`. Four of them are `String.raw` templates, written as the browser runs them, so they must contain no backtick and no `${`; a test checks. The first is an ordinary template, where a backslash has to be doubled. Every word the page shows lives in `src/web-strings.ts`, in English and Chinese together. Mail markup is never inserted into the page: it is rebuilt from an allowlist into a sandboxed frame (`cleanMail` in `src/web-client-reader.ts`), and the routes return a response object rather than writing to the socket, so `test/web-actions.test.ts` exercises all of them without a server.
+The page script is assembled from six parts (`src/web-client.ts` and `src/web-client-*.ts`) into one inline `<script>`. Five of them are `String.raw` templates, written as the browser runs them, so they must contain no backtick and no `${`; a test checks. The first is an ordinary template, where a backslash has to be doubled. Every word the page shows lives in `src/web-strings.ts`, in English and Chinese together. Mail markup is never inserted into the page: it is rebuilt from an allowlist into a sandboxed frame (`cleanMail` in `src/web-client-reader.ts`), and the routes return a response object rather than writing to the socket, so `test/web-actions.test.ts` exercises all of them without a server.
 
 Regenerate the icon with `npx tsx scripts/icons.ts` after changing the mark.
 

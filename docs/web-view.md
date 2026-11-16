@@ -12,6 +12,7 @@ It is off by default. A page a browser can reach is a wider surface than a JSON-
 - [Verification codes](#verification-codes)
 - [Reading a message](#reading-a-message)
 - [The conversation, and your own mail](#the-conversation-and-your-own-mail)
+- [The whole mailbox](#the-whole-mailbox)
 - [Acting on a message](#acting-on-a-message)
 - [Correcting a judgement](#correcting-a-judgement)
 - [Writing](#writing)
@@ -35,6 +36,7 @@ Which token you sign in with decides what the page may do, the same split MCP ma
 | | `MCP_TOKEN` (read) | `MCP_WRITE_TOKEN` (write) |
 |---|---|---|
 | Read the list, a message, attachments | yes | yes |
+| Open any folder, search the mailbox | yes | yes |
 | Search, ask a question, get notifications | yes | yes |
 | Mark done, put off until later | only when no write token is configured | yes |
 | Archive, bin, star, mark read, move out of spam | no | yes |
@@ -125,6 +127,20 @@ Your own messages come from two places:
 
 What is kept of a sent message is what a conversation shows: who it went to, its subject and date, the names of its files, and the text you wrote, without the quoted history below it (an "On … wrote:" or "在 … 写道：" line, an Outlook header block, a message forwarded under it, and lines quoted with `>`), at most 8,000 characters. It is stored locally in the state database like the snippets of the mail you receive, kept for `STATE_RETENTION_DAYS` counted from the day it was sent, and used for the conversation only: it is never judged, never sent to the model, never notified and never in a digest, the queue, the list or the search. `SENT_MAIL_ENABLED=false` stops reading Sent and storing what is sent from here; what was stored before stays until retention removes it.
 
+## The whole mailbox
+
+Everything above is what mailsift fetched and judged: the folders it watches, as far back as `STATE_RETENTION_DAYS`. The rest of each mailbox is a tap away, read from the mailbox when it is asked for and kept nowhere.
+
+- **Folders.** The folder button beside the window (or `g`, or "Folders…" in the palette) opens a small panel under it with the mailbox's folders: the ones every mailbox has first (Inbox, Starred, Drafts, Sent, Archive or All Mail, Spam, Trash), called that in the page's language wherever the server keeps them, then your own, each under its parent. Each says how many of its messages are unread, or how many it holds, when the server says so cheaply: in its folder list where it can (`LIST-STATUS`), and otherwise by asking each folder in turn for a few seconds, the rest without a count. A long list has a box to find a folder by part of its name, and with more than one mailbox a switch at the top picks which. A folder the palette has seen once is in it by name.
+- **A folder** takes the list's place, newest first, fifty at a time as you scroll. The line above it names the mailbox and the folder (press it to pick another) and says "Live from the mailbox, not triaged", with how many messages the folder holds; the arrow before it goes back to the triaged views, as do `Esc` and the back gesture. The window and the filters, which are the triaged views', are not shown meanwhile. Each row is what the mailbox says: the sender, the subject, the date, a dot and a heavier name while it is unread, and whether it is starred, answered or carries files. Only the messages' envelopes and flags are read, never a body, and nothing of it is stored, judged, sent to the model or put in the queue. A message mailsift did store is the same row as in the triaged list, with its ring, its check or its clock, so it can be marked done or put off from here, and its line of details says how it was judged.
+- **Reading** a message from a folder is the same reader as anywhere: its text, its pictures (held until asked), its attachments and safety clues, Reply, Reply all and Forward. What exists only for mail mailsift stored (the summary, the judgement and the way to correct it, Done, Remind me, the conversation) is left out for a message it never stored. Archive is not offered in the archive or in All Mail, nor Bin in the bin.
+- **Search the mailbox.** The search field searches what mailsift stored, as before. With a query in it, a quiet line under it offers "Search the mailbox" (one name per mailbox when there are several and no mailbox is picked in the filters): the provider's own search, in the inbox and the archive. Gmail searches All Mail in its own syntax, so what works in its search box (`from:`, `has:attachment`, `older_than:1y`) works here; other servers are asked for the words in the subject, the sender and the text, in UTF-8 where the words need it. In a folder, the field searches that folder when Enter is pressed, and clearing it goes back to the folder. Results are listed like a folder, newest first, with how many were found.
+- **QQ, and searches that cannot be trusted.** QQ's IMAP search answers some searches with the wrong messages and ignores Chinese on some accounts. So on QQ, and wherever a server refuses a search or finds nothing for text outside ASCII, the newest 2,000 messages of each folder searched are read envelope by envelope and only their subject and sender compared. The line above the results then says, every time, that only the subject and sender of the newest 2,000 messages in each folder were searched. A search that takes more than thirty seconds is stopped and said to be, and a new search from the page takes the place of one still running, which stops at its next request to the server.
+
+A message listed this way is named by a live handle: its mailbox, folder, the folder's UIDVALIDITY, its UID and its Message-ID. Whatever is done with it is done exactly there. Every time, the server checks that the mailbox is configured, the folder still exists and has not been rebuilt, and (under the lock it acts in, for an action) that the message at that UID still has that Message-ID; when it does not, the request is refused rather than sent looking for the message elsewhere, and the page lists the folder again. Where the server says where a moved message landed, the answer gives its new handle.
+
+The address keeps the folder or the search on show (`?in=` the mailbox, `&folder=`, and `&mq=` for a search), so a reload or a shared link comes back to it. The access audit records which mailbox and folder were listed or searched (`web:folders`, `web:folder`, `web:search`), never what was searched for.
+
 ## Acting on a message
 
 With a write session the bar under a message offers Done, Reply, Archive, and under "more": Reply all, Forward, Remind me (see [Later](#later)), Star, Mark unread, Not spam (for a message in the spam folder) and Bin. On a desk, Reply all, Star and Remind me sit in the bar itself.
@@ -207,6 +223,7 @@ The bell turns on Web Push for the device you are holding: a verification code o
 | `s` | star |
 | `#` | bin |
 | `b` | remind me later |
+| `g` | folders |
 | `n` | new message |
 | `c` | copy the newest code |
 | `/` | search |

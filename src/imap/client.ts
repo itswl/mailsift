@@ -155,6 +155,47 @@ export interface MessageHint {
   folder?: string;
   uid?: number;
   uidValidity?: string;
+  /**
+   * The message is exactly there or nowhere: a live handle names one UID in
+   * one folder, as the mailbox listed it. The folder must still exist, its
+   * UIDVALIDITY must be the one the handle has and the UID must still carry
+   * the handle's Message-ID (or none, for a message that has none). Nothing
+   * is searched for and no other folder is looked in: a handle that no
+   * longer fits is refused with a LiveMailError, never followed by guess.
+   */
+  exact?: boolean;
+}
+
+/**
+ * A message named by a live handle that is no longer where the handle says.
+ *
+ * - `folder`: the folder is gone, or cannot be opened.
+ * - `stale`: the folder was rebuilt (another UIDVALIDITY), so its UIDs name other messages now.
+ * - `moved`: the UID is gone, or now carries another Message-ID.
+ * - `cursor`: a page asked for after a place in a folder that was rebuilt since.
+ */
+export class LiveMailError extends Error {
+  constructor(readonly code: 'folder' | 'stale' | 'moved' | 'cursor', message: string) {
+    super(message);
+    this.name = 'LiveMailError';
+  }
+}
+
+/**
+ * Whether what the server fetched is the message asked for, by its
+ * Message-ID as the server has it. '' asks for a message that has none,
+ * which only a live handle does: it is then the UID alone that names it.
+ */
+function sameMessage(raw: FetchMessageObject | false | undefined, messageId: string): raw is FetchMessageObject {
+  return Boolean(raw) && ((raw as FetchMessageObject).envelope?.messageId?.trim() ?? '') === messageId;
+}
+
+/** The folder a live handle names, as the server lists it now; refused when it is gone. */
+export function exactFolder(entries: readonly ListResponse[], path: string | undefined): Folder {
+  const found = entries.find((entry) => entry.path === path) ?? entries.find((entry) => entry.pathAsListed === path);
+  const folder = found ? toFolder(found) : undefined;
+  if (!folder || !folder.selectable) throw new LiveMailError('folder', `no such folder: ${String(path ?? '').slice(0, 200)}`);
+  return folder;
 }
 
 /** A folder name, as before, or the fuller hint. */
@@ -166,7 +207,7 @@ function hintOf(hint: LookupHint): MessageHint {
 }
 
 /** The UIDVALIDITY of the folder now selected. */
-function selectedValidity(client: ImapFlow): string {
+export function selectedValidity(client: ImapFlow): string {
   const mailbox = client.mailbox;
   return typeof mailbox === 'object' && mailbox ? String(mailbox.uidValidity ?? '') : '';
 }
@@ -208,6 +249,7 @@ export function orderLookupFolders(
 }
 
 async function lookupFolders(client: ImapFlow, account: Account, hint?: LookupHint): Promise<LookupFolder[]> {
+  if (hintOf(hint).exact) return [exactFolder(await listFolders(client), hintOf(hint).folder)];
   const folderHint = hintOf(hint).folder;
   // Without a hint this is exactly targetFolders, one LIST and the same order.
   if (!folderHint?.trim()) return targetFolders(client, account);
@@ -226,7 +268,7 @@ async function lockFolder(client: ImapFlow, folder: LookupFolder, readOnly: bool
   }
 }
 
-function firstAddress(input: unknown): { name: string; address: string } {
+export function firstAddress(input: unknown): { name: string; address: string } {
   const list = (input ?? []) as Array<{ name?: string; address?: string }>;
   const head = list[0];
   return { name: head?.name?.trim() ?? '', address: (head?.address ?? '').toLowerCase() };
@@ -436,6 +478,9 @@ async function extractLargeMessageBody(
 async function searchMessageUids(
   client: ImapFlow, messageId: string, folder?: Folder, hint: MessageHint = {},
 ): Promise<number[]> {
+  // 0. A live handle: that UID, in this folder as it was, carrying that Message-ID, or nothing at all.
+  if (hint.exact) return [await exactUid(client, messageId, hint)];
+
   // 1. Where it was last seen. One small fetch settles it, and no search runs.
   const remembered = folder ? hintedUid(client, folder, hint) : undefined;
   if (remembered !== undefined) {
@@ -484,6 +529,22 @@ async function searchMessageUids(
   // search was too large, as the lookback does, rather than that it is gone.
   if (!matching.length && cutShort) throw overLimit();
   return matching;
+}
+
+/**
+ * The UID a live handle names in the folder now selected, once it is known
+ * to still be that message; a LiveMailError otherwise.
+ */
+async function exactUid(client: ImapFlow, messageId: string, hint: MessageHint): Promise<number> {
+  if (!hint.uid || hint.uid <= 0 || !hint.uidValidity) throw new LiveMailError('moved', 'the handle names no message');
+  if (selectedValidity(client) !== hint.uidValidity) {
+    throw new LiveMailError('stale', 'the folder was rebuilt since it was listed; its UIDs name other messages now');
+  }
+  const one = await client.fetchOne(String(hint.uid), { uid: true, envelope: true }, { uid: true });
+  if (!one || one.uid !== hint.uid || !sameMessage(one, messageId)) {
+    throw new LiveMailError('moved', 'the message is no longer where the folder listed it');
+  }
+  return hint.uid;
 }
 
 /** More hits than this for one Message-ID is not an answer to believe. */
@@ -671,11 +732,17 @@ async function findLiveSource(
   const maxSourceBytes = intEnv('MCP_LIVE_SOURCE_BYTES', 5 * 1024 * 1024);
   const slim = options.oversize === 'slim';
   const hint = options.hint ?? {};
+  // A live handle is told apart by the Message-ID as the server has it, which may be none.
+  const isIt = (raw: FetchMessageObject, message: MailMessage | undefined): boolean =>
+    hint.exact ? sameMessage(raw, messageId) : message?.messageId === messageId;
   for (const folder of folders) {
     const lock = await lockFolder(client, folder, true);
     if (!lock) continue;
     try {
       const uidValidity = selectedValidity(client);
+      if (hint.exact && uidValidity !== hint.uidValidity) {
+        throw new LiveMailError('stale', 'the folder was rebuilt since it was listed; its UIDs name other messages now');
+      }
       // Remembered from the last time: everything about the message in one
       // request, checked against its Message-ID. Only when that is not the
       // message any more (moved, or the folder rebuilt) is it searched for.
@@ -695,7 +762,7 @@ async function findLiveSource(
         const message = raw
           ? await toMailMessage(raw, account, folder, { body: '', hasAttachments: false }, uidValidity)
           : undefined;
-        if (raw && message?.messageId === messageId) {
+        if (raw && message && isIt(raw, message)) {
           // One byte more than the bite was asked for, so anything shorter is
           // the whole message. A longer one is read the way a search would
           // have had it read: whole when it fits, slim when it does not.
@@ -703,8 +770,10 @@ async function findLiveSource(
           return { raw, folder, message, uidValidity };
         }
       }
+      // A live handle names that place and no other: not there, it is not looked for.
+      if (hint.exact && remembered !== undefined) throw new LiveMailError('moved', 'the message is no longer where the folder listed it');
       // The remembered place was tried just above when reading slim; otherwise the search starts with it.
-      const foundUids = await searchMessageUids(client, messageId, folder, slim ? {} : hint);
+      const foundUids = await searchMessageUids(client, messageId, folder, slim && !hint.exact ? {} : hint);
       if (!foundUids.length) continue;
       // Collected before anything else is asked of the server: a command
       // issued while a fetch is still being read would wait on it forever.
@@ -731,7 +800,7 @@ async function findLiveSource(
         const message = await toMailMessage(
           raw, account, folder, options.parseBody ? undefined : { body: '', hasAttachments: false }, uidValidity,
         );
-        if (message.messageId !== messageId) continue;
+        if (!isIt(raw, message)) continue;
         if (slim) raw.source = await readingSource(client, raw, maxSourceBytes);
         return { raw, folder, message, uidValidity };
       }
@@ -780,11 +849,11 @@ async function readingSource(client: ImapFlow, raw: FetchMessageObject, maxSourc
  * This is used by the MCP Resource path. The caller supplies a configured
  * account and Message-ID; the body exists only for the duration of this call.
  */
-export async function fetchByMessageId(account: Account, messageId: string): Promise<MailMessage | undefined> {
+export async function fetchByMessageId(account: Account, messageId: string, hint?: LookupHint): Promise<MailMessage | undefined> {
   const client = await connect(account);
   try {
-    const folders = await targetFolders(client, account);
-    return (await findLiveSource(client, account, messageId, folders, { withFlags: false, parseBody: true }))?.message;
+    const folders = await lookupFolders(client, account, hint);
+    return (await findLiveSource(client, account, messageId, folders, { withFlags: false, parseBody: true, hint: hintOf(hint) }))?.message;
   } finally {
     await client.logout().catch(() => undefined);
   }
@@ -858,7 +927,7 @@ export async function fetchAttachmentManifestByMessageId(
           { uid: true, envelope: true, bodyStructure: true },
           { uid: true },
         )) {
-          if (raw.envelope?.messageId?.trim() !== messageId) continue;
+          if (!sameMessage(raw, messageId)) continue;
           return { folder: folder.path, manifest: extractAttachmentManifest(raw.bodyStructure) };
         }
       } finally {
@@ -923,7 +992,7 @@ export async function scanAttachmentByMessageId(
             { uid: true, envelope: true, bodyStructure: true },
             { uid: true },
           );
-          if (!raw || raw.envelope?.messageId?.trim() !== messageId) continue;
+          if (!sameMessage(raw, messageId)) continue;
           const metadata = extractAttachmentManifest(raw.bodyStructure).items.find((part) => part.partId === partId);
           if (!metadata) throw new AttachmentNotFoundError(partId);
           const prefix = await downloadDecodedPrefix(client, uid, partId, maxBytes);
@@ -968,8 +1037,7 @@ export async function inspectMailSafety(
             },
             { uid: true },
           );
-          if (!raw) continue;
-          if (raw.envelope?.messageId?.trim() !== messageId) continue;
+          if (!raw || !sameMessage(raw, messageId)) continue;
 
           const values = parseHeaderValues(raw.headers);
           const listId = (values.get('list-id')?.length ?? 0) > 0;
@@ -1149,7 +1217,7 @@ export async function fetchAttachmentByMessageId(
             { uid: true, envelope: true, bodyStructure: true },
             { uid: true },
           );
-          if (!raw || raw.envelope?.messageId?.trim() !== messageId) continue;
+          if (!sameMessage(raw, messageId)) continue;
           const metadata = extractAttachmentManifest(raw.bodyStructure).items.find((part) => part.partId === partId);
           if (!metadata) throw new AttachmentNotFoundError(partId);
           const download = await client.download(uid, partId, {
@@ -1212,7 +1280,7 @@ async function actOnMessage(
       if (!uids.length) continue;
       for (const uid of uids) {
         const raw = await client.fetchOne(uid, { uid: true, envelope: true }, { uid: true });
-        if (!raw || raw.envelope?.messageId?.trim() !== messageId) continue;
+        if (!sameMessage(raw, messageId)) continue;
         const change = action in FLAG_CHANGES ? FLAG_CHANGES[action as keyof typeof FLAG_CHANGES] : undefined;
         if (change) {
           committing();
@@ -1383,7 +1451,10 @@ export async function applyWebMailAction(
       ? resolveActionDestination(entries, action as MovingAction, account.provider, options.destination)
       : undefined;
     const hint: MessageHint = { ...(options.folderHint ? { folder: options.folderHint } : {}), ...(options.hint ?? {}) };
-    const folders = orderLookupFolders(entries, resolveFolders(entries, account.folders), hint.folder);
+    // A live handle is acted on where it says, after it is known to still be that message; nowhere else.
+    const folders = hint.exact
+      ? [exactFolder(entries, hint.folder)]
+      : orderLookupFolders(entries, resolveFolders(entries, account.folders), hint.folder);
     const acted = await actOnMessage(client, messageId, folders, action, destination?.path, hint, () => { committed = true; });
     if (acted === undefined) return undefined;
     return {
@@ -1399,6 +1470,32 @@ export async function applyWebMailAction(
         ? { destinationUid: acted.destinationUid, destinationUidValidity: acted.destinationUidValidity } : {}),
     };
   }, { repeatable: () => !committed });
+}
+
+/** What a folder is for, as a mail client names it, so it can be called that in the page's own words. */
+export type FolderRole = 'inbox' | 'archive' | 'all' | 'sent' | 'drafts' | 'junk' | 'trash' | 'starred' | 'important';
+
+const DRAFTS_NAMES = new Set(['drafts', 'draft', '草稿箱', '草稿']);
+
+/**
+ * What a folder is for, from the server's special-use flag and then the
+ * names the same folders go by (localized ones included), as the actions
+ * that file a message decide where it goes. Null for a folder of the owner's own.
+ */
+export function folderRole(entry: ListResponse, provider = ''): FolderRole | null {
+  const path = entry.path.trim().toLowerCase();
+  const leaf = path.split(entry.delimiter || '/').at(-1) ?? path;
+  const named = (names: ReadonlySet<string>): boolean => names.has(path) || names.has(leaf);
+  if (entryHasUse(entry, '\\inbox') || path === 'inbox') return 'inbox';
+  if (entryHasUse(entry, '\\junk') || toFolder(entry).isSpam) return 'junk';
+  if (entryHasUse(entry, '\\trash') || named(TRASH_NAMES)) return 'trash';
+  if (entryHasUse(entry, '\\sent') || named(SENT_NAMES)) return 'sent';
+  if (entryHasUse(entry, '\\drafts') || named(DRAFTS_NAMES)) return 'drafts';
+  if (entryHasUse(entry, '\\archive') || named(ARCHIVE_NAMES)) return 'archive';
+  if (entryHasUse(entry, '\\all') || GMAIL_ALL_NAMES.has(path)) return provider.toLowerCase().startsWith('gmail') || /^\[(?:gmail|google mail)\]\//i.test(entry.path) ? 'all' : 'archive';
+  if (entryHasUse(entry, '\\flagged')) return 'starred';
+  if (entryHasUse(entry, '\\important')) return 'important';
+  return null;
 }
 
 /** The folder sent mail is kept in, from the folder list alone. */

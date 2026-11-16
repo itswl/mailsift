@@ -134,12 +134,16 @@ function metaLine(m, thread, now) {
   if (level(m) !== 'info') add(word('level.', m.importance), 'lvl ' + level(m));
   if (m.category) add(word('category.', m.category));
   if (m.verificationCode) add(t('code.tag'));
-  if (m.inSpam) add(m.pushed ? t('row.rescued') : t('spam'), m.pushed ? 'rescued' : null);
+  if (m.inSpam && !m.live) add(m.pushed ? t('row.rescued') : t('spam'), m.pushed ? 'rescued' : null);
   else if (m.pushed) add(t('notified'));
   else if (m.withheld) add(t('row.withheld'));
   const due = dueInfo(m.deadline, now);
   // A deadline on something already dealt with is a fact, not a call to act.
   if (due) add(due.text, m.handledAt ? null : (due.late ? 'due late' : 'due'));
+  // Listed live: what the mailbox says of it.
+  if (m.live && m.flags && m.flags.flagged) add(t('live.starred'));
+  if (m.live && m.flags && m.flags.answered) add(t('live.answered'));
+  if (m.live && m.attachments) add(t('live.files'));
   // When it comes back, wherever a message that is put off is shown; and in
   // the queue, why a message that was not judged to matter is there.
   if (isSnoozed(m)) add(fill('snooze.meta', { when: whenLabel(new Date(m.snoozedUntil), now, true) }), 'whole');
@@ -207,7 +211,13 @@ function rowOf(item, now, queued) {
   } else if (isSnoozed(m)) {
     li.classList.add('later');
     li.appendChild(laterButton(m));
+  } else if (m.live) {
+    // Listed live, the mark says whether it was read, as a mail client's does.
+    const unseen = !(m.flags && m.flags.seen);
+    li.appendChild(el('span', 'mark ' + (unseen ? 'unseen' : 'seen')));
   } else li.appendChild(el('span', 'mark ' + level(m)));
+  if (m.live) li.classList.add('live');
+  if (m.live && !(m.flags && m.flags.seen)) li.classList.add('unseen');
   const who = highlightInto(el('a', 'who'), m.senderName || m.sender || t('unknownSender'));
   who.href = '#m=' + encodeURIComponent(key);
   who.onclick = (e) => { e.preventDefault(); openDetail(key); };
@@ -219,7 +229,9 @@ function rowOf(item, now, queued) {
     if (now - dateOf(m) > STALE_CODE_MS) li.classList.add('stale');
     li.appendChild(codeButton(m, 'code-copy'));
   } else {
-    li.appendChild(highlightInto(el('div', 'sum'), thread ? (m.subject || m.summary || t('noSubject')) : (m.summary || m.subject || t('noSubject'))));
+    // A live row is the mailbox's: its subject, as a mail client shows it.
+    const said = thread || m.live ? (m.subject || m.summary || t('noSubject')) : (m.summary || m.subject || t('noSubject'));
+    li.appendChild(m.live ? el('div', 'sum', said) : highlightInto(el('div', 'sum'), said));
   }
   li.appendChild(metaLine(m, thread, now));
   if (m.reason) li.appendChild(el('div', 'why', m.reason));
@@ -236,6 +248,7 @@ function rowSignature(item, now, queued) {
     m.deadline || '', m.deadline ? dayKey(now) : '', isThread(item) ? item.messageCount : 0, filters.q.value.trim(),
     isThread(item) ? (item.sentCount || 0) + ':' + (item.lastWordYours ? 1 : 0) : '',
     m.snoozedUntil || '', isSnoozed(m) ? dayKey(now) : '',
+    m.live ? [m.flags && m.flags.seen ? 1 : 0, m.flags && m.flags.flagged ? 1 : 0, m.flags && m.flags.answered ? 1 : 0, m.attachments ? 1 : 0].join('') : '',
   ].join('\u0001');
 }
 function markSelected() {
@@ -257,6 +270,8 @@ function eachCopy(key, touch) {
   for (const m of snoozedRows) one(m);
   for (const th of lastThreads || []) { one(th.latest); for (const m of th.messages || []) one(m); }
   one(extraRows.get(key));
+  // The same message listed live, when mailsift stored it: one row, whichever list it is shown in.
+  one(liveRows.get(key));
 }
 function markHandledLocal(key, at) {
   eachCopy(key, (m) => { m.handledAt = at; });
@@ -824,6 +839,8 @@ function buildList() {
   // draw of an empty list, it would tint every row of the next one.
   const arriving = washNext;
   washNext = false;
+  // A folder or a search of the mailbox, live, takes the list's place.
+  if (liveView) { buildLiveList(now); return; }
   if (!items) {
     lane.hidden = true;
     lane.replaceChildren();
@@ -909,7 +926,9 @@ function watchForMore() {
   if (!window.IntersectionObserver) return;
   if (!moreWatcher) {
     moreWatcher = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting) && nextCursor && !loadingMail && !loadMoreFailed) load(false);
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      if (liveView) { if (liveView.next && !liveView.loading && !liveView.moreFailed) liveLoad(false); return; }
+      if (nextCursor && !loadingMail && !loadMoreFailed) load(false);
     }, { rootMargin: '600px 0px' });
   }
   moreWatcher.disconnect();
@@ -921,7 +940,7 @@ function watchForMore() {
 const freshPill = $('#fresh-pill');
 let freshCount = 0;
 function noteArrivals(count) {
-  if (count <= 0 || window.scrollY < 320 || document.querySelector('dialog[open]')) return;
+  if (count <= 0 || liveView || window.scrollY < 320 || document.querySelector('dialog[open]')) return;
   freshCount += count;
   freshPill.textContent = freshCount === 1 ? t('fresh.pill1') : fill('fresh.pill', { count: freshCount });
   freshPill.hidden = false;
@@ -944,11 +963,14 @@ function updateBadge() {
 // ---- Loading ----
 let timer;
 function onFiltersChanged() {
+  // In a live view the field is the mailbox's search, asked on Enter (see runLiveQuery).
+  if (liveView) { syncUrl(); updateAsk(); return; }
   announceNextList = true;
   markSegs();
   renderTokens();
   syncUrl();
   updateAsk();
+  renderMailboxSearch();
   loadMoreFailed = false;
   queueExpanded = false;
   doneExpanded = false;

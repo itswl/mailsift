@@ -1,11 +1,12 @@
 # MCP
 
-mailsift includes an MCP server, so an AI assistant can see what needs you, list, search and read your triaged mail, preview the digest, look at attachments and at what your provider said about a sender, and check whether mailsift is healthy. With a second, write token it is given what the web view's owner has: it can mark mail done, file it, bin it, and send mail.
+mailsift includes an MCP server, so an AI assistant can see what needs you, list, search and read your triaged mail, reach the rest of the mailbox live, preview the digest, look at attachments and at what your provider said about a sender, and check whether mailsift is healthy. With a second, write token it is given what the web view's owner has: it can mark mail done, file it, bin it, and send mail.
 
 An agent that supports skills can load [`.agents/skills/mailsift/SKILL.md`](../.agents/skills/mailsift/SKILL.md), which says how these tools are meant to be used and where the limits are.
 
 - [Connecting](#connecting)
 - [Tools and resources](#tools-and-resources)
+- [The rest of the mailbox, live](#the-rest-of-the-mailbox-live)
 - [Prompts](#prompts)
 - [Errors](#errors)
 - [Write tools and the write token](#write-tools-and-the-write-token)
@@ -46,9 +47,11 @@ For local stdio clients, point the command at `dist/src/mcp.js` (or `npm run mcp
 | `mail_summary` | Processed and pushed totals for a time window, spam and spam rescues included. |
 | `list_digest` | The messages waiting for the next daily digest. |
 | `list_accounts` | The monitored mailboxes, their providers and the folders being watched; with the write credential, each mailbox's signature. |
-| `list_folders` | One mailbox's IMAP folders. |
+| `list_folders` | One mailbox's IMAP folders, what each is for, and how many messages each holds and how many are unread where the server says so cheaply. |
+| `browse_folder` | One folder of a mailbox, live, newest first, a page at a time: any folder, and older mail than mailsift keeps. Each message has a live handle. |
+| `search_mailbox` | A search the mailbox's own server runs (Gmail in its own syntax), live, for mail mailsift never stored. Says when it could only read the subject and sender of recent mail. |
 | `find_contacts` | Addresses for a name or part of one, as the web view's composer suggests them: those you have written to first, then people who wrote to you. |
-| `read_message` | One message as the web view shows it, read live: its text with the quoted history apart, who it is from and to, the provider's verdict on the sender, its flags and folder. |
+| `read_message` | One message as the web view shows it, read live: its text with the quoted history apart, who it is from and to, the provider's verdict on the sender, its flags and folder. Takes a stored Message-ID or a live handle. |
 | `prepare_reply` | What an answer to a message would start from: recipients, subject, thread references, the original quoted. Sends nothing. |
 | `prepare_forward` | What a forward of a message would start from: its subject, the forwarded block, and the original's attachments by part id. Sends nothing. |
 | `list_attachments` | A message's attachments, each with a resource URI to fetch the file. |
@@ -90,7 +93,20 @@ The poll reads each mailbox's Sent folder, and what `send_mail` and the web view
 
 `needs_you`, `list_mail`, `search_mail`, `get_mail` and the digest are received mail only. A reply found in Sent takes the message it answers out of `needs_you`, as answering it through `send_mail` does; see [What needs you](web-view.md#what-needs-you) for the rule. `SENT_MAIL_ENABLED=false` stops reading and storing it.
 
-`list_folders` takes the exact account address returned by `list_accounts` and lists its decoded IMAP folder paths, hierarchy delimiter, flags, special-use marker, and selectability. It uses IMAP LIST without opening folders or changing mail.
+`list_folders` takes the exact account address returned by `list_accounts` and lists its decoded IMAP folder paths, each with its `name` and `parent`, its `role` (`inbox`, `archive`, `all`, `sent`, `drafts`, `junk`, `trash`, `starred`, `important`, or null for a folder of the owner's own), hierarchy delimiter, flags, special-use marker and selectability, the inbox and the other folders every mailbox has first. `messages` and `unseen` are how many messages a folder holds and how many are unread, where the server says so cheaply: in the folder list itself (`LIST-STATUS`), or else by `STATUS` one folder at a time for a few seconds, the rest without them. It opens no folder and changes no mail. It is the list the web view's folder panel shows.
+
+## The rest of the mailbox, live
+
+The tools above are what mailsift fetched and judged: the monitored folders, within `STATE_RETENTION_DAYS`. `browse_folder` and `search_mailbox` reach the rest, live from IMAP: any folder, older mail, the archive, the Sent folder. They read envelopes and flags only, never a body, store nothing, and nothing they list is judged, sent to the model or put in `needs_you`. They need only the read credential, and are what the web view's folders and its "Search the mailbox" show.
+
+- `browse_folder` (`account`, `folder` as `list_folders` gives it, `limit` up to 100, default 50) lists a folder newest first. `next` is passed back as `before` for the next page; it is tied to the folder's UIDVALIDITY, and a folder rebuilt in between is refused with `NOT_FOUND` (`liveCursor`), to be listed again from the top.
+- `search_mailbox` (`account`, `query`, optional `folder`, `before`, `limit`) runs the mailbox's own search, newest first. Without `folder` it searches the inbox and the archive; on Gmail, All Mail alone, in Gmail's own syntax (`from:`, `has:attachment`, `older_than:1y`). Elsewhere the subject, the sender and the text are searched, in UTF-8 where the query needs it. QQ's IMAP search cannot be trusted (it answers some searches with the wrong messages and ignores Chinese on some accounts), so on QQ, and on any server that refuses a search or finds nothing for text outside ASCII, the newest 2,000 messages of each folder searched are read envelope by envelope and only their subject and sender compared. The answer then has `limited` (`reason`: `provider`, `refused` or `unicode`; `scanned`: how many were read): it is not a full search, and an assistant must say so.
+
+Each message they list has `from`, `to`, `subject`, `date`, `size`, `flags` (`seen`, `flagged`, `answered`), `attachments` (whether it carries files) and a `handle`, a string that starts `live:` and names the message by its mailbox, folder, the folder's UIDVALIDITY, its UID and its Message-ID. A message mailsift stored also has `key` (its `dedupKey`) and `stored`: how it was judged and whether it was dealt with or put off.
+
+A handle can be given wherever a tool takes a `messageId`: `read_message`, `prepare_reply`, `prepare_forward`, `list_attachments`, `inspect_mail_safety`, `scan_attachment`, the `mailsift://imap/...` resources, `manage_mail`, and `send_mail` as `replyTo` or `forward`. The message is then read and acted on exactly where the handle says. Each time, the server checks that the mailbox is configured, the folder exists and has not been rebuilt, and that the UID still carries that Message-ID (under the writable lock, for an action); when one of these no longer holds the call fails with `NOT_FOUND` and a hint to list the folder again, and nothing is looked for elsewhere. A handle that is not one this server made is `INVALID_ARGUMENT`. After a move, `manage_mail` answers with the message's new `handle` where the server said where it landed. A message named by a handle that mailsift stored is the stored record for everything else: archiving or binning it counts it as dealt with, answering it takes it out of `needs_you`. `mark_handled`, `snooze` and `record_feedback` take a handle only for such a message, and refuse one for a message mailsift never stored with `ACTION_REFUSED`: it has no place in the queue and no judgement to correct. A sender can write a Message-ID that looks like a handle: a string that starts `live:` only ever names a live message, and one that is also a stored record's Message-ID or key is refused with `INVALID_ARGUMENT`, to be named by the record's `dedupKey` instead.
+
+The audit records which mailbox and folder were browsed or searched, never what was searched for.
 
 ## Prompts
 
@@ -142,7 +158,7 @@ One letter is sent once. A letter's name is what the caller called it (`id`, opt
 
 Set `MCP_WRITE_TOKEN` to a second secret that differs from `MCP_TOKEN`; reusing one value for both is refused at startup. Present it as the bearer token to get the full surface. `MCP_TOKEN` then stays a read-only credential, which is what any shared client should hold. Over stdio the caller can already read the env file, so setting `MCP_WRITE_TOKEN` alone enables the write tools there without a second presentation.
 
-One message can be stored once per monitored mailbox (a forwarded copy, or a message sent to two of them). `manage_mail`, `mark_handled`, `snooze`, `record_feedback`, `read_message`, `prepare_reply`, `prepare_forward`, and `send_mail` with `replyTo` or `forward` take an optional `account`, and refuse an ambiguous id without one, naming the mailboxes, rather than acting on whichever copy was stored first. `get_mail` returns the first stored copy, lists the others under `storedFor`, and takes `account` to pick one. These tools take Message-IDs, as `list_mail` shows them, and also a record's key (`dedupKey`). A sender can write a Message-ID that spells another record's key; a string that is both one record's key and another message's Message-ID is refused with `INVALID_ARGUMENT` rather than guessed, and each record is then reached by a name only it has. A string shaped like a key (an email address, `|`, the rest) only ever names a record by its key, so a key whose record is gone is not found rather than taken as a look-alike's Message-ID.
+One message can be stored once per monitored mailbox (a forwarded copy, or a message sent to two of them). `manage_mail`, `mark_handled`, `snooze`, `record_feedback`, `read_message`, `prepare_reply`, `prepare_forward`, and `send_mail` with `replyTo` or `forward` take an optional `account`, and refuse an ambiguous id without one, naming the mailboxes, rather than acting on whichever copy was stored first. `get_mail` returns the first stored copy, lists the others under `storedFor`, and takes `account` to pick one. These tools take Message-IDs, as `list_mail` shows them, a record's key (`dedupKey`), and live handles (see [The rest of the mailbox, live](#the-rest-of-the-mailbox-live)). A sender can write a Message-ID that spells another record's key; a string that is both one record's key and another message's Message-ID is refused with `INVALID_ARGUMENT` rather than guessed, and each record is then reached by a name only it has. A string shaped like a key (an email address, `|`, the rest) only ever names a record by its key, so a key whose record is gone is not found rather than taken as a look-alike's Message-ID.
 
 What stays with the page: its own assistant (asking a question across your mail, drafting a reply), since an MCP client is itself the model that would do that; notifications to installed copies of the page, which belong to a browser; and attaching a file from your own device, which only the page can read. Everything else a letter can be in the page, it can be through `send_mail`: an answer, a forward from any of your mailboxes with any of the original's files, Bcc, and the signature or none.
 
@@ -150,7 +166,7 @@ What stays with the page: its own assistant (asking a question across your mail,
 
 ## Attachments
 
-`list_attachments` takes a configured account and Message-ID, and returns MIME metadata plus a `mailsift://imap/.../attachment/{partId}` resource URI for each file. Read the resource to fetch that one file from IMAP. The web view also lists and downloads attachments from a message's detail panel. Reads use a read-only mailbox lock; attachment bytes are never stored. New triage records keep only a bounded manifest of names, MIME types, part IDs, and reported sizes.
+`list_attachments` takes a configured account and a Message-ID or live handle, and returns MIME metadata plus a `mailsift://imap/.../attachment/{partId}` resource URI for each file. Read the resource to fetch that one file from IMAP. The web view also lists and downloads attachments from a message's detail panel. Reads use a read-only mailbox lock; attachment bytes are never stored. New triage records keep only a bounded manifest of names, MIME types, part IDs, and reported sizes.
 
 `MCP_ATTACHMENT_MAX_BYTES` limits the decoded size of each on-demand file and defaults to 10 MiB (configuration is capped at 100 MiB). This limit is separate from `MCP_LIVE_SOURCE_BYTES`, so attachment reads fetch the selected MIME part without downloading the entire message source. Filenames are treated as untrusted data and files are delivered as downloads. mailsift returns image and PDF files as-is; it does not recognize images or extract PDF text.
 

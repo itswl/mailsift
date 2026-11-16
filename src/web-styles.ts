@@ -128,6 +128,41 @@ input[type=search]::-webkit-search-cancel-button{-webkit-appearance:none}
 .token::after{content:" ×";color:var(--muted)}
 .token.clear{color:var(--muted)}.token.clear::after{content:none}
 
+/* ---- The whole mailbox: a folder or a search, live ----
+   The line that names it replaces the window and the filters, which are the
+   triaged view's; under it, quietly, that it is live and not triaged. */
+.live-head{display:flex;align-items:center;flex:1;min-width:0}
+.live-where{display:inline-flex;align-items:center;gap:4px;min-width:0;min-height:44px;padding:0 8px;border:0;border-radius:8px;background:none;color:var(--text);font:inherit;font-size:15px;font-weight:600;cursor:pointer}
+.live-where span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.live-where .icon{flex:none;width:14px;height:14px;color:var(--muted)}
+body.live-mode .window,body.live-mode #filters-open,body.live-mode #folders-open,body.live-mode #tally{display:none}
+.live-note{padding:0 16px 4px;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
+.live-note p{margin:0}
+.live-mark{font-weight:500}
+.live-limit{margin-top:2px!important;color:var(--warning-text)}
+.mailbox-search{display:flex;flex-wrap:wrap;align-items:center;gap:0 2px;padding:0 10px}
+.mailbox-search .text-btn{display:inline-flex;align-items:center;gap:6px;min-height:36px;padding:6px 8px;font-weight:500}
+.mailbox-search .icon{width:14px;height:14px}
+.mailbox-search-label{padding-left:8px;font-size:13px;color:var(--muted)}
+/* The folders of a mailbox, in a panel under the control that opened them. */
+#folder-sheet.popover .sheet-body{padding:0 8px 8px;overflow:auto}
+.folder-accounts{max-width:none;margin:0 8px 8px}
+.folder-filter{display:block;width:calc(100% - 16px);min-height:36px;margin:0 8px 6px;padding:6px 10px;border:0;border-radius:8px;background:var(--fill);color:var(--text);font:inherit;font-size:15px}
+.folder-filter::placeholder{color:var(--muted)}
+.folder-filter::-webkit-search-cancel-button{-webkit-appearance:none}
+.choice.folder-choice{padding-left:calc(8px + var(--depth,0) * 16px)}
+.folder-choice.on{font-weight:600}
+.folder-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.folder-name small{display:block;font-size:12px;color:var(--muted);font-weight:400}
+.choice-when.unseen{color:var(--text);font-weight:600}
+.folder-group{padding:10px 8px 2px calc(8px + var(--depth,0) * 16px);font-size:12px;font-weight:600;color:var(--muted)}
+.folder-list .inline-status,.folder-list .inline-error{margin:8px}
+/* A row listed live: its mark says whether it was read, and so does the weight of its sender. */
+.mark.unseen{background:var(--text)}
+.mark.seen{background:transparent;box-shadow:none}
+.row.live .who{font-weight:500}.row.live.unseen .who{font-weight:650}
+.row.live .sum{color:var(--text-2);-webkit-line-clamp:2}.row.live.unseen .sum{color:var(--text)}
+
 /* ---- Sheets: the detail on a phone, filters, the install steps ---- */
 .sheet{position:fixed;inset:auto 0 0 0;z-index:20;width:100%;max-width:640px;margin:0 auto;border:0;padding:0;background:var(--surface);color:var(--text);
 border-radius:16px 16px 0 0;box-shadow:var(--shadow-sheet);max-height:calc(100vh - env(safe-area-inset-top) - 8px);max-height:calc(100dvh - env(safe-area-inset-top) - 8px);

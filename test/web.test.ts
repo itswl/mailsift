@@ -1193,6 +1193,7 @@ describe('the composer', () => {
       attentionSet: new Set(['k1']), rowByKey: () => ({ handledAt: null }), markHandledLocal: (key: string) => marked.push(key),
       attentionCount: 3, liveData: new Map(), renderList: () => undefined, renderLede: () => undefined,
       renderBars: () => undefined, updateBadge: () => undefined, refreshConversations: () => { redrawn += 1; },
+      liveView: null,
     };
     let redrawn = 0;
     const deliver = lifted<(job: unknown) => Promise<void>>(['homeId', 'draftId', 'heldFiles', 'deliver'], 'deliver', context);
@@ -1776,7 +1777,7 @@ describe('putting a message off until later', () => {
     expect(page).toContain('<symbol id="i-clock" viewBox="0 0 24 24">');
     expect(script).toContain("item('i-clock', t('act.snooze'), () => {");
     expect(script).toContain("['b', 'keys.snooze']");
-    expect(script).toContain("else if (e.key === 'b' && !row.handledAt) {");
+    expect(script).toContain("else if (e.key === 'b' && !row.handledAt && markable) {");
     expect(script).toContain('openPopover(snoozeSheet, anchor, {');
     // The queue's own line for it, beside what was done, and the server told by the route for it.
     expect(script).toContain("fill('snooze.later', { count: later.length + laterExtra })");
@@ -1794,5 +1795,111 @@ describe('putting a message off until later', () => {
     // The list itself still has them, each carrying when it comes back.
     const mail = (await body('/api/mail', store))['mail'] as Array<{ dedupKey: string; snoozedUntil: string | null }>;
     expect(mail.find((m) => m.dedupKey === 'k1')?.snoozedUntil).toEqual(expect.any(String));
+  });
+});
+
+describe('the rest of the mailbox in the page', () => {
+  const words = (lang: 'en' | 'zh-CN') => {
+    const t = (key: string): string => STRINGS[lang][key as StringKey] ?? key;
+    return { t, lang, STRINGS };
+  };
+
+  it('offers the folders under their control, a line that says a list is live, and a quiet way to search the mailbox', async () => {
+    const page = String((await routeWeb(request(), url('/'), '', seeded())).body);
+    expect(page).toContain('<dialog id="folder-sheet" class="sheet bare" aria-labelledby="folder-title" tabindex="-1">');
+    expect(page).toMatch(/<button id="folders-open" type="button" class="icon-btn" aria-label="Folders"[^>]*aria-controls="folder-sheet"/);
+    expect(page).toMatch(/<div id="live-head" class="live-head" hidden><button id="live-back"[^>]*aria-label="Back to the triaged mail"/);
+    expect(page).toContain('<div id="live-note" class="live-note" role="status" hidden></div>');
+    expect(page).toContain('<div id="mailbox-search" class="mailbox-search" hidden></div>');
+    const script = clientScript();
+    expect(script).toContain("openPopover(folderSheet, anchor, { width: 340, align: 'start', history: !isWide() });");
+    expect(script).toContain("['g', 'keys.folders']");
+    expect(script).toContain("fetch((view.mode === 'search' ? '/api/search?' : '/api/folder?') + p.toString(), abort ? { signal: abort.signal } : {})");
+  });
+
+  it('names the folders every mailbox has in the page\'s words, and the rest as the owner named them', () => {
+    for (const [lang, inbox, junk, both] of [['en', 'Inbox', 'Spam', 'Inbox and archive'], ['zh-CN', '收件箱', '垃圾邮件', '收件箱和归档']] as const) {
+      const folderLists = new Map([['me@qq.com', { folders: [
+        { path: 'INBOX', name: 'INBOX', role: 'inbox' }, { path: '垃圾邮件', name: '垃圾邮件', role: 'junk' },
+        { path: 'Projects/2026', name: '2026', role: null },
+      ] }]]);
+      const name = lifted<(account: string, path: string | null) => string>(['folderInfo', 'folderName'], 'folderName', { ...words(lang), folderLists });
+      expect(name('me@qq.com', 'INBOX')).toBe(inbox);
+      expect(name('me@qq.com', '垃圾邮件')).toBe(junk);
+      expect(name('me@qq.com', 'Projects/2026')).toBe('2026');
+      expect(name('me@qq.com', null)).toBe(both);
+      // Before the folders are listed, the inbox is still the inbox.
+      expect(name('other@x', 'INBOX')).toBe(inbox);
+    }
+  });
+
+  it('makes a row of what the mailbox says, keyed by the stored record when there is one', () => {
+    const context = { folderLists: new Map(), accountName: (a: string) => `name of ${a}` };
+    const row = lifted<(item: Record<string, unknown>, account: string) => Record<string, unknown>>(
+      ['folderInfo', 'folderRoleOf', 'liveRow'], 'liveRow', context,
+    );
+    const unstored = row({ handle: 'live:a', messageId: '<a@x>', folder: 'INBOX', subject: 'Hi', from: { name: 'Ann', address: 'ann@x' },
+      date: '2026-11-01T00:00:00.000Z', flags: { seen: false }, attachments: true }, 'me@qq.com');
+    expect(unstored).toMatchObject({ dedupKey: 'live:a', handle: 'live:a', live: true, stored: false, sender: 'ann@x', senderName: 'Ann',
+      accountLabel: 'name of me@qq.com', importance: null, handledAt: null, attachments: true });
+    const stored = row({ handle: 'live:b', key: 'k1', stored: { importance: 'critical', handledAt: '2026-11-02T00:00:00.000Z' }, folder: 'Archive',
+      from: { name: '', address: 'b@x' }, flags: {} }, 'me@qq.com');
+    expect(stored).toMatchObject({ dedupKey: 'k1', handle: 'live:b', stored: true, importance: 'critical', handledAt: '2026-11-02T00:00:00.000Z' });
+    // What the server is asked to find it by: the handle, which says where it is.
+    const ref = lifted<(m: Record<string, unknown>) => string>(['rowKey', 'mailRef'], 'mailRef');
+    expect(ref(stored)).toBe('live:b');
+    expect(ref({ dedupKey: 'k2' })).toBe('k2');
+  });
+
+  it('keeps a live view on the address and in the history, and knows one from another', () => {
+    const same = lifted<(a: unknown, b: unknown) => boolean>(['sameLive'], 'sameLive');
+    expect(same({ mode: 'folder', account: 'a', folder: 'INBOX' }, { mode: 'folder', account: 'a', folder: 'INBOX', q: '' })).toBe(true);
+    expect(same({ mode: 'search', account: 'a', folder: null, q: 'x' }, { mode: 'search', account: 'a', folder: null, q: 'y' })).toBe(false);
+    expect(same(null, { mode: 'folder', account: 'a' })).toBe(false);
+    const context: Record<string, unknown> = { bootLive: null };
+    const read = lifted<(p: URLSearchParams) => void>(['readLiveUrl'], 'readLiveUrl', context);
+    read(new URLSearchParams('in=me%40qq.com&mq=invoice'));
+    expect(context['bootLive']).toEqual({ mode: 'search', account: 'me@qq.com', folder: null, q: 'invoice' });
+    read(new URLSearchParams('in=me%40qq.com'));
+    expect(context['bootLive']).toEqual({ mode: 'folder', account: 'me@qq.com', folder: 'INBOX', q: '' });
+    const p = new URLSearchParams('q=old&hours=72');
+    lifted<(p: URLSearchParams) => void>(['writeLiveUrl'], 'writeLiveUrl', { liveView: { mode: 'search', account: 'me@qq.com', folder: 'Archive', q: 'new' } })(p);
+    expect(p.toString()).toBe('hours=72&in=me%40qq.com&folder=Archive&mq=new');
+  });
+
+  it('says that a list is live, and when a search read only recent subjects and senders, in both languages', () => {
+    expect(STRINGS.en['live.mark']).toBe('Live from the mailbox, not triaged');
+    expect(STRINGS['zh-CN']['live.mark']).toBe('实时读取自邮箱，未经分拣');
+    expect(STRINGS.en['live.limited']).toContain('{count}');
+    expect(STRINGS['zh-CN']['live.limited']).toContain('{count}');
+    for (const key of Object.keys(STRINGS.en).filter((k) => k.startsWith('live.') || k.startsWith('folder'))) {
+      expect(STRINGS['zh-CN'][key as StringKey], key).toBeTruthy();
+    }
+  });
+
+  it('gives a live row only what applies to it: no Done or later for a message never stored, no Archive in the archive', () => {
+    const script = clientScript();
+    expect(script).toContain("if (markable) bar.appendChild(barButton('i-check'");
+    expect(script).toContain("if (!liveIn(row, 'archive') && !liveIn(row, 'all')) bar.appendChild(barButton('i-archive'");
+    expect(script).toContain("if (e.key === 'e') { if (!markable) return;");
+    expect(script).toContain('const conversation = stored ? conversationSection(box, row) : null;');
+  });
+});
+
+describe('the parts of the page script', () => {
+  it('are written as the browser runs them: no backtick and no interpolation inside a String.raw part', async () => {
+    const { readdirSync, readFileSync } = await import('node:fs');
+    const dir = new URL('../src/', import.meta.url);
+    const parts = readdirSync(dir).filter((name) => /^web-client-.+\.ts$/.test(name));
+    expect(parts).toEqual(expect.arrayContaining(['web-client-mailbox.ts', 'web-client-list.ts', 'web-client-reader.ts', 'web-client-compose.ts', 'web-client-live.ts']));
+    for (const name of parts) {
+      const source = readFileSync(new URL(name, dir), 'utf8');
+      const start = source.indexOf('String.raw`');
+      expect(start, name).toBeGreaterThan(-1);
+      const body = source.slice(start + 'String.raw`'.length, source.lastIndexOf('`;'));
+      expect(body.includes('`'), name).toBe(false);
+      expect(body.includes('${'), name).toBe(false);
+    }
+    expect(() => new Script(clientScript())).not.toThrow();
   });
 });

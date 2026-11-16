@@ -50,7 +50,8 @@ let composing = null;
 // sendCompose), so a message begun in the meantime has its own draft and
 // neither removes the other's. A forward and an answer to the same message
 // are two letters, with a draft each.
-const homeId = (state) => 'draft:' + (state && state.mode === 'forward' ? 'fwd:' : '') + (state && state.key ? state.key : 'new');
+// A message's draft is kept under its key, whichever list it was answered from.
+const homeId = (state) => 'draft:' + (state && state.mode === 'forward' ? 'fwd:' : '') + (state && (state.local || state.key) ? state.local || state.key : 'new');
 const draftId = (state) => (state && state.draftKey) || homeId(state);
 // Files added to a letter, by the name its draft is kept under (draftId), for
 // as long as this page is open. A draft on this device keeps only their
@@ -994,13 +995,14 @@ async function startReply(key, mode) {
   if (!requireWrite()) return;
   const row = rowByKey(key);
   if (!row) return;
+  // key is what the server finds the message by (a live handle for one listed live); local is the page's own.
   const state = {
-    mode, key, account: row.account, accountName: row.accountLabel || '',
+    mode, key: mailRef(row), local: rowKey(row), account: row.account, accountName: row.accountLabel || '',
     titleKey: mode === 'replyAll' ? 'act.replyAll' : 'act.reply',
   };
   openCompose(state);
   try {
-    const r = await fetch('/api/reply?mode=' + mode + '&key=' + encodeURIComponent(key));
+    const r = await fetch('/api/reply?mode=' + mode + '&key=' + encodeURIComponent(state.key));
     const d = await r.json().catch(() => ({}));
     // This very letter, not another one to the same message opened since:
     // a reply must not be filled in with a reply-all's recipients.
@@ -1018,7 +1020,7 @@ async function startForward(key) {
   const row = rowByKey(key);
   if (!row) return;
   const state = {
-    mode: 'forward', key, account: row.account, accountName: row.accountLabel || '', titleKey: 'act.forward',
+    mode: 'forward', key: mailRef(row), local: rowKey(row), account: row.account, accountName: row.accountLabel || '', titleKey: 'act.forward',
     files: [], originals: [],
   };
   openCompose(state);
@@ -1027,7 +1029,7 @@ async function startForward(key) {
   const failed = (why) => { state.forwardFailed = why; if (composing === state) composeSay(why, true); };
   try {
     // The forwarded message's header lines in the page's language.
-    const r = await fetch('/api/forward?key=' + encodeURIComponent(key) + '&language=' + encodeURIComponent(lang));
+    const r = await fetch('/api/forward?key=' + encodeURIComponent(state.key) + '&language=' + encodeURIComponent(lang));
     const d = await r.json().catch(() => ({}));
     if (!r.ok) { failed(failure(d)); return; }
     if (composing !== state) return;
@@ -1294,15 +1296,19 @@ async function deliver(job) {
   toast(refused.length ? fill('compose.partial', { list: refused.join(', ') }) : t(r.data.savedCopy === false ? 'compose.sentNoCopy' : 'compose.sent'),
     refused.length > 0);
   if (job.state.key) {
+    const local = job.state.local || job.state.key;
     // The message as the mailbox now has it is read afresh next time.
-    liveData.delete(job.state.key);
+    liveData.delete(local);
     // An answered or forwarded message is dealt with, when the server says
     // so: a forward to nobody but the owner's own mailboxes is not.
     if (r.data.handled === true) {
-      const counted = attentionSet.has(job.state.key) && !(rowByKey(job.state.key) || {}).handledAt;
-      markHandledLocal(job.state.key, new Date().toISOString());
+      const counted = attentionSet.has(local) && !(rowByKey(local) || {}).handledAt;
+      markHandledLocal(local, new Date().toISOString());
       if (counted) attentionCount = Math.max(0, attentionCount - 1);
     }
+    // Answered from a folder listed live: it carries the flag now.
+    const shown = liveView && liveRows.get(local);
+    if (shown && isAnswer(job.state)) shown.flags = Object.assign({}, shown.flags || {}, { answered: true });
   }
   if (typeof r.data.attention === 'number') attentionCount = r.data.attention;
   renderList();
