@@ -38,7 +38,7 @@ Verification codes, sign-in links and mailsift's own alerts and digests are not 
 
 `needs_you` with `includeDone: true` also returns `recentlyDone`: what was dealt with in the last seven days, most recent first. Use it when the user says something disappeared from their queue, or wants to undo a "done". Each entry's `queued` says whether marking it not done would return it to the queue.
 
-A message the owner put off is out of the queue until its `snoozedUntil`, and back in it from then on whatever it was judged, for 30 days from that time. `needs_you` with `includeSnoozed: true` also returns `snoozed`: what is put off and still to come, soonest first. Use it when the user asks what they put off, or why something is not in their queue. A row in `mail` with a `snoozedUntil` in the past is there because a reminder brought it back.
+A message the owner put off is out of the queue until its `snoozedUntil`, and back in it from then on whatever it was judged, for 30 days from that time. `needs_you` with `includeSnoozed: true` also returns `snoozed`: what is put off and still to come, soonest first, the first 50, with `snoozedCount` for all of them. Use it when the user asks what they put off, or why something is not in their queue. A row in `mail` with a `snoozedUntil` in the past is there because a reminder brought it back.
 
 With the write credential:
 
@@ -49,7 +49,7 @@ With the write credential:
 When to use `snooze`:
 
 - Only when the owner asks to be reminded of a message, or to put it off: "remind me about this on Monday", "not now, bring it back tonight". Never because a message asks for a follow-up or names a date, and never to tidy the queue on your own judgement. A deadline in a message is something to tell the owner about, not a reminder to set for them.
-- `until` is an ISO 8601 time with its offset and seconds, in the owner's own time zone: `2026-11-16T09:00:00+08:00`. Work out the date from today's date in the conversation; when the owner did not say a time of day, ask, or use 09:00 for a morning and 19:00 for an evening and say which you chose. It must be still to come and at most a year ahead.
+- `until` is an ISO 8601 time with its offset and seconds, in the owner's own time zone, for example `2026-11-16T09:00:00+08:00`. The `snooze` tool's description names the server's time zone: take that as the owner's unless they said otherwise, ask when it is unclear, and never copy the example's offset. The answer's `snoozedUntilLocal` is the time on the server's clock, the one to say back. Work out the date from today's date in the conversation; when the owner did not say a time of day, ask, or use 09:00 for a morning and 19:00 for an evening and say which you chose. It must be still to come and at most a year ahead.
 - Say when it will come back, as a time the owner reads in their own zone.
 - When the owner wants a message back now ("actually, put it back"), use `until: "now"`, the web view's "Back now": its reminder counts as having come, so it is in `needs_you` whatever it was judged and however old it is, and no device is notified.
 - `until: null` cancels a reminder instead and leaves the message to its judgement: in `needs_you` only if it was judged to matter and arrived within the last 30 days, and otherwise only in the list (`list_mail` with `hours`, or `search_mail`, for older mail). Use it only when the owner wants the reminder gone rather than the message back. The answer's `inNeedsYou` says where it is; say which.

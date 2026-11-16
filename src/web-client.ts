@@ -332,13 +332,21 @@ function openSheet(dialog, state, here) {
 }
 // Several sheets closed in one go leave the history in one step, not one each:
 // a second back() issued before the first has landed would be lost.
-let backsOwed = 0;
+// backPending: a step back has been asked of the browser and has not landed.
+// It lands later, as a task of its own: an entry pushed meanwhile, by a
+// panel opened with the same press, would be the one it steps off.
+let backsOwed = 0, backPending = false;
 function oweBack() {
   backsOwed += 1;
   if (backsOwed > 1) return;
   Promise.resolve().then(() => {
     const steps = backsOwed;
     backsOwed = 0;
+    backPending = true;
+    const landed = () => { backPending = false; window.removeEventListener('popstate', landed); };
+    window.addEventListener('popstate', landed);
+    // A step with nowhere to go never lands; nothing waits on it for long.
+    setTimeout(landed, 1000);
     history.go(-steps);
   });
 }
@@ -508,7 +516,14 @@ function placePopover(dialog) {
     ? Math.max(12, Math.min(r.left - 4, vw - width - 12))
     : Math.max(12, Math.min(vw - 12, r.right + 4) - width);
   const below = window.innerHeight - r.bottom - 22, over = r.top - 22;
-  const tall = dialog.open ? dialog.scrollHeight : 0;
+  // Its height as it would be with the room it wants, not as squeezed by the
+  // last placing: measured squeezed, it would never flip, or flip by a short
+  // height and then grow back down over its own control.
+  let tall = 0;
+  if (dialog.open && p.flip) {
+    dialog.style.setProperty('--pop-max', '640px');
+    tall = dialog.offsetHeight;
+  }
   const up = Boolean(p.flip) && tall > below && over > below;
   const room = Math.max(160, up ? over : below);
   const top = up ? r.top - 10 - Math.min(tall, room) : r.bottom + 10;
@@ -529,9 +544,13 @@ function openPopover(dialog, anchor, options) {
   dialog.classList.remove('closing');
   dialog.classList.add('popover');
   placePopover(dialog);
+  // Shown unseen until it is in its place: show() focuses what is inside,
+  // and focusing it where it was last left would scroll the page to it.
+  dialog.style.visibility = 'hidden';
   dialog.show();
   // Only now does it have a height, which says whether it fits under its control.
   if (p.flip) placePopover(dialog);
+  dialog.style.visibility = '';
   dialog.focus({ preventScroll: true });
   if (!reduceMotion()) {
     dialog.classList.add('opening');
@@ -713,7 +732,8 @@ let attention = null, attentionCount = 0, attentionSet = new Set();
 let doneRecent = [], doneExpanded = false;
 // What was put off until later, soonest first, each with the time it comes
 // back: out of the queue for now, and listed under it.
-let snoozedRows = [], laterExpanded = false;
+// laterExtra: how many more are put off than the server listed.
+let snoozedRows = [], laterExtra = 0, laterExpanded = false;
 // What this session may do; the summary carries it.
 let session = { writable: false, writeConfigured: false, assistant: false, push: true, auth: false };
 // Whether the page is on the server's live line, and so hears of mail as it is judged.

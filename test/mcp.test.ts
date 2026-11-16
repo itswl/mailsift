@@ -391,10 +391,14 @@ describe('what needs the mailbox owner', () => {
     const local = new Date(when.getTime() + 8 * 3_600_000).toISOString().replace(/\.000Z$/, '+08:00');
     const put = await call(client, 'snooze', { messageId: '<one@x>', until: local });
     expect(put).toMatchObject({ messageId: '<one@x>', account: 'me@qq.com', snoozedUntil: when.toISOString(), handledAt: null, needsYou: 1 });
+    // The same time on the server's clock, with its offset, to say back to the owner.
+    expect(Date.parse(String(put['snoozedUntilLocal']))).toBe(when.getTime());
+    expect(String(put['snoozedUntilLocal'])).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$/);
 
     const queue = await call(client, 'needs_you', { includeSnoozed: true });
     expect((queue['mail'] as Array<{ messageId: string }>).map((m) => m.messageId)).toEqual(['<two@x>']);
     expect(queue['snoozed']).toEqual([expect.objectContaining({ messageId: '<one@x>', snoozedUntil: when.toISOString() })]);
+    expect(queue['snoozedCount']).toBe(1);
     expect(await call(client, 'needs_you')).not.toHaveProperty('snoozed');
 
     // Cancelled, it is back where it was judged to belong; nothing in the mailbox moved either way.
@@ -404,6 +408,11 @@ describe('what needs the mailbox owner', () => {
     state.setHandled('k2', true);
     expect(await call(client, 'snooze', { messageId: '<two@x>', until: when.toISOString() })).toMatchObject({ handledAt: null });
     expect(state.listMcpAudit(10).map((event) => event.action)).toEqual(expect.arrayContaining(['snooze']));
+    // The audit tells putting off from cancelling: a cancel carries no time.
+    const targets = state.listMcpAudit(10).filter((event) => event.action === 'snooze').map((event) => JSON.parse(event.target ?? '{}') as Record<string, string>);
+    expect(targets).toEqual(expect.arrayContaining([
+      { messageId: '<one@x>', until: local }, { messageId: '<one@x>' }, { messageId: '<two@x>', until: when.toISOString() },
+    ]));
   });
 
   it('brings a message back now as the page\'s "Back now" does, and says where a cancelled one went', async () => {
@@ -439,6 +448,9 @@ describe('what needs the mailbox owner', () => {
     expect(said('snooze')).toContain('arrived within the last 30 days');
     expect(said('snooze')).toContain('until="now"');
     expect(said('snooze')).toContain('list_mail with hours');
+    // A zone to start from, and a warning against the example's.
+    expect(said('snooze')).toMatch(/This server keeps \S+ time \(UTC[+-]\d\d:\d\d/);
+    expect(said('snooze')).toContain('never copy the example');
   });
 
   it('refuses a reminder in the past, more than a year ahead, without an offset, or for an id that names two copies', async () => {
@@ -454,9 +466,11 @@ describe('what needs the mailbox owner', () => {
     const hour = new Date(Date.now() + 3_600_000).toISOString();
     await refused({ messageId: '<two@x>', until: new Date(Date.now() - 3_600_000).toISOString() }, 'snoozePast');
     await refused({ messageId: '<two@x>', until: new Date(Date.now() + 400 * 86_400_000).toISOString() }, 'snoozeFar');
-    // Refused by the published schema before the call runs, naming the argument.
+    // Refused by the published schema before the call runs, naming the argument:
+    // the handler's own refusal names it too, so the schema's wording is what is checked.
+    await refused({ messageId: '<two@x>', until: '2030-01-01T09:00:00' }, 'Input validation error');
     await refused({ messageId: '<two@x>', until: '2030-01-01T09:00:00' }, 'until');
-    await refused({ messageId: '<two@x>' }, 'until');
+    await refused({ messageId: '<two@x>' }, 'Input validation error');
     await refused({ messageId: '<one@x>', until: hour }, 'more than one mailbox');
     await refused({ messageId: '<absent@x>', until: hour }, 'NOT_FOUND');
     expect(state.snoozed()).toEqual([]);

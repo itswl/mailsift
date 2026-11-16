@@ -354,6 +354,29 @@ describe('declined deliveries', () => {
     expect(state.pendingNotifications().map((e) => e.notificationKey)).toEqual(['good']);
   });
 
+  it('holds an entry for a message put off until its time, and leaves one dealt with to the digest', async () => {
+    const { w, state, sink } = watcher();
+    const later = new Date(Date.now() + 3 * 86_400_000).toISOString();
+    for (const key of ['put-off', 'done', 'plain']) {
+      state.markSeen(key, 'me@qq.com', 'Invoice');
+      state.recordOutcome(key, 'critical', false, { messageId: `<${key}@x>`, subject: 'Invoice', folder: 'INBOX' });
+      state.enqueueNotification(key, makeMessage({ messageId: `<${key}@x>` }), makeResult({ importance: 'critical' }));
+    }
+    state.setSnoozed('put-off', later);
+    state.setHandled('done', true);
+    vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [], cursors: [] });
+
+    await w.pollOnce();
+
+    expect(sink.pushed.map(([m]) => m.messageId)).toEqual(['<plain@x>']);
+    const left = state.pendingNotifications(50, false);
+    expect(left.map((e) => e.notificationKey)).toEqual(['put-off']);
+    // Waiting, not failing: no attempt counted, and due at the time chosen.
+    expect(left[0]).toMatchObject({ attempts: 0, nextAttemptAt: later });
+    expect(state.pendingNotifications(50, true)).toEqual([]);
+    expect(state.digestPending()).toBe(1);
+  });
+
   it('retries an outbox entry whose delivery failed', async () => {
     const { w, state } = watcher(new RecordingSink('failed'));
     state.enqueueNotification('pending', makeMessage(), makeResult());
@@ -497,6 +520,50 @@ describe('re-triage after an LLM outage', () => {
 
     const row = state.getMail('old-code');
     expect(row).toMatchObject({ verificationCode: '482913', summary: '收到验证码邮件。' });
+  });
+
+  it('does not notify a message put off, or one dealt with, when the late verdict would', async () => {
+    vi.restoreAllMocks();
+    process.env.PUSH_MIN_IMPORTANCE = 'critical';
+    process.env.LLM_API_KEY = 'k';
+    const { w, state, sink } = watcher();
+    const later = new Date(Date.now() + 3 * 86_400_000).toISOString();
+    // Filed by the keyword fallback while the model was down, then seen in the page.
+    for (const key of ['put-off', 'done']) {
+      state.markSeen(key, 'me@qq.com', 'Invoice');
+      state.recordOutcome(key, 'info', false, {
+        messageId: `<${key}@x>`, decidedBy: 'fallback', summary: 'Invoice', snippet: 'Please pay the invoice by Friday',
+        subject: 'Invoice', folder: 'INBOX',
+      });
+      state.queueDigest(key, { subject: 'Invoice' });
+    }
+    state.setSnoozed('put-off', later);
+    state.setHandled('done', true);
+    state.setMeta('llm_fail_count', '3');
+    // One verdict per message asked about: critical, every one.
+    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
+      const asked = JSON.parse(String(init?.body ?? '{}')) as { messages?: Array<{ content?: string }> };
+      const user = asked.messages?.findLast?.((m) => String(m.content ?? '').includes('"emails"'))?.content ?? '{"emails":[]}';
+      const count = (JSON.parse(user) as { emails: unknown[] }).emails.length;
+      const results = Array.from({ length: count }, (_, index) => ({
+        index, importance: 'critical', category: 'Finance', summary: 'Pay the invoice', reason: 'due', deadline: '', action_required: true,
+      }));
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ results }) } }] }), { status: 200 });
+    }));
+
+    await w.dispatch([makeMessage({ messageId: '<new@x>', subject: 'Weekly notes' })], stats());
+
+    const pushed = sink.pushed.map(([m]) => m.messageId);
+    expect(pushed).not.toContain('<put-off@x>');
+    expect(pushed).not.toContain('<done@x>');
+    // The verdict is kept, and the digest carries both as usual.
+    expect(state.getMail('put-off')).toMatchObject({ importance: 'critical', pushed: false, snoozedUntil: later });
+    expect(state.getMail('done')).toMatchObject({ importance: 'critical', pushed: false });
+    // The one put off waits for the time chosen, for the outputs without reminders of their own.
+    const waiting = state.pendingNotifications(50, false);
+    expect(waiting.map((e) => e.notificationKey)).toEqual(['put-off']);
+    expect(waiting[0]).toMatchObject({ attempts: 0, nextAttemptAt: later });
+    expect(state.pendingNotifications(50, true)).toEqual([]);
   });
 });
 

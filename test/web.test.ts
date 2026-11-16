@@ -1417,7 +1417,7 @@ describe('putting a message off until later', () => {
     expect(script).toContain("else if (e.key === 'b' && !row.handledAt) {");
     expect(script).toContain('openPopover(snoozeSheet, anchor, {');
     // The queue's own line for it, beside what was done, and the server told by the route for it.
-    expect(script).toContain("fill('snooze.later', { count: later.length })");
+    expect(script).toContain("fill('snooze.later', { count: later.length + laterExtra })");
     expect(script).toContain("post('/api/snooze', { key, until })");
   });
 

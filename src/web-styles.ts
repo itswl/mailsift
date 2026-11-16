@@ -246,6 +246,7 @@ dialog.sheet:focus{outline:none}
 .sum{grid-area:sum;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}
 .row.info .sum{color:var(--text-2);-webkit-line-clamp:2}
 .meta{grid-area:meta;font-size:12px;color:var(--muted)}
+.meta .whole{white-space:nowrap}
 .lvl{font-weight:500}.lvl.critical{color:var(--critical-text)}.lvl.warning{color:var(--warning-text)}
 .due{color:var(--warning-text);font-weight:500}.due.late{color:var(--critical-text)}.rescued{color:var(--text);font-weight:500}
 .why{grid-area:why;font-size:13px;color:var(--muted);display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}

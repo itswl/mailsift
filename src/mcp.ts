@@ -168,11 +168,31 @@ function auditTarget(value: unknown): string | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const input = value as Record<string, unknown>;
   const target: Record<string, string> = {};
-  for (const key of ['account', 'messageId', 'partId', 'deadKey', 'action', 'destination']) {
+  for (const key of ['account', 'messageId', 'partId', 'deadKey', 'action', 'destination', 'until']) {
     const raw = input[key];
     if (typeof raw === 'string' && raw.trim()) target[key] = raw.trim().slice(0, 500);
   }
   return Object.keys(target).length ? JSON.stringify(target) : undefined;
+}
+
+/** This server's time zone and its offset at a moment, as +08:00. */
+function serverZone(at = new Date()): { name: string; offset: string } {
+  const minutes = -at.getTimezoneOffset();
+  const sign = minutes < 0 ? '-' : '+';
+  const abs = Math.abs(minutes);
+  const offset = `${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`;
+  let name = '';
+  try { name = Intl.DateTimeFormat().resolvedOptions().timeZone ?? ''; } catch { /* no Intl zone data */ }
+  return { name: name || `UTC${offset}`, offset };
+}
+
+/** A UTC time as this server's clock reads it, with its offset: what an assistant can say back to the owner. */
+function onServerClock(iso: unknown): string | undefined {
+  if (typeof iso !== 'string' || !Number.isFinite(Date.parse(iso))) return undefined;
+  const at = new Date(iso);
+  const { offset } = serverZone(at);
+  const local = new Date(at.getTime() - at.getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
+  return `${local}${offset}`;
 }
 
 /** How long a live read of one message may take: what the page allows its own. */
@@ -495,7 +515,8 @@ export function createServer(
         'was judged, for 30 days from that time. includeDone=true adds what was dealt with ' +
         'in the last 7 days (marked done, archived, binned, answered or forwarded), most recent first; queued says ' +
         'whether marking it not done would return it to the queue. includeSnoozed=true adds what is put off and ' +
-        'still to come, soonest first, each with the snoozedUntil it comes back at.',
+        'still to come, soonest first, each with the snoozedUntil it comes back at: the first 50, with ' +
+        'snoozedCount saying how many there are in all.',
       inputSchema: {
         limit: z.number().int().positive().max(100).default(30),
         includeDone: z.boolean().default(false),
@@ -508,7 +529,7 @@ export function createServer(
       ...(args.includeDone
         ? { recentlyDone: store.recentlyHandled(30).map(({ row, queued }) => ({ ...row, queued })) }
         : {}),
-      ...(args.includeSnoozed ? { snoozed: store.snoozed(50) } : {}),
+      ...(args.includeSnoozed ? { snoozedCount: store.snoozedCount(), snoozed: store.snoozed(50) } : {}),
     }),
   );
 
@@ -1150,8 +1171,11 @@ export function createServer(
       {
         description:
           'Put a message out of needs_you until a time, and have it come back then: "not now, remind me on Monday". ' +
-          'until is an ISO 8601 time with its offset, seconds included (2026-11-17T09:00:00+08:00, in the owner\'s ' +
-          'own time zone), still to come and at most a year ahead. From that minute the message is back in needs_you ' +
+          'until is an ISO 8601 time with its offset, seconds included (for example 2026-11-17T09:00:00+08:00), in ' +
+          'the owner\'s own time zone, still to come and at most a year ahead. This server keeps ' +
+          `${serverZone().name} time (UTC${serverZone().offset} when it started); take that as the owner\'s zone unless ` +
+          'they have said otherwise, ask when it is unclear, and never copy the example\'s offset. ' +
+          'snoozedUntilLocal in the answer is the time on the server\'s clock. From that minute the message is back in needs_you ' +
           'whatever it was judged, and every device with the web view\'s notifications on is told. Putting off a ' +
           'message that was marked done puts it back, since a reminder is for what is not done. until="now" brings ' +
           'it back at once, as the web view\'s "Back now" does: its reminder counts as having come, so it is in ' +
@@ -1174,7 +1198,9 @@ export function createServer(
         const answer = pageAnswer(await asPage((ctx, life) => snoozeMail({ key, until: args.until }, store, ctx, life)));
         return json({
           messageId: args.messageId, account: store.getMail(key)?.account,
-          snoozedUntil: answer['snoozedUntil'], handledAt: answer['handledAt'], inNeedsYou: answer['inQueue'],
+          snoozedUntil: answer['snoozedUntil'],
+          ...(onServerClock(answer['snoozedUntil']) ? { snoozedUntilLocal: onServerClock(answer['snoozedUntil']) } : {}),
+          handledAt: answer['handledAt'], inNeedsYou: answer['inQueue'],
           needsYou: answer['attention'],
         });
       },

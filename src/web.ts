@@ -289,6 +289,7 @@ export async function handleApi(
       mail: rows.map(decorate),
       done: done.map(({ row, queued }) => ({ ...decorate(row), queued })),
       snoozed: later.map(decorate),
+      snoozedCount: store.snoozedCount(),
     });
   }
 
