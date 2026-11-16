@@ -536,13 +536,30 @@ function refocusAfterSnooze(key, back, find) {
   const list = li ? li.parentElement : null;
   const near = li && (li.nextElementSibling || li.previousElementSibling);
   const nearKey = near && near.dataset ? near.dataset.key : null;
+  // Only in the list the row was in, or outside any list (the reader's bar):
+  // the same message's copy in another list may be a screen away.
+  const here = (node) => {
+    const row = node && node.closest('li.row');
+    return !row || !list || row.parentElement === list;
+  };
+  // Lost, or left by whatever closed on a copy of this message in another list.
+  const lost = () => {
+    const a = document.activeElement;
+    if (!a || a === document.body) return true;
+    const row = a.closest && a.closest('li.row');
+    return Boolean(row && row.dataset.key === key && !here(a));
+  };
   const land = () => {
-    if (document.activeElement && document.activeElement !== document.body) return;
-    let target = back && back.isConnected ? back : (find ? find() : null);
-    if (target && target.matches('li')) target = target.querySelector('.mark, .who');
-    if (!target) { const same = rowIn(list, key); target = same && same.querySelector('.mark, .who'); }
-    if (!target) { const next = nearKey && rowIn(list, nearKey); target = next && next.querySelector('.who'); }
-    if (target) target.focus({ preventScroll: true });
+    if (!lost()) return;
+    let control = back && back.isConnected ? back : (find ? find() : null);
+    if (control && control.matches('li')) control = control.querySelector('.mark, .who');
+    const same = rowIn(list, key), next = nearKey && rowIn(list, nearKey);
+    // The first that takes the focus: one in a sheet that has closed does not.
+    for (const target of [control && here(control) ? control : null, same && same.querySelector('.mark, .who'), next && next.querySelector('.who')]) {
+      if (!target) continue;
+      target.focus({ preventScroll: true });
+      if (document.activeElement === target) return;
+    }
   };
   land();
   setTimeout(land, 420);
@@ -1132,7 +1149,8 @@ function saveSnapshot() {
         attention: (attention || []).slice(0, 40).map(plain),
         done: doneRecent.slice(0, 20).map(plain),
         later: snoozedRows.slice(0, 20).map(plain),
-        laterCount: snoozedRows.filter(isSnoozed).length + laterExtra,
+        // The ones not kept here, which nothing on this device can list.
+        laterExtra: snoozedRows.filter(isSnoozed).length + laterExtra - snoozedRows.slice(0, 20).filter(isSnoozed).length,
         attentionCount, summary: lastSummary, digest: lastDigest,
       }));
     } catch (e) {}
@@ -1150,7 +1168,7 @@ function restoreSnapshot() {
     attention = Array.isArray(snap.attention) ? snap.attention : [];
     doneRecent = Array.isArray(snap.done) ? snap.done : [];
     snoozedRows = Array.isArray(snap.later) ? snap.later : [];
-    laterExtra = Math.max(0, (Number(snap.laterCount) || 0) - snoozedRows.filter(isSnoozed).length);
+    laterExtra = Math.max(0, Number(snap.laterExtra) || 0);
     attentionCount = Number(snap.attentionCount) || 0;
     attentionSet = new Set(attention.map(rowKey));
     lastFetchAt = new Date(snap.at);

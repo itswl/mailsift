@@ -343,7 +343,17 @@ function oweBack() {
     const steps = backsOwed;
     backsOwed = 0;
     backPending = true;
-    const landed = () => { backPending = false; window.removeEventListener('popstate', landed); };
+    // The browser puts back the scroll the page had when the entry was made;
+    // the page has scrolled since, under a panel that dims nothing. It stays
+    // where it is: the step back is only the panel's closing.
+    const x = window.scrollX, y = window.scrollY;
+    const settle = () => { if (window.scrollX !== x || window.scrollY !== y) window.scrollTo(x, y); };
+    const landed = (e) => {
+      if (!backPending) return;
+      backPending = false;
+      window.removeEventListener('popstate', landed);
+      if (e && e.type === 'popstate') { settle(); requestAnimationFrame(settle); }
+    };
     window.addEventListener('popstate', landed);
     // A step with nowhere to go never lands; nothing waits on it for long.
     setTimeout(landed, 1000);

@@ -354,7 +354,7 @@ describe('declined deliveries', () => {
     expect(state.pendingNotifications().map((e) => e.notificationKey)).toEqual(['good']);
   });
 
-  it('holds an entry for a message put off until its time, and leaves one dealt with to the digest', async () => {
+  it('holds an entry for a message put off until its time, and drops one dealt with', async () => {
     const { w, state, sink } = watcher();
     const later = new Date(Date.now() + 3 * 86_400_000).toISOString();
     for (const key of ['put-off', 'done', 'plain']) {
@@ -374,7 +374,34 @@ describe('declined deliveries', () => {
     // Waiting, not failing: no attempt counted, and due at the time chosen.
     expect(left[0]).toMatchObject({ attempts: 0, nextAttemptAt: later });
     expect(state.pendingNotifications(50, true)).toEqual([]);
-    expect(state.digestPending()).toBe(1);
+    // Dealt with, it is not listed again in a digest that may have gone out already.
+    expect(state.digestPending()).toBe(0);
+    // Held is not failing: health counts it apart.
+    expect(state.notificationOutboxPending()).toBe(0);
+    expect(state.notificationOutboxHeld()).toBe(1);
+    // Brought forward, it goes at the new time; taken back now, nobody is told.
+    const sooner = new Date(Date.now() + 3_600_000).toISOString();
+    state.setSnoozed('put-off', sooner);
+    expect(state.pendingNotifications(50, false)[0]).toMatchObject({ nextAttemptAt: sooner });
+    state.setSnoozed('put-off', later);
+    expect(state.pendingNotifications(50, false)[0]).toMatchObject({ nextAttemptAt: sooner });
+    state.wakeNow('put-off');
+    expect(state.pendingNotifications(50, false)).toEqual([]);
+  });
+
+  it('sends a held entry at once when the reminder is taken away', async () => {
+    const { w, state, sink } = watcher();
+    state.markSeen('k', 'me@qq.com', 'Invoice');
+    state.recordOutcome('k', 'critical', false, { messageId: '<k@x>', subject: 'Invoice', folder: 'INBOX' });
+    state.enqueueNotification('k', makeMessage({ messageId: '<k@x>' }), makeResult({ importance: 'critical' }));
+    state.setSnoozed('k', new Date(Date.now() + 86_400_000).toISOString());
+    vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [], cursors: [] });
+    await w.pollOnce();
+    expect(sink.pushed).toEqual([]);
+
+    state.setSnoozed('k', null);
+    await w.pollOnce();
+    expect(sink.pushed.map(([m]) => m.messageId)).toEqual(['<k@x>']);
   });
 
   it('retries an outbox entry whose delivery failed', async () => {
@@ -559,11 +586,44 @@ describe('re-triage after an LLM outage', () => {
     // The verdict is kept, and the digest carries both as usual.
     expect(state.getMail('put-off')).toMatchObject({ importance: 'critical', pushed: false, snoozedUntil: later });
     expect(state.getMail('done')).toMatchObject({ importance: 'critical', pushed: false });
-    // The one put off waits for the time chosen, for the outputs without reminders of their own.
+    // The one put off waits for the time chosen, for the outputs without reminders of their own,
+    // and that is its only way out: no digest lists it meanwhile.
     const waiting = state.pendingNotifications(50, false);
     expect(waiting.map((e) => e.notificationKey)).toEqual(['put-off']);
     expect(waiting[0]).toMatchObject({ attempts: 0, nextAttemptAt: later });
     expect(state.pendingNotifications(50, true)).toEqual([]);
+    expect(state.digestPending()).toBe(1);
+  });
+
+  it('decides on the message as it is after the model answers, not as it was before', async () => {
+    vi.restoreAllMocks();
+    process.env.PUSH_MIN_IMPORTANCE = 'critical';
+    process.env.LLM_API_KEY = 'k';
+    const { w, state, sink } = watcher();
+    state.markSeen('late', 'me@qq.com', 'Invoice');
+    state.recordOutcome('late', 'info', false, {
+      messageId: '<late@x>', decidedBy: 'fallback', summary: 'Invoice', snippet: 'Please pay the invoice by Friday',
+      subject: 'Invoice', folder: 'INBOX',
+    });
+    state.queueDigest('late', { subject: 'Invoice' });
+    state.setMeta('llm_fail_count', '3');
+    const later = new Date(Date.now() + 86_400_000).toISOString();
+    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init?: { body?: unknown }) => {
+      const asked = JSON.parse(String(init?.body ?? '{}')) as { messages?: Array<{ content?: string }> };
+      const user = asked.messages?.findLast?.((m) => String(m.content ?? '').includes('"emails"'))?.content ?? '{"emails":[]}';
+      const emails = (JSON.parse(user) as { emails: Array<{ subject?: string }> }).emails;
+      // The owner puts it off in the page while the backlog is being judged.
+      if (emails.some((e) => e.subject === 'Invoice')) state.setSnoozed('late', later);
+      const results = emails.map((_, index) => ({
+        index, importance: 'critical', category: 'Finance', summary: 'Pay', reason: 'due', deadline: '', action_required: true,
+      }));
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ results }) } }] }), { status: 200 });
+    }));
+
+    await w.dispatch([makeMessage({ messageId: '<new@x>', subject: 'Weekly notes' })], stats());
+
+    expect(sink.pushed.map(([m]) => m.messageId)).not.toContain('<late@x>');
+    expect(state.pendingNotifications(50, false)).toEqual([expect.objectContaining({ notificationKey: 'late', nextAttemptAt: later })]);
   });
 });
 
