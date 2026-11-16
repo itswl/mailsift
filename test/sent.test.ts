@@ -167,6 +167,11 @@ describe('the setting', () => {
     expect(sentLookbackDays()).toBe(90);
     process.env.SENT_LOOKBACK_DAYS = 'soon';
     expect(sentLookbackDays()).toBe(30);
+    process.env.SENT_LOOKBACK_DAYS = '-3';
+    expect(sentLookbackDays()).toBe(30);
+    // 0 is no look back at all, not the default.
+    process.env.SENT_LOOKBACK_DAYS = '0';
+    expect(sentLookbackDays()).toBe(0);
   });
 });
 
@@ -264,6 +269,26 @@ describe('reading a Sent folder', () => {
     const result = await fetchSent(client, ACCOUNT, 'Sent', undefined, { now: NOW });
     expect(result.messages).toEqual([]);
     expect(result.cursor).toMatchObject({ lastUid: 40, backfillBelow: 0 });
+  });
+
+  it('reads only what is sent from now on when there is no look back', async () => {
+    process.env.SENT_LOOKBACK_DAYS = '0';
+    const mail = hourly(5);
+    const { client, asked } = sentFolder(mail);
+    const first = await fetchSent(client, ACCOUNT, 'Sent', undefined, { now: NOW });
+    expect(first.messages).toEqual([]);
+    expect(asked.searches).toEqual([]);
+    expect(first.cursor).toMatchObject({ lastUid: 5, backfillBelow: 0, backfillLeft: 0 });
+    mail.push({ uid: 6, date: new Date(NOW + 60_000) });
+    expect(uids(await fetchSent(client, ACCOUNT, 'Sent', first.cursor, { now: NOW }))).toEqual([6]);
+  });
+
+  it('takes a refused search for a failure to try again, never for an empty folder', async () => {
+    const { client } = sentFolder(hourly(5));
+    (client as unknown as { search: () => Promise<false> }).search = async () => false;
+    await expect(fetchSent(client, ACCOUNT, 'Sent', undefined, { now: NOW })).rejects.toThrow(/refused to search/);
+    const later: SentCursorRow = { folder: 'Sent', uidValidity: '7', lastUid: 2, backfillBelow: 2, backfillLeft: 10, backfillSince: null };
+    await expect(fetchSent(client, ACCOUNT, 'Sent', later, { now: NOW })).rejects.toThrow(/refused to search/);
   });
 
   it('skips a message it cannot read, and moves on past it', async () => {

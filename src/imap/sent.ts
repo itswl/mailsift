@@ -54,10 +54,13 @@ export function sentMailEnabled(): boolean {
  * How far back the first look at a Sent folder reaches: SENT_LOOKBACK_DAYS,
  * 30 unless set, at most 365, and never further than the store keeps mail
  * (STATE_RETENTION_DAYS), since what is read past that is pruned the next day.
+ * 0 is no look back at all: only what is sent from then on is read, and
+ * nothing already sent takes a message off the queue.
  */
 export function sentLookbackDays(): number {
   const raw = process.env.SENT_LOOKBACK_DAYS?.trim();
   const value = raw ? Number(raw) : SENT_LOOKBACK_DEFAULT_DAYS;
+  if (value === 0) return 0;
   const days = Number.isFinite(value) && value >= 1 ? Math.min(Math.floor(value), SENT_LOOKBACK_MAX_DAYS) : SENT_LOOKBACK_DEFAULT_DAYS;
   const keep = Number(process.env.STATE_RETENTION_DAYS ?? 90);
   return Number.isFinite(keep) && keep >= 1 ? Math.min(days, Math.floor(keep)) : days;
@@ -196,9 +199,13 @@ export async function fetchSent(
     const mailbox = client.mailbox;
     const uidValidity = typeof mailbox === 'object' && mailbox ? String(mailbox.uidValidity ?? '') : '';
     const uidNext = typeof mailbox === 'object' && mailbox ? Number(mailbox.uidNext ?? 0) : 0;
+    // A refusal (ImapFlow answers false) is not an empty folder: taken for
+    // one, the look back would be skipped for good. Thrown, the cursor stays
+    // where it was and the next poll asks again.
     const search = async (query: Record<string, unknown>): Promise<number[]> => {
       const found = await client.search(query, { uid: true });
-      return Array.isArray(found) ? found : [];
+      if (!Array.isArray(found)) throw new Error(`the server refused to search ${folder}`);
+      return found;
     };
     const fresh = !cursor || cursor.folder !== folder || cursor.uidValidity !== uidValidity;
     if (cursor && fresh) {
@@ -208,8 +215,10 @@ export async function fetchSent(
     const picked: number[] = [];
     let next: SentCursorRow;
     if (fresh) {
-      const since = new Date(nowMs - (options.lookbackDays ?? sentLookbackDays()) * 86_400_000);
-      const found = (await search({ since })).sort((a, b) => b - a);
+      const days = options.lookbackDays ?? sentLookbackDays();
+      const since = new Date(nowMs - days * 86_400_000);
+      // No look back: start above what the folder holds now.
+      const found = days > 0 ? (await search({ since })).sort((a, b) => b - a) : [];
       const window = found.slice(0, lookbackMessages);
       const take = window.slice(0, limit);
       picked.push(...take);

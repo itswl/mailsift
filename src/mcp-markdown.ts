@@ -93,8 +93,19 @@ const dateOf = (entry: { kind: 'in'; row: MailRow } | { kind: 'out'; sent: SentR
 const people = (list: readonly SentAddress[]): string =>
   list.map((p) => (p.name ? `${p.name} <${p.address}>` : p.address)).join(', ');
 
-/** One of the owner's own messages, as a section of the thread page. */
-function sentToMarkdown(sent: SentRow): string {
+/** A subject without its "Re:" and "Fwd:", to tell a new subject from the same one answered. */
+function bareSubject(value: string | null): string {
+  let subject = (value ?? '').trim();
+  for (let i = 0; i < 5; i += 1) {
+    const next = subject.replace(/^(re|fwd?|fw|aw|wg|sv|vs|回复|答复|回覆|转发|轉發)\s*(\[\d+\])?\s*[:：]\s*/i, '');
+    if (next === subject) break;
+    subject = next;
+  }
+  return subject.toLowerCase();
+}
+
+/** One of the owner's own messages, as a section of the thread page; its subject only when it says something new. */
+function sentToMarkdown(sent: SentRow, threadSubject: string | null): string {
   const lines = [
     '- Sent by: the owner (this is their own message)',
     line('Mailbox', sent.accountLabel ? `${sent.accountLabel} (${sent.account})` : sent.account),
@@ -102,7 +113,7 @@ function sentToMarkdown(sent: SentRow): string {
     line('Cc', people(sent.cc)),
     line('Bcc', people(sent.bcc)),
     line('Date', sent.date ?? sent.createdAt),
-    line('Subject', sent.subject),
+    line('Subject', bareSubject(sent.subject) !== bareSubject(threadSubject) ? sent.subject : null),
     line('Files', sent.attachmentCount ? (sent.attachmentNames.length ? sent.attachmentNames.join(', ') : String(sent.attachmentCount)) : null),
     line('Message id', `\`${sent.messageId}\``),
   ].filter((l): l is string => l !== null);
@@ -116,7 +127,7 @@ function sentToMarkdown(sent: SentRow): string {
  * turn, oldest first. The owner's own messages, stored from Sent and from
  * what was sent through mailsift, are among them and say so.
  */
-export function threadToMarkdown(threadKey: string, rows: readonly MailRow[], sent: readonly SentRow[] = []): string {
+export function threadToMarkdown(threadKey: string, rows: readonly MailRow[], sent: readonly SentRow[] = [], omitted = 0): string {
   const ordered = [
     ...rows.map((row) => ({ kind: 'in' as const, row })),
     ...sent.map((s) => ({ kind: 'out' as const, sent: s })),
@@ -128,6 +139,7 @@ export function threadToMarkdown(threadKey: string, rows: readonly MailRow[], se
     '',
     `- Thread key: \`${threadKey}\``,
     `- Messages: ${ordered.length}${sent.length ? ` (${sent.length} sent by the owner)` : ''}`,
+    ...(omitted > 0 ? [`- Older messages not shown: ${omitted} (this page holds the newest)`] : []),
   ];
   if (ordered.length === 0) return `${[...head, '', '_(no messages)_'].join('\n')}\n`;
 
@@ -135,7 +147,7 @@ export function threadToMarkdown(threadKey: string, rows: readonly MailRow[], se
     const when = dateOf(entry);
     if (entry.kind === 'out') {
       const to = people(entry.sent.to) || people(entry.sent.cc) || people(entry.sent.bcc) || 'nobody named';
-      return `\n## ${index + 1}. From the owner to ${to} on ${when}\n\n${sentToMarkdown(entry.sent)}`;
+      return `\n## ${index + 1}. From the owner to ${to} on ${when}\n\n${sentToMarkdown(entry.sent, subject)}`;
     }
     const row = entry.row;
     const sender = row.senderName || row.sender || 'unknown sender';

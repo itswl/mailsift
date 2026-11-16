@@ -5,6 +5,7 @@ import { StateStore } from '../src/services/state.js';
 import { Watcher } from '../src/services/watcher.js';
 import type { WatchConfig } from '../src/config.js';
 import * as triageModule from '../src/services/triage.js';
+import * as health from '../src/services/health.js';
 import * as clientModule from '../src/imap/client.js';
 import * as sentModule from '../src/imap/sent.js';
 import type { SentCursorRow, SentRecord } from '../src/services/state.js';
@@ -720,10 +721,83 @@ describe('the Sent folder', () => {
     expect(state.attentionCount()).toBe(0);
     // Written down once, as having come from the Sent folder.
     expect(state.listMailActions()).toMatchObject([{ action: 'handled', client: 'sent-folder', messageId: '<q@x>' }]);
+    // Not listed in the digest either: the owner answered it.
+    expect(state.digestPending()).toBe(0);
     // Not counted as mail that arrived, and both cursors moved.
-    expect(stats).toMatchObject({ fresh: 1, pushed: 0 });
+    expect(stats).toMatchObject({ fresh: 1, pushed: 0, queued: 0 });
     expect(state.getCursor('me@qq.com', 'INBOX')).toEqual({ uidValidity: '1', lastUid: 9 });
     expect(state.getSentCursor('me@qq.com')).toMatchObject({ folder: 'Sent', lastUid: 7 });
+  });
+
+  it('keeps a warning answered on arrival out of the digest, and in reach of the queue when it is put back', async () => {
+    process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    const { w, state, sink } = polling();
+    stubTriage({ '<q@x>': makeResult({ importance: 'warning' }) });
+    vi.spyOn(w, 'collectAll').mockResolvedValue({
+      messages: [makeMessage({ messageId: '<q@x>', date: at(-60 * 60_000) })], cursors: [], sent: [batch([reply()])],
+    });
+    const stats = await w.pollOnce();
+    expect(sink.pushed).toEqual([]);
+    expect(state.digestPending()).toBe(0);
+    expect(stats.queued).toBe(0);
+    expect(state.recentlyHandled()).toMatchObject([{ row: { dedupKey: 'me@qq.com|<q@x>' }, queued: true }]);
+    state.setHandled('me@qq.com|<q@x>', false);
+    expect(state.attentionCount()).toBe(1);
+  });
+
+  it('does not notify, after an LLM outage, a message answered while it waited for its verdict', async () => {
+    const { w, state, sink } = polling();
+    // Judged by the fallback during the outage, so it waits in the digest, out of the queue.
+    state.markSeen('me@qq.com|<q@x>', 'me@qq.com', 'Contract');
+    state.recordOutcome('me@qq.com|<q@x>', 'info', false, {
+      messageId: '<q@x>', folder: 'INBOX', decidedBy: 'fallback', snippet: 'Please sign the contract.', mailDate: at(-3 * 3_600_000),
+    });
+    state.queueDigest('me@qq.com|<q@x>', { subject: 'Contract' });
+    // Answered from the phone; the poll read the reply while the message was not in the queue.
+    state.recordSent(reply());
+    expect(state.answerFromSent([])).toEqual([]);
+    state.setMeta(health.LLM_FAIL_COUNT_KEY, '3');
+    // The model is back: the next batch succeeds and the waiting message is judged again, critical.
+    vi.spyOn(triageModule, 'triage').mockImplementation(async (messages, _rules, onLlm) => {
+      onLlm?.(null);
+      return messages.map((m) => [m, makeResult({ importance: 'critical', decidedBy: 'llm' })] as [MailMessage, TriageResult]);
+    });
+    await w.dispatch([makeMessage({ messageId: '<new@x>' })], stats());
+    expect(sink.pushed.map(([m]) => m.messageId)).toEqual(['<new@x>']);
+    expect(state.getMail('me@qq.com|<q@x>')).toMatchObject({ importance: 'critical', pushed: false, handledAt: expect.any(String) });
+    expect(state.digestPending()).toBe(0);
+  });
+
+  it('drops a retried notification for a message answered while it waited', async () => {
+    const { w, state, sink } = polling();
+    state.markSeen('me@qq.com|<q@x>', 'me@qq.com', 'Invoice');
+    state.recordOutcome('me@qq.com|<q@x>', 'warning', false, { messageId: '<q@x>', folder: 'INBOX', mailDate: at(-3 * 3_600_000) });
+    state.enqueueNotification('me@qq.com|<q@x>', makeMessage({ messageId: '<q@x>' }), makeResult({ importance: 'warning' }));
+    state.queueDigest('me@qq.com|<q@x>', { subject: 'Invoice' });
+    state.recordSent(reply());
+    expect(state.answerFromSent([])).toEqual([]);
+    vi.spyOn(w, 'collectAll').mockResolvedValue({ messages: [], cursors: [] });
+    await w.pollOnce();
+    expect(sink.pushed).toEqual([]);
+    expect(state.notificationOutboxPending()).toBe(0);
+    expect(state.digestPending()).toBe(0);
+    expect(state.getMail('me@qq.com|<q@x>')!.handledAt).not.toBeNull();
+    // It was owed that notification, so putting it back puts it in the queue.
+    state.setHandled('me@qq.com|<q@x>', false);
+    expect(state.attentionCount()).toBe(1);
+  });
+
+  it('never writes a code\'s subject to the log when a code mail was answered already', async () => {
+    process.env.LOG_LEVEL = 'info';
+    const { w, state } = polling();
+    state.recordSent(reply());
+    const written: string[] = [];
+    vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string) => { written.push(String(chunk)); return true; }) as never);
+    stubTriage({ '<q@x>': makeResult({ importance: 'critical', sensitiveVerification: true, sensitiveKind: 'code', verificationCode: '483920' }) });
+    await w.dispatch([makeMessage({ messageId: '<q@x>', subject: 'Your code is 483920', date: at(-60_000) })], stats());
+    expect(state.getMail('me@qq.com|<q@x>')!.handledAt).not.toBeNull();
+    expect(written.some((line) => line.includes('Already answered'))).toBe(true);
+    expect(written.join('')).not.toContain('483920');
   });
 
   it('takes a message off the queue when a later poll finds the answer to it in Sent', async () => {

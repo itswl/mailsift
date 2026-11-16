@@ -220,7 +220,10 @@ composeForm.addEventListener('submit', (e) => e.preventDefault());
 // takes addresses alone (see addresses() above).
 const suggestList = $('#compose-suggest');
 const ADDRESS_FIELDS = ['to', 'cc', 'bcc'];
-const suggest = { field: null, items: [], active: 0, seq: 0, timer: null, escapedAt: 0 };
+// token: what the list was drawn for (where it starts in the field, and its
+// text). The list stands only for that token: once the caret or the text has
+// moved on, it is closed rather than accepted (see listFits).
+const suggest = { field: null, items: [], active: 0, seq: 0, timer: null, escapedAt: 0, token: null };
 // The address being typed: what lies between the separators around the caret.
 function tokenAround(value, caret) {
   const text = String(value || '');
@@ -253,6 +256,32 @@ function suggestKey(key, open, count, active, composing) {
   if (key === 'Escape') return { act: 'close', active };
   return { act: '', active };
 }
+// Whether the list on show was drawn for what is being typed in this field now.
+function listFits(field) {
+  if (suggest.field !== field || suggestList.hidden || !suggest.token) return false;
+  const now = tokenAround(field.value, field.selectionStart);
+  return now.start === suggest.token.start && now.text === suggest.token.text;
+}
+// Whether an address offered still fits what is typed, as far as the page can
+// tell: it only narrows a list the server drew, until the server answers again.
+function fitsQuery(c, q) {
+  const address = String(c.address || '').toLowerCase(), name = String(c.name || '').toLowerCase();
+  return address.indexOf(q) === 0 || address.split(/[@._+-]+/).some((p) => p.indexOf(q) === 0)
+    || name.indexOf(q) === 0 || name.split(/[\s,.;:'"()<>@_\/-]+/).some((w) => w.indexOf(q) === 0)
+    || (/[^\x00-\x7f]/.test(q) && name.indexOf(q) !== -1);
+}
+// Typing on with the list open: it keeps only what still fits, at once, or
+// shuts; the server's answer to the new text follows.
+function narrowSuggest(field) {
+  if (suggest.field !== field || suggestList.hidden) return;
+  const token = tokenAround(field.value, field.selectionStart);
+  const q = token.text.toLowerCase();
+  if (!suggest.token || token.start !== suggest.token.start || !q || /[<>"]/.test(q)) { closeSuggest(); return; }
+  const active = suggest.items[suggest.active];
+  const keep = suggest.items.filter((c) => fitsQuery(c, q));
+  if (!keep.length || keep.some((c) => String(c.address).toLowerCase() === q)) { closeSuggest(); return; }
+  showSuggest(field, keep, token, Math.max(0, keep.indexOf(active)));
+}
 // Addresses already on the letter, but for the one being typed.
 function takenAddresses(field, token) {
   const out = new Set();
@@ -284,14 +313,15 @@ function lookUpAddresses(field, now) {
     const items = (Array.isArray(d.contacts) ? d.contacts : []).filter((c) => c && c.address && !taken.has(String(c.address).toLowerCase()));
     // What is typed is already one of them, whole: there is nothing to add, and Enter must not change it.
     if (items.some((c) => String(c.address).toLowerCase() === q.toLowerCase())) { closeSuggest(); return; }
-    showSuggest(field, items);
+    showSuggest(field, items, current, 0);
   }, now ? 0 : 160);
 }
-function showSuggest(field, items) {
+function showSuggest(field, items, token, active) {
   suggest.items = items.slice(0, 8);
   if (!suggest.items.length) { closeSuggest(); return; }
   suggest.field = field;
-  suggest.active = 0;
+  suggest.token = { start: token.start, text: token.text };
+  suggest.active = Math.min(active || 0, suggest.items.length - 1);
   suggestList.replaceChildren();
   suggest.items.forEach((c, i) => {
     const li = el('li', 'suggest-item');
@@ -333,6 +363,7 @@ function closeSuggest() {
   suggestList.replaceChildren();
   suggest.items = [];
   suggest.field = null;
+  suggest.token = null;
   for (const name of ADDRESS_FIELDS) {
     composeForm[name].setAttribute('aria-expanded', 'false');
     composeForm[name].removeAttribute('aria-activedescendant');
@@ -347,6 +378,8 @@ function suggestionsTookEscape() {
 function acceptSuggestion(i) {
   const field = suggest.field, item = suggest.items[i];
   if (!field || !item) return;
+  // Drawn for something else than what is typed now: it replaces nothing.
+  if (!listFits(field)) { closeSuggest(); return; }
   const next = acceptAddress(field.value, field.selectionStart, String(item.address));
   closeSuggest();
   field.value = next.value;
@@ -361,7 +394,17 @@ function suggestKeydown(e) {
   if (e.isComposing || e.keyCode === 229) return;
   // Ctrl or Cmd with Enter sends the letter, and Shift+Tab goes back: neither is the list's.
   if (e.metaKey || e.ctrlKey || e.altKey || (e.shiftKey && e.key === 'Tab')) { closeSuggest(); return; }
-  const said = suggestKey(e.key, suggest.field === field && !suggestList.hidden, suggest.items.length, suggest.active, false);
+  // The caret moving to another address takes the list's reason away.
+  if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].indexOf(e.key) !== -1) { closeSuggest(); return; }
+  const shown = suggest.field === field && !suggestList.hidden;
+  const fits = shown && listFits(field);
+  if (shown && !fits) {
+    // A list left over from what was typed before is never accepted. Escape
+    // still only shuts it; any other key is the field's own again.
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); suggest.escapedAt = Date.now(); closeSuggest(); return; }
+    closeSuggest();
+  }
+  const said = suggestKey(e.key, fits, suggest.items.length, suggest.active, false);
   if (!said.act) return;
   // Down in an empty field is the field's own: there is nothing to look up.
   if (said.act === 'open' && !tokenAround(field.value, field.selectionStart).text) return;
@@ -375,8 +418,10 @@ function suggestKeydown(e) {
 for (const name of ADDRESS_FIELDS) {
   const field = composeForm[name];
   field.addEventListener('keydown', suggestKeydown);
-  field.addEventListener('input', (e) => { if (!e.isComposing) lookUpAddresses(field, false); });
-  field.addEventListener('compositionend', () => lookUpAddresses(field, false));
+  field.addEventListener('input', (e) => { if (!e.isComposing) { narrowSuggest(field); lookUpAddresses(field, false); } });
+  // A click that moves the caret to another address shuts a list drawn for the one it left.
+  field.addEventListener('click', () => { if (suggest.field === field && !listFits(field)) closeSuggest(); });
+  field.addEventListener('compositionend', () => { narrowSuggest(field); lookUpAddresses(field, false); });
   field.addEventListener('blur', () => setTimeout(() => { if (suggest.field === field && document.activeElement !== field) closeSuggest(); }, 150));
 }
 composeSheet.addEventListener('close', closeSuggest);

@@ -1288,14 +1288,17 @@ describe('suggesting addresses while one is typed', () => {
     const done: string[] = [];
     const field = { name: 'to', value: 'an', selectionStart: 2 };
     const context: Record<string, unknown> = {
-      suggest: { field, items: [{ address: 'ann@acme.example' }, { address: 'anand@acme.example' }], active: 0, escapedAt: 0 },
+      suggest: {
+        field, items: [{ address: 'ann@acme.example' }, { address: 'anand@acme.example' }], active: 0, escapedAt: 0,
+        token: { start: 0, text: 'an' },
+      },
       suggestList: { hidden: false },
       acceptSuggestion: (i: number) => done.push(`accept ${i}`),
       closeSuggest: () => { done.push('close'); return true; },
       markSuggest: () => done.push('mark'),
       lookUpAddresses: () => done.push('look up'),
     };
-    const keydown = lifted<(e: Record<string, unknown>) => void>(['tokenAround', 'suggestKey', 'suggestKeydown'], 'suggestKeydown', context);
+    const keydown = lifted<(e: Record<string, unknown>) => void>(['tokenAround', 'listFits', 'suggestKey', 'suggestKeydown'], 'suggestKeydown', context);
     const press = (key: string, extra: Record<string, unknown> = {}) => {
       const said = { prevented: 0, stopped: 0 };
       keydown({ key, target: field, preventDefault: () => { said.prevented += 1; }, stopPropagation: () => { said.stopped += 1; }, ...extra });
@@ -1336,6 +1339,77 @@ describe('suggesting addresses while one is typed', () => {
     expect(done).toEqual(['look up']);
   });
 
+  it('never puts a suggestion in place of something else than what it was drawn for', () => {
+    const done: string[] = [];
+    const field = { name: 'to', value: 'boris@new.example', selectionStart: 17, focus: () => undefined, setSelectionRange: () => undefined };
+    // The list still on show was drawn for "bo", typed before the rest of the address.
+    const context: Record<string, unknown> = {
+      suggest: { field, items: [{ address: 'bob@acme.example', name: 'Bob Stone' }], active: 0, escapedAt: 0, token: { start: 0, text: 'bo' } },
+      suggestList: { hidden: false },
+      closeSuggest: () => { done.push('close'); (context['suggestList'] as { hidden: boolean }).hidden = true; return true; },
+      markSuggest: () => done.push('mark'), lookUpAddresses: () => done.push('look up'),
+      draftTimer: 0, clearTimeout: () => undefined, setTimeout: () => 0, saveDraft: () => undefined,
+    };
+    const page = lifted<{ keydown: (e: Record<string, unknown>) => void; accept: (i: number) => void }>(
+      ['tokenAround', 'acceptAddress', 'listFits', 'suggestKey', 'acceptSuggestion', 'suggestKeydown'],
+      '({ keydown: suggestKeydown, accept: acceptSuggestion })', context,
+    );
+    const press = (key: string) => {
+      const said = { prevented: 0 };
+      page.keydown({ key, target: field, preventDefault: () => { said.prevented += 1; }, stopPropagation: () => undefined });
+      return said;
+    };
+    // Tab moves on, as it would with no list, and the address typed stays.
+    expect(press('Tab')).toEqual({ prevented: 0 });
+    expect(field.value).toBe('boris@new.example');
+    expect(done).toEqual(['close']);
+    // Enter on it likewise, and a press on one of its rows.
+    (context['suggestList'] as { hidden: boolean }).hidden = false;
+    expect(press('Enter')).toEqual({ prevented: 0 });
+    (context['suggestList'] as { hidden: boolean }).hidden = false;
+    page.accept(0);
+    expect(field.value).toBe('boris@new.example');
+    // The caret moved back to another address: the list for the old one is shut, and so is its Enter.
+    field.value = 'boris@new.example, an';
+    field.selectionStart = 21;
+    (context['suggest'] as Record<string, unknown>)['token'] = { start: 18, text: 'an' };
+    (context['suggestList'] as { hidden: boolean }).hidden = false;
+    done.length = 0;
+    expect(press('Home')).toEqual({ prevented: 0 });
+    expect(done).toEqual(['close']);
+    field.selectionStart = 0;
+    (context['suggestList'] as { hidden: boolean }).hidden = false;
+    expect(press('Enter')).toEqual({ prevented: 0 });
+    expect(field.value).toBe('boris@new.example, an');
+    // Escape on a list left over still only shuts the list.
+    (context['suggestList'] as { hidden: boolean }).hidden = false;
+    expect(press('Escape')).toEqual({ prevented: 1 });
+  });
+
+  it('narrows the list at once as the address is typed on, and shuts it when nothing fits', () => {
+    const shown: Array<{ items: Array<{ address: string }>; token: unknown }> = [];
+    let closed = 0;
+    const field = { value: 'an', selectionStart: 2 };
+    const context: Record<string, unknown> = {
+      suggest: {
+        field, active: 1, token: { start: 0, text: 'an' },
+        items: [{ address: 'ann@acme.example', name: 'Ann Lee' }, { address: 'anand@acme.example', name: 'Anand Rao' }],
+      },
+      suggestList: { hidden: false },
+      showSuggest: (_f: unknown, items: Array<{ address: string }>, token: unknown) => shown.push({ items, token }),
+      closeSuggest: () => { closed += 1; return true; },
+    };
+    const narrow = lifted<(f: unknown) => void>(['tokenAround', 'fitsQuery', 'narrowSuggest'], 'narrowSuggest', context);
+    field.value = 'ana';
+    field.selectionStart = 3;
+    narrow(field);
+    expect(shown.at(-1)!.items.map((c) => c.address)).toEqual(['anand@acme.example']);
+    expect(shown.at(-1)!.token).toMatchObject({ start: 0, text: 'ana' });
+    field.value = 'anx';
+    narrow(field);
+    expect(closed).toBe(1);
+  });
+
   it('keeps the letter open on the Escape that shut the list, and only on that one', () => {
     const context: Record<string, unknown> = { suggest: { escapedAt: 0 }, closeSuggest: () => false, Date };
     const took = lifted<() => boolean>(['suggestionsTookEscape'], 'suggestionsTookEscape', context);
@@ -1358,8 +1432,9 @@ describe('the conversation in the reader', () => {
       const self: Record<string, unknown> = {
         tag, className: cls ?? '', textContent: text ?? '', hidden: false, children: [] as unknown[], attrs: {} as Record<string, string>,
         appendChild: (child: unknown) => { (self['children'] as unknown[]).push(child); return child; },
-        replaceChildren: () => { self['children'] = []; },
+        replaceChildren: () => { self['children'] = []; self['redrawn'] = Number(self['redrawn'] ?? 0) + 1; },
         setAttribute: (name: string, value: string) => { (self['attrs'] as Record<string, string>)[name] = value; },
+        dataset: {}, contains: () => false,
       };
       Object.defineProperty(self, 'childNodes', { get: () => self['children'] });
       return self;
@@ -1370,10 +1445,11 @@ describe('the conversation in the reader', () => {
       t, fill, DOT: ' · ', NB: ' ', el: (tag: string, cls?: string, value?: string) => node(tag, cls, value),
       textNode: (value: string) => node('#text', undefined, value), dayLabel: () => 'Today', hhmm: () => '10:00',
       textBody: (value: string) => node('div', 'mail-text', value), extraRows: new Map(), openDetail: () => undefined,
-      rowKey: (m: { dedupKey?: string }) => m.dedupKey ?? '', sentOpen: new Set(),
+      rowKey: (m: { dedupKey?: string }) => m.dedupKey ?? '', sentOpen: new Set(), lang: 'en', document: { activeElement: null },
     };
     const draw = lifted<(entry: unknown, d: unknown) => void>(
-      ['bareSubject', 'newSubject', 'whenLine', 'receivedItem', 'peopleLine', 'sentItem', 'fillSent', 'drawConversation'], 'drawConversation', context,
+      ['bareSubject', 'newSubject', 'whenLine', 'receivedItem', 'peopleLine', 'sentItem', 'fillSent', 'conversationSignature', 'drawConversation'],
+      'drawConversation', context,
     );
     const current = { dedupKey: 'k2', subject: 'Lunch?' };
     const alone = { section: node('section'), row: current };
@@ -1407,6 +1483,47 @@ describe('the conversation in the reader', () => {
     (button['onclick'] as () => void)();
     expect((button['attrs'] as Record<string, string>)['aria-expanded']).toBe('true');
     expect(text((yours['children'] as Array<Record<string, unknown>>)[1]!)).toContain('boss@qq.com');
+
+    // The same answer again (a live event about other mail) leaves the drawn timeline, and its focus, alone.
+    const before = entry.section['redrawn'];
+    draw(entry, { omitted: 0, messages: [
+      { direction: 'in', current: true, dedupKey: 'k2', at: '2026-11-17T09:00:00Z' },
+      {
+        direction: 'out', id: 7, at: '2026-11-17T10:00:00Z', subject: 'Re: Lunch?', excerpt: 'Thursday works.', text: 'Thursday works.',
+        to: [{ name: 'Ann', address: 'ann@example.org' }], cc: [], bcc: [{ name: '', address: 'boss@qq.com' }], attachments: { count: 0 },
+      },
+    ] });
+    expect(entry.section['redrawn']).toBe(before);
+    // Something new in it is drawn, and says how many more the conversation holds, in the singular when one.
+    draw(entry, { omitted: 1, messages: [{ direction: 'in', current: true, dedupKey: 'k2', at: '2026-11-17T09:00:00Z' }, {
+      direction: 'in', dedupKey: 'k3', at: '2026-11-17T11:00:00Z', senderName: 'Ann', summary: 'See you then.',
+    }] });
+    expect(entry.section['redrawn']).toBe(Number(before) + 1);
+    expect(text(entry.section)).toContain('1 more message in this conversation is not shown');
+    expect(text(entry.section)).toContain('Conversation · 3');
+    expect(STRINGS['zh-CN']['conv.omitted1']).toBeTruthy();
+  });
+
+  it('puts the keyboard back where it was when the timeline is drawn again', () => {
+    const script = clientScript();
+    expect(script).toContain("open.dataset.conv = 'in:' + rowKey(m);");
+    expect(script).toContain("open.dataset.conv = 'out:' + m.id;");
+    expect(script).toContain('const again = section.querySelector(\'[data-conv="\' + CSS.escape(focused) + \'"]\');');
+  });
+
+  it('asks for no conversation for a reader already left behind', () => {
+    let asked = 0;
+    const context: Record<string, unknown> = {
+      fetch: () => { asked += 1; return new Promise(() => undefined); }, conversations: new Map(), Date,
+      drawConversation: () => undefined,
+    };
+    const load = lifted<(entry: unknown, fresh: boolean) => void>(['showKnownConversation', 'loadConversation'], 'loadConversation', context);
+    load({ key: 'k1', section: { isConnected: false } }, false);
+    load({ key: 'k1', section: { isConnected: false } }, true);
+    expect(asked).toBe(0);
+    load({ key: 'k1', section: { isConnected: true } }, false);
+    expect(asked).toBe(1);
+    expect(clientScript()).toContain('setTimeout(() => { if (conversation.section.isConnected) loadConversation(conversation, false); }, 300);');
   });
 });
 

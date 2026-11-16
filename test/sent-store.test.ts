@@ -123,6 +123,51 @@ describe('a conversation', () => {
   });
 });
 
+describe('a long conversation', () => {
+  it('shows the newest of it, and says truly how many are left out', () => {
+    const state = new StateStore(':memory:');
+    const thread = `${ME}|<busy@example.org>`;
+    for (let n = 0; n < 260; n += 1) {
+      received(state, `k${n}`, { messageId: `<m${n}@example.org>`, threadKey: thread, mailDate: iso(-(260 - n) * 60 * MIN) });
+    }
+    state.recordSent(sent({ messageId: '<r@qq.com>', threadKey: thread, answers: '<m258@example.org>', date: iso(-90 * MIN) }));
+    const { entries, omitted } = state.conversation(state.getMail('k259')!);
+    const names = entries.map((e) => (e.direction === 'in' ? e.row.dedupKey : 'SENT'));
+    expect(names).toHaveLength(50);
+    expect(names.slice(-4)).toEqual(['k257', 'k258', 'SENT', 'k259']);
+    expect(names[0]).toBe('k211');
+    expect(omitted).toBe(261 - 50);
+    // An old message opened: itself, and the newest of the rest.
+    const old = state.conversation(state.getMail('k10')!);
+    expect(old.entries[0]).toMatchObject({ direction: 'in', row: { dedupKey: 'k10' } });
+    expect(old.entries.at(-1)).toMatchObject({ direction: 'in', row: { dedupKey: 'k259' } });
+    expect(old.omitted).toBe(261 - 50);
+  });
+});
+
+describe('a copy of the owner\'s own message that came back', () => {
+  it('is the owner\'s message: shown once, counted once, and the latest word is still theirs', () => {
+    const state = new StateStore(':memory:');
+    const thread = `${ME}|<root@list.example>`;
+    received(state, 'ann', { messageId: '<root@list.example>', threadKey: thread, mailDate: iso(-60 * MIN), sender: 'ann@example.org' });
+    state.recordSent(sent({ messageId: '<reply@qq.com>', threadKey: thread, answers: '<root@list.example>', date: iso(-30 * MIN) }));
+    // The list sends the post back to its poster: the same Message-ID, in the inbox.
+    received(state, 'echo', { messageId: '<reply@qq.com>', threadKey: thread, mailDate: iso(-29 * MIN), sender: ME, importance: 'info', pushed: false });
+
+    const shown = state.conversation(state.getMail('ann')!).entries
+      .map((e) => (e.direction === 'in' ? `in ${e.row.messageId}` : `out ${e.sent.messageId}`));
+    expect(shown).toEqual(['in <root@list.example>', 'out <reply@qq.com>']);
+    expect(state.conversation(state.getMail('ann')!).omitted).toBe(0);
+    // Opened from the list, the copy is the message being read, and the sent one is not shown beside it.
+    const fromCopy = state.conversation(state.getMail('echo')!).entries
+      .map((e) => (e.direction === 'in' ? `in ${e.row.dedupKey}` : `out ${e.sent.messageId}`));
+    expect(fromCopy).toEqual(['in ann', 'in echo']);
+
+    expect(state.queryThreads({ sinceHours: 24 })).toMatchObject([{ threadKey: thread, messageCount: 1, sentCount: 1, lastWordYours: true }]);
+    expect(state.threadWindow(thread).entries).toHaveLength(2);
+  });
+});
+
 describe('threads', () => {
   it('count the owner\'s messages and say when the latest word is theirs, while the list stays the received mail', () => {
     const state = new StateStore(':memory:');
@@ -138,6 +183,18 @@ describe('threads', () => {
     expect(threads.find((t) => t.threadKey === answered)).toMatchObject({ messageCount: 1, sentCount: 1, lastWordYours: true });
     // Answered once, and written to again since: the latest word is theirs.
     expect(threads.find((t) => t.threadKey === waiting)).toMatchObject({ sentCount: 1, lastWordYours: false });
+  });
+
+  it('count the owner\'s messages in the same window as the received ones', () => {
+    const state = new StateStore(':memory:');
+    const thread = `${ME}|<a@example.org>`;
+    received(state, 'a', { messageId: '<a@example.org>', threadKey: thread, mailDate: iso(-3 * DAY) });
+    db(state).prepare('UPDATE seen SET created_at = ? WHERE dedup_key = ?').run(iso(-3 * DAY), 'a');
+    received(state, 'b', { messageId: '<b@example.org>', threadKey: thread, mailDate: iso(-2 * 60 * MIN) });
+    state.recordSent(sent({ messageId: '<old@qq.com>', threadKey: thread, date: iso(-2 * DAY) }));
+    state.recordSent(sent({ messageId: '<new@qq.com>', threadKey: thread, date: iso(-60 * MIN) }));
+    expect(state.queryThreads({ sinceHours: 24 })).toMatchObject([{ messageCount: 1, sentCount: 1, lastWordYours: true }]);
+    expect(state.queryThreads({ sinceHours: 24 * 7 })).toMatchObject([{ messageCount: 2, sentCount: 2, lastWordYours: true }]);
   });
 });
 
@@ -179,7 +236,8 @@ describe('an existing database', () => {
       const state = new StateStore(path);
       expect(performance.now() - started).toBeLessThan(3000);
       const columns = (db(state).prepare('PRAGMA table_info(seen)').all() as Array<{ name: string }>).map((c) => c.name);
-      expect(columns).toContain('put_back_at');
+      expect(columns).toContain('kept_at');
+      expect(columns).toContain('withheld');
       const names = (db(state).prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'index')").all() as Array<{ name: string }>)
         .map((r) => r.name);
       for (const name of ['sent_mail', 'sent_cursors', 'idx_sent_thread', 'idx_sent_answers', 'idx_seen_message_id']) {
@@ -189,6 +247,59 @@ describe('an existing database', () => {
       state.close();
       // Opened again, as every web request and the MCP process do: nothing to do twice.
       new StateStore(path).close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the owner\'s decisions from before this release', () => {
+  it('are read from the audit once, so the first look back never undoes a put-back or a reminder', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mailsift-kept-'));
+    const path = join(dir, 'state.db');
+    try {
+      const old = new DatabaseSync(path);
+      old.exec(`CREATE TABLE seen (
+        dedup_key TEXT PRIMARY KEY, account TEXT NOT NULL, account_label TEXT,
+        message_id TEXT, thread_key TEXT, subject TEXT, sender TEXT, sender_name TEXT,
+        folder TEXT, in_spam INTEGER NOT NULL DEFAULT 0,
+        importance TEXT, category TEXT, summary TEXT, reason TEXT, deadline TEXT,
+        decided_by TEXT, pushed INTEGER NOT NULL DEFAULT 0,
+        mail_date TEXT, snippet TEXT, attachments_json TEXT, verification_code TEXT, handled_at TEXT,
+        uid INTEGER, uid_validity TEXT, snoozed_until TEXT, created_at TEXT NOT NULL)`);
+      old.exec(`CREATE TABLE mcp_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, client TEXT, target TEXT,
+        success INTEGER NOT NULL, created_at TEXT NOT NULL)`);
+      old.exec('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+      old.prepare('INSERT INTO meta (key, value) VALUES (?, ?)').run('attention_since', iso(-30 * DAY));
+      const row = old.prepare(`INSERT INTO seen (dedup_key, account, message_id, importance, pushed, folder, mail_date, snoozed_until, created_at)
+        VALUES (?, ?, ?, 'critical', 1, 'INBOX', ?, ?, ?)`);
+      // Put back in the page; marked done and back through MCP (by Message-ID); put off in the page.
+      row.run(`${ME}|<a@x>`, ME, '<a@x>', iso(-3 * DAY), null, iso(-3 * DAY));
+      row.run(`${ME}|<b@x>`, ME, '<b@x>', iso(-3 * DAY), null, iso(-3 * DAY));
+      row.run(`${ME}|<c@x>`, ME, '<c@x>', iso(-3 * DAY), iso(2 * DAY), iso(-3 * DAY));
+      const audit = old.prepare('INSERT INTO mcp_audit (action, client, target, success, created_at) VALUES (?, ?, ?, 1, ?)');
+      audit.run('web:handled', 'page', `${ME}|<a@x>`, iso(-2 * DAY));
+      audit.run('web:unhandled', 'page', `${ME}|<a@x>`, iso(-1 * DAY));
+      audit.run('mark_handled', 'agent', JSON.stringify({ messageId: '<b@x>', account: ME }), iso(-1 * DAY));
+      audit.run('web:snooze', 'page', `${ME}|<c@x>`, iso(-1 * DAY));
+      // Rows that are not JSON, which the backfill must read past.
+      audit.run('snooze', 'agent', 'not json at all', iso(-1 * DAY));
+      audit.run('web:feedback', 'page', `${ME}|<a@x>`, iso(-1 * DAY));
+      old.close();
+
+      const state = new StateStore(path);
+      // Replies from the phone two days ago, read only now by the first look back.
+      for (const id of ['a', 'b', 'c']) {
+        state.recordSent(sent({ messageId: `<r${id}@qq.com>`, answers: `<${id}@x>`, threadKey: `${ME}|<${id}@x>`, date: iso(-2 * DAY) }));
+      }
+      expect(state.answerFromSent(OWN)).toEqual([]);
+      expect(state.attentionCount()).toBe(2);
+      expect(state.snoozedCount()).toBe(1);
+      // A reply written since does count.
+      state.recordSent(sent({ messageId: '<ra2@qq.com>', answers: '<a@x>', threadKey: `${ME}|<a@x>`, date: iso(-1 * MIN) }));
+      expect(state.answerFromSent(OWN)).toEqual([`${ME}|<a@x>`]);
+      state.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -215,13 +326,37 @@ describe('answered from another client', () => {
     expect(state.listMailActions()).toHaveLength(1);
   });
 
-  it('takes off a message that was put off, as answering it in the page would', () => {
+  it('takes off a message that was put off by a reply written after that, as answering it in the page would', () => {
     const state = new StateStore(':memory:');
     received(state, 'k1', { messageId: '<q@example.org>' });
     state.setSnoozed('k1', iso(2 * DAY));
-    state.recordSent(sent());
+    state.recordSent(sent({ date: iso(1 * MIN) }));
     expect(state.answerFromSent(OWN)).toEqual(['k1']);
     expect(state.snoozed()).toEqual([]);
+  });
+
+  it('never lets a reply written before the owner put a message off, or changed its reminder, cancel that', () => {
+    for (const decide of [
+      (state: StateStore) => state.setSnoozed('k1', iso(3 * DAY)),
+      (state: StateStore) => { state.setSnoozed('k1', iso(3 * DAY)); state.setSnoozed('k1', iso(5 * DAY)); },
+      (state: StateStore) => { state.setSnoozed('k1', iso(3 * DAY)); state.wakeNow('k1'); },
+    ]) {
+      const state = new StateStore(':memory:');
+      received(state, 'k1', { messageId: '<q@example.org>', mailDate: iso(-2 * 60 * MIN) });
+      decide(state);
+      // Replied from the phone half an hour ago; the poll reads it only now.
+      state.recordSent(sent({ date: iso(-30 * MIN) }));
+      expect(state.answerFromSent(OWN)).toEqual([]);
+      expect(state.getMail('k1')!.handledAt).toBeNull();
+    }
+    // A reminder taken away is a decision too: the message stays as the owner left it.
+    const state = new StateStore(':memory:');
+    received(state, 'k1', { messageId: '<q@example.org>' });
+    state.setSnoozed('k1', iso(3 * DAY));
+    state.setSnoozed('k1', null);
+    state.recordSent(sent({ date: iso(-5 * MIN) }));
+    expect(state.answerFromSent(OWN)).toEqual([]);
+    expect(state.inAttention('k1')).toBe(true);
   });
 
   it('leaves alone what the reply does not answer, or answers only the owner', () => {
@@ -230,8 +365,6 @@ describe('answered from another client', () => {
       ['a reply to the owner\'s own addresses only', (state) => state.recordSent(sent({
         to: [{ name: '', address: 'me@gmail.com' }], bcc: [{ name: '', address: ME }],
       }))],
-      ['a reply written before the message came', (state) => state.recordSent(sent({ date: iso(-2 * DAY) }))],
-      ['a reply with no date', (state) => state.recordSent(sent({ date: undefined }))],
       ['a reply to another message', (state) => state.recordSent(sent({ answers: '<other@example.org>' }))],
     ];
     for (const [what, write] of cases) {
@@ -242,6 +375,19 @@ describe('answered from another client', () => {
       expect(state.getMail('k1')!.handledAt, what).toBeNull();
       expect(state.listMailActions(), what).toEqual([]);
     }
+  });
+
+  it('believes a reply to the message whatever the sender\'s clock says', () => {
+    const state = new StateStore(':memory:');
+    // The sender's clock runs seven minutes ahead; the owner answered a minute ago.
+    received(state, 'k1', { messageId: '<q@example.org>', mailDate: iso(7 * MIN) });
+    state.recordSent(sent({ date: iso(-1 * MIN) }));
+    expect(state.answerFromSent(OWN)).toEqual(['k1']);
+
+    const arriving = new StateStore(':memory:');
+    arriving.recordSent(sent({ date: undefined }));
+    arriving.markSeen('k1', ME, 'q');
+    expect(arriving.answerStored('k1', OWN, true, '<q@example.org>')).toBe(true);
   });
 
   it('touches nothing that is not waiting on the owner', () => {
@@ -273,24 +419,37 @@ describe('answered from another client', () => {
     expect(state.answerFromSent(OWN)).toEqual(['k1']);
   });
 
-  it('stores a message as dealt with when an answer to it is stored already', () => {
+  it('stores a message as dealt with when an answer to it is stored already, and keeps it ready to put back', () => {
     const state = new StateStore(':memory:');
     state.recordSent(sent({ date: iso(-5 * MIN) }));
     state.markSeen('k1', ME, 'q');
-    expect(state.answerOnArrival('k1', ME, '<q@example.org>', iso(-60 * MIN), OWN)).toBe(true);
+    expect(state.answerStored('k1', OWN, true, '<q@example.org>')).toBe(true);
+    // Judged warning and owed a notification it was not sent.
+    state.recordOutcome('k1', 'warning', false, { messageId: '<q@example.org>', folder: 'INBOX' });
     expect(state.getMail('k1')!.handledAt).not.toBeNull();
     expect(state.listMailActions()[0]).toMatchObject({ action: 'handled', client: SENT_FOLDER_CLIENT });
+    expect(state.recentlyHandled()).toMatchObject([{ row: { dedupKey: 'k1' }, queued: true }]);
+    state.setHandled('k1', false);
+    expect(state.inAttention('k1')).toBe(true);
 
     const own = new StateStore(':memory:');
     own.recordSent(sent({ to: [{ name: '', address: 'me@gmail.com' }] }));
     own.markSeen('k1', ME, 'q');
-    expect(own.answerOnArrival('k1', ME, '<q@example.org>', iso(-60 * MIN), OWN)).toBe(false);
+    expect(own.answerStored('k1', OWN, true, '<q@example.org>')).toBe(false);
+  });
 
-    const later = new StateStore(':memory:');
-    later.recordSent(sent({ date: iso(-2 * DAY) }));
-    later.markSeen('k1', ME, 'q');
-    expect(later.answerOnArrival('k1', ME, '<q@example.org>', iso(-60 * MIN), OWN)).toBe(false);
-    expect(later.getMail('k1')!.handledAt).toBeNull();
+  it('says nothing more about a message it takes off: a notification still owed and its digest line go', () => {
+    const state = new StateStore(':memory:');
+    received(state, 'k1', { messageId: '<q@example.org>', importance: 'warning', pushed: false });
+    state.enqueueNotification('k1', { account: ME, messageId: '<q@example.org>' } as never, { importance: 'warning' } as never);
+    state.queueDigest('k1', { subject: 'q' });
+    state.recordSent(sent());
+    expect(state.answerStored('k1', OWN)).toBe(true);
+    expect(state.notificationOutboxPending()).toBe(0);
+    expect(state.digestPending()).toBe(0);
+    // It was owed a notification, so putting it back puts it in the queue.
+    state.setHandled('k1', false);
+    expect(state.inAttention('k1')).toBe(true);
   });
 });
 
@@ -356,6 +515,27 @@ describe('whom to write to', () => {
     expect(found).toHaveLength(1);
     expect(found[0]).toMatchObject({ address: 'ann@acme.example', name: 'Ann Lee', sent: 2, received: 1 });
     expect(state.contacts('me', 8, OWN)).toEqual([]);
+  });
+
+  it('lets no spam or bulk mail from an address the owner writes to rename it', () => {
+    const state = new StateStore(':memory:');
+    state.recordSent(sent({ messageId: '<1@qq.com>', to: to('ann@acme.example', 'Ann Lee'), date: iso(-2 * DAY) }));
+    received(state, 'spoof', { messageId: '<s@x>', sender: 'ann@acme.example', senderName: 'Ann Lee (CEO) urgent wire', inSpam: true, mailDate: iso(-1 * MIN) });
+    received(state, 'news', { messageId: '<n@x>', sender: 'ann@acme.example', senderName: 'Acme Weekly', category: 'Marketing', mailDate: iso(-1 * MIN) });
+    expect(state.contacts('ann', 8, OWN)).toMatchObject([{ address: 'ann@acme.example', name: 'Ann Lee', received: 0 }]);
+  });
+
+  it('finds a name however its characters were written', () => {
+    const state = new StateStore(':memory:');
+    received(state, 'fw', { messageId: '<fw@x>', sender: 'bob@lee.example', senderName: 'Ｂｏｂ Ｌｅｅ' });
+    received(state, 'hw', { messageId: '<hw@x>', sender: 't@tanaka.example', senderName: 'ﾀﾅｶ' });
+    received(state, 'nfd', { messageId: '<nfd@x>', sender: 'em@martin.example', senderName: 'E\u0301lise Martin' });
+    state.recordSent(sent({ messageId: '<z@qq.com>', to: to('zoe@studio.example', 'Ｚｏｅ Ｗｏｏ') }));
+    expect(state.contacts('bob', 8, OWN).map((c) => c.address)).toEqual(['bob@lee.example']);
+    expect(state.contacts('lee', 8, OWN).map((c) => c.address)).toEqual(['bob@lee.example']);
+    expect(state.contacts('タナカ', 8, OWN).map((c) => c.address)).toEqual(['t@tanaka.example']);
+    expect(state.contacts('élise', 8, OWN).map((c) => c.address)).toEqual(['em@martin.example']);
+    expect(state.contacts('woo', 8, OWN)).toMatchObject([{ address: 'zoe@studio.example', name: 'Zoe Woo' }]);
   });
 
   it('never gives more than asked, nor more than twenty', () => {
