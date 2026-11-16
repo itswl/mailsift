@@ -145,6 +145,27 @@ describe('a long conversation', () => {
   });
 });
 
+describe('an older message opened in a long conversation', () => {
+  it('says how many messages lie between it and the newest shown', () => {
+    const state = new StateStore(':memory:');
+    const thread = `${ME}|<ci@example.org>`;
+    for (let n = 0; n < 60; n += 1) {
+      received(state, `k${n}`, { messageId: `<m${n}@example.org>`, threadKey: thread, mailDate: iso(-(60 - n) * 60 * MIN) });
+    }
+    // The owner's reply to k5, which the newest 49 leave out.
+    state.recordSent(sent({ messageId: '<r@qq.com>', threadKey: thread, answers: '<m5@example.org>', date: iso(-(54.5 * 60) * MIN) }));
+    const { entries, omitted, between } = state.conversation(state.getMail('k5')!);
+    expect(entries).toHaveLength(50);
+    expect(entries[0]).toMatchObject({ direction: 'in', row: { dedupKey: 'k5' } });
+    expect(entries[1]).toMatchObject({ direction: 'in', row: { dedupKey: 'k11' } });
+    expect(omitted).toBe(61 - 50);
+    // k6..k10 and the reply lie between k5 and k11; k0..k4 are older.
+    expect(between).toBe(6);
+    // The newest opened: nothing between.
+    expect(state.conversation(state.getMail('k59')!).between).toBe(0);
+  });
+});
+
 describe('a copy of the owner\'s own message that came back', () => {
   it('is the owner\'s message: shown once, counted once, and the latest word is still theirs', () => {
     const state = new StateStore(':memory:');
@@ -390,6 +411,19 @@ describe('answered from another client', () => {
     expect(arriving.answerStored('k1', OWN, true, '<q@example.org>')).toBe(true);
   });
 
+  it('takes off a message whose notification is still owed, before any digest lists it', () => {
+    const state = new StateStore(':memory:');
+    received(state, 'k1', { messageId: '<q@example.org>', importance: 'warning', pushed: false });
+    state.enqueueNotification('k1', { account: ME, messageId: '<q@example.org>' } as never, { importance: 'warning' } as never);
+    state.queueDigest('k1', { subject: 'q' });
+    expect(state.inAttention('k1')).toBe(false);
+    state.recordSent(sent());
+    expect(state.answerFromSent(OWN)).toEqual(['k1']);
+    expect(state.digestPending()).toBe(0);
+    expect(state.notificationOutboxPending()).toBe(0);
+    expect(state.getMail('k1')).toMatchObject({ withheld: true, handledAt: expect.any(String) });
+  });
+
   it('touches nothing that is not waiting on the owner', () => {
     const state = new StateStore(':memory:');
     received(state, 'quiet', { messageId: '<quiet@example.org>', importance: 'info', pushed: false });
@@ -417,6 +451,21 @@ describe('answered from another client', () => {
     // Answered again since: that answer counts.
     state.recordSent(sent({ messageId: '<again@qq.com>', date: iso(1 * MIN) }));
     expect(state.answerFromSent(OWN)).toEqual(['k1']);
+  });
+
+  it('carries withheld on the stored record, and the record page says why it was not notified', async () => {
+    const { mailRecordToMarkdown } = await import('../src/mcp-markdown.js');
+    const state = new StateStore(':memory:');
+    state.recordSent(sent());
+    state.markSeen('k1', ME, 'q');
+    state.answerStored('k1', OWN, true, '<q@example.org>');
+    state.recordOutcome('k1', 'warning', false, { messageId: '<q@example.org>', folder: 'INBOX' });
+    const row = state.getMail('k1')!;
+    expect(row).toMatchObject({ pushed: false, withheld: true });
+    expect(state.queryMail({ sinceHours: 1 })[0]).toMatchObject({ withheld: true });
+    const page = mailRecordToMarkdown(row);
+    expect(page).toContain('withheld because the owner had already answered it');
+    expect(page).not.toContain('carried by the daily digest');
   });
 
   it('stores a message as dealt with when an answer to it is stored already, and keeps it ready to put back', () => {

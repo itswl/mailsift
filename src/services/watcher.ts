@@ -17,7 +17,7 @@ import {
   type FolderCursor,
   type MessageBudget,
 } from '../imap/client.js';
-import { fetchSent, sentMailEnabled } from '../imap/sent.js';
+import { fetchSent, firstRefusal, SentSearchRefused, sentMailEnabled } from '../imap/sent.js';
 import type { Folder } from '../imap/folders.js';
 import {
   dedupKey, SENSITIVE_WORDS, sensitiveKindOf, snippet, type MailMessage,
@@ -198,6 +198,11 @@ export class Watcher {
       const result = await fetchSent(client, account, folder, this.state.getSentCursor(account.username));
       return { account: account.username, accountName: account.name, folder, messages: result.messages, cursor: result.cursor };
     } catch (error) {
+      // A server that keeps refusing is said once, until it answers again.
+      if (error instanceof SentSearchRefused && !firstRefusal(`${account.username}|${error.folder}`)) {
+        log.debug(`[${account.name}] the Sent folder's server still refuses to search`);
+        return undefined;
+      }
       log.warn(`[${account.name}] the Sent folder could not be read this time (the poll goes on): ${String(error).slice(0, 200)}`);
       return undefined;
     }
@@ -345,7 +350,9 @@ export class Watcher {
       // so would listing it again in a digest that may already have gone out.
       const row = this.state.getMail(entry.notificationKey);
       if (row?.handledAt) {
-        this.state.dropNotification(entry.notificationKey);
+        // As if it had been answered elsewhere: withheld, with its digest
+        // line, so putting it back returns it to the queue whoever dealt with it.
+        this.state.withholdNotification(entry.notificationKey);
         continue;
       }
       if (row?.snoozedUntil && Date.parse(row.snoozedUntil) > Date.now()) {
@@ -485,9 +492,16 @@ export class Watcher {
       // Answered from another client while it waited for its verdict: a reply
       // read from Sent while it was out of the queue was not held against it
       // then, so it is now, before anything is said about it.
-      if (!row.handledAt && (wouldPush || result.importance === 'critical')
+      if (!row.handledAt && (wouldPush || rank(result) >= IMPORTANCE_RANK.warning)
         && this.answeredAlready(key, safeMessage.subject, wouldPush)) {
         this.state.recordOutcome(key, result.importance, false, fields);
+        continue;
+      }
+      // Marked done while it waited: the notification it is now owed is
+      // withheld, as for one answered elsewhere, and so is its digest line.
+      if (row.handledAt && wouldPush) {
+        this.state.recordOutcome(key, result.importance, false, fields);
+        this.state.withholdNotification(key);
         continue;
       }
 
@@ -579,9 +593,11 @@ export class Watcher {
       const wouldPush = !forwardedCopy && effectiveRank(message, result) >= pushLimit;
       // Already answered from another mail client (the answer is in Sent):
       // stored as dealt with, never notified and not listed in the digest,
-      // and still eligible for the queue if it is put back. Only mail that
-      // would have been put before the owner is looked at; see StateStore.answerStored.
-      if (!forwardedCopy && (wouldPush || result.importance === 'critical')
+      // and still eligible for the queue if it is put back when it was owed a
+      // notification. Warnings are looked at whatever PUSH_MIN_IMPORTANCE
+      // says: a browser that asked for warnings is told of them by Web Push,
+      // which leaves a handled row alone. See StateStore.answerStored.
+      if (!forwardedCopy && (wouldPush || rank(result) >= IMPORTANCE_RANK.warning)
         && this.answeredAlready(key, safeMessage.subject, wouldPush, message.messageId)) {
         this.state.recordOutcome(key, result.importance, false, fields);
         continue;

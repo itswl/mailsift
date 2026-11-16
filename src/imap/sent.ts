@@ -159,6 +159,29 @@ export async function toSentRecord(raw: FetchMessageObject, account: Account, fo
   };
 }
 
+/** A server that refused to search a Sent folder: tried again next poll, and said once until it answers. */
+export class SentSearchRefused extends Error {
+  constructor(readonly folder: string) {
+    super(`the server refused to search ${folder}`);
+    this.name = 'SentSearchRefused';
+  }
+}
+
+/** Sent folders whose server refuses to search, by account and path, so a lasting refusal is logged once. */
+const refused = new Set<string>();
+
+/** Whether this is the first refusal in a row for a folder; the next one is not. */
+export function firstRefusal(key: string): boolean {
+  if (refused.has(key)) return false;
+  refused.add(key);
+  return true;
+}
+
+/** That a folder's server answered a search again, so its next refusal is said. */
+export function searchAnswered(key: string): void {
+  refused.delete(key);
+}
+
 export interface SentFetch {
   messages: SentRecord[];
   cursor: SentCursorRow;
@@ -202,9 +225,15 @@ export async function fetchSent(
     // A refusal (ImapFlow answers false) is not an empty folder: taken for
     // one, the look back would be skipped for good. Thrown, the cursor stays
     // where it was and the next poll asks again.
-    const search = async (query: Record<string, unknown>): Promise<number[]> => {
+    const refusals = `${account.username}|${folder}`;
+    let refusedNow = false;
+    const ask = async (query: Record<string, unknown>): Promise<number[] | undefined> => {
       const found = await client.search(query, { uid: true });
-      if (!Array.isArray(found)) throw new Error(`the server refused to search ${folder}`);
+      return Array.isArray(found) ? found : undefined;
+    };
+    const search = async (query: Record<string, unknown>): Promise<number[]> => {
+      const found = await ask(query);
+      if (!found) throw new SentSearchRefused(folder);
       return found;
     };
     const fresh = !cursor || cursor.folder !== folder || cursor.uidValidity !== uidValidity;
@@ -243,15 +272,30 @@ export async function fetchSent(
       picked.push(...newer);
       if (newer.length) next.lastUid = newer.at(-1)!;
       const room = limit - newer.length;
+      // The look back as the setting now has it: switched off (0) it ends,
+      // and made shorter it reaches no further than the new setting.
+      const days = options.lookbackDays ?? sentLookbackDays();
+      if (days === 0) next.backfillBelow = 0;
       if (next.backfillBelow > 1 && next.backfillLeft > 0) {
         if (room > 0) {
-          const since = next.backfillSince ? new Date(next.backfillSince) : new Date(nowMs - sentLookbackDays() * 86_400_000);
-          const older = (await search({ since, uid: `1:${next.backfillBelow - 1}` }))
-            .filter((uid) => uid < next.backfillBelow).sort((a, b) => b - a);
-          const take = older.slice(0, Math.min(room, next.backfillLeft));
-          picked.push(...take);
-          next.backfillLeft -= take.length;
-          next.backfillBelow = take.length && older.length > take.length && next.backfillLeft > 0 ? Math.min(...take) : 0;
+          const reach = nowMs - days * 86_400_000;
+          const stored = next.backfillSince ? Date.parse(next.backfillSince) : NaN;
+          const since = new Date(Number.isFinite(stored) ? Math.max(stored, reach) : reach);
+          next.backfillSince = since.toISOString();
+          const found = await ask({ since, uid: `1:${next.backfillBelow - 1}` });
+          if (found) {
+            const older = found.filter((uid) => uid < next.backfillBelow).sort((a, b) => b - a);
+            const take = older.slice(0, Math.min(room, next.backfillLeft));
+            picked.push(...take);
+            next.backfillLeft -= take.length;
+            next.backfillBelow = take.length && older.length > take.length && next.backfillLeft > 0 ? Math.min(...take) : 0;
+          } else {
+            // Refused, the look back waits for a later poll; new mail is read meanwhile.
+            refusedNow = true;
+            if (firstRefusal(refusals)) {
+              log.warn(`[${account.name}/${folder}] the server refused to search the look back; it is tried again on later polls`);
+            }
+          }
         }
       } else {
         next.backfillBelow = 0;
@@ -259,6 +303,8 @@ export async function fetchSent(
       }
     }
     if (next.backfillBelow === 0) next.backfillLeft = 0;
+    // Every search was answered: a refusal after this is said again.
+    if (!refusedNow) searchAnswered(refusals);
     if (!picked.length) return { messages: [], cursor: next, skipped: 0 };
 
     // Collected before anything is parsed: nothing else is asked of the

@@ -1888,6 +1888,27 @@ describe('the owner\'s own mail', () => {
     expect(text).toContain('## The owner\'s own mail: stored, but not searched here');
   });
 
+  it('tells a withheld message from quiet digest mail, and says sentCount counts the window', async () => {
+    const state = seeded();
+    state.recordSent({
+      account: 'me@qq.com', messageId: '<r@qq.com>', threadKey: 'me@qq.com|<q@x>', answers: '<q@x>', subject: 'Re: q',
+      fromAddr: 'me@qq.com', to: [{ name: '', address: 'ann@example.org' }], cc: [], bcc: [], date: new Date().toISOString(),
+      text: 'Done.', attachmentCount: 0, attachmentNames: [], source: 'poll',
+    });
+    state.markSeen('me@qq.com|<q@x>', 'me@qq.com', 'q');
+    state.answerStored('me@qq.com|<q@x>', ['me@qq.com'], true, '<q@x>');
+    state.recordOutcome('me@qq.com|<q@x>', 'warning', false, { messageId: '<q@x>', folder: 'INBOX' });
+    state.setHandled('me@qq.com|<q@x>', false);
+    const client = await connect(state);
+    const queue = await call(client, 'needs_you');
+    expect(queue['mail']).toEqual(expect.arrayContaining([expect.objectContaining({ messageId: '<q@x>', pushed: false, withheld: true })]));
+    const tools = (await client.listTools()).tools;
+    expect(tools.find((t) => t.name === 'needs_you')?.description).toContain('withheld');
+    expect(tools.find((t) => t.name === 'list_threads')?.description).toContain('holds in that same window');
+    const page = String(((await client.readResource({ uri: `mailsift://mail/${encodeURIComponent('<q@x>')}` })).contents[0] as { text: string }).text);
+    expect(page).toContain('not notified: it was due a notification, withheld because the owner had already answered it');
+  });
+
   it('turns a name into addresses with the read credential alone', async () => {
     const state = seeded();
     state.recordSent({

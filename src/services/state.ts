@@ -147,6 +147,12 @@ export interface MailRow {
   deadline: string | null;
   decidedBy: string | null;
   pushed: boolean;
+  /**
+   * Due a notification that was not sent because the owner had dealt with
+   * the message already: answered it from another client, or marked it done
+   * while its notification waited. Counted like pushed by the queue.
+   */
+  withheld: boolean;
   mailDate: string | null;
   createdAt: string;
   /** When the reader marked it dealt with, in the page or through feedback; null while it still needs them. */
@@ -572,7 +578,7 @@ export function notificationRetryDelayMs(attempt: number): number {
 const ROW_COLUMNS = [
   'dedup_key', 'message_id', 'thread_key', 'account', 'account_label', 'subject', 'sender', 'sender_name',
   'folder', 'in_spam', 'importance', 'category', 'summary', 'reason', 'deadline',
-  'decided_by', 'pushed', 'mail_date', 'attachments_json', 'verification_code', 'handled_at', 'snoozed_until', 'created_at',
+  'decided_by', 'pushed', 'withheld', 'mail_date', 'attachments_json', 'verification_code', 'handled_at', 'snoozed_until', 'created_at',
 ] as const;
 
 function parseAttachmentManifest(value: unknown): AttachmentManifest | null {
@@ -626,6 +632,7 @@ function toRow(raw: Record<string, unknown>): MailRow {
     deadline: (raw['deadline'] as string) ?? null,
     decidedBy: (raw['decided_by'] as string) ?? null,
     pushed: Boolean(raw['pushed']),
+    withheld: Boolean(raw['withheld']),
     mailDate: (raw['mail_date'] as string) ?? null,
     createdAt: String(raw['created_at'] ?? ''),
     handledAt: (raw['handled_at'] as string) ?? null,
@@ -1058,6 +1065,23 @@ export class StateStore {
         'UPDATE notification_outbox SET delivered_at = ?, last_error = NULL, next_attempt_at = NULL WHERE notification_key = ?',
       ).run(now(), notificationKey);
     }
+    // Delivered is notified, however late: on a retry, or when a held one's
+    // time came. The row says so, for the queue, the "notified" mark and the
+    // feedback asked about it, as it does for one delivered at once.
+    this.db.prepare('UPDATE seen SET pushed = 1 WHERE dedup_key = ? AND pushed = 0').run(notificationKey);
+  }
+
+  /**
+   * A notification owed for a message the owner dealt with before it could
+   * go, in the page, through MCP or by answering it elsewhere: it is not
+   * sent, its digest line goes with it, and the message is marked withheld,
+   * so that putting it back returns it to the queue as a notified message
+   * would. Who dealt with it makes no difference to that.
+   */
+  withholdNotification(notificationKey: string): void {
+    this.db.prepare('DELETE FROM notification_outbox WHERE notification_key = ? AND delivered_at IS NULL').run(notificationKey);
+    this.db.prepare('DELETE FROM digest_queue WHERE dedup_key = ?').run(notificationKey);
+    this.db.prepare('UPDATE seen SET withheld = 1 WHERE dedup_key = ? AND withheld = 0').run(notificationKey);
   }
 
   /**
@@ -2063,7 +2087,9 @@ export class StateStore {
    * own messages is the owner's message: shown once, as sent, unless it is
    * the one being read.
    */
-  threadWindow(threadKey: string, limit = CONVERSATION_LIMIT, current?: MailRow): { entries: ConversationEntry[]; omitted: number } {
+  threadWindow(
+    threadKey: string, limit = CONVERSATION_LIMIT, current?: MailRow,
+  ): { entries: ConversationEntry[]; omitted: number; between: number } {
     const bound = Math.max(1, Math.min(Math.floor(limit), CONVERSATION_LIMIT));
     const at = (value: string | null, fallback: string): string => value || fallback;
     // The newest of each table, which together hold the newest of the thread.
@@ -2088,15 +2114,31 @@ export class StateStore {
     const others = all.filter((entry) => !isCurrent(entry));
     const kept = new Set<ConversationEntry>([...all.filter(isCurrent), ...others.slice(-(bound - all.filter(isCurrent).length))]);
     const entries = all.filter((entry) => kept.has(entry));
-    return { entries, omitted: Math.max(0, total - entries.length) };
+    const omitted = Math.max(0, total - entries.length);
+    // An older message opened sits apart from the newest: how many of the
+    // left-out messages lie between it and the next one shown, so the reader
+    // can mark the gap (a reply to it may be among them).
+    let between = 0;
+    const at0 = entries.findIndex(isCurrent);
+    const after = at0 === -1 ? undefined : entries[at0 + 1];
+    if (omitted && at0 !== -1 && after) {
+      const from = entries[at0]!.at;
+      const span = (sql: string): number => Number((this.db.prepare(sql).get(threadKey, from, after.at) as Record<string, unknown>)['n'] ?? 0);
+      between = span(`SELECT COUNT(*) AS n FROM seen WHERE thread_key = ? AND NOT ${OWN_COPY}
+          AND COALESCE(mail_date, created_at) > ? AND COALESCE(mail_date, created_at) < ?`)
+        + span(`SELECT COUNT(*) AS n FROM sent_mail WHERE thread_key = ?
+          AND COALESCE(mail_date, created_at) > ? AND COALESCE(mail_date, created_at) < ?`);
+      between = Math.min(between, omitted);
+    }
+    return { entries, omitted, between };
   }
 
   /**
    * One stored message's conversation, as the reader shows it under the
    * message: the message itself and the newest of the rest of its thread.
    */
-  conversation(row: MailRow, limit = CONVERSATION_LIMIT): { entries: ConversationEntry[]; omitted: number } {
-    if (!row.threadKey) return { entries: [{ direction: 'in', at: row.mailDate || row.createdAt, row }], omitted: 0 };
+  conversation(row: MailRow, limit = CONVERSATION_LIMIT): { entries: ConversationEntry[]; omitted: number; between: number } {
+    if (!row.threadKey) return { entries: [{ direction: 'in', at: row.mailDate || row.createdAt, row }], omitted: 0, between: 0 };
     return this.threadWindow(row.threadKey, limit, row);
   }
 
@@ -2129,8 +2171,11 @@ export class StateStore {
     if (!sent.answers || !this.answersSomeone(sent, own)) return undefined;
     const rule = this.queueRule();
     const raw = this.db.prepare(
+      // In the queue, put off, or still owed a notification (one that failed
+      // and waits for a retry): all are waiting on the owner.
       `SELECT dedup_key, message_id, folder, kept_at FROM seen
-       WHERE account = ? AND message_id = ? AND handled_at IS NULL AND (${rule.clause} OR snoozed_until > ?)
+       WHERE account = ? AND message_id = ? AND handled_at IS NULL AND (${rule.clause} OR snoozed_until > ?
+         OR EXISTS (SELECT 1 FROM notification_outbox n WHERE n.notification_key = seen.dedup_key AND n.delivered_at IS NULL))
        ORDER BY created_at LIMIT 1`,
     ).get(sent.account, sent.answers, ...rule.params, now()) as Record<string, unknown> | undefined;
     if (!raw || !this.afterDecision(sent.date, raw['kept_at'])) return undefined;
@@ -2146,9 +2191,10 @@ export class StateStore {
    */
   private handleAnswered(target: { key: string; messageId: string; folder: string | null }, account: string, sentId: number, withheld: boolean): void {
     this.setHandled(target.key, true);
-    const owed = Number(this.db.prepare('DELETE FROM notification_outbox WHERE notification_key = ? AND delivered_at IS NULL')
-      .run(target.key).changes) > 0;
-    if (withheld || owed) this.db.prepare('UPDATE seen SET withheld = 1 WHERE dedup_key = ?').run(target.key);
+    const owed = this.db.prepare('SELECT 1 FROM notification_outbox WHERE notification_key = ? AND delivered_at IS NULL')
+      .get(target.key) !== undefined;
+    if (withheld || owed) this.withholdNotification(target.key);
+    // Nothing more is said about it: not in a digest either.
     this.db.prepare('DELETE FROM digest_queue WHERE dedup_key = ?').run(target.key);
     this.db.prepare('UPDATE sent_mail SET answered_key = ? WHERE id = ?').run(target.key, sentId);
     this.recordMailAction({

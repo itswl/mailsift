@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import './setup.js';
 import type { ImapFlow } from 'imapflow';
 import type { Account } from '../src/config.js';
@@ -289,6 +289,44 @@ describe('reading a Sent folder', () => {
     await expect(fetchSent(client, ACCOUNT, 'Sent', undefined, { now: NOW })).rejects.toThrow(/refused to search/);
     const later: SentCursorRow = { folder: 'Sent', uidValidity: '7', lastUid: 2, backfillBelow: 2, backfillLeft: 10, backfillSince: null };
     await expect(fetchSent(client, ACCOUNT, 'Sent', later, { now: NOW })).rejects.toThrow(/refused to search/);
+  });
+
+  it('keeps reading new mail while the server refuses to search the look back, and says so once', async () => {
+    const mail = hourly(6);
+    const { client } = sentFolder(mail);
+    const search = (client as unknown as { search: (q: Record<string, unknown>) => Promise<number[] | false> }).search.bind(client);
+    (client as unknown as { search: unknown }).search = async (q: Record<string, unknown>) => (q['since'] ? false : search(q));
+    const cursor: SentCursorRow = {
+      folder: 'Sent', uidValidity: '7', lastUid: 5, backfillBelow: 4, backfillLeft: 10, backfillSince: new Date(NOW - 30 * DAY).toISOString(),
+    };
+    const written: string[] = [];
+    process.env.LOG_LEVEL = 'warn';
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string) => { written.push(String(chunk)); return true; }) as never);
+    try {
+      const first = await fetchSent(client, ACCOUNT, 'Sent', cursor, { now: NOW });
+      expect(uids(first)).toEqual([6]);
+      // The look back waits where it was, for a later poll.
+      expect(first.cursor).toMatchObject({ lastUid: 6, backfillBelow: 4, backfillLeft: 10 });
+      await fetchSent(client, ACCOUNT, 'Sent', first.cursor, { now: NOW });
+      expect(written.filter((line) => line.includes('refused to search the look back'))).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('stops a look back under way when it is switched off, and shortens it when it is made shorter', async () => {
+    const { client } = sentFolder(hourly(5).map((m, i) => ({ ...m, date: new Date(NOW - (5 - i) * 3 * DAY) })));
+    const cursor: SentCursorRow = {
+      folder: 'Sent', uidValidity: '7', lastUid: 5, backfillBelow: 4, backfillLeft: 10, backfillSince: new Date(NOW - 30 * DAY).toISOString(),
+    };
+    process.env.SENT_LOOKBACK_DAYS = '0';
+    const off = await fetchSent(client, ACCOUNT, 'Sent', cursor, { now: NOW });
+    expect(off.messages).toEqual([]);
+    expect(off.cursor).toMatchObject({ backfillBelow: 0, backfillLeft: 0 });
+    // Ten days: of what is left of the look back (UIDs 1 to 3, sent 15, 12 and 9 days ago), only what was sent in them.
+    process.env.SENT_LOOKBACK_DAYS = '10';
+    const shorter = await fetchSent(client, ACCOUNT, 'Sent', cursor, { now: NOW });
+    expect(uids(shorter)).toEqual([3]);
   });
 
   it('skips a message it cannot read, and moves on past it', async () => {

@@ -96,6 +96,13 @@ describe('the owner\'s sent mail', () => {
     expect(prose(read('docs/web-view.md'))).toContain('used for the conversation only: it is never judged, never sent to the model');
     expect(prose(read('docs/mcp.md'))).toContain('used for the conversation only, and never judged or sent to the model');
     expect(prose(read('.agents/skills/mailsift/SKILL.md'))).toContain('it is never judged or sent to the model');
+    // sentCount counts the window, wherever it is described.
+    expect(prose(read('docs/mcp.md'))).toContain('how many of your own messages it holds in the window (`sentCount`)');
+    expect(prose(read('.agents/skills/mailsift/SKILL.md'))).toContain('holds within the window it lists (`sentCount`)');
+    // Withheld is told apart from quiet digest mail.
+    expect(prose(read('docs/mcp.md'))).toContain('it is not quiet digest mail');
+    expect(prose(read('.agents/skills/mailsift/SKILL.md'))).toContain('`withheld: true` means it was judged worth a notification');
+    expect(prose(read('docs/web-view.md'))).toContain('one that would have been notified is not listed in the digest either');
     // The audit still records only that a letter left; the letter is kept for its conversation.
     expect(prose(read('docs/web-view.md'))).not.toContain('What is recorded about a sent message is that one left');
   });

@@ -1399,7 +1399,7 @@ describe('suggesting addresses while one is typed', () => {
       showSuggest: (_f: unknown, items: Array<{ address: string }>, token: unknown) => shown.push({ items, token }),
       closeSuggest: () => { closed += 1; return true; },
     };
-    const narrow = lifted<(f: unknown) => void>(['tokenAround', 'fitsQuery', 'narrowSuggest'], 'narrowSuggest', context);
+    const narrow = lifted<(f: unknown) => void>(['tokenAround', 'fitsQuery', 'highlightIn', 'narrowSuggest'], 'narrowSuggest', context);
     field.value = 'ana';
     field.selectionStart = 3;
     narrow(field);
@@ -1408,6 +1408,43 @@ describe('suggesting addresses while one is typed', () => {
     field.value = 'anx';
     narrow(field);
     expect(closed).toBe(1);
+  });
+
+  it('keeps the person picked when the server\'s answer for the same text redraws the list', async () => {
+    const field = { value: 'bo', selectionStart: 2 };
+    const boris = { address: 'boris@old.example' }, bob = { address: 'bob@b.example' }, bonnie = { address: 'bonnie@lee.example' };
+    let later: (() => Promise<void>) | undefined;
+    const drawn: Array<{ items: unknown[]; active: number }> = [];
+    const context: Record<string, unknown> = {
+      // Down, Down: Bonnie is picked in the list drawn for "bo" before the server answered.
+      suggest: { field, items: [boris, bob, bonnie], active: 2, seq: 0, timer: null, token: { start: 0, text: 'bo' } },
+      suggestList: { hidden: false },
+      document: { activeElement: field },
+      fetch: async () => ({ ok: true, json: async () => ({ contacts: [boris, bonnie, bob, { address: 'bonita@x.example' }] }) }),
+      setTimeout: (run: () => Promise<void>) => { later = run; return 1; }, clearTimeout: () => undefined,
+      closeSuggest: () => true, takenAddresses: () => new Set(),
+      showSuggest: (_f: unknown, items: unknown[], _token: unknown, active: number) => drawn.push({ items, active }),
+      encodeURIComponent,
+    };
+    const lookUp = lifted<(f: unknown, now: boolean) => void>(['tokenAround', 'highlightIn', 'lookUpAddresses'], 'lookUpAddresses', context);
+    lookUp(field, false);
+    await later!();
+    expect(drawn).toHaveLength(1);
+    expect((drawn[0]!.items as Array<{ address: string }>)[drawn[0]!.active]!.address).toBe('bonnie@lee.example');
+    // With no list on show, the first is the one highlighted.
+    (context['suggestList'] as { hidden: boolean }).hidden = true;
+    lookUp(field, false);
+    await later!();
+    expect(drawn[1]!.active).toBe(0);
+  });
+
+  it('narrows names in any Unicode form as the server matches them', () => {
+    const fits = lifted<(c: unknown, q: string) => boolean>(['fitsQuery'], 'fitsQuery');
+    expect(fits({ address: 'tanaka@corp.jp', name: 'Ｍｉｋａ Ｔａｎａｋａ' }, 'mik')).toBe(true);
+    expect(fits({ address: 'tanaka@corp.jp', name: 'Ｍｉｋａ Ｔａｎａｋａ' }, 'tan')).toBe(true);
+    expect(fits({ address: 't@corp.jp', name: 'ﾀﾅｶ' }, 'タナ')).toBe(true);
+    expect(fits({ address: 'em@x.fr', name: 'E\u0301lise' }, 'élise')).toBe(true);
+    expect(fits({ address: 'tanaka@corp.jp', name: 'Ｍｉｋａ Ｔａｎａｋａ' }, 'mix')).toBe(false);
   });
 
   it('keeps the letter open on the Escape that shut the list, and only on that one', () => {
@@ -1502,6 +1539,36 @@ describe('the conversation in the reader', () => {
     expect(text(entry.section)).toContain('1 more message in this conversation is not shown');
     expect(text(entry.section)).toContain('Conversation · 3');
     expect(STRINGS['zh-CN']['conv.omitted1']).toBeTruthy();
+
+    // An older message opened: the gap after it is marked where it is, and the top line counts only the rest.
+    const older = { section: node('section'), row: { dedupKey: 'k1', subject: 'Lunch?' } };
+    draw(older, { omitted: 5, between: 3, messages: [
+      { direction: 'in', current: true, dedupKey: 'k1', at: '2026-11-10T09:00:00Z' },
+      { direction: 'in', dedupKey: 'k9', at: '2026-11-17T11:00:00Z', senderName: 'Ann', summary: 'Any news?' },
+    ] });
+    const items = ((older.section['children'] as Array<Record<string, unknown>>)[2]!['children'] as Array<Record<string, unknown>>);
+    expect(items.map((li) => li['className'])).toEqual(['tl-current', 'tl-gap', '']);
+    expect(text(items[1]!)).toBe('3 messages after this one are not shown');
+    expect(text(older.section)).toContain('2 more messages in this conversation are not shown');
+  });
+
+  it('asks about a withheld message\'s judgement as about a notified one\'s, and says why it was not notified', () => {
+    const t = (key: string): string => STRINGS.en[key as StringKey] ?? key;
+    const made: Array<{ text: string }> = [];
+    const el = (_tag: string, _cls?: string, text?: string) => {
+      const node = { text: text ?? '', children: [] as unknown[], appendChild(child: unknown) { this.children.push(child); return child; }, replaceChildren() {} };
+      made.push(node);
+      return node;
+    };
+    const line = lifted<(row: unknown) => void>(['feedbackLine'], 'feedbackLine', { el, t, fill: t, post: async () => ({ ok: true, data: {} }) });
+    line({ pushed: false, withheld: true, sender: 'ann@example.org' });
+    expect(made.map((n) => n.text)).toContain('Should not have notified');
+    expect(made.map((n) => n.text)).not.toContain('Should have notified');
+    expect(clientScript()).toContain("else if (row.withheld) judged += DOT + t('detail.withheld');");
+    expect(clientScript()).toContain("else if (m.withheld) add(t('row.withheld'));");
+    for (const key of ['detail.withheld', 'row.withheld', 'conv.between', 'conv.between1'] as const) {
+      expect(STRINGS['zh-CN'][key], key).toBeTruthy();
+    }
   });
 
   it('puts the keyboard back where it was when the timeline is drawn again', () => {

@@ -38,9 +38,9 @@ For local stdio clients, point the command at `dist/src/mcp.js` (or `npm run mcp
 
 | Tool | What it does |
 | --- | --- |
-| `needs_you` | The queue the web view opens on: mail judged to matter that nobody has dealt with yet. Optionally also what was dealt with in the last seven days, and what is put off until later. Start here for "what needs me". |
+| `needs_you` | The queue the web view opens on: mail judged to matter that nobody has dealt with yet. A row with `withheld: true` was due a notification that was not sent because you had already answered it from another client or marked it done; it is not quiet digest mail. Optionally also what was dealt with in the last seven days, and what is put off until later. Start here for "what needs me". |
 | `list_mail` | Recently processed mail (24 hours by default), filtered by level, exact category, mailbox, spam only or pushed only. |
-| `list_threads` | Recent conversations, grouped by their References/In-Reply-To root, each with how many of your own messages it holds (`sentCount`) and whether the latest word is yours (`lastWordYours`). |
+| `list_threads` | Recent conversations, grouped by their References/In-Reply-To root, each with how many of your own messages it holds in the window (`sentCount`) and whether the latest word is yours (`lastWordYours`). |
 | `search_mail` | Keyword search over subject, sender, category, summary, reason, the stored body preview and attachment metadata. |
 | `get_mail` | The stored triage record for one Message-ID, with a bounded body preview. |
 | `mail_summary` | Processed and pushed totals for a time window, spam and spam rescues included. |
