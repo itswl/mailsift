@@ -146,8 +146,13 @@ function decodeCursor(raw: string | undefined): MailCursor | undefined {
  * tried, what the endpoint said) while keeping the bounded-preview rule that
  * the rest of this surface follows.
  */
-function outboxSummary(row: NotificationOutboxRow): Record<string, unknown> {
+function outboxSummary(row: NotificationOutboxRow, store: StateStore): Record<string, unknown> {
+  // Held for a message the owner put off: waiting for the time chosen, not failing.
+  const mail = store.getMail(row.notificationKey);
+  const held = mail && !mail.handledAt && mail.snoozedUntil && Date.parse(mail.snoozedUntil) > Date.now()
+    ? mail.snoozedUntil : undefined;
   return {
+    ...(held ? { heldUntil: held } : {}),
     notificationKey: row.notificationKey,
     createdAt: row.createdAt,
     attempts: row.attempts,
@@ -1606,7 +1611,8 @@ export function createServer(
       description:
         'Show account health timelines, folder UID progress, the dead-letter backlog, and the ' +
         'notifications still queued for retry, including each next attempt time. A queued entry means delivery genuinely ' +
-        'failed: an output declining a message under its own threshold settles it instead of queueing it.',
+        'failed (an output declining a message under its own threshold settles it instead of queueing it), unless it ' +
+        'has heldUntil: then the owner put the message off, and its notification waits for that time on purpose.',
       inputSchema: {
         deadLetterLimit: z.number().int().positive().max(200).default(50),
         outboxLimit: z.number().int().positive().max(200).default(50),
@@ -1628,7 +1634,7 @@ export function createServer(
         cursors: store.listCursors(),
         deadLetters,
         deadLetterCount: deadLetters.length,
-        notificationOutbox: outbox.map(outboxSummary),
+        notificationOutbox: outbox.map((row) => outboxSummary(row, store)),
         notificationOutboxPending: store.notificationOutboxPending(),
       });
     },

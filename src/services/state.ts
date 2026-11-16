@@ -280,6 +280,12 @@ export const REJUDGED_KEY = 'web_push_rejudged';
  * message back by hand reads it too (see wakeNow).
  */
 export const SNOOZE_CHECKED_KEY = 'snooze_checked_at';
+/**
+ * An outbox entry (n) whose message (s) is put off and still to come: held for
+ * that time rather than failing. One parameter, the clock. COALESCE, because a
+ * comparison with a row that is not there is NULL, and NOT NULL excludes too.
+ */
+const HELD_FOR_SNOOZE = 'COALESCE(s.snoozed_until > ? AND s.handled_at IS NULL, 0)';
 /** A mark no older than this says a dispatcher is keeping the time: it looks once a minute. */
 const FRESH_WAKE_MARK_MS = 3 * 60_000;
 /** Nobody may be reading the list (notifications off); it must not grow without end. */
@@ -816,17 +822,34 @@ export class StateStore {
     ).run(until, notificationKey);
   }
 
+  /**
+   * Notifications not yet delivered, leaving out those held for a message the
+   * owner put off: they wait for the time chosen, and are not a delivery
+   * problem (see notificationOutboxHeld).
+   */
   notificationOutboxPending(): number {
     const row = this.db.prepare(
-      'SELECT COUNT(*) AS n FROM notification_outbox WHERE delivered_at IS NULL',
-    ).get() as Record<string, unknown>;
+      `SELECT COUNT(*) AS n FROM notification_outbox n LEFT JOIN seen s ON s.dedup_key = n.notification_key
+       WHERE n.delivered_at IS NULL AND NOT ${HELD_FOR_SNOOZE}`,
+    ).get(now()) as Record<string, unknown>;
+    return Number(row['n'] ?? 0);
+  }
+
+  /** Notifications held until the time the owner put their message off until. */
+  notificationOutboxHeld(): number {
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS n FROM notification_outbox n LEFT JOIN seen s ON s.dedup_key = n.notification_key
+       WHERE n.delivered_at IS NULL AND ${HELD_FOR_SNOOZE}`,
+    ).get(now()) as Record<string, unknown>;
     return Number(row['n'] ?? 0);
   }
 
   notificationOutboxDelayed(): number {
+    const at = now();
     const row = this.db.prepare(
-      'SELECT COUNT(*) AS n FROM notification_outbox WHERE delivered_at IS NULL AND next_attempt_at > ?',
-    ).get(now()) as Record<string, unknown>;
+      `SELECT COUNT(*) AS n FROM notification_outbox n LEFT JOIN seen s ON s.dedup_key = n.notification_key
+       WHERE n.delivered_at IS NULL AND n.next_attempt_at > ? AND NOT ${HELD_FOR_SNOOZE}`,
+    ).get(at, at) as Record<string, unknown>;
     return Number(row['n'] ?? 0);
   }
 
@@ -888,6 +911,7 @@ export class StateStore {
       deadLetterTotal: this.listDeadLetters(200).length,
       notificationOutboxPending: this.notificationOutboxPending(),
       notificationOutboxDelayed: this.notificationOutboxDelayed(),
+      notificationOutboxHeld: this.notificationOutboxHeld(),
       feedback: this.feedbackSummary(),
       mailActionTotal: Number((this.db.prepare('SELECT COUNT(*) AS n FROM mail_actions').get() as Record<string, unknown>)['n'] ?? 0),
       mailActionFailures: Number((this.db.prepare('SELECT COUNT(*) AS n FROM mail_actions WHERE success = 0').get() as Record<string, unknown>)['n'] ?? 0),
@@ -1222,7 +1246,18 @@ export class StateStore {
       ).run(until, key, until)
       : this.db.prepare('UPDATE seen SET snoozed_until = NULL WHERE dedup_key = ? AND snoozed_until IS NOT NULL').run(key);
     // Open pages move the row out of the queue, or back into it.
-    if (Number(result.changes) > 0) this.bumpMailRevision();
+    if (Number(result.changes) > 0) {
+      this.bumpMailRevision();
+      // A notification held for the old time comes no later than the new one,
+      // or at once when the reminder is taken away: Feishu and the webhook have
+      // no reminder of their own, so it is theirs. A later time defers it again
+      // when the old one comes, since the outbox reads the row before sending.
+      const due = until ?? now();
+      this.db.prepare(
+        `UPDATE notification_outbox SET next_attempt_at = ?
+         WHERE notification_key = ? AND delivered_at IS NULL AND next_attempt_at > ?`,
+      ).run(due, key, due);
+    }
     return this.getMail(key);
   }
 
@@ -1256,7 +1291,13 @@ export class StateStore {
     const mark = raw && Number.isFinite(Date.parse(raw)) ? new Date(Date.parse(raw)).toISOString() : undefined;
     const recent = new Date(Date.parse(at) - FRESH_WAKE_MARK_MS).toISOString();
     const usable = mark !== undefined && mark <= at && mark >= recent;
-    return this.setSnoozed(idOrKey, usable ? mark : at);
+    const row = this.setSnoozed(idOrKey, usable ? mark : at);
+    // Nobody is told of it, on any output: a notification held until its
+    // time is dropped, since the owner is the one who asked for it back.
+    if (row) {
+      this.db.prepare('DELETE FROM notification_outbox WHERE notification_key = ? AND delivered_at IS NULL').run(row.dedupKey);
+    }
+    return row;
   }
 
   /**

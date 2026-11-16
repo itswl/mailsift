@@ -304,11 +304,10 @@ export class Watcher {
     for (const entry of this.state.pendingNotifications(50, true)) {
       // The owner saw this message in the page while its notification waited
       // for a retry. Put off: it waits for the time they chose, when the
-      // reminder comes too. Dealt with: telling them now would be noise; the
-      // digest keeps it, as for a notification every output declines.
+      // reminder comes too. Dealt with: telling them now would be noise, and
+      // so would listing it again in a digest that may already have gone out.
       const row = this.state.getMail(entry.notificationKey);
       if (row?.handledAt) {
-        this.state.upsertDigest(entry.notificationKey, digest.toDigestItem(entry.message, entry.result));
         this.state.dropNotification(entry.notificationKey);
         continue;
       }
@@ -422,8 +421,9 @@ export class Watcher {
       const forwardedCopy = Boolean(isSelfForward(message, rules));
       // Seen in the page meanwhile: a message put off is not announced before
       // its time, by any output, and one already dealt with not at all. Its
-      // new verdict is kept, and the digest carries it as usual.
-      const row = rows[index]!;
+      // new verdict is kept. Read again now, not as it was before the model
+      // was asked: the owner may have acted on it while the backlog was judged.
+      const row = this.state.getMail(key) ?? rows[index]!;
       const putOffUntil = !row.handledAt && row.snoozedUntil && Date.parse(row.snoozedUntil) > Date.now()
         ? row.snoozedUntil : undefined;
       const wouldPush = !forwardedCopy && effectiveRank(message, result) >= pushLimit;
@@ -471,10 +471,15 @@ export class Watcher {
       }
 
       // Waits in the outbox for the time the owner chose, and goes out then
-      // on the outputs that have no reminder of their own.
+      // on the outputs that have no reminder of their own. That is its only
+      // way out: listed in a digest meanwhile, it would be announced early and
+      // then again. The flush files it in the digest if every output declines.
       if (wouldPush && putOffUntil) {
         this.state.enqueueNotification(key, { ...safeMessage, body: snippet(safeMessage) }, result);
         this.state.deferNotification(key, putOffUntil);
+        this.state.recordOutcome(key, result.importance, false, fields);
+        this.state.clearDigest([key]);
+        continue;
       }
       this.state.recordOutcome(key, result.importance, false, fields);
       if (message.inSpam || rank(result) >= digestThreshold) {
