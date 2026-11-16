@@ -419,9 +419,10 @@ interface DownloadedPrefix {
  * What may be asked for a message: by the page, and by an MCP caller holding
  * the write credential, which is given what the page has. Marking, starring,
  * and moving: to a folder by name, or to the mailbox's own archive, inbox or
- * bin.
+ * bin; into its spam folder, and out of it to the inbox (not_spam, which
+ * applies only to a message in the spam folder).
  */
-export const MAIL_ACTIONS = ['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox', 'trash'] as const;
+export const MAIL_ACTIONS = ['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox', 'trash', 'spam', 'not_spam'] as const;
 export type MailAction = (typeof MAIL_ACTIONS)[number];
 
 export interface MailActionResult {
@@ -440,7 +441,7 @@ export interface MailActionResult {
 }
 
 export class MailActionError extends Error {
-  constructor(readonly code: 'invalid_action' | 'invalid_destination' | 'not_found' | 'failed', message: string) {
+  constructor(readonly code: 'invalid_action' | 'invalid_destination' | 'not_found' | 'not_applicable' | 'failed', message: string) {
     super(message);
     this.name = 'MailActionError';
   }
@@ -1282,6 +1283,8 @@ async function actOnMessage(
         const raw = await client.fetchOne(uid, { uid: true, envelope: true }, { uid: true });
         if (!sameMessage(raw, messageId)) continue;
         const change = action in FLAG_CHANGES ? FLAG_CHANGES[action as keyof typeof FLAG_CHANGES] : undefined;
+        // "Not spam" is about a message in the spam folder; anywhere else it is not what was meant.
+        if (action === 'not_spam' && !folder.isSpam) throw new MailActionError('not_applicable', 'the message is not in a spam folder');
         if (change) {
           committing();
           const accepted = change.add
@@ -1318,8 +1321,8 @@ export type WebMailAction = (typeof WEB_MAIL_ACTIONS)[number];
 
 export type WebMailActionResult = MailActionResult;
 
-type MovingAction = 'move' | 'archive' | 'trash' | 'inbox';
-const MOVING_ACTIONS = new Set<WebMailAction>(['move', 'archive', 'trash', 'inbox']);
+type MovingAction = 'move' | 'archive' | 'trash' | 'inbox' | 'spam' | 'not_spam';
+const MOVING_ACTIONS = new Set<WebMailAction>(['move', 'archive', 'trash', 'inbox', 'spam', 'not_spam']);
 
 /** Names for servers that list an archive folder without its special-use flag. */
 const ARCHIVE_NAMES = new Set(['archive', 'archives', '归档', '已归档', '存档', '封存']);
@@ -1399,10 +1402,15 @@ export function resolveActionDestination(
     if (!found || !entrySelectable(found)) {
       throw new MailActionError('invalid_destination', `destination folder not found or not selectable: ${target}`);
     }
-  } else if (action === 'inbox') {
+  } else if (action === 'inbox' || action === 'not_spam') {
     found = entries.find((entry) => entrySelectable(entry) && (entryHasUse(entry, '\\inbox') || entry.path.toUpperCase() === 'INBOX'));
     // Every IMAP server has INBOX, listed or not.
     if (!found) return { path: 'INBOX', isSpam: false };
+  } else if (action === 'spam') {
+    // The server's own spam folder, by its flag and then the names it goes by; never one made up for it.
+    found = entries.find((entry) => entrySelectable(entry) && entryHasUse(entry, '\\junk'))
+      ?? entries.find((entry) => entrySelectable(entry) && toFolder(entry).isSpam);
+    if (!found) throw new MailActionError('invalid_destination', 'this mailbox has no spam folder');
   } else if (action === 'archive') {
     const gmail = provider.toLowerCase().startsWith('gmail');
     found = entries.find((entry) => entrySelectable(entry) && entryHasUse(entry, '\\archive'))
@@ -1496,6 +1504,89 @@ export function folderRole(entry: ListResponse, provider = ''): FolderRole | nul
   if (entryHasUse(entry, '\\flagged')) return 'starred';
   if (entryHasUse(entry, '\\important')) return 'important';
   return null;
+}
+
+/** One message of a batch: what it is called and where to find it, as for one action alone. */
+export interface BulkTarget {
+  messageId: string;
+  folderHint?: string;
+  hint?: MessageHint;
+}
+
+/** What became of one message of a batch: done, not found where it was looked for, or refused. */
+export type BulkOutcome = { done: WebMailActionResult } | { missing: true } | { error: unknown };
+
+/**
+ * Apply one action to many messages of one mailbox, over one connection.
+ *
+ * Each message is found and checked exactly as one acted on alone (a live
+ * handle where it says and nowhere else, a stored message by its Message-ID
+ * starting where it was last seen), and each has an outcome of its own: one
+ * that is refused does not stop the others. `each` is told of every outcome
+ * as it is known, so what happened is recorded even if whoever asked has
+ * stopped waiting. Messages not reached before the connection was lost are
+ * reported with that error. Never throws.
+ */
+export async function applyMailActions(
+  account: Account,
+  targets: readonly BulkTarget[],
+  action: WebMailAction,
+  options: { destination?: string } = {},
+  each?: (index: number, outcome: BulkOutcome) => void,
+): Promise<BulkOutcome[]> {
+  const outcomes: Array<BulkOutcome | undefined> = targets.map(() => undefined);
+  const settle = (index: number, outcome: BulkOutcome): void => {
+    outcomes[index] = outcome;
+    try { each?.(index, outcome); } catch (error) { log.warn(`Recording one action of a batch failed: ${String(error).slice(0, 160)}`); }
+  };
+  if (!WEB_MAIL_ACTIONS.includes(action) || (action === 'move' && !options.destination?.trim())) {
+    const refused = new MailActionError(action === 'move' ? 'invalid_destination' : 'invalid_action', `unsupported mail action: ${String(action)}`);
+    targets.forEach((_, index) => settle(index, { error: refused }));
+    return outcomes as BulkOutcome[];
+  }
+  // Until a change has been sent, the batch may be begun again on a new connection; after, never.
+  let committed = false;
+  try {
+    await withSession(account, async (client) => {
+      const entries = await listFolders(client);
+      let destination: { path: string; isSpam: boolean } | undefined;
+      try {
+        destination = MOVING_ACTIONS.has(action)
+          ? resolveActionDestination(entries, action as MovingAction, account.provider, options.destination) : undefined;
+      } catch (error) {
+        targets.forEach((_, index) => settle(index, { error }));
+        return;
+      }
+      const configured = resolveFolders(entries, account.folders);
+      for (const [index, target] of targets.entries()) {
+        if (outcomes[index]) continue;
+        const hint: MessageHint = { ...(target.folderHint ? { folder: target.folderHint } : {}), ...(target.hint ?? {}) };
+        try {
+          const folders = hint.exact ? [exactFolder(entries, hint.folder)] : orderLookupFolders(entries, configured, hint.folder);
+          const acted = await actOnMessage(client, target.messageId, folders, action, destination?.path, hint, () => { committed = true; });
+          settle(index, acted === undefined ? { missing: true } : {
+            done: {
+              action, account: account.username, messageId: target.messageId, sourceFolder: acted.sourceFolder,
+              ...(destination ? {
+                destinationFolder: destination.path, destinationIsSpam: destination.isSpam,
+                ...(inBin(entries, destination.path) ? { destinationIsTrash: true } : {}),
+              } : {}),
+              ...(acted.destinationUid && acted.destinationUidValidity
+                ? { destinationUid: acted.destinationUid, destinationUidValidity: acted.destinationUidValidity } : {}),
+            },
+          });
+        } catch (error) {
+          // A connection that is gone takes the rest of the batch with it: begun again on a new one
+          // when nothing was changed yet, and otherwise reported as not known to have happened.
+          if (!client.usable) throw error;
+          settle(index, { error });
+        }
+      }
+    }, { repeatable: () => !committed, timeoutMs: 30_000 + targets.length * 2_000 });
+  } catch (error) {
+    targets.forEach((_, index) => { if (!outcomes[index]) settle(index, { error }); });
+  }
+  return outcomes.map((outcome) => outcome ?? { error: new Error('not reached') });
 }
 
 /** The folder sent mail is kept in, from the folder list alone. */

@@ -843,6 +843,7 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
           <button id="health" type="button" class="health-line" aria-haspopup="dialog" aria-controls="health-sheet" aria-expanded="false" hidden></button>
         </section>
         <form id="filters" class="controls" autocomplete="off">
+          <div id="pick-bar" class="pick-bar" hidden>${iconButton('pick-clear', 'x', 'pick.clear')}<span id="pick-count" class="pick-count" role="status"></span><button id="pick-all" type="button" class="text-btn quiet" data-i18n="pick.all">${s('pick.all')}</button><span class="bar-space"></span><div id="pick-actions" class="pick-actions"></div></div>
           <div id="control-line" class="control-line">
             <fieldset class="window" role="radiogroup" aria-label="${s('filter.window')}" data-i18n-label="filter.window">
               ${seg('hours', '24', 'window.24h', true)}${seg('hours', '72', 'window.3d')}${seg('hours', '168', 'window.7d')}${seg('hours', '720', 'window.30d')}
@@ -901,6 +902,10 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
     </dialog>
     <dialog id="folder-sheet" class="sheet bare" aria-labelledby="folder-title" tabindex="-1">
       ${sheetHead('folder-title', 'folders.title', 'folder-done')}
+      <div class="sheet-body"></div>
+    </dialog>
+    <dialog id="bulk-sheet" class="sheet bare" aria-labelledby="bulk-title" tabindex="-1">
+      ${sheetHead('bulk-title', 'bulk.title', 'bulk-done')}
       <div class="sheet-body"></div>
     </dialog>
     <dialog id="keys-sheet" class="sheet" aria-labelledby="keys-title" tabindex="-1">

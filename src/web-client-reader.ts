@@ -850,10 +850,11 @@ function requireWrite() {
 const ACTION_SAID = {
   archive: 'act.archived', trash: 'act.trashed', inbox: 'act.movedInbox', star: 'act.starred',
   unstar: 'act.unstarred', mark_unread: 'act.markedUnread', mark_read: 'act.markedRead',
+  spam: 'act.spammed', not_spam: 'act.unspammed',
 };
 // One of each at a time: a held key or a second tap is the same request.
 const acting = new Set();
-async function mailAction(key, action) {
+async function mailAction(key, action, destination) {
   if (!requireWrite()) return;
   if (menuSheet.open) closeSheet(menuSheet, false);
   const name = action + ' ' + key;
@@ -862,7 +863,7 @@ async function mailAction(key, action) {
   const row = rowByKey(key);
   // Where it was listed, before anything the answer says moves it.
   const listedIn = row ? row.folder : null;
-  const r = await post('/api/action', { key: row ? mailRef(row) : key, action });
+  const r = await post('/api/action', Object.assign({ key: row ? mailRef(row) : key, action }, destination ? { destination } : {}));
   acting.delete(name);
   if (!r.ok) {
     toast(r.data && (r.data.code || r.data.error) ? failure(r.data) : t('act.failed'), true);
@@ -883,13 +884,13 @@ async function mailAction(key, action) {
     if (r.data.moved && r.data.moved.folder !== listedIn) dropLive(key);
   }
   if (typeof r.data.attention === 'number') attentionCount = r.data.attention;
-  toast(t(ACTION_SAID[action]));
+  toast(action === 'move' ? fill('act.moved', { folder: folderName(row ? row.account : '', destination) }) : t(ACTION_SAID[action]));
   renderList();
   renderLede();
   renderBars();
   updateBadge();
   // Filed away: the reader goes back to the list on a phone.
-  if ((action === 'archive' || action === 'trash') && sheet.open && isOpenRow(key)) closeSheet(sheet, false);
+  if ((action === 'archive' || action === 'trash' || action === 'spam') && sheet.open && isOpenRow(key)) closeSheet(sheet, false);
   else if (shown && r.data.moved && sheet.open && isOpenRow(key)) closeSheet(sheet, false);
   else if (action === 'inbox') renderPane(true);
 }
@@ -939,7 +940,15 @@ function openMenu(key, anchor) {
   }
   item('i-star', t(flags.flagged ? 'act.unstar' : 'act.star'), () => mailAction(key, flags.flagged ? 'unstar' : 'star'));
   item('i-read', t(flags.seen === false ? 'act.markRead' : 'act.markUnread'), () => mailAction(key, flags.seen === false ? 'mark_read' : 'mark_unread'));
-  if (row.inSpam) item('i-inbox', t('act.notSpam'), () => mailAction(key, 'inbox'));
+  // Any folder of its mailbox, from the panel of folders, under the control that opened this menu.
+  item('i-folder', t('act.moveTo'), () => {
+    closeSheet(menuSheet, false);
+    afterBack(() => openMovePicker(row.account, row.folder, anchor && anchor.isConnected ? anchor
+      : document.querySelector((isWide() ? '#pane-bar' : '#sheet-bar') + ' [data-act="more"]'), (path) => mailAction(key, 'move', path)));
+  });
+  // Spam is a judgement as well as a folder: the triage learns from it either way.
+  if (row.inSpam) item('i-inbox', t('act.notSpam'), () => mailAction(key, 'not_spam'));
+  else if (!liveIn(row, 'sent') && !liveIn(row, 'drafts')) item('i-alert', t('act.spam'), () => mailAction(key, 'spam'));
   if (!liveIn(row, 'trash')) item('i-trash', t('act.trash'), () => mailAction(key, 'trash'));
   openSheet(menuSheet, {});
 }

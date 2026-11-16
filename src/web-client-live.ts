@@ -576,7 +576,7 @@ const fineKeys = matchMedia('(pointer: fine)').matches;
 const macKeys = /Mac|iPhone|iPad/.test(navigator.platform || '');
 const KEY_LIST = [
   ['j k', 'keys.move'], ['⏎', 'keys.open'], ['e', 'keys.done'], ['r a', 'keys.reply'], ['f', 'keys.forward'], ['y', 'keys.archive'],
-  ['s', 'keys.star'], ['#', 'keys.trash'], ['b', 'keys.snooze'], ['g', 'keys.folders'], ['n', 'keys.compose'], ['c', 'keys.code'], ['/', 'keys.search'],
+  ['s', 'keys.star'], ['#', 'keys.trash'], ['b', 'keys.snooze'], ['x', 'keys.pick'], ['g', 'keys.folders'], ['n', 'keys.compose'], ['c', 'keys.code'], ['/', 'keys.search'],
   [macKeys ? '⌘K' : 'Ctrl K', 'keys.palette'], ['.', 'keys.check'], ['esc', 'keys.close'], ['?', 'keys.help'],
 ];
 function openKeys() {
@@ -641,6 +641,12 @@ document.addEventListener('keydown', (e) => {
   } else if (e.key === 'g') {
     e.preventDefault();
     openFolders(liveView ? $('#live-where') : $('#folders-open'));
+  } else if (e.key === 'Escape' && picked.size) {
+    // What is picked is put down before anything else is closed.
+    clearPicks(false);
+  } else if (e.key === 'x' && current) {
+    e.preventDefault();
+    togglePick(current, false);
   } else if (e.key === 'Escape' && current) {
     clearSelection();
   } else if (e.key === 'Escape' && liveView) {

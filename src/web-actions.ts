@@ -32,10 +32,10 @@ import { loadConfig, type Account } from './config.js';
 import { MailboxUnreachableError } from './imap/connection.js';
 import { outgoingRecord, sentMailEnabled } from './imap/sent.js';
 import {
-  appendToSent, applyWebMailAction, AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
+  appendToSent, applyMailActions, applyWebMailAction, AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
   fetchAttachmentManifestByMessageId, fetchReadableByMessageId, LiveMailError, MAIL_ACTIONS, MailActionError,
-  type AttachmentManifestLookup, type DownloadedAttachment, type LiveMessage, type LookupHint, type MessageHint,
-  type WebMailAction, type WebMailActionResult,
+  type AttachmentManifestLookup, type BulkOutcome, type BulkTarget, type DownloadedAttachment, type LiveMessage, type LookupHint,
+  type MessageHint, type WebMailAction, type WebMailActionResult,
 } from './imap/client.js';
 import {
   browseFolder, handleShaped, liveHandle, mailboxFolders, parseLiveHandle, searchMailbox,
@@ -85,6 +85,14 @@ export interface WebBackend {
   folders: (account: Account) => Promise<MailboxFolder[]>;
   /** One page of a folder, newest first, live. */
   browse: (account: Account, folder: string, options: { before?: string | null; limit?: number }) => Promise<LivePage>;
+  /**
+   * One action on many messages of one mailbox, over one connection; each
+   * outcome is told to `each` as it is known.
+   */
+  bulk: (
+    account: Account, targets: readonly BulkTarget[], action: WebMailAction, options: { destination?: string },
+    each?: (index: number, outcome: BulkOutcome) => void,
+  ) => Promise<BulkOutcome[]>;
   /** A search of the mailbox, live. */
   search: (
     account: Account,
@@ -126,6 +134,7 @@ export const defaultBackend: WebBackend = {
   folders: (account) => mailboxFolders(account, { counts: true }),
   browse: browseFolder,
   search: searchMailbox,
+  bulk: applyMailActions,
 };
 
 /** Whether this deployment offers notifications to installed copies of the page. */
@@ -466,7 +475,7 @@ export interface Life { over: boolean }
  * Run bookkeeping on the request's own handle while the request is alive, and
  * on a handle of its own once the request has been answered.
  */
-function record<T>(ctx: ActionContext, store: StateStore, life: Life, work: (db: StateStore) => T): T {
+export function record<T>(ctx: ActionContext, store: StateStore, life: Life, work: (db: StateStore) => T): T {
   if (!life.over) return work(store);
   const own = ctx.backend.openStore();
   try {
@@ -477,7 +486,7 @@ function record<T>(ctx: ActionContext, store: StateStore, life: Life, work: (db:
 }
 
 /** Bookkeeping that must not undo what it is recording: a failure here is logged, never thrown. */
-function quietly(what: string, work: () => void): void {
+export function quietly(what: string, work: () => void): void {
   try {
     work();
   } catch (error) {
@@ -485,7 +494,7 @@ function quietly(what: string, work: () => void): void {
   }
 }
 
-const readOnly = (): WebResponse =>
+export const readOnly = (): WebResponse =>
   json(403, { error: 'this session is read-only; sign in with the write token to act on mail', code: 'readOnly' });
 
 const badRequest = (error: string): WebResponse => json(400, { error, code: 'badRequest' });
@@ -713,12 +722,7 @@ export async function actOnMail(
   const row = target.row;
   const account = target.account;
 
-  const audit = {
-    account: account.username, messageId: auditId(target), action, client: ctx.client,
-    ...(target.view.folder ? { sourceFolder: target.view.folder } : {}),
-    // Where a move was aimed, so a refused one can still be traced; a move that goes through records where it landed.
-    ...(destination ? { destinationFolder: destination } : {}),
-  };
+  const audit = mailAudit(target, action, ctx.client, destination);
   // What the mailbox said, written down and turned into an answer. This runs
   // when the mailbox answers, which may be after the page stopped waiting:
   // the message has moved either way, and the row has to follow it.
@@ -727,26 +731,11 @@ export async function actOnMail(
       db.recordMailAction({ ...audit, success: false, error: 'not found' });
       return json(404, { error: 'message not found in the mailbox', code: 'actionNotFound' });
     }
-    db.recordMailAction({
-      ...audit, success: true, sourceFolder: result.sourceFolder,
-      ...(result.destinationFolder ? { destinationFolder: result.destinationFolder } : {}),
-    });
-    forgetLive(target.cacheKey);
-    if (row) forgetLive(row.dedupKey);
-    // The row follows the message, so the next read looks where it now is.
-    if (row && result.destinationFolder) {
-      db.updateMailLocation(row.dedupKey, result.destinationFolder, Boolean(result.destinationIsSpam), {
-        ...(result.destinationUid && result.destinationUidValidity
-          ? { uid: result.destinationUid, uidValidity: result.destinationUidValidity } : {}),
-      });
-    }
-    // Filing a message away is dealing with it, and so is putting it in the bin by the bin's name.
-    if (row && (action === 'archive' || action === 'trash' || result.destinationIsTrash)) db.setHandled(row.dedupKey, true);
-    const after = row ? db.getMail(row.dedupKey) ?? row : undefined;
+    const kept = keepBooks(db, target, action, result, audit);
     return json(200, {
-      ok: true, action, ...(after ? { row: ctx.decorate(after) } : {}), attention: db.attentionCount(),
+      ok: true, action, ...(kept.after ? { row: ctx.decorate(kept.after) } : {}), attention: db.attentionCount(),
       // Where a live message is now, and its handle there when the server said its new UID.
-      ...(result.destinationFolder ? { moved: movedTo(target, result) } : {}),
+      ...(kept.moved ? { moved: kept.moved } : {}),
     });
   };
   const refused = (error: unknown): WebResponse => {
@@ -776,6 +765,51 @@ export async function actOnMail(
     log.warn(`A mailbox action could not be recorded: ${String(error).slice(0, 160)}`);
     return json(500, { error: 'the action was applied but could not be recorded', code: 'actionFailed', detail: 'bookkeeping' });
   }
+}
+
+/** The audit row of one mail action, before what came of it is known. */
+export function mailAudit(target: MailTarget, action: WebMailAction, client: string, destination = ''): {
+  account: string; messageId: string; action: string; client: string; sourceFolder?: string; destinationFolder?: string;
+} {
+  return {
+    account: target.account.username, messageId: auditId(target), action, client,
+    ...(target.view.folder ? { sourceFolder: target.view.folder } : {}),
+    // Where a move was aimed, so a refused one can still be traced; a move that goes through records where it landed.
+    ...(destination ? { destinationFolder: destination } : {}),
+  };
+}
+
+/**
+ * What one action that went through leaves behind: its audit row, and for
+ * a stored message its books. The record follows the message to its new
+ * folder; filing it away (archive, bin, spam) is dealing with it; and spam
+ * or not spam is feedback the triage learns from, as the owner said it.
+ */
+export function keepBooks(
+  db: StateStore, target: MailTarget, action: WebMailAction, result: WebMailActionResult, audit: ReturnType<typeof mailAudit>,
+): { after?: MailRow; moved?: { folder: string; handle?: string } } {
+  db.recordMailAction({
+    ...audit, success: true, sourceFolder: result.sourceFolder,
+    ...(result.destinationFolder ? { destinationFolder: result.destinationFolder } : {}),
+  });
+  forgetLive(target.cacheKey);
+  const row = target.row;
+  if (row) forgetLive(row.dedupKey);
+  // The row follows the message, so the next read looks where it now is.
+  if (row && result.destinationFolder) {
+    db.updateMailLocation(row.dedupKey, result.destinationFolder, Boolean(result.destinationIsSpam), {
+      ...(result.destinationUid && result.destinationUidValidity
+        ? { uid: result.destinationUid, uidValidity: result.destinationUidValidity } : {}),
+    });
+  }
+  // Filing a message away is dealing with it, and so is putting it in the bin by the bin's name, or in spam.
+  if (row && (action === 'archive' || action === 'trash' || action === 'spam' || result.destinationIsTrash)) db.setHandled(row.dedupKey, true);
+  if (row && (action === 'spam' || action === 'not_spam')) {
+    // Against this record, by its key: its Message-ID alone could name another one.
+    db.recordFeedback(row.messageId ?? row.dedupKey, action, '', row.dedupKey);
+  }
+  const after = row ? db.getMail(row.dedupKey) ?? row : undefined;
+  return { ...(after ? { after } : {}), ...(result.destinationFolder ? { moved: movedTo(target, result) } : {}) };
 }
 
 /** Where a message is after a move: its folder, and its new handle when the server said where it landed. */

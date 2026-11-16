@@ -521,7 +521,7 @@ function liveFixture(messageId: string): LiveMessage | undefined {
   }) };
 }
 
-const backend: Partial<WebBackend> = {
+const backend: Partial<WebBackend> & Pick<WebBackend, 'act'> = {
   read: async (account, messageId, hint) => {
     await sleep(350);
     return mailbox.read(account, messageId, typeof hint === 'string' ? { folder: hint } : hint, liveFixture);
@@ -573,6 +573,25 @@ const backend: Partial<WebBackend> = {
     const manifest = exact ? mailbox.attachments(account, messageId, exact) : store.getMail(messageId)?.attachmentManifest;
     const item = manifest?.items.find((entry) => entry.partId === partId);
     return item ? { metadata: item, content: Buffer.alloc(Math.min(item.sizeBytes ?? 1024, 1024 * 1024), 0x25) } : undefined;
+  },
+  // Many at once: each in turn, as one connection would take them.
+  bulk: async (account, targets, action, options, each) => {
+    const outcomes = [];
+    for (const [index, target] of targets.entries()) {
+      await sleep(60);
+      let outcome: Awaited<ReturnType<NonNullable<WebBackend['bulk']>>>[number];
+      try {
+        const done = mailbox.act(account, target.messageId, action, {
+          ...(options.destination ? { destination: options.destination } : {}), ...(target.hint ? { hint: target.hint } : {}),
+        }) ?? await backend.act!(account, target.messageId, action, { ...options, ...(target.hint ? { hint: target.hint } : {}) });
+        outcome = done ? { done } : { missing: true };
+      } catch (error) {
+        outcome = { error };
+      }
+      outcomes.push(outcome);
+      each?.(index, outcome);
+    }
+    return outcomes;
   },
   folders: async (account) => { await sleep(300); return mailbox.list(account); },
   browse: async (account, folder, options) => { await sleep(400); return mailbox.browse(account, folder, options); },

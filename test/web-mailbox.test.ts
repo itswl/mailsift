@@ -2,11 +2,12 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import './setup.js';
 import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
-import { LiveMailError, type LiveMessage, type MessageHint } from '../src/imap/client.js';
+import { LiveMailError, MailActionError, type LiveMessage, type MessageHint } from '../src/imap/client.js';
 import { liveHandle, SearchCancelled, type LiveItem, type LivePage, type SearchPage } from '../src/imap/mailbox.js';
 import type { ReadableMessage } from '../src/imap/readable.js';
 import { StateStore } from '../src/services/state.js';
 import { forgetLive, forgetSends, type WebBackend } from '../src/web-actions.js';
+import { forgetBulk } from '../src/web-mailbox.js';
 import { routeWeb, SESSION_COOKIE, type WebResponse } from '../src/web.js';
 
 /**
@@ -116,6 +117,7 @@ const post = (store: StateStore, path: string, body: unknown, mailbox = fake(), 
 beforeEach(() => {
   forgetLive();
   forgetSends();
+  forgetBulk();
   process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw';
   process.env.MAIL_ACCOUNT_1_NAME = 'personal';
 });
@@ -302,5 +304,145 @@ describe('a message named by its handle', () => {
     expect(listed.json).toMatchObject({ folder: 'Archive', attachments: [] });
     const conversation = await call(store, `/api/conversation?key=${encodeURIComponent(OLD)}`);
     expect(conversation.json).toMatchObject({ count: 0, messages: [] });
+  });
+});
+
+describe('many messages at once', () => {
+  function stored(): StateStore {
+    const state = seeded();
+    for (const [key, id, sender] of [['k2', '<two@x>', 'promo@shop.example'], ['k3', '<three@x>', 'promo@shop.example']] as const) {
+      state.markSeen(key, 'me@qq.com', `subject ${key}`);
+      state.recordOutcome(key, 'info', false, { messageId: id, sender, folder: 'INBOX' });
+    }
+    return state;
+  }
+  /** A mailbox that does each action of a batch, and says how many batches it was asked for. */
+  function batches(overrides: Partial<WebBackend> = {}) {
+    const asked: Array<{ account: string; action: string; targets: unknown[] }> = [];
+    const mailbox = fake({
+      bulk: async (account, targets, action, options, each) => {
+        asked.push({ account: account.username, action, targets: [...targets] });
+        return targets.map((target, index) => {
+          const outcome = target.messageId === '<gone@x>' ? { missing: true as const }
+            : action === 'not_spam' && target.messageId === '<one@x>' ? { error: new MailActionError('not_applicable', 'the message is not in a spam folder') }
+              : {
+                done: {
+                  action, account: account.username, messageId: target.messageId, sourceFolder: 'INBOX',
+                  ...(action === 'spam' ? { destinationFolder: 'Junk', destinationIsSpam: true }
+                    : action === 'move' ? { destinationFolder: options.destination!, destinationIsSpam: false } : {}),
+                },
+              };
+          each?.(index, outcome);
+          return outcome;
+        });
+      },
+      ...overrides,
+    });
+    return { asked, mailbox };
+  }
+
+  it('acts on each over one batch per mailbox, and answers for each', async () => {
+    process.env.MAIL_ACCOUNT_2 = 'gmail_pw|me@gmail.com|pw';
+    const store = stored();
+    const elsewhere = liveHandle({ account: 'me@gmail.com', folder: 'INBOX', uidValidity: '1', uid: 4, messageId: '<g@x>' });
+    const { asked, mailbox } = batches();
+    const { json } = await post(store, '/api/bulk', { items: ['k1', 'k2', OLD, elsewhere, 'missing-key'], action: 'star' }, mailbox);
+    expect(asked.map((batch) => [batch.account, batch.targets.length])).toEqual([['me@qq.com', 3], ['me@gmail.com', 1]]);
+    expect(json).toMatchObject({ action: 'star', done: 4, skipped: 0, failed: 1 });
+    const results = json['results'] as Array<Record<string, unknown>>;
+    expect(results.map((r) => [r['key'], r['status']])).toEqual([
+      ['k1', 'done'], ['k2', 'done'], [OLD, 'done'], [elsewhere, 'done'], ['missing-key', 'failed'],
+    ]);
+    expect(results[4]).toMatchObject({ code: 'notFound' });
+    // Each audited as one action alone is.
+    expect(store.listMailActions(10).filter((row) => row.action === 'star')).toHaveLength(4);
+  });
+
+  it('keeps the books of stored messages, skips what an action does not apply to, and fails what is not there', async () => {
+    const store = stored();
+    const { mailbox } = batches();
+    const spam = await post(store, '/api/bulk', { items: ['k2', 'k3', ONE], action: 'spam' }, mailbox);
+    expect(spam.json).toMatchObject({ done: 3 });
+    expect(store.getMail('k2')).toMatchObject({ folder: 'Junk', inSpam: true });
+    expect(store.getMail('k2')?.handledAt).not.toBeNull();
+    // Two of one sender's messages put in spam: a rule, as two false positives make one.
+    expect(store.feedbackRuleHints(2).neverImportant).toContain('promo@shop.example');
+    const back = await post(store, '/api/bulk', { items: ['k1', 'k2'], action: 'not_spam' }, mailbox);
+    expect((back.json['results'] as Array<Record<string, unknown>>).map((r) => [r['status'], r['code'] ?? ''])).toEqual([['skipped', 'notApplicable'], ['done', '']]);
+    // The owner said one of the sender's messages is not spam: the spam no longer counts against the sender.
+    expect(store.feedbackRuleHints(2).neverImportant).not.toContain('promo@shop.example');
+    const gone = await post(store, '/api/bulk', { items: [liveHandle({ account: 'me@qq.com', folder: 'INBOX', uidValidity: '1', uid: 9, messageId: '<gone@x>' })], action: 'archive' }, mailbox);
+    expect(gone.json['results']).toEqual([expect.objectContaining({ status: 'failed', code: 'actionNotFound' })]);
+  });
+
+  it('marks done and puts off only what mailsift stored, and marks the done ones read in one batch per mailbox', async () => {
+    const store = stored();
+    const { asked, mailbox } = batches();
+    const done = await post(store, '/api/bulk', { items: ['k1', 'k2', OLD], action: 'done' }, mailbox);
+    expect((done.json['results'] as Array<Record<string, unknown>>).map((r) => [r['status'], r['code'] ?? ''])).toEqual([
+      ['done', ''], ['done', ''], ['skipped', 'notStored'],
+    ]);
+    expect(store.getMail('k1')?.handledAt).not.toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(asked).toEqual([expect.objectContaining({ action: 'mark_read', account: 'me@qq.com' })]);
+    expect(asked[0]!.targets).toHaveLength(2);
+    // Done again: nothing changes, and it says so.
+    const again = await post(store, '/api/bulk', { items: ['k1'], action: 'done' }, mailbox);
+    expect(again.json['results']).toEqual([expect.objectContaining({ status: 'skipped', code: 'unchanged' })]);
+    const later = new Date(Date.now() + 3_600_000).toISOString();
+    const snoozed = await post(store, '/api/bulk', { items: ['k2', 'k3'], action: 'snooze', until: later }, mailbox);
+    expect(snoozed.json).toMatchObject({ done: 2 });
+    expect(store.getMail('k3')?.snoozedUntil).toBe(later);
+    expect((await post(store, '/api/bulk', { items: ['k3'], action: 'snooze', until: '2020-01-01T00:00:00Z' }, mailbox)).json).toMatchObject({ code: 'snoozePast' });
+    expect(store.listMcpAudit(20).filter((row) => row.action === 'web:snooze')).toHaveLength(2);
+  });
+
+  it('is done once when the same batch is asked for twice', async () => {
+    const store = stored();
+    const { asked, mailbox } = batches();
+    const first = await post(store, '/api/bulk', { items: ['k1'], action: 'archive', id: 'press-0001' }, mailbox);
+    const second = await post(store, '/api/bulk', { items: ['k1'], action: 'archive', id: 'press-0001' }, mailbox);
+    expect(asked).toHaveLength(1);
+    expect(second.json).toEqual(first.json);
+  });
+
+  it('is refused to a read session, beyond a hundred messages, and without a destination for a move', async () => {
+    const store = stored();
+    const { asked, mailbox } = batches();
+    expect((await post(store, '/api/bulk', { items: ['k1'], action: 'archive' }, mailbox, 'read')).json).toMatchObject({ code: 'readOnly' });
+    expect((await post(store, '/api/bulk', { items: ['k1'], action: 'done' }, mailbox, 'read')).json).toMatchObject({ code: 'readOnly' });
+    const many = Array.from({ length: 101 }, (_, n) => `k${n}`);
+    expect((await post(store, '/api/bulk', { items: many, action: 'star' }, mailbox)).json).toMatchObject({ code: 'bulk_too_many' });
+    expect((await post(store, '/api/bulk', { items: ['k1'], action: 'move' }, mailbox)).json).toMatchObject({ code: 'badRequest' });
+    expect((await post(store, '/api/bulk', { items: ['k1'], action: 'delete' }, mailbox)).json).toMatchObject({ code: 'badRequest' });
+    expect(asked).toEqual([]);
+  });
+
+  it('says a mailbox has no spam folder, for each message, and changes nothing', async () => {
+    const store = stored();
+    const { mailbox } = batches({
+      bulk: async (_account, targets, _action, _options, each) => targets.map((_, index) => {
+        const outcome = { error: new MailActionError('invalid_destination', 'this mailbox has no spam folder') };
+        each?.(index, outcome);
+        return outcome;
+      }),
+    });
+    const { json } = await post(store, '/api/bulk', { items: ['k2'], action: 'spam' }, mailbox);
+    expect(json['results']).toEqual([expect.objectContaining({ status: 'failed', code: 'action_invalid_destination', error: 'this mailbox has no spam folder' })]);
+    expect(store.getMail('k2')).toMatchObject({ folder: 'INBOX', handledAt: null });
+    expect(store.feedbackSummary()['spam']).toBeUndefined();
+  });
+
+  it('moves one message into spam, or out of it, with the judgement recorded either way', async () => {
+    const store = stored();
+    const mailbox = fake({
+      act: async (account, messageId, action) => ({
+        action, account: account.username, messageId, sourceFolder: action === 'not_spam' ? 'Junk' : 'INBOX',
+        destinationFolder: action === 'spam' ? 'Junk' : 'INBOX', destinationIsSpam: action === 'spam',
+      }),
+    });
+    expect((await post(store, '/api/action', { key: 'k2', action: 'spam' }, mailbox)).json).toMatchObject({ ok: true, row: { folder: 'Junk', inSpam: true } });
+    expect((await post(store, '/api/action', { key: 'k2', action: 'not_spam' }, mailbox)).json).toMatchObject({ ok: true, row: { folder: 'INBOX', inSpam: false } });
+    expect(store.feedbackSummary()).toMatchObject({ spam: 1, not_spam: 1 });
   });
 });

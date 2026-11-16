@@ -95,7 +95,7 @@ Triage rates every message `critical`, `warning` or `info`. `PUSH_MIN_IMPORTANCE
 
 `MAIL_KEYWORDS` are the keywords the local fallback looks for, on top of its built-in list, when no LLM is configured or it fails; see [Triage](triage.md#when-the-llm-fails).
 
-Feedback becomes rules too. After two feedback records for the same sender, recorded through MCP `record_feedback` or by correcting a judgement in the web view, `missed` feedback infers an always-important rule and `false_positive` feedback infers a never-important rule. Explicit environment rules take precedence; inspect inferred rules with MCP `feedback_rules`.
+Feedback becomes rules too. After two feedback records for the same sender, recorded through MCP `record_feedback` or by correcting a judgement in the web view, `missed` feedback infers an always-important rule and `false_positive` feedback infers a never-important rule. Putting a message in spam (Spam in the web view, `manage_mail` with `spam`) records `spam` feedback, which counts towards a never-important rule as `false_positive` does; taking one of that sender's messages out of spam again (`not_spam`) stops their earlier spam records counting. Explicit environment rules take precedence; inspect inferred rules with MCP `feedback_rules`.
 
 ## Daily digest
 

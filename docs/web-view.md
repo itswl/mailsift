@@ -14,6 +14,7 @@ It is off by default. A page a browser can reach is a wider surface than a JSON-
 - [The conversation, and your own mail](#the-conversation-and-your-own-mail)
 - [The whole mailbox](#the-whole-mailbox)
 - [Acting on a message](#acting-on-a-message)
+- [Many at once](#many-at-once)
 - [Correcting a judgement](#correcting-a-judgement)
 - [Writing](#writing)
 - [Asking](#asking)
@@ -39,7 +40,8 @@ Which token you sign in with decides what the page may do, the same split MCP ma
 | Open any folder, search the mailbox | yes | yes |
 | Search, ask a question, get notifications | yes | yes |
 | Mark done, put off until later | only when no write token is configured | yes |
-| Archive, bin, star, mark read, move out of spam | no | yes |
+| Archive, bin, star, mark read, move to any folder, spam and not spam | no | yes |
+| The same to many messages at once | no (done and later: as above) | yes |
 | Reply, forward and send; change a signature | no | yes |
 | Correct a judgement, draft with the model | no | yes |
 
@@ -143,11 +145,25 @@ The address keeps the folder or the search on show (`?in=` the mailbox, `&folder
 
 ## Acting on a message
 
-With a write session the bar under a message offers Done, Reply, Archive, and under "more": Reply all, Forward, Remind me (see [Later](#later)), Star, Mark unread, Not spam (for a message in the spam folder) and Bin. On a desk, Reply all, Star and Remind me sit in the bar itself.
+With a write session the bar under a message offers Done, Reply, Archive, and under "more": Reply all, Forward, Remind me (see [Later](#later)), Star, Mark unread, Move to…, Spam (Not spam for a message in the spam folder) and Bin. On a desk, Reply all, Star and Remind me sit in the bar itself.
 
 Each action is applied in the mailbox itself, to the message found by its Message-ID, and recorded in the same audit table the MCP write tools use. Archive and Bin go to the folder the server marks for that purpose (the special-use flag, then the well-known names); a mailbox that has no such folder is told so rather than given a new one. On Gmail, archiving removes the message from the inbox and leaves it in All Mail. The page follows a message to its new folder, so it can still be opened, answered, or brought back afterwards.
 
-There is no permanent delete, and no move to a folder of your choosing: that stays with MCP's `manage_mail`.
+**Move to…** opens the folder panel under the control that asked for it, to pick where the message goes: the folders you moved mail to lately first (kept in this browser, five per mailbox), then the rest of its mailbox, with the box to find one by name, and without the folder it is in. A message moves within its own mailbox.
+
+**Spam** moves a message into its mailbox's spam folder (the server's `\Junk` flag, then the usual names) and counts it as dealt with; **Not spam**, offered for a message in the spam folder, moves it to the inbox. Either is also a judgement, recorded as feedback (`spam`, `not_spam`) the triage learns from: two of one sender's messages put in spam make that sender's mail low priority from then on, as two corrections of a notification do (see [Correcting a judgement](#correcting-a-judgement)), until you take one of that sender's messages out of spam again. A mailbox with no spam folder says so, and nothing is moved.
+
+There is no permanent delete.
+
+## Many at once
+
+Any list can be acted on many at a time: the triaged list and the queue, a folder, the results of a search.
+
+- **Picking.** On a desk, a box appears to the left of a row under the pointer or the keyboard; pressing it picks the row, and with Shift held picks every row between it and the last one pressed. `x` picks the row that is open. On a phone, a long press on a row starts picking (the phone gives a short buzz where it can), the rows' marks become boxes, and a tap then picks or puts down a row rather than opening it.
+- **The bar.** While anything is picked, a bar takes the place of the window and filters line and stays at the top as the list scrolls: how many are picked, Select all (every row the page has loaded), the way to put the selection down, and the actions. Done (or Not done, when every one picked is done), Archive and Bin are in the bar; Mark read and unread, Star and Remove star, Move to…, Spam or Not spam and Remind me are under "more". Each is offered only when at least one picked message can take it: Done and Remind me need a message mailsift stored, Move to needs messages of one mailbox. `Esc`, or the back gesture on a phone, puts the selection down before it closes anything else.
+- **What happens.** At most 100 messages go at once, in one request; the server reaches each mailbox over one connection, checks each message as it would one alone (a live handle exactly where it was listed), and answers for each. A message the action does not apply to (Done for one mailsift never stored, Not spam for one outside the spam folder, Spam for one already there) is skipped, not failed. A line says what happened ("Archived 12 · 2 skipped"), and offers Undo for what has an Undo one at a time: Done, and Remind me, which goes back to what each message had. Each message is audited as it would be alone, and the same press arriving twice is done once.
+
+## Correcting a judgement
 
 ## Correcting a judgement
 
@@ -224,6 +240,7 @@ The bell turns on Web Push for the device you are holding: a verification code o
 | `#` | bin |
 | `b` | remind me later |
 | `g` | folders |
+| `x` | pick, for acting on many at once |
 | `n` | new message |
 | `c` | copy the newest code |
 | `/` | search |

@@ -220,7 +220,11 @@ function rowOf(item, now, queued) {
   if (m.live && !(m.flags && m.flags.seen)) li.classList.add('unseen');
   const who = highlightInto(el('a', 'who'), m.senderName || m.sender || t('unknownSender'));
   who.href = '#m=' + encodeURIComponent(key);
-  who.onclick = (e) => { e.preventDefault(); openDetail(key); };
+  // While picking on a phone, a tap picks; on a desk a row still opens, and its box picks.
+  who.onclick = (e) => { e.preventDefault(); if (picked.size && !isWide()) togglePick(key, false); else openDetail(key); };
+  li.appendChild(pickBox(key, m.senderName || m.sender || t('unknownSender')));
+  if (picked.has(key)) li.classList.add('picked');
+  enablePick(li, key);
   if (key === selectedKey) { li.classList.add('selected'); who.setAttribute('aria-current', 'true'); }
   li.appendChild(who);
   li.appendChild(el('span', 'when', queued ? whenQueued(m, now) : when(m, now)));
@@ -394,7 +398,7 @@ async function complete(key, li, undo) {
 function enableSwipe(li, key) {
   let x0 = 0, y0 = 0, dx = 0, tracking = false, swiping = false;
   li.addEventListener('pointerdown', (e) => {
-    if (e.pointerType === 'mouse' || e.clientX < 24 || e.target.closest('.code-copy')) return;
+    if (e.pointerType === 'mouse' || e.clientX < 24 || picked.size || e.target.closest('.code-copy')) return;
     tracking = true; swiping = false; x0 = e.clientX; y0 = e.clientY; dx = 0;
   });
   li.addEventListener('pointermove', (e) => {
@@ -486,13 +490,15 @@ function showSnooze(row, anchor) {
     align: r.left + r.width / 2 < document.documentElement.clientWidth / 2 ? 'start' : 'end',
   });
 }
-function drawSnooze(row) {
+// run: what a choice does, for the times offered to several messages at once (no row then).
+function drawSnooze(row, run) {
   const body = snoozeSheet.querySelector('.sheet-body');
-  const key = rowKey(row);
+  const key = row ? rowKey(row) : null;
+  const go = run || ((at) => snooze(key, at));
   const now = new Date();
   body.replaceChildren();
   // Put off already: when, and a way to have it back now.
-  if (isSnoozed(row)) body.appendChild(el('p', 'sheet-text quiet snooze-now', fill('snooze.toast', { when: whenLabel(new Date(row.snoozedUntil), now, true) })));
+  if (row && isSnoozed(row)) body.appendChild(el('p', 'sheet-text quiet snooze-now', fill('snooze.toast', { when: whenLabel(new Date(row.snoozedUntil), now, true) })));
   const choices = el('div', 'choices');
   const choice = (label, at, run) => {
     const b = el('button', 'choice');
@@ -503,8 +509,8 @@ function drawSnooze(row) {
     choices.appendChild(b);
     return b;
   };
-  if (isSnoozed(row)) choice(t('snooze.now'), null, () => snooze(key, 'now'));
-  for (const c of snoozeChoices(now)) choice(t(c.key), c.at, () => snooze(key, c.at));
+  if (row && isSnoozed(row)) choice(t('snooze.now'), null, () => go('now'));
+  for (const c of snoozeChoices(now)) choice(t(c.key), c.at, () => go(c.at));
   // Any other moment, on this device's own clock, still to come and within a year.
   const form = el('form', 'snooze-pick');
   form.hidden = true;
@@ -529,7 +535,7 @@ function drawSnooze(row) {
     e.preventDefault();
     const at = new Date(input.value);
     note.textContent = isNaN(at) || at <= new Date() ? t('snooze.past') : at > latest ? t('snooze.far') : '';
-    if (!note.textContent) snooze(key, at);
+    if (!note.textContent) { if (run && popovers.has(snoozeSheet)) closePopover(snoozeSheet, false); go(at); }
   };
   const pick = choice(t('snooze.pick'), null, () => {
     pick.hidden = true;

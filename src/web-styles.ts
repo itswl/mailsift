@@ -163,6 +163,36 @@ body.live-mode .window,body.live-mode #filters-open,body.live-mode #folders-open
 .row.live .who{font-weight:500}.row.live.unseen .who{font-weight:650}
 .row.live .sum{color:var(--text-2);-webkit-line-clamp:2}.row.live.unseen .sum{color:var(--text)}
 
+/* ---- Many at once: a box beside each row, and the bar that acts on what is picked ----
+   On a desk the box sits in the gutter left of the row, seen under the
+   pointer or the keyboard and while anything is picked; on a phone it takes
+   the mark's place while picking. Neither moves anything. */
+.pick-box{position:absolute;z-index:2;left:-21px;top:15px;width:18px;height:18px;margin:0;padding:0;border:1.5px solid var(--line-strong);border-radius:5px;background:var(--surface);color:transparent;display:grid;place-items:center;cursor:pointer;opacity:0;transition:opacity .12s,background .12s,border-color .12s}
+.pick-box::after{content:"";position:absolute;inset:-10px}
+.pick-box .icon{width:12px;height:12px;stroke-width:2.6}
+.pick-box[aria-checked=true]{background:var(--accent);border-color:var(--accent);color:var(--on-accent);opacity:1}
+.row:focus-within .pick-box,body.picking .pick-box{opacity:1}
+@media(hover:hover){.row:hover .pick-box{opacity:1}}
+.row.picked{background:var(--accent-tint)}
+.pick-bar{display:flex;align-items:center;gap:2px;min-height:44px;padding:0 6px 0 4px}
+.pick-count{font-size:15px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;padding:0 4px}
+.pick-actions{display:flex;align-items:center;gap:2px}
+.pick-actions .bar-btn{flex:none;min-height:36px;border-radius:8px;font-size:13px}
+.pick-actions .bar-btn.primary{padding:0 12px}
+.pick-actions .bar-btn.icon-only{min-width:36px}
+.pick-actions .bar-btn:disabled{opacity:.4;cursor:default}
+/* While anything is picked, the bar takes the controls' line and stays at the top as the list scrolls. */
+body.picking .controls{position:sticky;top:calc(52px + env(safe-area-inset-top));z-index:4;background:var(--bg)}
+body.picking .control-line{display:none!important}
+#bulk-sheet.popover .sheet-body{padding:0 8px 8px}
+@media(max-width:899px){
+  .pick-box{left:14px;top:14px;display:none}
+  body.picking .pick-box{display:grid}
+  body.picking .row>.mark,body.picking .row>.ring{visibility:hidden}
+  body.picking .search-line{display:none!important}
+  body.picking .row{-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
+}
+
 /* ---- Sheets: the detail on a phone, filters, the install steps ---- */
 .sheet{position:fixed;inset:auto 0 0 0;z-index:20;width:100%;max-width:640px;margin:0 auto;border:0;padding:0;background:var(--surface);color:var(--text);
 border-radius:16px 16px 0 0;box-shadow:var(--shadow-sheet);max-height:calc(100vh - env(safe-area-inset-top) - 8px);max-height:calc(100dvh - env(safe-area-inset-top) - 8px);
@@ -618,6 +648,10 @@ a.primary-action{display:inline-flex;align-items:center;justify-content:center;t
   .day{top:calc(56px + env(safe-area-inset-top))}
   .row{scroll-margin-top:calc(96px + env(safe-area-inset-top))}
   .row.needs{touch-action:auto}
+  /* The box beside a row sits in the gutter, outside the row. */
+  .group{overflow-x:visible}
+  /* Over the gutter too, where the rows' boxes would otherwise show beside it. */
+  body.picking .controls{top:calc(56px + env(safe-area-inset-top));box-shadow:-24px 0 0 var(--bg)}
   .fresh-pill{left:calc(max(24px,(100vw - 1440px)/2 + 24px) + 220px)}
   .pane{display:flex;flex-direction:column;position:sticky;top:calc(68px + env(safe-area-inset-top));height:calc(100vh - 84px - env(safe-area-inset-top));overflow:hidden;border-radius:16px;background:var(--surface);box-shadow:0 0 0 1px var(--line)}
   .pane-bar{display:flex;flex:none;align-items:center;gap:2px;min-height:52px;padding:6px 10px;border-bottom:1px solid var(--line)}

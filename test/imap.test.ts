@@ -709,7 +709,7 @@ describe('where a moving action puts a message', () => {
 
 describe('acting on a message from the web view', () => {
   it('has one list of what may be asked for a message, and one thing nobody asks for', () => {
-    expect([...MAIL_ACTIONS]).toEqual(['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox', 'trash']);
+    expect([...MAIL_ACTIONS]).toEqual(['mark_read', 'mark_unread', 'star', 'unstar', 'move', 'archive', 'inbox', 'trash', 'spam', 'not_spam']);
     // Marking a message answered is what a reply leaving does, not a request.
     expect([...WEB_MAIL_ACTIONS]).toEqual([...MAIL_ACTIONS, 'answered']);
   });

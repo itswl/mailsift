@@ -105,13 +105,16 @@ A `pass` proves the domain, not the intent: a real domain can still send a scam.
 | `inbox` | Brings a message back to the inbox: from spam, from the archive, or from the bin. |
 | `trash` | Moves the message to the mailbox's bin, and counts it as dealt with. The provider empties the bin on its own schedule, usually within 30 days. |
 | `move` | Moves to `destination`, a folder path exactly as `list_folders` gives it. A move into the bin, or into a folder inside it, is binning and counts as dealt with. |
+| `spam` | Moves the message into the mailbox's spam folder, counts it as dealt with, and records that it is spam: two of one sender's make that sender's mail low priority. Refused where the mailbox has no spam folder. |
+| `not_spam` | Moves a message that is in the spam folder to the inbox and records that it is not spam, which undoes what the sender's spam records counted. Refused for a message anywhere else. |
 
 Rules for using it:
 
 - Pass the `messageId` that `list_mail`, `needs_you` or `search_mail` shows. A sender can write a Message-ID that spells another record's `dedupKey`. A string that is both is refused with `INVALID_ARGUMENT` rather than guessed: reach the message whose Message-ID it is by that message's own `dedupKey`, and the record whose key it is by its own `messageId`. A string shaped like a key (an email address, `|`, the rest) only ever names a record by its key.
 - One message can be stored once per monitored mailbox (a forwarded copy, or a message sent to two of them). Then `manage_mail`, `mark_handled`, `snooze`, `record_feedback`, `read_message`, `prepare_reply`, `prepare_forward` and `send_mail` with `replyTo` or `forward` answer `INVALID_ARGUMENT` naming the mailboxes; call again with `account` set to the one the user means. `get_mail` returns the first stored copy and lists the others under `storedFor`; give `account` there too to see a particular one.
 
-- One message, named by the user, per call. Do not sweep a folder or act on "all of these" without the user listing or confirming them.
+- Act on what the user named. `manage_mail`, `mark_handled` and `snooze` take `messageIds` (up to 100) for several at once, which is right when the user asked about exactly those ("archive these five", "mark everything from the shop as spam" after you showed them which). Never sweep a folder or act on "all of these" without showing the list and getting a yes. The answer has a result for each id: report how many were done, skipped (the action did not apply) and failed, and name the failed ones.
+- `spam` and `not_spam` are judgements as well as moves: they teach the triage. Use them only when the user says a message is or is not spam, never because it looks like spam to you.
 - Say what you are about to do before a move or a bin, and afterwards report the `folder` the answer gives.
 - `trash` only when the user asked for that message to be deleted. When unsure whether they meant archive or delete, ask; `archive` is the one that loses nothing. A binned message can be brought back with `inbox` until the provider empties the bin.
 - mailsift finds the message again in the mailbox by its Message-ID before changing anything. `NOT_FOUND` means it is no longer where mailsift last saw it, or, when you gave `account`, that it is not stored for that mailbox (the hint names the ones it is stored for): say which, and do not guess another message.
@@ -186,7 +189,7 @@ The digest is rendered inside a character budget and always ends by saying how m
 These change mailsift's own state and need the write credential and the user's explicit intent.
 
 - `retry_dead_letter` rewinds one folder cursor so the next poll retries one skipped message. Never pass a guessed dead-key.
-- `record_feedback` labels a processed message `false_positive`, `missed`, `handled` or `correct`. Two `missed` or two `false_positive` labels for one sender become a standing rule, and a never-important rule silences that sender's future alerts. Record a label only when the user gives it; never infer one from the mail. `feedback_rules` shows the rules already inferred. Use `mark_handled`, not the `handled` label, to take something out of the queue.
+- `record_feedback` labels a processed message `false_positive`, `missed`, `handled`, `correct`, `spam` or `not_spam`. Two `missed` labels for one sender become an always-important rule, and two `false_positive` or `spam` labels a never-important one, which silences that sender's future alerts; a later `not_spam` for that sender undoes what its `spam` labels counted. To move a message into or out of spam as well, use `manage_mail` with `spam` or `not_spam`, which records the same label. Record a label only when the user gives it; never infer one from the mail. `feedback_rules` shows the rules already inferred. Use `mark_handled`, not the `handled` label, to take something out of the queue.
 
 ## Prompts
 
