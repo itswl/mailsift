@@ -23,6 +23,10 @@
  * files a new message every N seconds, to watch the live line work. Two
  * messages are put off, one until tomorrow and one whose time has come, and
  * a reminder set from the page comes back on its minute, as in the service.
+ *
+ * Behind the stored mail is a made-up mailbox (scripts/preview-mailbox.ts):
+ * folders with counts, older mail to page through, a search (Gmail's, and
+ * QQ's limited one), and actions that move messages between its folders.
  */
 import { mkdtempSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -39,7 +43,8 @@ import { PushDispatcher, type PushNotice } from '../src/services/push-dispatcher
 import { StateStore, type MailRecord } from '../src/services/state.js';
 import { HEARTBEAT_KEY, type PollStats } from '../src/services/watcher.js';
 import { routeWeb, type WebBackend } from '../src/web.js';
-import { requestTimeoutMs } from '../src/web-actions.js';
+import { configuredAccounts, requestTimeoutMs } from '../src/web-actions.js';
+import { PreviewMailbox } from './preview-mailbox.js';
 
 // The config reader wants mailboxes before it answers. These are fixtures: the
 // names feed the mailbox filter and the provider feeds the "open in" link, and
@@ -362,6 +367,25 @@ function seed(): void {
 seed();
 const store = new StateStore(dbPath);
 
+// The mailbox behind the stored mail: what was stored is in it where it was filed, and older mail besides.
+const mailbox = new PreviewMailbox(configuredAccounts());
+FIXTURES.forEach((fixture, index) => {
+  const folder = fixture.fields.folder;
+  if (!folder) return;
+  const message = {
+    messageId: `<preview-${String(index + 1).padStart(2, '0')}@preview>`, subject: fixture.subject,
+    from: { name: fixture.fields.senderName ?? '', address: fixture.fields.sender ?? '' },
+    date: new Date(Date.now() - fixture.age * 60_000).toISOString(),
+    flags: { seen: fixture.age > 3 * H, flagged: index % 7 === 2, answered: false }, size: 12_000 + index * 1_300,
+    ...(fixture.fields.attachmentManifest ? { attachments: fixture.fields.attachmentManifest } : {}),
+    text: `${fixture.fields.summary ?? ''}`,
+  };
+  mailbox.add(fixture.account, folder, message);
+  // Gmail keeps everything in All Mail too, under UIDs of its own.
+  if (fixture.account === GMAIL.account && folder === 'INBOX') mailbox.add(fixture.account, '[Gmail]/All Mail', message);
+});
+mailbox.fillOlder();
+
 // The minute on which what was put off comes back, as the service keeps it.
 // No notification leaves: a device that subscribes here is told on the
 // console instead, in the words its phone would show.
@@ -498,9 +522,17 @@ function liveFixture(messageId: string): LiveMessage | undefined {
 }
 
 const backend: Partial<WebBackend> = {
-  read: async (_account, messageId) => { await sleep(350); return liveFixture(messageId); },
-  act: async (account, messageId, action) => {
+  read: async (account, messageId, hint) => {
+    await sleep(350);
+    return mailbox.read(account, messageId, typeof hint === 'string' ? { folder: hint } : hint, liveFixture);
+  },
+  act: async (account, messageId, action, options) => {
     await sleep(300);
+    // In the made-up mailbox when it is there: moved between its folders, and refused once a handle no longer fits.
+    const done = mailbox.act(account, messageId, action, {
+      ...(options?.destination ? { destination: options.destination } : {}), ...(options?.hint ? { hint: options.hint } : {}),
+    });
+    if (done) return done;
     const row = store.getMail(messageId);
     const sourceFolder = row?.folder ?? 'INBOX';
     const destination = action === 'archive' ? 'Archive' : action === 'trash' ? 'Trash' : action === 'inbox' ? 'INBOX' : undefined;
@@ -529,15 +561,22 @@ const backend: Partial<WebBackend> = {
   },
   // A forward lists the original's files and carries them: here, the list triage
   // stored with the fixture, and made-up bytes of about the size it gives.
-  attachments: async (_account, messageId) => {
+  attachments: async (account, messageId, hint) => {
     await sleep(250);
-    return { folder: 'INBOX', manifest: store.getMail(messageId)?.attachmentManifest ?? { items: [], truncated: false } };
+    const exact = typeof hint === 'object' && hint.exact ? hint : undefined;
+    const listed = exact ? mailbox.attachments(account, messageId, exact) : undefined;
+    return { folder: exact?.folder ?? 'INBOX', manifest: listed ?? store.getMail(messageId)?.attachmentManifest ?? { items: [], truncated: false } };
   },
-  attachment: async (_account, messageId, partId) => {
+  attachment: async (account, messageId, partId, hint) => {
     await sleep(400);
-    const item = store.getMail(messageId)?.attachmentManifest?.items.find((entry) => entry.partId === partId);
+    const exact = typeof hint === 'object' && hint.exact ? hint : undefined;
+    const manifest = exact ? mailbox.attachments(account, messageId, exact) : store.getMail(messageId)?.attachmentManifest;
+    const item = manifest?.items.find((entry) => entry.partId === partId);
     return item ? { metadata: item, content: Buffer.alloc(Math.min(item.sizeBytes ?? 1024, 1024 * 1024), 0x25) } : undefined;
   },
+  folders: async (account) => { await sleep(300); return mailbox.list(account); },
+  browse: async (account, folder, options) => { await sleep(400); return mailbox.browse(account, folder, options); },
+  search: async (account, options) => { await sleep(700); return mailbox.search(account, options); },
   appendSent: async () => 'Sent',
   savesSentCopy: () => true,
   sending: () => ({ available: true }),

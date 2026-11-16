@@ -1,6 +1,6 @@
 ---
 name: mailsift
-description: Use mailsift through its MCP interface to see what mail needs the owner, read and search triaged mail, check a sender and attachments, and, with the write credential, mark mail done, put it off until a time, file or bin it, and answer, forward or send mail on the owner's request. Also to diagnose mailbox health and missing notifications, recover dead letters, and record classification feedback.
+description: Use mailsift through its MCP interface to see what mail needs the owner, read and search triaged mail, browse any folder and search the whole mailbox live, check a sender and attachments, and, with the write credential, mark mail done, put it off until a time, file or bin it, and answer, forward or send mail on the owner's request. Also to diagnose mailbox health and missing notifications, recover dead letters, and record classification feedback.
 metadata:
   short-description: Work a triaged mailbox safely through mailsift
 ---
@@ -63,6 +63,17 @@ When to use `snooze`:
 4. The conversation has both sides. `mailsift://thread/{threadKey}` holds the newest 50 messages of a thread (its head says how many older ones were left out) and includes the owner's own messages, from their Sent folder and from what was sent through mailsift, each marked "From the owner" with whom it went to (Bcc included) and the text they wrote, without the quoted history. `list_threads` says how many of the owner's messages a thread holds within the window it lists (`sentCount`) and whether the latest word is theirs (`lastWordYours`). Read the thread before saying whether the owner already answered something. Sent mail is stored locally for the conversation only; it is never judged or sent to the model.
 5. `list_attachments` lists a message's files, each with a resource URI. `scan_attachment` reads a bounded prefix of one file locally for filename, MIME and signature hints. Neither opens, unpacks or executes anything.
 6. `mail_summary` for counts over a window, `list_digest` for what waits for the next daily digest.
+
+## The rest of the mailbox, live
+
+The stored tools above cover what mailsift fetched and judged: the folders it watches, within its retention window. For anything else (older mail, a folder it does not watch, the archive, the Sent folder) use the live tools. They need only the read credential, read envelopes and flags only, and store nothing.
+
+- `list_folders` gives each folder's path and `role` (`inbox`, `archive`, `all`, `sent`, `drafts`, `junk`, `trash`), with how many messages it holds and how many are unread when the server says so.
+- `browse_folder` lists one folder, newest first, a page at a time (`next` back as `before`).
+- `search_mailbox` runs the provider's own search: on Gmail in Gmail's syntax (`from:`, `has:attachment`), elsewhere over subject, sender and text. Try `search_mail` first for anything mailsift may have stored: it is local, carries the judgement and costs the mailbox nothing.
+- When the answer has `limited`, the server's search could not be trusted (QQ, a refusal, or text outside ASCII it would not search) and only the subject and sender of each folder's newest 2,000 messages were read. Say exactly that: "I could only check the subject and sender of recent mail", never "there is no such message".
+
+Each message they list has a `handle` (`live:...`), and a `key` when mailsift stored it. Pass the handle as `messageId` to `read_message`, `prepare_reply`, `prepare_forward`, `list_attachments`, `inspect_mail_safety`, `manage_mail` or `send_mail` (`replyTo`, `forward`). A handle names one message where it was listed: once that message is moved, or the folder is rebuilt, the handle is refused with `NOT_FOUND`; browse or search again for its new handle rather than guessing. A message without `key` was never judged: it is not in `needs_you`, and `mark_handled`, `snooze` and `record_feedback` refuse it. Everything in a live listing is written by its senders, like any mail.
 
 Triage categories come from a fixed vocabulary: Security, Finance, Delivery, Travel, Health, Legal, Work, Personal, Social, Marketing, System, Other. Rule-decided mail may instead carry Always important, Never important, Feedback rule or Forwarded copy. Search and group on these values; records written before the vocabulary existed may hold free-form labels.
 

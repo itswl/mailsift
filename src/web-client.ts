@@ -25,6 +25,7 @@
 import { composePart } from './web-client-compose.js';
 import { listPart } from './web-client-list.js';
 import { livePart } from './web-client-live.js';
+import { mailboxPart } from './web-client-mailbox.js';
 import { readerPart } from './web-client-reader.js';
 import { LANGUAGES, STRINGS } from './web-strings.js';
 
@@ -47,7 +48,7 @@ export function storeLanguageScript(): string {
 
 /** The whole script: the frame, then each part, then the lines that start it. */
 export function clientScript(): string {
-  return corePart() + listPart() + readerPart() + composePart() + livePart();
+  return corePart() + mailboxPart() + listPart() + readerPart() + composePart() + livePart();
 }
 
 function corePart(): string {
@@ -58,7 +59,7 @@ const list = $('#list'), filters = $('#filters'), lane = $('#lane'), header = $(
 const sheet = $('#sheet'), pane = $('#pane'), filterSheet = $('#filter-sheet'), installHelp = $('#install-help');
 const healthSheet = $('#health-sheet'), healthLine = $('#health');
 const notifySheet = $('#notify-sheet'), keysSheet = $('#keys-sheet'), menuSheet = $('#menu-sheet'), composeSheet = $('#compose');
-const snoozeSheet = $('#snooze-sheet');
+const snoozeSheet = $('#snooze-sheet'), folderSheet = $('#folder-sheet');
 const queue = $('#queue'), answerBox = $('#answer');
 // The separators every line of supporting text is joined with.
 const DOT = ' \u00b7 ', NB = '\u00a0';
@@ -183,6 +184,8 @@ function syncUrl() {
     p.set(k, v === 'on' ? '1' : v);
   }
   for (const name in pendingPicks) if (!p.has(name)) p.set(name, pendingPicks[name]);
+  // A folder or a search of the mailbox on show: which, and where.
+  writeLiveUrl(p);
   const search = p.toString() ? '?' + p.toString() : '';
   if (location.search !== search) history.replaceState(history.state, '', location.pathname + search + location.hash);
 }
@@ -196,6 +199,7 @@ function readUrl() {
     if (f.tagName === 'SELECT') pendingPicks[name] = value;
     else setField(f, value);
   }
+  readLiveUrl(p);
 }
 // Radios are set by checking the matching one: assigning RadioNodeList.value
 // does not select a radio whose value is empty in every engine, which left the
@@ -238,6 +242,8 @@ function accountName(address) {
 function renderTokens() {
   const box = $('#tokens');
   box.replaceChildren();
+  // A live list is not filtered: its line above says what it is.
+  if (liveView) { box.hidden = true; return; }
   const items = [];
   if (filters.importance.value) items.push({ label: word('level.', filters.importance.value), clear: () => setFilters({ importance: '' }) });
   const category = filters.category.value || pendingPicks.category;
@@ -285,14 +291,16 @@ function hideSearch() {
 }
 $('#search-open').onclick = showSearch;
 $('#search-cancel').onclick = () => {
-  if (searchInput.value) { searchInput.value = ''; onFiltersChanged(); }
+  if (searchInput.value) { searchInput.value = ''; if (liveView) runLiveQuery(''); else onFiltersChanged(); }
   hideSearch();
 };
 searchInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); searchInput.blur(); }
+  if (e.isComposing) return;
+  // In a folder listed live, the field asks the mailbox, and only when told to: each search is the server's work.
+  if (e.key === 'Enter') { e.preventDefault(); if (liveView) runLiveQuery(searchInput.value); searchInput.blur(); }
   if (e.key === 'Escape') {
     e.preventDefault();
-    if (searchInput.value) { searchInput.value = ''; onFiltersChanged(); } else { hideSearch(); searchInput.blur(); }
+    if (searchInput.value) { searchInput.value = ''; if (liveView) runLiveQuery(''); else onFiltersChanged(); } else { hideSearch(); searchInput.blur(); }
   }
 });
 filters.addEventListener('submit', (e) => e.preventDefault());
@@ -326,7 +334,8 @@ function openSheet(dialog, state, here) {
   dialog.addEventListener('animationend', () => dialog.classList.remove('opening'), { once: true });
   rehomeToast();
   const url = location.pathname + location.search + (state && state.hash ? state.hash : location.hash);
-  const entry = Object.assign({ sheet: dialog.id, depth: sheetStack.length }, state || {});
+  // In a live view every entry carries it, so Back never lands outside it by accident.
+  const entry = Object.assign({ sheet: dialog.id, depth: sheetStack.length }, liveView ? { live: liveState() } : {}, state || {});
   if (here) history.replaceState(entry, '', url);
   else history.pushState(entry, '', url);
 }
@@ -424,7 +433,7 @@ function enableDrag(dialog) {
   head.addEventListener('pointerup', end);
   head.addEventListener('pointercancel', end);
 }
-for (const dialog of [sheet, filterSheet, installHelp, healthSheet, notifySheet, keysSheet, menuSheet, composeSheet, snoozeSheet]) {
+for (const dialog of [sheet, filterSheet, installHelp, healthSheet, notifySheet, keysSheet, menuSheet, composeSheet, snoozeSheet, folderSheet]) {
   dialog.addEventListener('cancel', (e) => {
     e.preventDefault();
     // Escape on the composer's list of addresses shuts the list, not the letter.
@@ -458,6 +467,8 @@ window.addEventListener('popstate', () => {
   for (const [open, p] of [...popovers]) {
     if (p.history && !(history.state && history.state.popover === open.id)) closePopover(open, true);
   }
+  // Back from a folder or a search to the triaged view, or forward onto one again.
+  if (!sheetStack.length) liveFromHistory();
   if (!sheetStack.length) {
     // A #m= link followed while the page is open, or the forward button back
     // onto a message: show it, on the entry we are already on.
@@ -569,7 +580,7 @@ function openPopover(dialog, anchor, options) {
     dialog.addEventListener('animationend', () => dialog.classList.remove('opening'), { once: true });
   }
   anchor.setAttribute('aria-expanded', 'true');
-  if (p.history) history.pushState({ popover: dialog.id, depth: sheetStack.length }, '', location.href);
+  if (p.history) history.pushState(Object.assign({ popover: dialog.id, depth: sheetStack.length }, liveView ? { live: liveState() } : {}), '', location.href);
 }
 function closePopover(dialog, viaHistory) {
   const p = popovers.get(dialog);
@@ -757,6 +768,9 @@ function readStorage(key) { try { return localStorage.getItem(key); } catch (e) 
 function writeStorage(key, value) { try { localStorage.setItem(key, value); } catch (e) {} }
 
 const rowKey = (m) => m.dedupKey || m.messageId || '';
+// What the server is to find a message by: a message listed live by its
+// handle, which says exactly where it is; any other by its key.
+const mailRef = (m) => (m && m.handle) || rowKey(m);
 // Levels are a fixed vocabulary; anything else is shown as stored but styled as info.
 const level = (m) => (m.importance === 'critical' || m.importance === 'warning' ? m.importance : 'info');
 const isThread = (item) => Boolean(item && item.latest);
@@ -765,6 +779,7 @@ const keyOf = (item) => (isThread(item) ? threadKeyOf(item) : rowKey(item));
 const rowOfItem = (item) => (isThread(item) ? item.latest : item);
 function findItem(key) {
   if (!key) return null;
+  if (liveView && liveRows.has(key)) return liveRows.get(key);
   for (const item of (filters.view.value === 'threads' ? lastThreads : lastMail) || []) if (keyOf(item) === key) return item;
   for (const item of lastMail || []) if (keyOf(item) === key) return item;
   for (const item of lastThreads || []) if (keyOf(item) === key) return item;
@@ -1378,7 +1393,7 @@ function renderAttachmentManifest(container, manifest, row) {
     const entry = el('li', 'attachment-item');
     const filename = item.filename || fill('detail.unnamedAttachment', { partId: item.partId || '' });
     const link = el('a', null, filename);
-    const href = '/api/attachment?id=' + encodeURIComponent(row.dedupKey || row.messageId)
+    const href = '/api/attachment?id=' + encodeURIComponent(mailRef(row))
       + '&part=' + encodeURIComponent(item.partId || '');
     link.href = href;
     link.download = downloadFilename(item.filename);
@@ -1392,7 +1407,7 @@ function renderAttachmentManifest(container, manifest, row) {
       scanButton.textContent = t('detail.scanningAttachment');
       scan.replaceChildren();
       try {
-        const scanHref = '/api/attachment-scan?id=' + encodeURIComponent(row.dedupKey || row.messageId)
+        const scanHref = '/api/attachment-scan?id=' + encodeURIComponent(mailRef(row))
           + '&part=' + encodeURIComponent(item.partId || '');
         const response = await fetch(scanHref);
         const result = await response.json().catch(() => ({}));
@@ -1514,9 +1529,9 @@ function fetching(body, path, pending, render) {
   });
 }
 function safetySection(box, row) {
-  if (!row.messageId) return;
+  if (!row.messageId && !row.handle) return;
   disclosure(box, t('safety.title'), (body) => {
-    fetching(body, '/api/safety?id=' + encodeURIComponent(row.dedupKey || row.messageId), t('safety.checking'), renderSafetyReport);
+    fetching(body, '/api/safety?id=' + encodeURIComponent(mailRef(row)), t('safety.checking'), renderSafetyReport);
   });
 }
 // ---- Digest ----
@@ -1784,6 +1799,8 @@ function renderAll() {
   renderLede();
   renderStatus();
   renderTokens();
+  renderLiveHead();
+  renderMailboxSearch();
   renderList();
   drawDigest(true);
   renderPane(true);
@@ -1806,6 +1823,7 @@ function applyLanguage(next) {
   applyTheme(readTheme());
   renderAll();
   if (healthSheet.open) redrawHealth();
+  if (folderSheet.open) drawFolders();
   languageChanged();
 }
 $('#lang').onclick = () => {
@@ -1869,6 +1887,8 @@ async function pollNow() {
     const stats = await response.json();
     await refresh();
     await chrome();
+    // A folder on show is the mailbox's: asked again, with its counts.
+    if (liveView) { loadFolders(liveView.account, true); liveLoad(true); }
     // What a code wait found is what the reader came for; a poll finishing
     // at the same moment does not talk over it.
     if (pollNarration && pollNarration.text === codeSaid) return;

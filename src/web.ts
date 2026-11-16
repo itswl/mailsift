@@ -18,7 +18,7 @@ import { loadConfig, type Account } from './config.js';
 import { escapeHtml } from './html.js';
 import {
   AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
-  fetchAttachmentManifestByMessageId, inspectMailSafety, scanAttachmentByMessageId,
+  inspectMailSafety, scanAttachmentByMessageId,
 } from './imap/client.js';
 import { buildLink } from './links.js';
 import { nextDigestAt, renderDigest, type DigestItem } from './services/digest.js';
@@ -27,10 +27,12 @@ import { CATEGORIES } from './services/triage.js';
 import { HEARTBEAT_KEY, type PollStats } from './services/watcher.js';
 import { attachmentLimitBytes, MAX_ATTACHMENTS } from './smtp.js';
 import {
-  configuredAccounts, defaultBackend, forgetLive, liveMessage, mailboxFailure, rememberWhereabouts, routeActions,
-  SIGNATURE_MAX_CHARS, signatureOf, webPushEnabled, whereabouts,
-  type ActionContext, type WebBackend,
+  configuredAccounts, defaultBackend, forgetLive, liveRead, mailboxFailure, rememberWhereabouts, resolveTarget, routeActions,
+  SIGNATURE_MAX_CHARS, signatureOf, webPushEnabled,
+  type ActionContext, type MailTarget, type WebBackend,
 } from './web-actions.js';
+import { handleShaped } from './imap/mailbox.js';
+import { routeMailbox } from './web-mailbox.js';
 import { clientScript, LANGUAGE_COOKIE, storeLanguageScript } from './web-client.js';
 import {
   credentialMark, crossSite, embedded, json, localHost, presentedToken, rateWindow, readBody, readCookie,
@@ -295,8 +297,18 @@ export async function handleApi(
     // included: what the reader shows under the message.
     const key = params.get('key')?.trim();
     if (!key) return json(400, { error: 'key is required', code: 'badRequest' });
-    const row = store.getMail(key);
-    if (!row) return json(404, { error: 'not found', code: 'notFound' });
+    // The conversation is the store's: a live handle names the stored record of its message, if there is one.
+    let row: MailRow | undefined;
+    if (handleShaped(key)) {
+      const resolved = resolveTarget(store, key);
+      if ('refused' in resolved && resolved.refused.status !== 409) return resolved.refused;
+      row = 'target' in resolved ? resolved.target.row : undefined;
+      // A message listed live that mailsift never stored has no conversation in the store.
+      if (!row) return json(200, { key, threadKey: null, count: 0, omitted: 0, between: 0, messages: [] });
+    } else {
+      row = store.getMail(key);
+      if (!row) return json(404, { error: 'not found', code: 'notFound' });
+    }
     const { entries, omitted, between } = store.conversation(row);
     return json(200, {
       key: row.dedupKey,
@@ -407,28 +419,40 @@ export async function handleApi(
   if (path === '/api/message') {
     const messageId = params.get('id')?.trim();
     if (!messageId) return json(400, { error: 'id is required' });
-    const found = store.getMail(messageId);
-    if (!found) return json(404, { error: 'not found', code: 'notFound' });
+    // A stored record's key or Message-ID, or a live handle. Each failure carries
+    // a code as well as the message, so the browser can word it in the reader's
+    // language while a JSON client still reads the text.
     // Linked like a row of the list, so a message opened from a shared link
-    // still offers the provider's own client.
-    const stored = decorate(found);
-    if (params.get('live') !== 'true') return json(200, { ...stored, body: null });
+    // still offers the provider's own client. A message listed live has
+    // nothing stored to show without reading it, so it is always read.
+    if (params.get('live') !== 'true' && !handleShaped(messageId)) {
+      const found = store.getMail(messageId);
+      return found ? json(200, { ...decorate(found), body: null }) : json(404, { error: 'not found', code: 'notFound' });
+    }
+    const resolved = resolveTarget(store, messageId);
+    if ('refused' in resolved) return resolved.refused;
+    const target = resolved.target;
+    const stored = { ...decorate(target.view), ...(target.handle ? { handle: target.ref, stored: Boolean(target.row) } : {}) };
 
-    const account = loadConfig().accounts.find((a) => a.username === found.account);
-    // Each failure carries a code as well as the message, so the browser can
-    // word it in the reader's language while a JSON client still reads the text.
-    if (!account) return json(409, { error: 'this mailbox is no longer configured', code: 'unconfigured' });
+    const account = target.account;
     // A retry asks the mailbox again rather than a copy read a moment ago.
-    if (params.get('fresh') === 'true') forgetLive(found.dedupKey);
+    if (params.get('fresh') === 'true') forgetLive(target.cacheKey);
+    if (!target.messageId && !target.handle) return json(404, { error: 'the message is no longer where it was filed', code: 'notInMailbox' });
     try {
-      const live = await within(liveMessage(found, account, backend, whereabouts(store, found)), LIVE_FETCH_TIMEOUT_MS);
+      const live = await within(liveRead(target, backend), LIVE_FETCH_TIMEOUT_MS);
       if (timedOut(live)) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
       if (!live) return json(404, { error: 'the message is no longer where it was filed', code: 'notInMailbox' });
       // Where it was found is kept, so the next opening is a fetch and not a search.
-      rememberWhereabouts(store, found, live);
+      if (target.row) rememberWhereabouts(store, target.row, live);
       const r = live.readable;
+      // A message nothing was stored about is described by what the mailbox says of it.
+      const said = target.row ? {} : {
+        subject: r.subject, sender: r.from?.address ?? null, senderName: r.from?.name || null, mailDate: r.date,
+        accountLabel: account.name,
+      };
       return json(200, {
         ...stored,
+        ...said,
         body: r.text.slice(0, LIVE_BODY_CHARS),
         // The message as it was written. `html` is the sender's own markup and
         // is not safe to put in a page: the browser view cleans it and shows it
@@ -465,10 +489,25 @@ function attachmentContentType(value: string): string {
     : 'application/octet-stream';
 }
 
+/**
+ * The message an attachment or safety request names, with where to find it:
+ * a stored record (by key or Message-ID), or a live handle, which is looked
+ * for exactly where it says and nowhere else.
+ */
+function namedMessage(store: StateStore, id: string): { target: MailTarget } | { refused: WebResponse } {
+  const resolved = resolveTarget(store, id);
+  if ('refused' in resolved) return resolved;
+  if (!resolved.target.messageId && !resolved.target.handle) {
+    return { refused: json(404, { error: 'mail record not found', code: 'notFound' }) };
+  }
+  return resolved;
+}
+
 async function handleAttachmentsApi(
   params: URLSearchParams,
   store: StateStore,
   client: string,
+  backend: WebBackend,
 ): Promise<WebResponse> {
   const id = params.get('id')?.trim();
   const target = id;
@@ -476,21 +515,17 @@ async function handleAttachmentsApi(
     store.recordMcpAudit('web:list-attachments', client, false, target);
     return json(400, { error: 'id is required' });
   }
-  const stored = store.getMail(id);
-  if (!stored?.messageId) {
+  const named = namedMessage(store, id);
+  if ('refused' in named) {
     store.recordMcpAudit('web:list-attachments', client, false, target);
-    return json(404, { error: 'mail record not found', code: 'notFound' });
+    return named.refused.status === 404 ? json(404, { error: 'mail record not found', code: 'notFound' }) : named.refused;
   }
-  const account = loadConfig().accounts.find((candidate) => candidate.username === stored.account);
-  if (!account) {
-    store.recordMcpAudit('web:list-attachments', client, false, target);
-    return json(409, { error: 'mailbox is no longer configured', code: 'unconfigured' });
-  }
+  const { account, messageId, hint } = named.target;
 
   try {
     const timeout = Symbol('attachment lookup timeout');
     const found = await Promise.race([
-      fetchAttachmentManifestByMessageId(account, stored.messageId, whereabouts(store, stored)),
+      backend.attachments(account, messageId, hint),
       new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_ATTACHMENT_TIMEOUT_MS).unref()),
     ]);
     if (found === timeout) {
@@ -521,21 +556,17 @@ async function handleMailSafetyApi(
     store.recordMcpAudit('web:inspect-mail-safety', client, false, target);
     return json(400, { error: 'id is required' });
   }
-  const stored = store.getMail(id);
-  if (!stored?.messageId) {
+  const named = namedMessage(store, id);
+  if ('refused' in named) {
     store.recordMcpAudit('web:inspect-mail-safety', client, false, target);
-    return json(404, { error: 'mail record not found', code: 'safetyNotFound' });
+    return named.refused.status === 404 ? json(404, { error: 'mail record not found', code: 'safetyNotFound' }) : named.refused;
   }
-  const account = loadConfig().accounts.find((candidate) => candidate.username === stored.account);
-  if (!account) {
-    store.recordMcpAudit('web:inspect-mail-safety', client, false, target);
-    return json(409, { error: 'mailbox is no longer configured', code: 'unconfigured' });
-  }
+  const { account, messageId, hint } = named.target;
 
   try {
     const timeout = Symbol('mail safety lookup timeout');
     const report = await Promise.race([
-      inspectMailSafety(account, stored.messageId, whereabouts(store, stored)),
+      inspectMailSafety(account, messageId, hint),
       new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_SAFETY_TIMEOUT_MS).unref()),
     ]);
     if (report === timeout) {
@@ -565,21 +596,17 @@ async function handleAttachmentApi(
     store.recordMcpAudit('web:get-attachment', client, false, target);
     return json(400, { error: 'id and part are required' });
   }
-  const stored = store.getMail(id);
-  if (!stored?.messageId) {
+  const named = namedMessage(store, id);
+  if ('refused' in named) {
     store.recordMcpAudit('web:get-attachment', client, false, target);
-    return json(404, { error: 'mail record not found', code: 'notFound' });
+    return named.refused.status === 404 ? json(404, { error: 'mail record not found', code: 'notFound' }) : named.refused;
   }
-  const account = loadConfig().accounts.find((candidate) => candidate.username === stored.account);
-  if (!account) {
-    store.recordMcpAudit('web:get-attachment', client, false, target);
-    return json(409, { error: 'mailbox is no longer configured', code: 'unconfigured' });
-  }
+  const { account, messageId, hint } = named.target;
 
   try {
     const timeout = Symbol('attachment download timeout');
     const found = await Promise.race([
-      fetchAttachmentByMessageId(account, stored.messageId, partId, whereabouts(store, stored)),
+      fetchAttachmentByMessageId(account, messageId, partId, hint),
       new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_ATTACHMENT_TIMEOUT_MS).unref()),
     ]);
     if (found === timeout) {
@@ -626,21 +653,17 @@ async function handleAttachmentScanApi(
     store.recordMcpAudit('web:scan-attachment', client, false, target);
     return json(400, { error: 'id and a valid part are required' });
   }
-  const stored = store.getMail(id);
-  if (!stored?.messageId) {
+  const named = namedMessage(store, id);
+  if ('refused' in named) {
     store.recordMcpAudit('web:scan-attachment', client, false, target);
-    return json(404, { error: 'mail record not found', code: 'notFound' });
+    return named.refused.status === 404 ? json(404, { error: 'mail record not found', code: 'notFound' }) : named.refused;
   }
-  const account = loadConfig().accounts.find((candidate) => candidate.username === stored.account);
-  if (!account) {
-    store.recordMcpAudit('web:scan-attachment', client, false, target);
-    return json(409, { error: 'mailbox is no longer configured', code: 'unconfigured' });
-  }
+  const { account, messageId, hint } = named.target;
 
   try {
     const timeout = Symbol('attachment scan timeout');
     const report = await Promise.race([
-      scanAttachmentByMessageId(account, stored.messageId, partId, whereabouts(store, stored)),
+      scanAttachmentByMessageId(account, messageId, partId, hint),
       new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), LIVE_ATTACHMENT_TIMEOUT_MS).unref()),
     ]);
     if (report === timeout) {
@@ -751,6 +774,8 @@ const ICONS: Record<string, string> = {
   image: '<path d="M4 5h16v14H4z"/><path d="M4 16l4.5-4.5 3.5 3.5 2.5-2.5L20 17"/><path d="M9 9.5h.01" stroke-width="2.4"/>',
   read: '<path d="M4 9.5l8-5 8 5V19H4z"/><path d="M4 9.5l8 5 8-5"/>',
   clock: '<circle cx="12" cy="12" r="8"/><path d="M12 7.5V12l3 2"/>',
+  back: '<path d="M15 6l-6 6 6 6"/>',
+  folder: '<path d="M3.5 7.5A1.5 1.5 0 0 1 5 6h4.2l1.8 2H19a1.5 1.5 0 0 1 1.5 1.5v7.5A1.5 1.5 0 0 1 19 18.5H5A1.5 1.5 0 0 1 3.5 17z"/>',
 };
 
 function iconSymbols(): string {
@@ -822,6 +847,8 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
             <fieldset class="window" role="radiogroup" aria-label="${s('filter.window')}" data-i18n-label="filter.window">
               ${seg('hours', '24', 'window.24h', true)}${seg('hours', '72', 'window.3d')}${seg('hours', '168', 'window.7d')}${seg('hours', '720', 'window.30d')}
             </fieldset>
+            <div id="live-head" class="live-head" hidden>${iconButton('live-back', 'back', 'live.back')}<button id="live-where" type="button" class="live-where" aria-haspopup="dialog" aria-controls="folder-sheet" aria-expanded="false"><span id="live-where-name"></span>${icon('down')}</button></div>
+            ${iconButton('folders-open', 'folder', 'folders.title', 'aria-haspopup="dialog" aria-controls="folder-sheet" aria-expanded="false"')}
             ${iconButton('search-open', 'search', 'search.open')}
             <button id="filters-open" type="button" class="text-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="filter-sheet">${s('filter.more')}</button>
           </div>
@@ -829,7 +856,9 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
             <div class="search-field">${icon('search')}<input type="search" name="q" placeholder="${s('search.short')}" aria-label="${s('search')}" data-i18n-label="search" inputmode="search" enterkeyhint="search" autocapitalize="off" autocorrect="off" spellcheck="false"><button id="ask" type="button" class="ask-btn" hidden>${icon('sparkle')}${worded('span', 'ask.button')}</button><kbd id="palette-hint" class="kbd" hidden></kbd></div>
             <button id="search-cancel" type="button" class="text-btn quiet" data-i18n="search.cancel">${s('search.cancel')}</button>
           </div>
+          <div id="mailbox-search" class="mailbox-search" hidden></div>
           <div id="tokens" class="tokens" hidden></div>
+          <div id="live-note" class="live-note" role="status" hidden></div>
           <dialog id="filter-sheet" class="sheet" aria-labelledby="filter-title" tabindex="-1">
             <div class="sheet-head"><span class="handle"></span><button id="filter-clear" type="button" class="text-btn quiet" data-i18n="filter.clearAll">${s('filter.clearAll')}</button><h2 id="filter-title" data-i18n="filter.more">${s('filter.more')}</h2><button id="filter-done" type="button" class="text-btn" data-i18n="done" autofocus>${s('done')}</button></div>
             <div class="sheet-body">
@@ -868,6 +897,10 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
     </dialog>
     <dialog id="snooze-sheet" class="sheet bare" aria-labelledby="snooze-title" tabindex="-1">
       ${sheetHead('snooze-title', 'snooze.title', 'snooze-done')}
+      <div class="sheet-body"></div>
+    </dialog>
+    <dialog id="folder-sheet" class="sheet bare" aria-labelledby="folder-title" tabindex="-1">
+      ${sheetHead('folder-title', 'folders.title', 'folder-done')}
       <div class="sheet-body"></div>
     </dialog>
     <dialog id="keys-sheet" class="sheet" aria-labelledby="keys-title" tabindex="-1">
@@ -1214,9 +1247,11 @@ async function route(
   };
   const acted = await routeActions(req, url, store, context);
   if (acted) return acted;
+  const browsed = await routeMailbox(req, url, store, context);
+  if (browsed) return browsed;
 
   if (url.pathname === '/api/attachments' && req.method === 'GET') {
-    const answer = await handleAttachmentsApi(url.searchParams, store, client);
+    const answer = await handleAttachmentsApi(url.searchParams, store, client, backendOf(options));
     answer.cacheControl = 'no-store';
     return answer;
   }

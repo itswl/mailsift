@@ -33,10 +33,14 @@ import { MailboxUnreachableError } from './imap/connection.js';
 import { outgoingRecord, sentMailEnabled } from './imap/sent.js';
 import {
   appendToSent, applyWebMailAction, AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
-  fetchAttachmentManifestByMessageId, fetchReadableByMessageId, MAIL_ACTIONS, MailActionError,
+  fetchAttachmentManifestByMessageId, fetchReadableByMessageId, LiveMailError, MAIL_ACTIONS, MailActionError,
   type AttachmentManifestLookup, type DownloadedAttachment, type LiveMessage, type LookupHint, type MessageHint,
   type WebMailAction, type WebMailActionResult,
 } from './imap/client.js';
+import {
+  browseFolder, handleShaped, liveHandle, mailboxFolders, parseLiveHandle, searchMailbox,
+  type LiveHandle, type LivePage, type MailboxFolder, type SearchPage,
+} from './imap/mailbox.js';
 import {
   askMail, AssistantError, assistantConfigured, draftReply, type AskAnswer, type DraftInput,
 } from './services/assistant.js';
@@ -77,6 +81,15 @@ export interface WebBackend {
   ask: (store: StateStore, question: string, options: { lang: Language }) => Promise<AskAnswer>;
   draft: (input: DraftInput) => Promise<{ draft: string }>;
   testPush: (store: StateStore, endpoint: string) => Promise<PushSendResult>;
+  /** A mailbox's folders, with their counts where the server gives them cheaply. */
+  folders: (account: Account) => Promise<MailboxFolder[]>;
+  /** One page of a folder, newest first, live. */
+  browse: (account: Account, folder: string, options: { before?: string | null; limit?: number }) => Promise<LivePage>;
+  /** A search of the mailbox, live. */
+  search: (
+    account: Account,
+    options: { query: string; folder?: string | null; before?: string | null; limit?: number; signal?: AbortSignal },
+  ) => Promise<SearchPage>;
   /**
    * A database handle for work that outlives its request. The one a request
    * is given is closed when the answer goes out, and a send or a mailbox
@@ -110,6 +123,9 @@ export const defaultBackend: WebBackend = {
     }
   },
   openStore: () => new StateStore(),
+  folders: (account) => mailboxFolders(account, { counts: true }),
+  browse: browseFolder,
+  search: searchMailbox,
 };
 
 /** Whether this deployment offers notifications to installed copies of the page. */
@@ -216,22 +232,154 @@ export function rememberWhereabouts(store: StateStore, row: MailRow, live: LiveM
 export async function liveMessage(
   row: MailRow, account: Account, backend: WebBackend, hint?: MessageHint,
 ): Promise<LiveMessage | undefined> {
-  const cached = liveCache.get(row.dedupKey);
-  if (cached && Date.now() - cached.at < LIVE_TTL_MS) return cached.value;
-  if (!row.messageId) return undefined;
-  const running = liveInFlight.get(row.dedupKey);
+  if (!row.messageId) return liveCache.get(row.dedupKey)?.value;
+  return readOnce(row.dedupKey, account, row.messageId, hint ?? (row.folder ? { folder: row.folder } : undefined), backend);
+}
+
+/** A message named by a key or a handle, as the mailbox has it now; from memory when it was read moments ago. */
+export async function liveRead(target: MailTarget, backend: WebBackend): Promise<LiveMessage | undefined> {
+  if (!target.messageId && !target.handle) return liveCache.get(target.cacheKey)?.value;
+  return readOnce(target.cacheKey, target.account, target.messageId, target.hint, backend);
+}
+
+function readOnce(
+  key: string, account: Account, messageId: string, hint: MessageHint | undefined, backend: WebBackend,
+): Promise<LiveMessage | undefined> {
+  const cached = liveCache.get(key);
+  if (cached && Date.now() - cached.at < LIVE_TTL_MS) return Promise.resolve(cached.value);
+  const running = liveInFlight.get(key);
   if (running) return running;
-  const work: Promise<LiveMessage | undefined> = backend.read(account, row.messageId, hint ?? (row.folder ? { folder: row.folder } : undefined))
+  const work: Promise<LiveMessage | undefined> = backend.read(account, messageId, hint)
     .then((value) => {
       // An abandoned read keeps its result to itself: something newer was asked for since.
-      if (value && liveInFlight.get(row.dedupKey) === work) rememberLive(row.dedupKey, value);
+      if (value && liveInFlight.get(key) === work) rememberLive(key, value);
       return value;
     })
     .finally(() => {
-      if (liveInFlight.get(row.dedupKey) === work) liveInFlight.delete(row.dedupKey);
+      if (liveInFlight.get(key) === work) liveInFlight.delete(key);
     });
-  liveInFlight.set(row.dedupKey, work);
+  liveInFlight.set(key, work);
   return work;
+}
+
+// ---- What a key or a live handle names ----
+
+/**
+ * The message a request names, by a stored record's key (or Message-ID), or
+ * by a live handle from a folder listed or searched live.
+ *
+ * A handle is read and acted on exactly where it says (see MessageHint.exact),
+ * and refused when it no longer fits. When the mailbox of the handle has a
+ * stored record with its Message-ID, that record is `row`: done, put off,
+ * feedback and the audit are about it, as they would be from the triaged
+ * list, while the mailbox is reached at the handle's place.
+ */
+export interface MailTarget {
+  /** The stored record: named by its key, or found by the Message-ID a handle carries. */
+  row: MailRow | undefined;
+  /** The record as reading and acting see it: the stored one, or one made from the handle alone. */
+  view: MailRow;
+  account: Account;
+  /** What the mailbox is asked for: the Message-ID, '' for a handle to a message that has none. */
+  messageId: string;
+  /** Where to look: where the record was last seen, or exactly where the handle says. */
+  hint: MessageHint | undefined;
+  /** What act() is told about where to look. */
+  place: ActHint;
+  /** Set when the message was named by a live handle. */
+  handle?: LiveHandle;
+  /** The string the request named it by. */
+  ref: string;
+  /** What a live read of it is kept under in memory. */
+  cacheKey: string;
+}
+
+/** A record made from a handle alone, for a message nothing was stored about. */
+function handleRow(handle: LiveHandle, ref: string, account: Account): MailRow {
+  return {
+    dedupKey: ref, messageId: handle.messageId || null, threadKey: null, account: account.username, accountLabel: account.name,
+    subject: null, sender: null, senderName: null, folder: handle.folder, inSpam: false, importance: null, category: null,
+    summary: null, reason: null, deadline: null, decidedBy: null, pushed: false, withheld: false, mailDate: null,
+    createdAt: '', handledAt: null, snoozedUntil: null,
+  };
+}
+
+/**
+ * What a key or a handle names, or the answer that refuses it. A string
+ * shaped like a handle only ever names a live message; one that is also the
+ * key or the Message-ID of a stored record is refused rather than guessed
+ * between, since a sender can write a Message-ID that spells a handle.
+ */
+export function resolveTarget(store: StateStore, ref: string): { target: MailTarget } | { refused: WebResponse } {
+  if (!handleShaped(ref)) {
+    const row = ref ? store.getMail(ref) : undefined;
+    if (!row) return { refused: json(404, { error: 'not found', code: 'notFound' }) };
+    const account = accountOf(row);
+    if (!account) return { refused: json(409, { error: 'this mailbox is no longer configured', code: 'unconfigured' }) };
+    const hint = whereabouts(store, row);
+    return {
+      target: {
+        row, view: row, account, messageId: row.messageId ?? '', hint: hint ?? (row.folder ? { folder: row.folder } : undefined),
+        place: hint ? { folderHint: row.folder!, hint } : {}, ref, cacheKey: row.dedupKey,
+      },
+    };
+  }
+  const handle = parseLiveHandle(ref);
+  if (!handle) return { refused: json(400, { error: 'not a live handle this server made', code: 'badHandle' }) };
+  if (store.recordsFor(ref.trim()).length) {
+    return {
+      refused: json(400, {
+        error: 'this is a live handle and also the key or Message-ID of a stored message; name the stored message by its key',
+        code: 'ambiguousHandle',
+      }),
+    };
+  }
+  const account = configuredAccounts().find((candidate) => candidate.username === handle.account);
+  if (!account) return { refused: json(409, { error: 'this mailbox is not configured', code: 'unconfigured' }) };
+  const canonical = liveHandle(handle);
+  const row = handle.messageId ? store.storedFor(account.username, [handle.messageId]).get(handle.messageId) : undefined;
+  const hint: MessageHint = { folder: handle.folder, uid: handle.uid, uidValidity: handle.uidValidity, exact: true };
+  return {
+    target: {
+      row, view: row ?? handleRow(handle, canonical, account), account, messageId: handle.messageId, hint,
+      place: { folderHint: handle.folder, hint }, handle, ref: canonical, cacheKey: canonical,
+    },
+  };
+}
+
+/** What a mail action's audit row names a message by: its Message-ID, or where it is when it has none. */
+function auditId(target: MailTarget): string {
+  return target.messageId || (target.handle ? `uid ${target.handle.uid} in ${target.handle.folder}` : target.view.dedupKey);
+}
+
+/**
+ * The answer for a live handle that no longer fits: the folder is gone, was
+ * rebuilt, or no longer has that message at that UID. Nothing was read or
+ * changed; the folder is to be listed again.
+ */
+export function staleHandle(error: LiveMailError): WebResponse {
+  const words = {
+    folder: 'the folder this message was listed in is gone',
+    stale: 'the folder was rebuilt since it was listed; list it again',
+    moved: 'the message is no longer where the folder listed it; list the folder again',
+    cursor: 'the folder changed since it was listed; list it again from the top',
+  }[error.code];
+  return json(error.code === 'folder' ? 404 : 409, { error: words, code: error.code === 'cursor' ? 'liveCursor' : 'liveStale', reason: error.code });
+}
+
+/** The stored record a key or a handle names, for what only a stored message has: done, later, feedback. */
+function storedKey(store: StateStore, ref: string): { key: string } | { refused: WebResponse } {
+  if (!handleShaped(ref)) return { key: ref };
+  const resolved = resolveTarget(store, ref);
+  if ('refused' in resolved) return resolved;
+  if (!resolved.target.row) {
+    return {
+      refused: json(409, {
+        error: 'mailsift has not stored this message, so it has no place in the queue or a judgement to correct', code: 'notStored',
+      }),
+    };
+  }
+  return { key: resolved.target.row.dedupKey };
 }
 
 // ---- Shared pieces ----
@@ -350,6 +498,7 @@ const badRequest = (error: string): WebResponse => json(400, { error, code: 'bad
  * other failure keeps its code and its detail.
  */
 export function mailboxFailure(error: unknown, code: string, what: string): WebResponse {
+  if (error instanceof LiveMailError) return staleHandle(error);
   if (error instanceof MailboxUnreachableError) {
     return {
       ...json(503, { error: 'the mail provider is not answering right now', code: 'mailboxUnreachable' }),
@@ -417,8 +566,11 @@ export async function markHandled(
   body: Record<string, unknown> | undefined, store: StateStore, ctx: ActionContext, life: Life,
 ): Promise<WebResponse> {
   if (!ctx.mayMark) return readOnly();
-  const key = text(body?.['key'], 1200);
-  if (!key) return badRequest('key is required');
+  const ref = text(body?.['key'], 5000);
+  if (!ref) return badRequest('key is required');
+  const stored = storedKey(store, ref);
+  if ('refused' in stored) return stored.refused;
+  const key = stored.key;
   const handled = body?.['handled'] !== false;
   const row = store.setHandled(key, handled);
   if (!row) return json(404, { error: 'not found', code: 'notFound' });
@@ -501,11 +653,14 @@ export async function snoozeMail(
   body: Record<string, unknown> | undefined, store: StateStore, ctx: ActionContext, _life: Life,
 ): Promise<WebResponse> {
   if (!ctx.mayMark) return readOnly();
-  const key = text(body?.['key'], 1200);
-  if (!key) return badRequest('key is required');
+  const ref = text(body?.['key'], 5000);
+  if (!ref) return badRequest('key is required');
   if (!body || !('until' in body)) {
     return badRequest('until is required: a time, \'now\' to bring the message back now, or null to cancel the reminder');
   }
+  const stored = storedKey(store, ref);
+  if ('refused' in stored) return stored.refused;
+  const key = stored.key;
   let row: MailRow | undefined;
   let audit: string;
   if (body['until'] === 'now') {
@@ -533,24 +688,34 @@ async function handleAction(req: IncomingMessage, store: StateStore, ctx: Action
   return actOnMail(await readJson(req), store, ctx, life);
 }
 
-/** Do one thing to a message in its mailbox. `body`: key, action, and for a move its destination folder. */
+/**
+ * Do one thing to a message in its mailbox. `body`: key (a stored record's
+ * key, or a live handle), action, and for a move its destination folder.
+ *
+ * A message named by a handle is acted on exactly where the handle says, and
+ * refused when it is no longer there. What only a stored message has (being
+ * dealt with, where the page will look for it next) is kept for the stored
+ * record when there is one.
+ */
 export async function actOnMail(
   body: Record<string, unknown> | undefined, store: StateStore, ctx: ActionContext, life: Life,
 ): Promise<WebResponse> {
   if (ctx.session !== 'write') return readOnly();
-  const key = text(body?.['key'], 1200);
+  const ref = text(body?.['key'], 5000);
   const action = text(body?.['action'], 40) as WebMailAction;
-  if (!key || !PAGE_ACTIONS.has(action)) return badRequest('key and a supported action are required');
+  if (!ref || !PAGE_ACTIONS.has(action)) return badRequest('key and a supported action are required');
   const destination = action === 'move' ? text(body?.['destination'], 500) : '';
   if (action === 'move' && !destination) return badRequest('a move needs a destination folder');
-  const row = store.getMail(key);
-  if (!row?.messageId) return json(404, { error: 'not found', code: 'notFound' });
-  const account = accountOf(row);
-  if (!account) return json(409, { error: 'this mailbox is no longer configured', code: 'unconfigured' });
+  const resolved = resolveTarget(store, ref);
+  if ('refused' in resolved) return resolved.refused;
+  const target = resolved.target;
+  if (!target.messageId && !target.handle) return json(404, { error: 'not found', code: 'notFound' });
+  const row = target.row;
+  const account = target.account;
 
   const audit = {
-    account: row.account, messageId: row.messageId, action, client: ctx.client,
-    ...(row.folder ? { sourceFolder: row.folder } : {}),
+    account: account.username, messageId: auditId(target), action, client: ctx.client,
+    ...(target.view.folder ? { sourceFolder: target.view.folder } : {}),
     // Where a move was aimed, so a refused one can still be traced; a move that goes through records where it landed.
     ...(destination ? { destinationFolder: destination } : {}),
   };
@@ -566,25 +731,31 @@ export async function actOnMail(
       ...audit, success: true, sourceFolder: result.sourceFolder,
       ...(result.destinationFolder ? { destinationFolder: result.destinationFolder } : {}),
     });
-    forgetLive(row.dedupKey);
+    forgetLive(target.cacheKey);
+    if (row) forgetLive(row.dedupKey);
     // The row follows the message, so the next read looks where it now is.
-    if (result.destinationFolder) {
+    if (row && result.destinationFolder) {
       db.updateMailLocation(row.dedupKey, result.destinationFolder, Boolean(result.destinationIsSpam), {
         ...(result.destinationUid && result.destinationUidValidity
           ? { uid: result.destinationUid, uidValidity: result.destinationUidValidity } : {}),
       });
     }
     // Filing a message away is dealing with it, and so is putting it in the bin by the bin's name.
-    if (action === 'archive' || action === 'trash' || result.destinationIsTrash) db.setHandled(row.dedupKey, true);
-    const after = db.getMail(row.dedupKey) ?? row;
-    return json(200, { ok: true, action, row: ctx.decorate(after), attention: db.attentionCount() });
+    if (row && (action === 'archive' || action === 'trash' || result.destinationIsTrash)) db.setHandled(row.dedupKey, true);
+    const after = row ? db.getMail(row.dedupKey) ?? row : undefined;
+    return json(200, {
+      ok: true, action, ...(after ? { row: ctx.decorate(after) } : {}), attention: db.attentionCount(),
+      // Where a live message is now, and its handle there when the server said its new UID.
+      ...(result.destinationFolder ? { moved: movedTo(target, result) } : {}),
+    });
   };
   const refused = (error: unknown): WebResponse => {
+    if (error instanceof LiveMailError) return staleHandle(error);
     if (error instanceof MailActionError) return json(409, { error: error.message, code: `action_${error.code}` });
     return json(502, { error: 'the mailbox action failed', code: 'actionFailed', detail: String(error).slice(0, 200) });
   };
   const work: Promise<WebResponse> = ctx.backend.act(
-    account, row.messageId, action, { ...actHint(store, row), ...(destination ? { destination } : {}) },
+    account, target.messageId, action, { ...target.place, ...(destination ? { destination } : {}) },
   ).then(
     (result) => record(ctx, store, life, (db) => settle(db, result)),
     (error: unknown) => {
@@ -607,15 +778,30 @@ export async function actOnMail(
   }
 }
 
+/** Where a message is after a move: its folder, and its new handle when the server said where it landed. */
+function movedTo(target: MailTarget, result: WebMailActionResult): { folder: string; handle?: string } {
+  const folder = result.destinationFolder!;
+  if (!result.destinationUid || !result.destinationUidValidity) return { folder };
+  return {
+    folder,
+    handle: liveHandle({
+      account: target.account.username, folder, uidValidity: result.destinationUidValidity, uid: result.destinationUid,
+      messageId: target.handle ? target.handle.messageId : target.messageId,
+    }),
+  };
+}
+
 const FEEDBACK_LABELS = new Set(['false_positive', 'missed', 'correct']);
 
 async function handleFeedback(req: IncomingMessage, store: StateStore, ctx: ActionContext): Promise<WebResponse> {
   if (ctx.session !== 'write') return readOnly();
   const body = await readJson(req);
-  const key = text(body?.['key'], 1200);
+  const ref = text(body?.['key'], 5000);
   const label = text(body?.['label'], 40);
-  if (!key || !FEEDBACK_LABELS.has(label)) return badRequest('key and a known label are required');
-  const row = store.getMail(key);
+  if (!ref || !FEEDBACK_LABELS.has(label)) return badRequest('key and a known label are required');
+  const stored = storedKey(store, ref);
+  if ('refused' in stored) return stored.refused;
+  const row = store.getMail(stored.key);
   if (!row) return json(404, { error: 'not found', code: 'notFound' });
   // Against this record, by its key: its Message-ID alone could name another one.
   store.recordFeedback(row.messageId ?? row.dedupKey, label as 'false_positive' | 'missed' | 'correct', '', row.dedupKey);
@@ -715,25 +901,38 @@ async function handleReply(params: URLSearchParams, store: StateStore, ctx: Acti
   return replyDraft({ key: params.get('key')?.trim() ?? '', mode: params.get('mode') ?? '' }, store, ctx);
 }
 
+/**
+ * A message read live for something done with it (an answer, a forward, a
+ * draft), or the answer that says why it could not be. Where a stored message
+ * was found is kept, so the next reading of it is a fetch.
+ */
+async function readTarget(
+  target: MailTarget, store: StateStore, backend: WebBackend,
+): Promise<{ live: LiveMessage } | { refused: WebResponse }> {
+  if (!target.messageId && !target.handle) return { refused: json(404, { error: 'message not found in the mailbox', code: 'actionNotFound' }) };
+  try {
+    const found = await within(liveRead(target, backend), LIVE_TIMEOUT_MS);
+    if (timedOut(found)) return { refused: json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' }) };
+    if (!found) return { refused: json(404, { error: 'message not found in the mailbox', code: 'actionNotFound' }) };
+    if (target.row) rememberWhereabouts(store, target.row, found);
+    return { live: found };
+  } catch (error) {
+    return { refused: mailboxFailure(error, 'readFailed', 'mailbox read failed') };
+  }
+}
+
 /** What an answer to a message starts from: who it goes to, its subject, the thread it continues, the original quoted. */
 export async function replyDraft(
   asked: { key: string; mode?: string }, store: StateStore, ctx: ActionContext,
 ): Promise<WebResponse> {
-  const key = asked.key;
-  const row = key ? store.getMail(key) : undefined;
-  if (!row) return json(404, { error: 'not found', code: 'notFound' });
-  const account = accountOf(row);
-  if (!account) return json(409, { error: 'this mailbox is no longer configured', code: 'unconfigured' });
-  let live: LiveMessage | undefined;
-  try {
-    const found = await within(liveMessage(row, account, ctx.backend, whereabouts(store, row)), LIVE_TIMEOUT_MS);
-    if (timedOut(found)) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
-    live = found;
-    rememberWhereabouts(store, row, live);
-  } catch (error) {
-    return mailboxFailure(error, 'readFailed', 'mailbox read failed');
-  }
-  if (!live) return json(404, { error: 'message not found in the mailbox', code: 'actionNotFound' });
+  const resolved = resolveTarget(store, asked.key);
+  if ('refused' in resolved) return resolved.refused;
+  const target = resolved.target;
+  const row = target.view;
+  const account = target.account;
+  const read = await readTarget(target, store, ctx.backend);
+  if ('refused' in read) return read.refused;
+  const live = read.live;
   const r = live.readable;
   const self = configuredAccounts().map((candidate) => candidate.username);
   const envelope = replyEnvelope(
@@ -754,7 +953,7 @@ export async function replyDraft(
   const replyToElsewhere = envelope.addressedTo === 'replyTo'
     && envelope.to.some((address) => !sender || domain(address) !== domain(sender));
   return json(200, {
-    key: row.dedupKey, account: account.username, accountName: account.name,
+    key: target.ref, account: account.username, accountName: account.name,
     ...envelope,
     sender, replyToElsewhere,
     canSend: sending.available, ...(sending.reason ? { reason: sending.reason } : {}),
@@ -815,21 +1014,14 @@ function bodyPicture(
 export async function forwardDraft(
   asked: { key: string; language?: string }, store: StateStore, ctx: ActionContext,
 ): Promise<WebResponse> {
-  const key = asked.key;
-  const row = key ? store.getMail(key) : undefined;
-  if (!row) return json(404, { error: 'not found', code: 'notFound' });
-  const account = accountOf(row);
-  if (!account) return json(409, { error: 'this mailbox is no longer configured', code: 'unconfigured' });
-  let live: LiveMessage | undefined;
-  try {
-    const found = await within(liveMessage(row, account, ctx.backend, whereabouts(store, row)), LIVE_TIMEOUT_MS);
-    if (timedOut(found)) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
-    live = found;
-    rememberWhereabouts(store, row, live);
-  } catch (error) {
-    return mailboxFailure(error, 'readFailed', 'mailbox read failed');
-  }
-  if (!live) return json(404, { error: 'message not found in the mailbox', code: 'actionNotFound' });
+  const resolved = resolveTarget(store, asked.key);
+  if ('refused' in resolved) return resolved.refused;
+  const target = resolved.target;
+  const row = target.view;
+  const account = target.account;
+  const read = await readTarget(target, store, ctx.backend);
+  if ('refused' in read) return read.refused;
+  const live = read.live;
   const r = live.readable;
   const lang: Language = asked.language === 'en' || asked.language === 'zh-CN' ? asked.language : ctx.lang;
   const envelope = forwardEnvelope({
@@ -845,9 +1037,11 @@ export async function forwardDraft(
   const notForwardable: Array<{ partId: string; filename: string; contentType: string }> = [];
   let unavailable = false;
   try {
-    // Asked where the read just found it, which is now on record.
-    const found = row.messageId
-      ? await within(ctx.backend.attachments(account, row.messageId, whereabouts(store, row)), LIVE_TIMEOUT_MS)
+    // Asked where the read just found it, which is now on record (or exactly where a handle says).
+    const found = target.messageId || target.handle
+      ? await within(ctx.backend.attachments(
+        account, target.messageId, target.row && !target.handle ? whereabouts(store, target.row) : target.hint,
+      ), LIVE_TIMEOUT_MS)
       : undefined;
     if (timedOut(found) || !found) unavailable = true;
     else {
@@ -865,12 +1059,14 @@ export async function forwardDraft(
       }
     }
   } catch (error) {
+    // A handle that no longer fits is said as that: the forward could not carry what it would.
+    if (error instanceof LiveMailError) return staleHandle(error);
     log.warn(`The attachments of a message being forwarded could not be listed: ${String(error).slice(0, 160)}`);
     unavailable = true;
   }
   const sending = ctx.backend.sending(account);
   return json(200, {
-    key: row.dedupKey, account: account.username, accountName: account.name,
+    key: target.ref, account: account.username, accountName: account.name,
     subject: envelope.subject, forwarded: envelope.forwarded,
     attachments, ...(notForwardable.length ? { notForwardable } : {}), ...(unavailable ? { attachmentsUnavailable: true } : {}),
     canSend: sending.available, ...(sending.reason ? { reason: sending.reason } : {}),
@@ -1101,6 +1297,9 @@ async function forwardedFiles(
     }
     listed = found;
   } catch (error) {
+    if (error instanceof LiveMailError) {
+      return { refused: forwardOriginalFailed(404, 'the message being forwarded is no longer where its folder listed it') };
+    }
     log.warn(`The attachments of a message being forwarded could not be listed: ${String(error).slice(0, 160)}`);
     return { refused: forwardOriginalFailed(502, 'the attachments of the message being forwarded could not be read from its mailbox') };
   }
@@ -1127,6 +1326,9 @@ async function forwardedFiles(
       got = fetched;
     } catch (error) {
       if (error instanceof AttachmentTooLargeError) return { refused: sendTooLarge('bytes', filename) };
+      if (error instanceof LiveMailError) {
+        return { refused: forwardOriginalFailed(404, 'the message being forwarded is no longer where its folder listed it') };
+      }
       if (error instanceof AttachmentNotFoundError) {
         return { refused: forwardUnavailable(404, `${filename} is no longer in the message being forwarded`, filename) };
       }
@@ -1185,21 +1387,29 @@ export async function sendMessage(
 
   // A reply leaves from the mailbox that received the original: answering
   // from another address is how a thread loses its other half.
-  const replyKey = text(body['replyTo'], 1200);
-  const forwardKey = text(body['forwardOf'], 1200);
+  const replyKey = text(body['replyTo'], 5000);
+  const forwardKey = text(body['forwardOf'], 5000);
   if (replyKey && forwardKey) return badRequest('a letter answers a message or forwards one, not both');
-  const original = replyKey ? store.getMail(replyKey) : undefined;
-  // Read now: by the time the message has left, this handle may be closed.
-  const originalPlace: ActHint = original ? actHint(store, original) : {};
-  if (replyKey && !original) return json(404, { error: 'the message being answered was not found', code: 'notFound' });
-  const forwarded = forwardKey ? store.getMail(forwardKey) : undefined;
-  if (forwardKey && !forwarded) return json(404, { error: 'the message being forwarded was not found', code: 'notFound' });
+  // A stored record's key, or a live handle. Read now: by the time the message has left, this handle may be closed.
+  const answering = replyKey ? resolveTarget(store, replyKey) : undefined;
+  if (answering && 'refused' in answering) {
+    return answering.refused.status === 404
+      ? json(404, { error: 'the message being answered was not found', code: 'notFound' }) : answering.refused;
+  }
+  const original = answering?.target;
+  const originalPlace: ActHint = original ? original.place : {};
+  const passing = forwardKey ? resolveTarget(store, forwardKey) : undefined;
+  if (passing && 'refused' in passing) {
+    return passing.refused.status === 404
+      ? json(404, { error: 'the message being forwarded was not found', code: 'notFound' }) : passing.refused;
+  }
+  const forwarded = passing?.target;
   const parts = forwardedParts(body['forwardAttachments']);
   if (!parts) return badRequest('forwardAttachments must be a list of attachment part ids');
   if (parts.length && !forwarded) return badRequest('forwardAttachments needs forwardOf, the message they belong to');
   // A forward is a new letter about an old one, so it may leave from any of
   // the owner's mailboxes; by default, the one the original arrived in.
-  const address = original ? original.account : text(body['account'], 320) || (forwarded?.account ?? '');
+  const address = original ? original.account.username : text(body['account'], 320) || (forwarded?.account.username ?? '');
   const account = configuredAccounts().find((candidate) => candidate.username === address);
   if (!account) return json(409, { error: 'this mailbox is not configured', code: 'unconfigured' });
   const sending = ctx.backend.sending(account);
@@ -1211,12 +1421,11 @@ export async function sendMessage(
   if ('refused' in uploads) return uploads.refused;
   // The forwarded files are read from the mailbox the original is in, which
   // need not be the one the forward leaves from.
-  const source = forwarded && parts.length ? accountOf(forwarded) : undefined;
-  if (forwarded && parts.length) {
-    if (!source) return json(409, { error: 'the mailbox the forwarded message is in is no longer configured', code: 'unconfigured' });
-    if (!forwarded.messageId) return forwardOriginalFailed(404, 'the message being forwarded cannot be found in its mailbox');
+  const source = forwarded && parts.length ? forwarded.account : undefined;
+  if (forwarded && parts.length && !forwarded.messageId && !forwarded.handle) {
+    return forwardOriginalFailed(404, 'the message being forwarded cannot be found in its mailbox');
   }
-  const forwardPlace = forwarded ? whereabouts(store, forwarded) : undefined;
+  const forwardPlace = forwarded?.hint;
   const forwardMessageId = forwarded?.messageId ?? '';
 
   const mail: OutgoingMail = {
@@ -1232,7 +1441,7 @@ export async function sendMessage(
   }
 
   const audit = { account: account.username, action: 'send', client: ctx.client };
-  const about = replyKey || forwardKey || '(new message)';
+  const about = original ? auditId(original) : forwarded ? auditId(forwarded) : '(new message)';
   // Answering a message deals with it, and so does passing it on to whoever
   // it is for. A forward to nobody but the owner's own mailboxes (to deal with
   // it at work rather than at home) has dealt with nothing: the copy that
@@ -1245,6 +1454,8 @@ export async function sendMessage(
   const toSelfOnly = suppressSelfForwards() && [...recipients.to, ...recipients.cc, ...recipients.bcc]
     .every((address) => { const a = address.trim().toLowerCase(); return own.has(a) && a !== leftFrom; });
   const dealtWith = Boolean(original) || (Boolean(forwarded) && !toSelfOnly);
+  // Only a stored message is in the queue to be dealt with; one listed live has no place in it.
+  const settles = original ? original.row : forwarded?.row;
   // How long the request waits for the letter: the time any letter is given,
   // and on top of it the time its files take to travel, base64 and all: to
   // the mail server, as long again for the server to answer once it has them
@@ -1323,17 +1534,18 @@ export async function sendMessage(
     // dealtWith). Only an answer is flagged answered in the mailbox: a forward is not one.
     let attention: number | undefined;
     quietly('An answered or forwarded message', () => record(ctx, store, life, (db) => {
-      if (original) db.setHandled(original.dedupKey, true);
-      if (forwarded && dealtWith) db.setHandled(forwarded.dedupKey, true);
+      if (original?.row) db.setHandled(original.row.dedupKey, true);
+      if (forwarded?.row && dealtWith) db.setHandled(forwarded.row.dedupKey, true);
       attention = db.attentionCount();
     }));
     if (original) {
-      forgetLive(original.dedupKey);
-      if (original.messageId) {
+      forgetLive(original.cacheKey);
+      if (original.row) forgetLive(original.row.dedupKey);
+      if (original.messageId || original.handle) {
         const messageId = original.messageId;
         const flagged = {
-          account: account.username, messageId, action: 'answered', client: ctx.client,
-          ...(original.folder ? { sourceFolder: original.folder } : {}),
+          account: account.username, messageId: auditId(original), action: 'answered', client: ctx.client,
+          ...(original.view.folder ? { sourceFolder: original.view.folder } : {}),
         };
         void ctx.backend.act(account, messageId, 'answered', originalPlace).then(
           (result) => quietly('Marking a message answered', () => record(ctx, store, life, (db) => db.recordMailAction(
@@ -1353,7 +1565,7 @@ export async function sendMessage(
       savedCopy, ...(attention !== undefined ? { attention } : {}),
       // Whether the message answered or forwarded now counts as dealt with,
       // for the page to follow rather than decide for itself.
-      ...(original || forwarded ? { handled: dealtWith } : {}),
+      ...(settles ? { handled: dealtWith } : {}),
     });
   })();
   if (sendId) rememberSend(sendId, outcome, pace);
@@ -1373,23 +1585,16 @@ async function handleDraft(req: IncomingMessage, store: StateStore, ctx: ActionC
   const spent = assistantBudget(ctx.client);
   if (spent) return spent;
   const instruction = text(body['instruction'], 1000);
-  const key = text(body['key'], 1200);
+  const key = text(body['key'], 5000);
   let input: DraftInput = { subject: text(body['subject'], 300), from: '', text: '', instruction, lang: ctx.lang };
   if (key) {
-    const row = store.getMail(key);
-    if (!row) return json(404, { error: 'not found', code: 'notFound' });
-    const account = accountOf(row);
-    if (!account) return json(409, { error: 'this mailbox is no longer configured', code: 'unconfigured' });
-    let live: LiveMessage | undefined;
-    try {
-      const found = await within(liveMessage(row, account, ctx.backend, whereabouts(store, row)), LIVE_TIMEOUT_MS);
-      if (timedOut(found)) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
-      live = found;
-      rememberWhereabouts(store, row, live);
-    } catch (error) {
-      return mailboxFailure(error, 'readFailed', 'mailbox read failed');
-    }
-    if (!live) return json(404, { error: 'message not found in the mailbox', code: 'actionNotFound' });
+    const resolved = resolveTarget(store, key);
+    if ('refused' in resolved) return resolved.refused;
+    const row = resolved.target.view;
+    const account = resolved.target.account;
+    const read = await readTarget(resolved.target, store, ctx.backend);
+    if ('refused' in read) return read.refused;
+    const live = read.live;
     const from = live.readable.from;
     input = {
       subject: live.readable.subject || row.subject || '',

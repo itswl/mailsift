@@ -14,8 +14,8 @@ mailsift watches all your IMAP mailboxes, spam folders included. It judges each 
 - **Judged, not just filtered.** Your sender rules decide first; an LLM rates the rest critical, warning or info, with a one-line summary and the reason. Without an LLM, or while it fails, keyword rules keep mail moving.
 - **Pushed when it matters.** Important mail goes to Feishu or your webhook as soon as mailsift sees it, within seconds with IMAP IDLE. The rest waits for one daily digest.
 - **Codes at a glance.** A verification code is shown in the Feishu card and, in the web view, as one large copy button. Codes and sign-in links never reach the LLM.
-- **A mail client built on the triage.** The web view opens on what needs you. Read each message as it was sent, safely; mark it done, archive it or answer it; ask a question across your mail. It installs to a phone's home screen and notifies you there.
-- **An MCP server**, so an AI assistant can see what needs you, and list, search and read your triaged mail.
+- **A mail client built on the triage.** The web view opens on what needs you. Read each message as it was sent, safely; mark it done, archive it or answer it; open any folder or search the whole mailbox, live; ask a question across your mail. It installs to a phone's home screen and notifies you there.
+- **An MCP server**, so an AI assistant can see what needs you, list, search and read your triaged mail, and reach the rest of the mailbox live.
 - **Says when it cannot see.** Alerts when a mailbox or the LLM keeps failing, and an optional heartbeat lets an outside monitor notice if mailsift itself stops.
 
 ## Quick start

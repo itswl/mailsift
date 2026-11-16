@@ -35,6 +35,7 @@ function rememberLive(key, data) {
   if (data && data.flags) flagsByKey.set(key, data.flags);
 }
 function rowByKey(key) {
+  if (liveView && liveRows.has(key)) return liveRows.get(key);
   for (const m of lastMail || []) if (rowKey(m) === key) return m;
   for (const m of attention || []) if (rowKey(m) === key) return m;
   for (const th of lastThreads || []) {
@@ -46,9 +47,14 @@ function rowByKey(key) {
   return extraRows.get(key) || null;
 }
 // A row the server sent back after an action replaces every copy of it.
+// A copy listed live keeps what the mailbox said of it where it was listed:
+// its folder, its handle and its flags are the place, not the record.
 function applyRow(row) {
   if (!row) return;
-  eachCopy(rowKey(row), (m) => { Object.assign(m, row); });
+  eachCopy(rowKey(row), (m) => {
+    const place = m.live ? { live: true, stored: true, handle: m.handle, folder: m.folder, flags: m.flags, subject: m.subject, inSpam: m.inSpam, link: m.link } : null;
+    Object.assign(m, row, place || {});
+  });
 }
 
 // ---- Cleaning a message's HTML: an allowlist, rebuilt element by element ----
@@ -361,7 +367,7 @@ function alwaysImages(sender) {
 const openMessages = new Set();
 function loadMessage(row, section, hooks, fresh) {
   const key = rowKey(row);
-  if (!row.messageId) { section.hidden = true; return; }
+  if (!row.messageId && !row.handle) { section.hidden = true; return; }
   const waiting = el('p', 'inline-status reading', t('detail.loading'));
   section.replaceChildren(waiting);
   const have = !fresh && liveData.get(key);
@@ -379,7 +385,7 @@ function loadMessage(row, section, hooks, fresh) {
   const go = () => {
     // Moved on before the read began (arrowing down a list): nothing to fetch.
     if (!section.isConnected) { clearTimeout(slow); return; }
-    fetch('/api/message?live=true' + (fresh ? '&fresh=true' : '') + '&id=' + encodeURIComponent(key)).then(async (r) => {
+    fetch('/api/message?live=true' + (fresh ? '&fresh=true' : '') + '&id=' + encodeURIComponent(mailRef(row))).then(async (r) => {
       if (r.status === 401) { location.reload(); return; }
       const d = await r.json().catch(() => ({}));
       if (!r.ok) { failed(d); return; }
@@ -522,7 +528,7 @@ function attachmentSection(box, row) {
     return;
   }
   disclosure(box, t('detail.attachments'), (body) => {
-    fetching(body, '/api/attachments?id=' + encodeURIComponent(row.dedupKey || row.messageId), t('detail.loadingAttachments'),
+    fetching(body, '/api/attachments?id=' + encodeURIComponent(mailRef(row)), t('detail.loadingAttachments'),
       (target, result) => renderAttachmentManifest(target, result, row));
   });
 }
@@ -605,8 +611,11 @@ function detail(row) {
   const to = el('p', 'to');
   to.hidden = true;
   byline.appendChild(to);
-  byline.appendChild(el('p', 'where', [row.accountLabel || row.account, row.folder, dayLabel(d, now) + NB + hhmm(d)].filter(Boolean).join(DOT)));
+  const folder = row.live ? folderName(row.account, row.folder) : row.folder;
+  byline.appendChild(el('p', 'where', [row.accountLabel || row.account, folder, isNaN(d) ? '' : dayLabel(d, now) + NB + hhmm(d)].filter(Boolean).join(DOT)));
   box.appendChild(byline);
+  // Listed live and never stored: nothing was judged, so there is no judgement to show or correct.
+  const stored = !row.live || row.stored;
 
   const judgement = el('div', 'judgement');
   const line = el('div', 'line');
@@ -628,7 +637,7 @@ function detail(row) {
   }
   if (dl.childNodes.length) judgement.appendChild(dl);
   if (row.importance && row.decidedBy !== 'health' && row.decidedBy !== 'digest') judgement.appendChild(feedbackLine(row));
-  box.appendChild(judgement);
+  if (stored) box.appendChild(judgement);
   if (row.summary) box.appendChild(el('p', 'summary', row.summary));
 
   const actions = el('div', 'actions');
@@ -645,11 +654,12 @@ function detail(row) {
   attachmentSection(box, row);
   safetySection(box, row);
   // Last, under everything: when it arrives it moves nothing already on the screen.
-  const conversation = conversationSection(box, row);
+  // A message nothing was stored about has no conversation in the store.
+  const conversation = stored ? conversationSection(box, row) : null;
   loadMessage(row, message, { trust, to, actions }, false);
   // After the message's own read has started; at once when it is already known.
   // Not at all for a reader already left (arrowing down a list).
-  if (!showKnownConversation(conversation)) setTimeout(() => { if (conversation.section.isConnected) loadConversation(conversation, false); }, 300);
+  if (conversation && !showKnownConversation(conversation)) setTimeout(() => { if (conversation.section.isConnected) loadConversation(conversation, false); }, 300);
   return box;
 }
 // A thread opens on its latest message; the rest of it is its conversation.
@@ -849,15 +859,29 @@ async function mailAction(key, action) {
   const name = action + ' ' + key;
   if (acting.has(name)) return;
   acting.add(name);
-  const r = await post('/api/action', { key, action });
+  const row = rowByKey(key);
+  // Where it was listed, before anything the answer says moves it.
+  const listedIn = row ? row.folder : null;
+  const r = await post('/api/action', { key: row ? mailRef(row) : key, action });
   acting.delete(name);
-  if (!r.ok) { toast(r.data && (r.data.code || r.data.error) ? failure(r.data) : t('act.failed'), true); return; }
+  if (!r.ok) {
+    toast(r.data && (r.data.code || r.data.error) ? failure(r.data) : t('act.failed'), true);
+    // Not where its folder listed it any more: the list is out of date, and is listed again.
+    if (r.data && r.data.code === 'liveStale' && liveView) liveLoad(true);
+    return;
+  }
   applyRow(r.data.row);
   liveData.delete(key);
   const flags = Object.assign({}, flagsByKey.get(key) || {});
   if (action === 'star' || action === 'unstar') flags.flagged = action === 'star';
   if (action === 'mark_read' || action === 'mark_unread') flags.seen = action === 'mark_read';
   flagsByKey.set(key, flags);
+  // A row listed live shows its flags, and leaves the folder on show when it was moved out of it.
+  const shown = liveView && liveRows.get(key);
+  if (shown) {
+    shown.flags = Object.assign({}, shown.flags || {}, flags);
+    if (r.data.moved && r.data.moved.folder !== listedIn) dropLive(key);
+  }
   if (typeof r.data.attention === 'number') attentionCount = r.data.attention;
   toast(t(ACTION_SAID[action]));
   renderList();
@@ -866,6 +890,7 @@ async function mailAction(key, action) {
   updateBadge();
   // Filed away: the reader goes back to the list on a phone.
   if ((action === 'archive' || action === 'trash') && sheet.open && isOpenRow(key)) closeSheet(sheet, false);
+  else if (shown && r.data.moved && sheet.open && isOpenRow(key)) closeSheet(sheet, false);
   else if (action === 'inbox') renderPane(true);
 }
 // Run once a sheet just closed has gone: the history has stepped back from
@@ -904,8 +929,8 @@ function openMenu(key, anchor) {
   };
   item('i-reply-all', t('act.replyAll'), () => { closeSheet(menuSheet, false); startReply(key, 'replyAll'); });
   item('i-forward', t('act.forward'), () => { closeSheet(menuSheet, false); startForward(key); });
-  // A reminder is for what is not done; one marked done is put back first.
-  if (!row.handledAt && anchor) {
+  // A reminder is for what is not done; one marked done is put back first. Only a stored message has one.
+  if (!row.handledAt && anchor && (!row.live || row.stored)) {
     item('i-clock', t('act.snooze'), () => {
       closeSheet(menuSheet, false);
       // Under the "more" that opened the menu, or its successor if the bar was drawn again meanwhile.
@@ -915,7 +940,7 @@ function openMenu(key, anchor) {
   item('i-star', t(flags.flagged ? 'act.unstar' : 'act.star'), () => mailAction(key, flags.flagged ? 'unstar' : 'star'));
   item('i-read', t(flags.seen === false ? 'act.markRead' : 'act.markUnread'), () => mailAction(key, flags.seen === false ? 'mark_read' : 'mark_unread'));
   if (row.inSpam) item('i-inbox', t('act.notSpam'), () => mailAction(key, 'inbox'));
-  item('i-trash', t('act.trash'), () => mailAction(key, 'trash'));
+  if (!liveIn(row, 'trash')) item('i-trash', t('act.trash'), () => mailAction(key, 'trash'));
   openSheet(menuSheet, {});
 }
 function barButton(glyph, label, run, cls) {
@@ -933,13 +958,16 @@ function fillBar(bar, row, wide) {
   if (!row) return;
   const key = rowKey(row);
   const flags = flagsByKey.get(key) || {};
-  bar.appendChild(barButton('i-check', t(row.handledAt ? 'act.undone' : 'act.done'), () => complete(key, null, Boolean(row.handledAt)), 'primary' + (row.handledAt ? ' on' : '')));
-  bar.appendChild(barButton('i-reply', t('act.reply'), () => startReply(key, 'reply')));
+  // Done and later are the queue's, so only a stored message has them; one listed live answers to the rest.
+  const markable = !row.live || row.stored;
+  if (markable) bar.appendChild(barButton('i-check', t(row.handledAt ? 'act.undone' : 'act.done'), () => complete(key, null, Boolean(row.handledAt)), 'primary' + (row.handledAt ? ' on' : '')));
+  bar.appendChild(barButton('i-reply', t('act.reply'), () => startReply(key, 'reply'), markable ? '' : 'primary'));
   if (wide) bar.appendChild(barButton('i-reply-all', t('act.replyAll'), () => startReply(key, 'replyAll'), 'icon-only'));
-  bar.appendChild(barButton('i-archive', t('act.archive'), () => mailAction(key, 'archive'), wide ? 'icon-only' : ''));
+  // Filed in the archive already, it is not archived again.
+  if (!liveIn(row, 'archive') && !liveIn(row, 'all')) bar.appendChild(barButton('i-archive', t('act.archive'), () => mailAction(key, 'archive'), wide ? 'icon-only' : ''));
   if (wide) bar.appendChild(barButton('i-star', t(flags.flagged ? 'act.unstar' : 'act.star'), () => mailAction(key, flags.flagged ? 'unstar' : 'star'), 'icon-only' + (flags.flagged ? ' lit' : '')));
   // On a desk there is room for it beside the star; on a phone it is under "more".
-  if (wide && !row.handledAt) {
+  if (wide && !row.handledAt && markable) {
     const later = barButton('i-clock', t('act.snooze'), () => openSnooze(key, later), 'icon-only snooze-btn' + (isSnoozed(row) ? ' lit' : ''));
     later.dataset.act = 'snooze';
     later.setAttribute('aria-haspopup', 'dialog');

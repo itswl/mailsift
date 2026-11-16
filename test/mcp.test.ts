@@ -4,7 +4,8 @@ import './setup.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { allowMcpRequest, createServer, forgetUnconfirmedSends, type InFlight } from '../src/mcp.js';
-import { AttachmentTooLargeError, MailActionError, type LiveMessage, type WebMailActionResult } from '../src/imap/client.js';
+import { AttachmentTooLargeError, LiveMailError, MailActionError, type LiveMessage, type WebMailActionResult } from '../src/imap/client.js';
+import { liveHandle, type LiveItem } from '../src/imap/mailbox.js';
 import { StateStore } from '../src/services/state.js';
 import { SendError, type OutgoingMail } from '../src/smtp.js';
 import { forgetLive, forgetSends, type WebBackend } from '../src/web-actions.js';
@@ -150,9 +151,9 @@ describe('tool surface', () => {
     const client = await connect(new StateStore(':memory:'));
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
-      'feedback_rules', 'find_contacts', 'get_mail', 'health', 'inspect_mail_safety', 'list_accounts', 'list_attachments', 'list_audit', 'list_dead_letters',
+      'browse_folder', 'feedback_rules', 'find_contacts', 'get_mail', 'health', 'inspect_mail_safety', 'list_accounts', 'list_attachments', 'list_audit', 'list_dead_letters',
       'list_digest', 'list_folders', 'list_mail', 'list_threads', 'mail_summary', 'needs_you', 'observability',
-      'prepare_forward', 'prepare_reply', 'read_message', 'recovery_status', 'scan_attachment', 'search_mail',
+      'prepare_forward', 'prepare_reply', 'read_message', 'recovery_status', 'scan_attachment', 'search_mail', 'search_mailbox',
     ]);
     for (const tool of tools) expect(tool.description ?? '').not.toBe('');
   });
@@ -1923,5 +1924,105 @@ describe('the owner\'s own mail', () => {
     });
     expect(await client.callTool({ name: 'find_contacts', arguments: { query: 'alice', limit: 21 } })).toMatchObject({ isError: true });
     expect(await client.callTool({ name: 'find_contacts', arguments: { query: '' } })).toMatchObject({ isError: true });
+  });
+});
+
+describe('the rest of the mailbox, live', () => {
+  const OLD = liveHandle({ account: 'me@qq.com', folder: 'Archive', uidValidity: '5', uid: 9, messageId: '<old@x>' });
+  const ONE = liveHandle({ account: 'me@qq.com', folder: 'Archive', uidValidity: '5', uid: 3, messageId: '<one@x>' });
+  const item = (uid: number, messageId: string, subject: string): LiveItem => ({
+    handle: liveHandle({ account: 'me@qq.com', folder: 'Archive', uidValidity: '5', uid, messageId }), account: 'me@qq.com', folder: 'Archive',
+    uid, uidValidity: '5', messageId, storedId: messageId, subject, from: { name: 'Ann', address: 'ann@example.com' }, to: [],
+    date: '2025-01-02T03:04:05.000Z', size: 1200, flags: { seen: true, flagged: false, answered: false }, attachments: false,
+  });
+  async function failed(client: Client, name: string, args: Record<string, unknown>): Promise<{ code: string; message: string; hint?: string }> {
+    const result = await client.callTool({ name, arguments: args });
+    expect(result).toMatchObject({ isError: true });
+    return JSON.parse((result.content as Array<{ text: string }>)[0]!.text) as { code: string; message: string; hint?: string };
+  }
+  function live(state: StateStore): Mailbox {
+    const box = mailbox(state);
+    box.backend = {
+      ...box.backend,
+      folders: async () => [{
+        path: 'Archive', name: 'Archive', parent: null, depth: 0, delimiter: '/', flags: [], specialUse: '\\Archive', specialUseSource: null,
+        role: 'archive', selectable: true, subscribed: true, messages: 2, unseen: 0,
+      }],
+      browse: async (_account, folder) => ({ account: 'me@qq.com', folder, uidValidity: '5', total: 2, items: [item(9, '<old@x>', 'Old news'), item(3, '<one@x>', 'subject k1')], next: '5.3' }),
+      search: async (_account, options) => ({
+        account: 'me@qq.com', query: options.query, folders: ['INBOX'], items: [item(9, '<old@x>', 'Old news')], total: 1, next: null,
+        limited: { reason: 'provider', scanned: 2000 },
+      }),
+    };
+    return box;
+  }
+  beforeEach(() => { process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|secret'; });
+
+  it('browses a folder and searches the mailbox with the read token, handing out handles and keys', async () => {
+    const state = seeded();
+    const client = await connect(state, false, live(state).backend);
+    const page = await call(client, 'browse_folder', { account: 'me@qq.com', folder: 'Archive', limit: 2 });
+    expect(page).toMatchObject({ folder: 'Archive', total: 2, next: '5.3' });
+    const items = page['items'] as Array<Record<string, unknown>>;
+    expect(items[0]).toMatchObject({ handle: OLD, subject: 'Old news' });
+    expect(items[0]).not.toHaveProperty('key');
+    expect(items[1]).toMatchObject({ handle: ONE, key: 'k1', stored: { importance: 'critical' } });
+    const found = await call(client, 'search_mailbox', { account: 'me@qq.com', query: 'old' });
+    expect(found).toMatchObject({ total: 1, limited: { reason: 'provider', scanned: 2000 }, items: [{ handle: OLD }] });
+    const folders = await call(client, 'list_folders', { account: 'me@qq.com' });
+    expect(folders).toMatchObject({ count: 1, folders: [{ path: 'Archive', role: 'archive', messages: 2 }] });
+    // Which folder was browsed is on record; the query is not.
+    const audit = state.listMcpAudit(10).find((row) => row.action === 'browse_folder');
+    expect(audit?.target).toContain('Archive');
+  });
+
+  it('reads, prepares an answer to and acts on a message by its handle, exactly where it was listed', async () => {
+    const state = seeded();
+    const box = live(state);
+    const client = await connect(state, true, box.backend);
+    const read = await call(client, 'read_message', { messageId: OLD });
+    expect(read).toMatchObject({ handle: OLD, stored: false, handledAt: null, importance: null });
+    expect(box.read[0]).toEqual({ folder: 'Archive', uid: 9, uidValidity: '5', exact: true });
+    const reply = await call(client, 'prepare_reply', { messageId: OLD });
+    expect(reply).toMatchObject({ account: 'me@qq.com', to: ['billing@vendor.com'] });
+    box.act = () => ({ destinationFolder: 'Projects', destinationUid: 40, destinationUidValidity: '6' });
+    const moved = await call(client, 'manage_mail', { messageId: OLD, action: 'move', destination: 'Projects' });
+    expect(moved).toMatchObject({ success: true, folder: 'Projects', account: 'me@qq.com' });
+    expect(moved['handle']).toBe(liveHandle({ account: 'me@qq.com', folder: 'Projects', uidValidity: '6', uid: 40, messageId: '<old@x>' }));
+    expect(box.acted[0]).toMatchObject({ messageId: '<old@x>', action: 'move', hint: { exact: true, uid: 9 } });
+  });
+
+  it('refuses a handle that no longer fits, and points at listing the folder again', async () => {
+    const state = seeded();
+    const box = live(state);
+    box.backend.read = async () => { throw new LiveMailError('moved', 'gone'); };
+    box.backend.act = async () => { throw new LiveMailError('stale', 'rebuilt'); };
+    const client = await connect(state, true, box.backend);
+    expect(await failed(client, 'read_message', { messageId: OLD })).toMatchObject({ code: 'NOT_FOUND', hint: expect.stringMatching(/again/) });
+    expect(await failed(client, 'manage_mail', { messageId: OLD, action: 'star' })).toMatchObject({ code: 'NOT_FOUND' });
+    expect(await failed(client, 'read_message', { messageId: 'live:forged' })).toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(await failed(client, 'read_message', { messageId: OLD, account: 'other@qq.com' })).toMatchObject({ code: 'INVALID_ARGUMENT' });
+  });
+
+  it('keeps the queue to what mailsift stored', async () => {
+    const state = seeded();
+    const client = await connect(state, true, live(state).backend);
+    expect(await failed(client, 'mark_handled', { messageId: OLD })).toMatchObject({ code: 'ACTION_REFUSED' });
+    expect(await failed(client, 'snooze', { messageId: OLD, until: 'now' })).toMatchObject({ code: 'ACTION_REFUSED' });
+    expect(await failed(client, 'record_feedback', { messageId: OLD, label: 'correct' })).toMatchObject({ code: 'ACTION_REFUSED' });
+    // The same message as stored: its handle reaches its record.
+    expect(await call(client, 'mark_handled', { messageId: ONE })).toMatchObject({ handled: true, account: 'me@qq.com' });
+    expect(state.getMail('k1')?.handledAt).not.toBeNull();
+  });
+
+  it('answers a message by its handle, and says nothing of a queue it was never in', async () => {
+    const state = seeded();
+    const box = live(state);
+    const client = await connect(state, true, box.backend);
+    const sent = await call(client, 'send_mail', { replyTo: OLD, text: 'Thanks' });
+    expect(sent).toMatchObject({ sent: true, account: 'me@qq.com', to: ['billing@vendor.com'] });
+    expect(sent).not.toHaveProperty('originalHandled');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(box.acted).toContainEqual(expect.objectContaining({ messageId: '<old@x>', action: 'answered', hint: expect.objectContaining({ exact: true }) }));
   });
 });
