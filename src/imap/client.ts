@@ -263,10 +263,25 @@ function attachmentWarningDetail(code: NonNullable<AttachmentInfo['safetyWarning
   }
 }
 
-function threadReference(headers: string): string | undefined {
+/** The Message-IDs of a header block's References line, in order, as written. */
+export function referenceIds(headers: string): string[] {
   const match = /^references:\s*([^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*)/im.exec(headers);
-  const ids = match?.[1]?.match(/<[^>\s]+>/g) ?? [];
-  return ids[0]?.trim().toLowerCase();
+  return (match?.[1]?.match(/<[^>\s]+>/g) ?? []).map((id) => id.trim());
+}
+
+function threadReference(headers: string): string | undefined {
+  return referenceIds(headers)[0]?.toLowerCase();
+}
+
+/**
+ * The key a message's conversation is stored under: the mailbox, and the
+ * first message of the thread as its References name it, else the one it
+ * answers, else itself. Received and sent mail are keyed the same way, so an
+ * answer lands in the conversation it answers.
+ */
+export function threadKeyOf(username: string, headers: string, inReplyTo: string | undefined, messageId: string): string {
+  const root = threadReference(headers) || inReplyTo?.trim().toLowerCase() || messageId.toLowerCase();
+  return `${username}|${root}`;
 }
 
 function attachmentMaxBytes(): number {
@@ -496,8 +511,6 @@ async function toMailMessage(
       uid: raw.uid,
     });
 
-  const rootReference = threadReference(headers) || envelope?.inReplyTo?.trim().toLowerCase() || messageId.toLowerCase();
-
   return {
     account: account.username,
     accountLabel: account.name,
@@ -515,7 +528,7 @@ async function toMailMessage(
       .filter(Boolean),
     date: normalizeDate(envelope?.date),
     body,
-    threadKey: `${account.username}|${rootReference}`,
+    threadKey: threadKeyOf(account.username, headers, envelope?.inReplyTo, messageId),
     hasAttachments: hasAttachments || attachmentManifest.items.length > 0 || attachmentManifest.truncated,
     attachmentManifest,
     listUnsubscribe: /^list-unsubscribe:/im.test(headers),

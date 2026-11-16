@@ -350,7 +350,9 @@ body.offline #refresh,body.offline .load-more{opacity:.4;pointer-events:none}
 .safety-finding.warning::before,.safety-warning{color:var(--critical-text)}.safety-finding.warning::before{background:var(--critical-text)}
 .safety-finding.caution::before{background:var(--warning-text)}
 .safety-warning{font-size:12px}
-.thread-history{margin-top:8px;border-top:1px solid var(--line);padding-top:4px}
+/* A message's conversation, under it: the reader's own messages carry the accent's dot, this one a hollow one. */
+.conversation{margin-top:8px;border-top:1px solid var(--line);padding-top:4px}
+.conv-omitted{margin:0 0 6px;font-size:12px;color:var(--muted)}
 .tl-open{display:block;width:100%;margin:0;padding:0;border:0;border-radius:6px;background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
 .timeline{list-style:none;margin:0;padding:0 0 0 14px;border-left:1px solid var(--line)}
 .timeline li{position:relative;padding:6px 0 10px;font-size:13px}
@@ -358,6 +360,11 @@ body.offline #refresh,body.offline .load-more{opacity:.4;pointer-events:none}
 .timeline .tl-head{color:var(--muted)}
 .timeline .tl-subject{font-weight:500;margin:1px 0}
 .timeline .tl-sum{color:var(--text-2);display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+.timeline li.tl-yours::before{background:var(--accent)}
+.timeline li.tl-current::before{background:var(--surface);box-shadow:inset 0 0 0 1.5px var(--line-strong)}
+.tl-you{color:var(--text);font-weight:600}
+.tl-full{margin:2px 0 0}.tl-full .mail-text{font-size:14px;line-height:1.55}
+.detail .tl-meta{margin:6px 0 0;font-size:12px;color:var(--muted)}.tl-meta dd{overflow-wrap:anywhere}
 
 /* ---- Digest ---- */
 .digest{margin:20px 16px 0;padding-top:14px;border-top:1px solid var(--line)}
@@ -481,7 +488,15 @@ a.primary-action{display:inline-flex;align-items:center;justify-content:center;t
 .compose .sheet-head{padding-left:8px}
 .text-btn.strong{display:inline-flex;align-items:center;gap:6px;font-size:15px}
 .text-btn.strong .icon{width:16px;height:16px}
-#compose-form{display:flex;flex-direction:column}
+#compose-form{position:relative;display:flex;flex-direction:column}
+/* The addresses that fit what is being typed: laid over the letter under the field, never pushing it down. */
+.suggest{position:absolute;right:0;z-index:6;max-width:440px;max-height:min(264px,40vh);margin:0;padding:4px;list-style:none;overflow:auto;overscroll-behavior:contain;border:1px solid var(--line);border-radius:12px;background:var(--surface);box-shadow:var(--shadow-pop)}
+.suggest-item{display:flex;flex-direction:column;justify-content:center;min-height:44px;padding:3px 10px;border-radius:8px;cursor:pointer}
+.suggest-item.on{background:var(--fill)}
+.suggest-name,.suggest-address{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.suggest-name{font-size:14px;color:var(--text)}
+.suggest-address{font-size:14px;color:var(--text-2)}.suggest-name+.suggest-address{font-size:12px;color:var(--muted)}
+@media (pointer:fine){.suggest-item{min-height:38px}}
 .cfield{display:flex;align-items:center;gap:10px;min-height:46px;border-bottom:1px solid var(--line)}
 .cfield .label{min-width:3.4em}
 .cfield input,.cfield select,.ai-line input{flex:1;min-width:0;margin:0;padding:8px 0;border:0;background:none;color:var(--text);font:inherit;font-size:16px;outline:none}

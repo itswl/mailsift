@@ -41,7 +41,7 @@ import { liveHub } from './web-live.js';
 import { LIGHT_BAR, styles } from './web-styles.js';
 import { isLanguage, LANGUAGES, t, type Language, type StringKey } from './web-strings.js';
 import { appPolicy, framePolicy, MAIL_FRAME, SERVICE_WORKER, SHELL_HEADER } from './web-worker.js';
-import type { MailRow, StateStore } from './services/state.js';
+import { MAX_CONTACTS, type MailRow, type SentRow, type StateStore } from './services/state.js';
 
 export { LANGUAGE_COOKIE, readCookie, SESSION_COOKIE, tokenMatches };
 export type { Session, WebBackend, WebResponse };
@@ -192,6 +192,22 @@ function backendOf(options: WebOptions | undefined): WebBackend {
   return { ...defaultBackend, ...(options?.backend ?? {}) };
 }
 
+/**
+ * One of the owner's own messages as a conversation shows it: whom it went
+ * to, its first words, and the stored text it opens to in place.
+ */
+export function sentView(sent: SentRow, at: string): Record<string, unknown> {
+  return {
+    direction: 'out', at, id: sent.id, account: sent.account, accountLabel: sent.accountLabel, subject: sent.subject,
+    from: { name: sent.fromName ?? '', address: sent.fromAddr ?? sent.account },
+    to: sent.to, cc: sent.cc, bcc: sent.bcc,
+    // The first words, without the signature under the standard delimiter.
+    excerpt: (sent.text.replace(/(^|\n)-- \n[\s\S]*$/, '').trim() || sent.text).replace(/\s+/g, ' ').trim().slice(0, 200),
+    text: sent.text,
+    attachments: { count: sent.attachmentCount, names: sent.attachmentNames },
+  };
+}
+
 /** A stored row as the list shows it: with its provider and its link out. */
 function decorate(row: MailRow): Record<string, unknown> {
   const provider = providerOf(row.account);
@@ -272,6 +288,33 @@ export async function handleApi(
         messages: thread.messages.map(decorate),
       })),
     });
+  }
+
+  if (path === '/api/conversation') {
+    // The rest of a message's conversation, the owner's own messages in it
+    // included: what the reader shows under the message.
+    const key = params.get('key')?.trim();
+    if (!key) return json(400, { error: 'key is required', code: 'badRequest' });
+    const row = store.getMail(key);
+    if (!row) return json(404, { error: 'not found', code: 'notFound' });
+    const { entries, omitted } = store.conversation(row);
+    return json(200, {
+      key: row.dedupKey,
+      threadKey: row.threadKey,
+      count: entries.length,
+      omitted,
+      messages: entries.map((entry) => entry.direction === 'in'
+        ? { ...decorate(entry.row), direction: 'in', at: entry.at, current: entry.row.dedupKey === row.dedupKey }
+        : sentView(entry.sent, entry.at)),
+    });
+  }
+
+  if (path === '/api/contacts') {
+    // Addresses for the one being typed into To, Cc or Bcc.
+    const q = (params.get('q') ?? '').slice(0, 200);
+    const limit = intParam(params, 'limit', 8, MAX_CONTACTS);
+    const own = configuredAccounts().map((account) => account.username);
+    return json(200, { contacts: q.trim() ? store.contacts(q, limit, own) : [] });
   }
 
   if (path === '/api/attention') {
@@ -746,6 +789,8 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
       + '<svg class="refresh-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
       + '<path d="M20 11a8 8 0 1 0-2.34 5.66"/><path d="M20 4v7h-7"/></svg></button>'
     : '';
+  // To, Cc and Bcc each offer the addresses that fit what is being typed, in one list under the field.
+  const suggesting = 'role="combobox" aria-autocomplete="list" aria-controls="compose-suggest" aria-expanded="false"';
   const sheetHead = (titleId: string, key: StringKey, doneId: string): string =>
     `<div class="sheet-head"><span class="handle"></span><span></span><h2 id="${titleId}" data-i18n="${key}">${s(key)}</h2><button id="${doneId}" type="button" class="text-btn" data-i18n="done">${s('done')}</button></div>`;
   return page(lang, 'mailsift', `
@@ -836,9 +881,10 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
       <div class="sheet-body">
         <form id="compose-form" autocomplete="off">
           <div id="compose-from" class="cfield" hidden>${worded('span', 'compose.from', 'class="label"')}<span id="compose-from-value" class="cvalue"></span></div>
-          <label class="cfield">${worded('span', 'compose.to', 'class="label" id="compose-to-label"')}<input name="to" type="text" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false" aria-labelledby="compose-to-label"><button id="compose-cc-toggle" type="button" class="text-btn quiet" data-i18n="compose.ccBcc">${s('compose.ccBcc')}</button></label>
-          <label id="compose-cc-row" class="cfield" hidden>${worded('span', 'compose.cc', 'class="label"')}<input name="cc" type="text" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
-          <label id="compose-bcc-row" class="cfield" hidden>${worded('span', 'compose.bcc', 'class="label"')}<input name="bcc" type="text" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+          <label class="cfield">${worded('span', 'compose.to', 'class="label" id="compose-to-label"')}<input name="to" type="text" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false" ${suggesting} aria-labelledby="compose-to-label"><button id="compose-cc-toggle" type="button" class="text-btn quiet" data-i18n="compose.ccBcc">${s('compose.ccBcc')}</button></label>
+          <label id="compose-cc-row" class="cfield" hidden>${worded('span', 'compose.cc', 'class="label"')}<input name="cc" type="text" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false" ${suggesting}></label>
+          <label id="compose-bcc-row" class="cfield" hidden>${worded('span', 'compose.bcc', 'class="label"')}<input name="bcc" type="text" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false" ${suggesting}></label>
+          <ul id="compose-suggest" class="suggest" role="listbox" aria-label="${s('compose.suggestions')}" data-i18n-label="compose.suggestions" hidden></ul>
           <label class="cfield">${worded('span', 'compose.subject', 'class="label" id="compose-subject-label"')}<input name="subject" type="text" aria-labelledby="compose-subject-label">${iconButton('compose-attach', 'clip', 'compose.attach')}</label>
           <input id="compose-file" type="file" multiple hidden>
           <div id="compose-ai" class="compose-ai" hidden>

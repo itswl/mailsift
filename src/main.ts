@@ -24,6 +24,7 @@ import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
 import { PollCoordinator } from './services/poll-scheduler.js';
 import { IdleSupervisor, idleEnabled, idleFolderTokens } from './imap/idle.js';
 import { stopConnecting } from './imap/connection.js';
+import { sentLookbackDays, sentMailEnabled } from './imap/sent.js';
 import { webUiEnabled } from './web.js';
 import { flushHeartbeats, heartbeatProblem, heartbeatUrl } from './services/heartbeat.js';
 import { getLogger } from './logger.js';
@@ -151,6 +152,11 @@ async function checkConfig(): Promise<number> {
   } else {
     console.log('   IMAP IDLE: disabled (set IMAP_IDLE_ENABLED=true for real-time wake-ups)');
   }
+  console.log(
+    sentMailEnabled()
+      ? `   Sent folders: read for the conversation, first looking back ${sentLookbackDays()} days (SENT_MAIL_ENABLED=false turns this off)`
+      : '   Sent folders: not read (SENT_MAIL_ENABLED=false)',
+  );
   if ((process.env.MCP_ENABLED ?? 'true').toLowerCase() === 'true') {
     const where = `${process.env.MCP_PUBLIC_HOST ?? '127.0.0.1'}:${process.env.MCP_PORT ?? 8410}`;
     console.log(

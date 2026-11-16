@@ -84,3 +84,19 @@ describe('putting off until later', () => {
     expect(prose(read('docs/web-view.md'))).toContain('one you put off comes back like anything else');
   });
 });
+
+describe('the owner\'s sent mail', () => {
+  it('is documented where it is set, said to be local, for the conversation only, and never sent to the model', () => {
+    const env = prose(read('.env.example'));
+    expect(env).toContain('SENT_MAIL_ENABLED=true');
+    expect(env).toContain('SENT_LOOKBACK_DAYS=30');
+    const config = prose(read('docs/configuration.md'));
+    expect(config).toContain('It is used for the conversation only. It is never judged, never sent to the model');
+    expect(config).toContain('What was stored before stays, and still shows in its conversations, until retention removes it');
+    expect(prose(read('docs/web-view.md'))).toContain('used for the conversation only: it is never judged, never sent to the model');
+    expect(prose(read('docs/mcp.md'))).toContain('used for the conversation only, and never judged or sent to the model');
+    expect(prose(read('.agents/skills/mailsift/SKILL.md'))).toContain('it is never judged or sent to the model');
+    // The audit still records only that a letter left; the letter is kept for its conversation.
+    expect(prose(read('docs/web-view.md'))).not.toContain('What is recorded about a sent message is that one left');
+  });
+});

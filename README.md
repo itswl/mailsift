@@ -98,6 +98,7 @@ Set `WEB_UI_ENABLED=true` and open `http://<host>:8410/` (the `MCP_PORT`). Sign 
 
 - **What needs you** comes first: mail judged important that you have not dealt with. Tick it off, swipe it away, put it off until later (it comes back when you said, with a notification), or open it.
 - **Read** a message as it was sent. Remote images wait until you ask, tracking pixels are dropped, a link that goes somewhere other than it says is marked, and your provider's verdict on the sender is shown.
+- **The whole conversation** under each message, your own replies included, read from your Sent folder. A message you answered from another mail app leaves what needs you, and the people you write to are suggested as you type.
 - **Act**: done, archive, bin, star, not spam. Reply, forward or write a new message, with Cc and Bcc, attachments (pasted pictures too), a signature for each mailbox, a first draft from the model if you want one and five seconds to undo a send.
 - **Ask** a question across your mail and get an answer that cites the messages it came from.
 - **Codes** are set large and copy on tap. On a phone, the **Latest code** home-screen shortcut opens on the newest one and waits for one still on its way.

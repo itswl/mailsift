@@ -104,6 +104,20 @@ export function findQuoteStart(lines: readonly string[]): number {
   return -1;
 }
 
+/**
+ * Where the writer's own words end in a message they sent: at the quoted
+ * history (as findQuoteStart finds it) or at a message forwarded under them,
+ * whichever comes first; -1 when there is neither. Unlike a received message,
+ * whose forwarded content is often its point, a sent one is kept for what the
+ * owner wrote in it.
+ */
+export function ownTextEnd(lines: readonly string[]): number {
+  const quote = findQuoteStart(lines);
+  const forward = lines.findIndex((line) => FORWARDED_MESSAGE.test(line.trim()));
+  if (quote === -1) return forward;
+  return forward === -1 ? quote : Math.min(quote, forward);
+}
+
 /** Drop the quoted history and any `>` lines above it. The original is kept if nothing is left. */
 export function stripQuotes(text: string): string {
   const lines = text.split('\n');

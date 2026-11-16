@@ -6,6 +6,8 @@ import { Watcher } from '../src/services/watcher.js';
 import type { WatchConfig } from '../src/config.js';
 import * as triageModule from '../src/services/triage.js';
 import * as clientModule from '../src/imap/client.js';
+import * as sentModule from '../src/imap/sent.js';
+import type { SentCursorRow, SentRecord } from '../src/services/state.js';
 import type { ImapFlow } from 'imapflow';
 import type { Account } from '../src/config.js';
 import type { Folder } from '../src/imap/folders.js';
@@ -661,5 +663,155 @@ describe('sign-in link mail through dispatch', () => {
     expect(s.pushed).toBe(0);
     expect(sink.pushed).toHaveLength(0);
     expect(state.getMail('<phish@x>')).toMatchObject({ importance: 'info', summary: '收到登录链接邮件（如果不是你刚刚请求的，请勿打开）。' });
+  });
+});
+
+describe('the Sent folder', () => {
+  const ACCOUNT: Account = {
+    name: 'qq', provider: 'qq', username: 'me@qq.com', host: 'imap.qq.com', port: 993,
+    auth: 'password', password: 'x', folders: ['INBOX'], useSsl: true,
+  };
+  const WITH_ACCOUNT: WatchConfig = { ...CONFIG, accounts: [ACCOUNT] };
+  const INBOX: Folder = { path: 'INBOX', rawPath: 'INBOX', flags: new Set(), isSpam: false, selectable: true };
+  const at = (offsetMs: number): string => new Date(Date.now() + offsetMs).toISOString();
+  const reply = (overrides: Partial<SentRecord> = {}): SentRecord => ({
+    account: 'me@qq.com', messageId: '<reply@qq.com>', threadKey: 'me@qq.com|<q@x>', inReplyTo: '<q@x>', answers: '<q@x>',
+    subject: 'Re: q', fromAddr: 'me@qq.com', to: [{ name: 'Ann', address: 'ann@example.org' }], cc: [], bcc: [],
+    date: at(-5 * 60_000), text: 'On it.', attachmentCount: 0, attachmentNames: [], folder: 'Sent', uid: 7, uidValidity: '3',
+    source: 'poll', ...overrides,
+  });
+  const cursor = (lastUid: number): SentCursorRow => ({
+    folder: 'Sent', uidValidity: '3', lastUid, backfillBelow: 0, backfillLeft: 0, backfillSince: null,
+  });
+  const batch = (messages: SentRecord[], lastUid = 7) => ({ account: 'me@qq.com', accountName: 'qq', folder: 'Sent', messages, cursor: cursor(lastUid) });
+
+  function polling(accounts = false) {
+    const state = new StateStore(':memory:');
+    const sink = new RecordingSink();
+    return { state, sink, w: new Watcher(accounts ? WITH_ACCOUNT : CONFIG, state, sink) };
+  }
+
+  /** The IMAP session of one account: an inbox with nothing new, and a Sent folder. */
+  function session(sentFolder: string | undefined) {
+    vi.spyOn(clientModule, 'connect').mockResolvedValue({ logout: async () => undefined } as unknown as ImapFlow);
+    vi.spyOn(clientModule, 'targetFolders').mockResolvedValue([INBOX]);
+    vi.spyOn(clientModule, 'listFolders').mockResolvedValue([]);
+    vi.spyOn(clientModule, 'sentFolderPath').mockReturnValue(sentFolder);
+    const inbound = vi.spyOn(clientModule, 'fetchNew').mockResolvedValue({ messages: [], cursor: { uidValidity: '1', lastUid: 0 }, failures: [] });
+    return { inbound };
+  }
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it('stores a message answered from another client before this poll as dealt with, and does not notify it', async () => {
+    process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    const { w, state, sink } = polling();
+    const message = makeMessage({ messageId: '<q@x>', date: at(-60 * 60_000) });
+    stubTriage({ '<q@x>': makeResult({ importance: 'critical' }) });
+    vi.spyOn(w, 'collectAll').mockResolvedValue({
+      messages: [message], cursors: [['me@qq.com', 'INBOX', '1', 9]], sent: [batch([reply()])],
+    });
+
+    const stats = await w.pollOnce();
+
+    expect(sink.pushed).toEqual([]);
+    expect(state.notificationOutboxPending()).toBe(0);
+    expect(state.getMail('me@qq.com|<q@x>')!.handledAt).not.toBeNull();
+    expect(state.attentionCount()).toBe(0);
+    // Written down once, as having come from the Sent folder.
+    expect(state.listMailActions()).toMatchObject([{ action: 'handled', client: 'sent-folder', messageId: '<q@x>' }]);
+    // Not counted as mail that arrived, and both cursors moved.
+    expect(stats).toMatchObject({ fresh: 1, pushed: 0 });
+    expect(state.getCursor('me@qq.com', 'INBOX')).toEqual({ uidValidity: '1', lastUid: 9 });
+    expect(state.getSentCursor('me@qq.com')).toMatchObject({ folder: 'Sent', lastUid: 7 });
+  });
+
+  it('takes a message off the queue when a later poll finds the answer to it in Sent', async () => {
+    process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    const { w, state, sink } = polling();
+    stubTriage({ '<q@x>': makeResult({ importance: 'critical' }) });
+    const collect = vi.spyOn(w, 'collectAll').mockResolvedValue({
+      messages: [makeMessage({ messageId: '<q@x>', date: at(-60 * 60_000) })], cursors: [],
+    });
+    await w.pollOnce();
+    expect(sink.pushed).toHaveLength(1);
+    expect(state.attentionCount()).toBe(1);
+
+    collect.mockResolvedValue({ messages: [], cursors: [], sent: [batch([reply()])] });
+    await w.pollOnce();
+    expect(state.attentionCount()).toBe(0);
+    expect(state.recentlyHandled().map(({ row }) => row.dedupKey)).toEqual(['me@qq.com|<q@x>']);
+  });
+
+  it('notifies as usual when the only answer went to the owner\'s own addresses', async () => {
+    process.env.PUSH_MIN_IMPORTANCE = 'warning';
+    const { w, state, sink } = polling(true);
+    stubTriage({ '<q@x>': makeResult({ importance: 'critical' }) });
+    vi.spyOn(w, 'collectAll').mockResolvedValue({
+      messages: [makeMessage({ messageId: '<q@x>', date: at(-60 * 60_000) })], cursors: [],
+      sent: [batch([reply({ to: [{ name: '', address: 'me@qq.com' }] })])],
+    });
+    await w.pollOnce();
+    expect(sink.pushed).toHaveLength(1);
+    expect(state.attentionCount()).toBe(1);
+  });
+
+  it('keeps its cursor apart from the inbound cursor of the same folder', async () => {
+    const { w, state } = polling();
+    vi.spyOn(w, 'collectAll').mockResolvedValue({
+      messages: [], cursors: [['me@qq.com', 'Sent', '3', 10]], sent: [batch([], 99)],
+    });
+    await w.pollOnce();
+    expect(state.getCursor('me@qq.com', 'Sent')).toEqual({ uidValidity: '3', lastUid: 10 });
+    expect(state.getSentCursor('me@qq.com')).toMatchObject({ folder: 'Sent', lastUid: 99 });
+  });
+
+  it('reads Sent after the inbound folders, on its own budget, whatever is left of the poll\'s', async () => {
+    const { w } = polling(true);
+    session('Sent Messages');
+    const read = vi.spyOn(sentModule, 'fetchSent').mockResolvedValue({ messages: [reply()], cursor: cursor(7), skipped: 0 });
+    const budget = { remaining: 0 };
+    const result = await w.collectAccount(ACCOUNT, budget);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(read.mock.calls[0]![2]).toBe('Sent Messages');
+    expect(read.mock.calls[0]!.length).toBe(4);
+    expect(budget.remaining).toBe(0);
+    expect(result.sent).toMatchObject({ folder: 'Sent Messages', messages: [{ messageId: '<reply@qq.com>' }] });
+    expect(result.failures).toEqual([]);
+  });
+
+  it('leaves the mailbox healthy and the poll whole when Sent cannot be read, or there is none', async () => {
+    const { w, state } = polling(true);
+    session('Sent');
+    vi.spyOn(sentModule, 'fetchSent').mockRejectedValue(new Error('NO [UNAVAILABLE] try later'));
+    const stats = await w.pollOnce();
+    expect(stats).toMatchObject({ accountsOk: 1, accountsFailed: 0, failures: [] });
+    expect(state.getMeta('account_fail_count:me@qq.com')).toBeFalsy();
+    expect(state.getSentCursor('me@qq.com')).toBeUndefined();
+
+    vi.restoreAllMocks();
+    session(undefined);
+    const read = vi.spyOn(sentModule, 'fetchSent');
+    expect((await w.pollOnce()).accountsOk).toBe(1);
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it('reads nothing from Sent once it is switched off', async () => {
+    process.env.SENT_MAIL_ENABLED = 'false';
+    const { w } = polling(true);
+    session('Sent');
+    const read = vi.spyOn(sentModule, 'fetchSent');
+    const result = await w.collectAccount(ACCOUNT, { remaining: 10 });
+    expect(read).not.toHaveBeenCalled();
+    expect(result.sent).toBeUndefined();
+  });
+
+  it('never counts sent mail among what the poll fetched', async () => {
+    const { w } = polling(true);
+    const { inbound } = session('Sent');
+    inbound.mockResolvedValue({ messages: [], cursor: { uidValidity: '1', lastUid: 0 }, failures: [] });
+    vi.spyOn(sentModule, 'fetchSent').mockResolvedValue({ messages: [reply(), reply({ messageId: '<two@qq.com>' })], cursor: cursor(8), skipped: 0 });
+    const stats = await w.pollOnce();
+    expect(stats).toMatchObject({ fetched: 0, fresh: 0, pushed: 0, queued: 0 });
   });
 });
