@@ -37,7 +37,7 @@ import {
 import { retryAttempts } from './services/delivery.js';
 import { HEARTBEAT_KEY, IDLE_WAKE_KEY, type PollStats } from './services/watcher.js';
 import { PushDispatcher } from './services/push-dispatcher.js';
-import { routeWeb, webUiEnabled } from './web.js';
+import { routeWeb, webRateLimited, webUiEnabled } from './web.js';
 import {
   actOnMail, asWriteSession, awaitEarlierSend, configuredAccounts, defaultBackend, earlierSend, forwardDraft, letterText,
   liveRead, markHandled, rememberWhereabouts, replyDraft, requestTimeoutMs, resolveTarget, saveSignature, sendMessage,
@@ -93,23 +93,65 @@ const INSTRUCTIONS =
 
 const IMPORTANCE = z.enum(['critical', 'warning', 'info']);
 
-const rateWindows = new Map<string, { startedAt: number; count: number }>();
-
 function mcpRateLimit(): number {
   const value = Number(process.env.MCP_RATE_LIMIT_PER_MINUTE ?? 120);
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : 120;
 }
 
+/**
+ * How many clients a budget table remembers. It is checked before any
+ * token, so every address that knocks would otherwise stay in it for the
+ * life of the process; past this, the ones whose minute is over go first,
+ * then the oldest.
+ */
+export const RATE_TABLE_MAX = 10_000;
+
+/** A per-client budget over a one-minute window, in a table that does not grow without end. */
+function rateLimiter(limit: () => number): { allow: (client: string, now?: number) => boolean; size: () => number } {
+  // In the order each client's minute began, which is the order they run out in.
+  const windows = new Map<string, { startedAt: number; count: number }>();
+  return {
+    allow: (client, now = Date.now()) => {
+      const key = client || 'unknown';
+      const current = windows.get(key);
+      if (!current || now - current.startedAt >= 60_000) {
+        windows.delete(key);
+        if (windows.size >= RATE_TABLE_MAX) {
+          for (const [other, window] of windows) {
+            if (now - window.startedAt < 60_000 && windows.size < RATE_TABLE_MAX) break;
+            windows.delete(other);
+          }
+        }
+        windows.set(key, { startedAt: now, count: 1 });
+        return true;
+      }
+      if (current.count >= limit()) return false;
+      current.count += 1;
+      return true;
+    },
+    size: () => windows.size,
+  };
+}
+
+const mcpRate = rateLimiter(mcpRateLimit);
+/**
+ * The web view's own budget, ten times MCP's. A page reading quickly makes
+ * a request or two a message, and an MCP client on the same machine is the
+ * same address: sharing one budget locked the owner's browser out.
+ */
+const webRate = rateLimiter(() => mcpRateLimit() * 10);
+
 export function allowMcpRequest(client: string, now = Date.now()): boolean {
-  const key = client || 'unknown';
-  const current = rateWindows.get(key);
-  if (!current || now - current.startedAt >= 60_000) {
-    rateWindows.set(key, { startedAt: now, count: 1 });
-    return true;
-  }
-  if (current.count >= mcpRateLimit()) return false;
-  current.count += 1;
-  return true;
+  return mcpRate.allow(client, now);
+}
+
+export function allowWebRequest(client: string, now = Date.now()): boolean {
+  return webRate.allow(client, now);
+}
+
+/** How many clients the two budget tables hold between them. */
+export function rateTableSize(): number {
+  return mcpRate.size() + webRate.size();
 }
 
 function clientFingerprint(value: string): string {
@@ -2183,8 +2225,15 @@ export async function startMcpHttp(
   const httpServer = createHttpServer((req, res) => {
     void (async () => {
       const client = clientFingerprint(clientAddress(req));
-      if (!allowMcpRequest(client)) {
-        res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '60' }).end('{"error":"rate_limited"}');
+      const forMcp = (req.url ?? '/').split('?')[0] === '/mcp';
+      if (!(forMcp ? allowMcpRequest(client) : allowWebRequest(client))) {
+        if (forMcp || !webUiEnabled()) {
+          res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '60' }).end('{"error":"rate_limited","code":"rate_limited"}');
+          return;
+        }
+        // The page says so in its own words: a page of them for a navigation, a code it words for its requests.
+        const answer = webRateLimited(req, req.url ?? '/');
+        res.writeHead(answer.status, { 'content-type': answer.contentType, ...answer.headers }).end(answer.body);
         return;
       }
       // With no token nothing identifies the caller, so the name the request
@@ -2216,7 +2265,8 @@ export async function startMcpHttp(
             if (answer.cookie) headers['set-cookie'] = answer.cookie;
             if (answer.cacheControl) headers['cache-control'] = answer.cacheControl;
             Object.assign(headers, answer.headers);
-            if (answer.status === 303) headers['location'] = '/';
+            // A sign-in goes back where it was asked for; anything else that moves on goes to the page.
+            if (answer.status === 303) headers['location'] ??= '/';
             if (answer.stream) {
               // A response that stays open: the page's live line. It reads
               // through the hub's own database handle, so the one opened for

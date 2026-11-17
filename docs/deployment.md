@@ -29,7 +29,7 @@ MCP_WRITE_TOKEN=<a-second-random-long-token>
 TRUSTED_PROXY=true
 ```
 
-`MCP_TOKEN` signs a browser in to read. `MCP_WRITE_TOKEN` signs it in to act: archive, reply, send. Leave the second one unset and the page never changes a mailbox. The proxy has to pass the live line through unbuffered; [Behind a reverse proxy](web-view.md#behind-a-reverse-proxy) has the nginx lines.
+`MCP_TOKEN` signs a browser in to read. `MCP_WRITE_TOKEN` signs it in to act: archive, reply, send. Leave the second one unset and the page never changes a mailbox. The proxy has to pass the live line through unbuffered, and send `X-Forwarded-Proto` and the `Host` it was asked for, which is what marks the session cookie (the token itself) `Secure`; [Behind a reverse proxy](web-view.md#behind-a-reverse-proxy) has the nginx lines. `WEB_COOKIE_SECURE=true` marks it `Secure` always, for a page only ever reached over HTTPS.
 
 Replacing either token signs out every browser that held it, and after the restart ends the notification subscriptions made under it. That is the way to cut off a lost device you cannot reach.
 

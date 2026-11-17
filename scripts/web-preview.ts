@@ -652,7 +652,8 @@ const server = createServer((req, res) => {
       if (answer.cookie) headers['set-cookie'] = answer.cookie;
       if (answer.cacheControl) headers['cache-control'] = answer.cacheControl;
       Object.assign(headers, answer.headers);
-      if (answer.status === 303) headers['location'] = '/';
+      // A sign-in goes back where it was asked for; anything else that moves on goes to the page.
+      if (answer.status === 303) headers['location'] ??= '/';
       if (answer.stream) {
         res.writeHead(answer.status, headers);
         res.flushHeaders();

@@ -93,22 +93,26 @@ function sessionChanged() {
   if (composeSheet.open) $('#compose-ai').hidden = !session.assistant;
 }
 async function signOut() {
-  // A device that is signed out stops being told about mail.
+  // Asked without post(), which reloads the page on a session that has ended: here that is no reason to stop.
+  const ask = (path, body) => fetch(path, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.ok, () => false);
   let reg = null;
-  try {
-    if ('serviceWorker' in navigator && 'PushManager' in window) {
-      reg = await navigator.serviceWorker.getRegistration();
-      const sub = reg ? await reg.pushManager.getSubscription() : null;
-      if (sub) { await post('/api/push/unsubscribe', { endpoint: sub.endpoint }); await sub.unsubscribe(); }
-    }
-  } catch (e) {}
-  // Said, when it did not work: a page that reloads still signed in, with
-  // nothing on it to say so, looks like signing out is broken.
-  const out = await post('/auth/signout', {});
-  if (!out.ok) { toast(t('session.signoutFailed'), true); return; }
+  try { if ('serviceWorker' in navigator) reg = await navigator.serviceWorker.getRegistration(); } catch (e) {}
+  // What this device kept goes first, whatever becomes of the requests: the
+  // drafts, the snapshot of the list and the page the worker keeps are this
+  // device's, and a session that has already ended must not leave them here.
   try { if (reg && reg.active) reg.active.postMessage({ type: 'signout' }); } catch (e) {}
   forgetLocal();
   if (navigator.clearAppBadge) navigator.clearAppBadge().catch(() => {});
+  // A device that is signed out stops being told about mail.
+  try {
+    const sub = reg && reg.pushManager ? await reg.pushManager.getSubscription() : null;
+    if (sub) { await ask('/api/push/unsubscribe', { endpoint: sub.endpoint }); await sub.unsubscribe(); }
+  } catch (e) {}
+  // Said, when it did not work: a page that reloads still signed in, with
+  // nothing on it to say so, looks like signing out is broken.
+  if (!(await ask('/auth/signout', {}))) { toast(t('session.signoutFailed'), true); return; }
   location.replace('/');
 }
 

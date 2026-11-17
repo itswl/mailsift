@@ -19,8 +19,9 @@ export const SHELL_HEADER = 'x-mailsift-shell';
  * Caching: exactly one thing is kept, the application shell at "/", which is
  * markup, styles and script and holds no mail. It is fetched from the network
  * every time and the stored copy is used only when the network does not
- * answer, so an installed app still opens in a tunnel and says it is offline
- * instead of showing the browser's error page. No API response is ever
+ * answer, or answers that it is too busy or failing, so an installed app
+ * still opens in a tunnel and says it is offline instead of showing the
+ * browser's error page. No API response is ever
  * stored here: a list of yesterday's judgements served as today's would be
  * worse than none. What the page shows while offline is its own last
  * snapshot, labelled with its time.
@@ -46,6 +47,11 @@ export const SERVICE_WORKER = [
   '    try {',
   '      const response = await fetch(request);',
   `      if (response.ok && response.headers.get('${SHELL_HEADER}') === '1') await cache.put('/', response.clone());`,
+  // Too busy, or failing: the page it kept opens instead, and says what its own requests are told.
+  '      if (response.status === 429 || response.status >= 500) {',
+  "        const kept = await cache.match('/');",
+  '        if (kept) return kept;',
+  '      }',
   '      return response;',
   '    } catch (error) {',
   "      const kept = await cache.match('/');",
@@ -133,7 +139,8 @@ export function framePolicy(remoteImages: boolean): string {
   return [
     "default-src 'none'",
     "style-src 'unsafe-inline'",
-    `img-src data:${remoteImages ? ' https:' : ''}`,
+    // Asked for, a picture loads as the page would load it: an http one too where the page is served over http.
+    `img-src data:${remoteImages ? ' https: http:' : ''}`,
     "form-action 'none'",
     "base-uri 'none'",
     "frame-ancestors 'self'",

@@ -3,9 +3,10 @@ import './setup.js';
 import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
 import {
-  allowAuthAttempt, handleApi, LANGUAGE_COOKIE, languageFromHeader, readCookie, routeWeb, SESSION_COOKIE,
-  tokenMatches, webUiEnabled, webVersion,
+  allowAuthAttempt, handleApi, LANGUAGE_COOKIE, languageFromHeader, readCookie, routeWeb, SESSION_COOKIE, signInTarget,
+  tokenMatches, webRateLimited, webUiEnabled, webVersion,
 } from '../src/web.js';
+import { SERVICE_WORKER } from '../src/web-worker.js';
 import { buildLink } from '../src/links.js';
 import { STRINGS, type StringKey } from '../src/web-strings.js';
 import { clientScript } from '../src/web-client.js';
@@ -14,7 +15,7 @@ import { webcrypto } from 'node:crypto';
 import { letterText } from '../src/web-actions.js';
 import { attachmentFilename } from '../src/smtp.js';
 import { Script } from 'node:vm';
-import { clientAddress } from '../src/mcp.js';
+import { allowMcpRequest, allowWebRequest, clientAddress, RATE_TABLE_MAX, rateTableSize } from '../src/mcp.js';
 import { StateStore } from '../src/services/state.js';
 import { HEARTBEAT_KEY } from '../src/services/watcher.js';
 
@@ -156,6 +157,92 @@ describe('authorization', () => {
     expect(tls.cookie).toContain('Secure');
   });
 
+  it('marks the cookie Secure always when WEB_COOKIE_SECURE says so, and as before otherwise', async () => {
+    // The cookie is the token itself: a deployment only ever reached over HTTPS can say so, whatever its proxy sends.
+    const store = seeded();
+    const signIn = async (headers: Record<string, string> = {}) =>
+      (await routeWeb(request({ method: 'POST', url: '/auth', body: 'token=s', headers }), url('/auth'), 's', store)).cookie;
+    process.env.WEB_COOKIE_SECURE = 'true';
+    expect(await signIn()).toContain('; Secure');
+    // Renewed on a visit, and cleared on signing out, under the same rule.
+    const visit = await routeWeb(request({ headers: { cookie: `${SESSION_COOKIE}=s` } }), url('/'), 's', store);
+    expect(visit.cookie).toContain('; Secure');
+    process.env.WEB_COOKIE_SECURE = 'auto';
+    expect(await signIn()).not.toContain('Secure');
+    expect(await signIn({ 'x-forwarded-proto': 'https' })).toContain('; Secure');
+  });
+
+  it('signs a device out whose session has already ended, so the page can forget what it kept', async () => {
+    const store = seeded();
+    const out = await routeWeb(
+      request({ method: 'POST', url: '/auth/signout', headers: { cookie: `${SESSION_COOKIE}=expired`, 'sec-fetch-site': 'same-origin' } }),
+      url('/auth/signout'), 'secret', store,
+    );
+    expect(out.status).toBe(200);
+    expect(out.cookie).toContain('Max-Age=0');
+    // Still only from this site.
+    const elsewhere = await routeWeb(
+      request({ method: 'POST', url: '/auth/signout', headers: { 'sec-fetch-site': 'cross-site' } }), url('/auth/signout'), 'secret', store,
+    );
+    expect(elsewhere.status).toBe(403);
+    expect(elsewhere.cookie).toBeUndefined();
+  });
+
+  it('refuses a mistyped write token where no read token is set, rather than signing in read-only on it', async () => {
+    const store = seeded();
+    const signIn = (token: string) => routeWeb(
+      request({ method: 'POST', url: '/auth', body: `token=${token}` }), url('/auth'), '', store, `write-only-${token}`, { writeToken: 'write' },
+    );
+    const wrong = await signIn('wrong-write-token');
+    expect(wrong.status).toBe(401);
+    expect(wrong.cookie).toBeUndefined();
+    expect(String(wrong.body)).toContain(STRINGS.en['login.rejected']);
+    expect((await signIn('write')).status).toBe(303);
+    // Nothing typed: the page reads without a token here, as it did.
+    expect((await signIn('')).status).toBe(303);
+  });
+
+  it('goes on to the address the sign-in was asked for, and never off this server', async () => {
+    const store = seeded();
+    const signIn = async (next: string) => (await routeWeb(
+      request({ method: 'POST', url: '/auth', body: `token=secret&next=${encodeURIComponent(next)}` }), url('/auth'), 'secret', store, `next-${next}`,
+    )).headers?.['location'];
+    expect(await signIn('/?focus=code')).toBe('/?focus=code');
+    expect(await signIn('/?in=me%40qq.com&folder=Travel%2F2025')).toBe('/?in=me%40qq.com&folder=Travel%2F2025');
+    expect(await signIn('/#m=k1')).toBe('/#m=k1');
+    for (const away of ['//evil.example/', 'https://evil.example/', '/\\evil.example', 'javascript:alert(1)', '/auth', '', 'x']) {
+      expect(await signIn(away), away).toBe('/');
+    }
+    expect(signInTarget('/\nLocation: x')).toBe('/');
+    // The form carries where it was asked for, and keeps it over a refused try.
+    const form = String((await routeWeb(request({ url: '/?focus=code' }), url('/?focus=code'), 'secret', store)).body);
+    expect(form).toContain('<input type="hidden" name="next" value="">');
+    expect(form).toContain('next.value = here + location.search + location.hash');
+    const refused = String((await routeWeb(
+      request({ method: 'POST', url: '/auth', body: `token=wrong&next=${encodeURIComponent('/?focus=code')}` }), url('/auth'), 'secret', store, 'next-wrong',
+    )).body);
+    expect(refused).toContain('name="next" value="/?focus=code"');
+  });
+
+  it('sends an address that is not a page to the page, answers HEAD, and does not call a cross-site sign-in a wrong token', async () => {
+    const store = seeded();
+    const as = { cookie: `${SESSION_COOKIE}=secret` };
+    for (const path of ['/index.html', '/signout', '/auth', '/nonexistent']) {
+      const answer = await routeWeb(request({ url: path, headers: as }), url(path), 'secret', store);
+      expect(answer.status, path).toBe(303);
+      expect(answer.headers?.['location'], path).toBe('/');
+    }
+    expect((await routeWeb(request({ url: '/api/nonexistent', headers: as }), url('/api/nonexistent'), 'secret', store)).status).toBe(404);
+    expect((await routeWeb(request({ method: 'HEAD', url: '/', headers: as }), url('/'), 'secret', store)).status).toBe(200);
+    const cross = await routeWeb(
+      request({ method: 'POST', url: '/auth', body: 'token=secret', headers: { origin: 'https://mail.example.com', host: '127.0.0.1:8410' } }),
+      url('/auth'), 'secret', store, 'cross-signin',
+    );
+    expect(cross.status).toBe(403);
+    expect(String(cross.body)).toContain(STRINGS.en['login.crossSite'].slice(0, 30));
+    expect(String(cross.body)).not.toContain(STRINGS.en['login.rejected']);
+  });
+
   it('rejects a wrong token without establishing anything', async () => {
     const store = seeded();
     const answer = await routeWeb(request({ method: 'POST', url: '/auth', body: 'token=wrong' }), url('/auth'), 'secret', store);
@@ -210,6 +297,38 @@ describe('exposure behind a proxy', () => {
     // Another client is unaffected, and the window reopens.
     expect(allowAuthAttempt('someone-else', at + 11)).toBe(true);
     expect(allowAuthAttempt('guesser', at + 60_000)).toBe(true);
+  });
+
+  it('gives the page a budget of its own, apart from MCP\'s, and says in its own words when it is spent', async () => {
+    const at = Date.parse('2026-11-17T00:00:00Z');
+    // An MCP client on the same address uses up its budget...
+    for (let n = 0; n < 120; n += 1) allowMcpRequest('shared-address', at + n);
+    expect(allowMcpRequest('shared-address', at + 200)).toBe(false);
+    // ...and the page on it reads on, ten times as long.
+    expect(Array.from({ length: 1200 }, (_, n) => allowWebRequest('shared-address', at + n)).every(Boolean)).toBe(true);
+    expect(allowWebRequest('shared-address', at + 1300)).toBe(false);
+    const navigation = webRateLimited(request({ headers: { 'accept-language': 'zh-CN' } }), '/');
+    expect(navigation.status).toBe(429);
+    expect(navigation.contentType).toContain('text/html');
+    expect(String(navigation.body)).toContain(STRINGS['zh-CN']['error.rate_limited']);
+    expect(String(navigation.body)).not.toContain('{"error"');
+    const api = webRateLimited(request(), '/api/message');
+    expect(JSON.parse(String(api.body))).toMatchObject({ code: 'rate_limited' });
+    expect(api.headers?.['retry-after']).toBe('60');
+    // The installed app opens the page it kept rather than the answer of a server too busy to give it one.
+    expect(SERVICE_WORKER).toContain('response.status === 429 || response.status >= 500');
+  });
+
+  it('does not let a stream of addresses grow the budget tables without end', () => {
+    const at = Date.parse('2026-11-17T01:00:00Z');
+    const before = rateTableSize();
+    for (let n = 0; n < RATE_TABLE_MAX * 2; n += 1) allowMcpRequest(`passer-by-${n}`, at + n);
+    expect(rateTableSize() - before).toBeLessThanOrEqual(RATE_TABLE_MAX);
+    for (let n = 0; n < RATE_TABLE_MAX * 2; n += 1) allowWebRequest(`passer-by-${n}`, at + n);
+    expect(rateTableSize()).toBeLessThanOrEqual(RATE_TABLE_MAX * 2);
+    // A client still within its minute keeps what it has used.
+    for (let n = 0; n < 120; n += 1) allowMcpRequest('busy', at + RATE_TABLE_MAX * 2 + n);
+    expect(allowMcpRequest('busy', at + RATE_TABLE_MAX * 2 + 200)).toBe(false);
   });
 
   it('refuses a sign-in once the budget is spent, without checking the token', async () => {
@@ -2471,5 +2590,85 @@ describe('picking many messages in the page', () => {
         expect(STRINGS[lang][key as StringKey], `${lang} ${key}`).toBeTruthy();
       }
     }
+  });
+});
+
+describe('what a QA pass found in the reader and on signing out', () => {
+  /** The reader's own checks, run on their own: URL is the one thing they need from a browser. */
+  const reader = () => {
+    const context: Record<string, unknown> = { URL, location: { origin: 'https://mail.example' } };
+    return lifted<{
+      misleadingSite: (text: string, hostname: string) => string;
+      cssUrls: (css: string, imagesOn: boolean, out: { remote: number }) => string;
+      cssUnescape: (css: string) => string;
+      backgroundStyle: (value: string) => string;
+    }>(['siteOf', 'ownAddress', 'RASTER_DATA', 'shownHost', 'misleadingSite', 'cssUnescape', 'cssCalls', 'cssUrls', 'backgroundStyle'],
+      '({ misleadingSite, cssUrls, cssUnescape, backgroundStyle })', context);
+  };
+
+  it('sees a link that names one site and goes to another through invisible characters and look-alike letters', () => {
+    const { misleadingSite } = reader();
+    for (const shown of [
+      'paypal.com', 'PayPal.com', 'paypal.com\u200b', 'paypal.com\u00ad', '\u200bpaypal.com', 'paypal.com!', 'paypal.com.',
+      '\u202epaypal.com', '\uff50\uff41\uff59\uff50\uff41\uff4c\uff0e\uff43\uff4f\uff4d', 'https://www.paypal.com/signin', '«paypal.com»', 'paypal.com is where you pay',
+    ]) {
+      expect(misleadingSite(shown, 'evil.example'), JSON.stringify(shown)).toBe(shown.includes('www.') ? 'www.paypal.com' : 'paypal.com');
+    }
+    // A look-alike letter is another site than the one it imitates, in the form that shows it.
+    expect(misleadingSite('\u0430pple.com', 'evil.example')).toBe('xn--pple-43d.com');
+    expect(misleadingSite('\u0430pple.com', 'apple.com')).toBe('xn--pple-43d.com');
+    // Text that goes where it says, or names no site, is left alone.
+    expect(misleadingSite('paypal.com', 'www.paypal.com')).toBe('');
+    expect(misleadingSite('Pay your invoice', 'evil.example')).toBe('');
+  });
+
+  it('cuts every remote picture from CSS however it is written, counts each, and keeps them when images are shown', () => {
+    const { cssUrls, cssUnescape } = reader();
+    const css = cssUnescape('.a{background-image:u\\72l(https://cssescape.example/a.png)}'
+      + '.b{background-image:image-set("https://imageset.example/b.png" 1x, url(https://imageset.example/c.png) 2x)}'
+      + '.c{background:url("https://quoted.example/a)b.png")}'
+      + '.d{background:URL( h\\74tps://upper.example/d.png )}'
+      + '.e{background:url(data:image/png;base64,AAAA)}');
+    const off = { remote: 0 };
+    const cut = cssUrls(css, false, off);
+    expect(cut).not.toMatch(/https?:/);
+    expect(cut).toContain('data:image/png;base64,AAAA');
+    expect(off.remote).toBe(5);
+    const on = { remote: 0 };
+    const kept = cssUrls(css, true, on);
+    for (const host of ['cssescape.example', 'imageset.example/b.png', 'imageset.example/c.png', 'quoted.example', 'upper.example']) {
+      expect(kept, host).toContain(host);
+    }
+    expect(on.remote).toBe(5);
+    // An escape that stands for a quote or a brace stays as written, so a string keeps its meaning.
+    expect(cssUnescape('content:"\\22"; a\\7d b')).toBe('content:"\\22"; a\\7d b');
+    // This server's own addresses never load, images on or not.
+    expect(cssUrls('a{background:url(https://mail.example/api/x)}', true, { remote: 0 })).not.toContain('mail.example');
+  });
+
+  it('shows a background picture of an old table layout with the rest, as a style the frame treats like any image', () => {
+    const { backgroundStyle } = reader();
+    expect(backgroundStyle('https://cdn.example/bg.png')).toBe('background-image:url("https://cdn.example/bg.png")');
+    // A quote cannot end the url() early.
+    expect(backgroundStyle('https://cdn.example/a").x{color:red')).not.toContain('a")');
+    const script = clientScript();
+    expect(script).toContain('if (imagesOn) background = backgroundStyle(target);');
+    // A link whose address was taken away is drawn as text, not as a link that does nothing.
+    expect(script).toContain("doc.createElement(tag === 'a' && !url ? 'span' : tag)");
+  });
+
+  it('forgets what this device kept on signing out, even when the session has already ended', async () => {
+    const did: string[] = [];
+    const context: Record<string, unknown> = {
+      navigator: { serviceWorker: { getRegistration: async () => ({ active: { postMessage: (m: { type: string }) => did.push(`worker ${m.type}`) } }) } },
+      forgetLocal: () => did.push('forgot'),
+      // The session ended: every request is refused.
+      fetch: async (path: string) => { did.push(`asked ${path}`); return { ok: false, status: 401 }; },
+      toast: (text: string) => did.push(`said ${text}`), t: (key: string) => key, location: { replace: () => did.push('left') },
+      JSON,
+    };
+    const signOut = lifted<() => Promise<void>>(['signOut'], 'signOut', context);
+    await signOut();
+    expect(did).toEqual(['worker signout', 'forgot', 'asked /auth/signout', 'said session.signoutFailed']);
   });
 });

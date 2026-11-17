@@ -30,7 +30,7 @@ It is off by default. A page a browser can reach is a wider surface than a JSON-
 
 ## Signing in, and what a session may do
 
-Signing in posts a token and exchanges it for an `HttpOnly` cookie that lasts six months and is renewed on each visit, so a browser in regular use is never asked again. The form carries an account field so a password manager will offer to save the token. An installed app keeps its own cookies on iOS, so expect to sign in once inside it even if the browser is already signed in.
+Signing in posts a token and exchanges it for an `HttpOnly` cookie that lasts six months and is renewed on each visit, so a browser in regular use is never asked again. The cookie holds the token itself, the same value MCP takes as its bearer token: whoever reads it holds that credential, so keep the page on HTTPS (see [How the page is protected](#how-the-page-is-protected)). The form carries an account field so a password manager will offer to save the token. An installed app keeps its own cookies on iOS, so expect to sign in once inside it even if the browser is already signed in. Signing in goes on to the address that asked for it: a shared link, a folder, a message named after `#m=`, or the Latest code shortcut opens on what it names rather than on the start of the page.
 
 Which token you sign in with decides what the page may do, the same split MCP makes between its two credentials:
 
@@ -45,7 +45,7 @@ Which token you sign in with decides what the page may do, the same split MCP ma
 | Reply, forward and send; change a signature | no | yes |
 | Correct a judgement, draft with the model | no | yes |
 
-With `MCP_WRITE_TOKEN` unset the page reads and never touches a mailbox; the one credential may still tick things off, because that is the page's own bookkeeping and the credential is the owner's. Once a write token exists, the read token is strictly read-only, so it can be given to something that should only look. The footer says which kind of session this is, and `/signin` signs in again with the other token without signing out first.
+With `MCP_WRITE_TOKEN` unset the page reads and never touches a mailbox; the one credential may still tick things off, because that is the page's own bookkeeping and the credential is the owner's. Once a write token exists, the read token is strictly read-only, so it can be given to something that should only look. With `MCP_WRITE_TOKEN` set and `MCP_TOKEN` unset (allowed on loopback only), the page reads without signing in, and a token typed at `/signin` that is not the write token is refused as wrong rather than signing in read-only. The footer says which kind of session this is, and `/signin` signs in again with the other token without signing out first.
 
 Pressing an action a session may not take explains this instead of failing.
 
@@ -168,8 +168,6 @@ Any list can be acted on many at a time: the triaged list and the queue, a folde
 
 ## Correcting a judgement
 
-## Correcting a judgement
-
 Under every judgement is a line that asks whether it was right. "Right" records agreement; the other answer records a false positive for something that was pushed and a miss for something that was not. Two corrections of the same kind for one sender become a rule, and the page says so when your vote was the one that made it, because that changes how future mail from that sender is judged. See [Configuration](configuration.md#your-own-rules).
 
 ## Writing
@@ -204,7 +202,7 @@ The question goes to the same model, through the same endpoint and key, that alr
 
 Finding the relevant judgements is done locally, by words, with no embeddings and no second service. Its known limit is a question in one language about summaries written in another.
 
-`WEB_ASSISTANT_DAILY_LIMIT` (default `300`) caps the model calls the page makes in a day, across questions and drafts and whoever is asking.
+`WEB_ASSISTANT_DAILY_LIMIT` (default `300`) caps the model calls the page makes in a day, across questions and drafts and whoever is asking, and twenty a minute from one client. The day is the server's (`TZ`), so the budget comes back at its midnight, which is what "it resets tomorrow" means; a restart also starts it again. A request refused before it reaches the model (a code, a message that cannot be read, a new letter with nothing said about it) costs nothing.
 
 ## Live updates
 
@@ -280,11 +278,12 @@ The page opens at once and then catches up. The browser keeps the last list it s
 - the service worker caches the page's shell (the markup and script, no mail), only when the server marks it as such, and always prefers the network;
 - the page keeps a snapshot of the first page of the unfiltered list in the browser's storage, without verification codes.
 
-Message bodies, attachments and API answers are never cached, by the worker or by any HTTP cache. Signing out removes the snapshot, the cached shell, the drafts and this device's notification subscription.
+Message bodies, attachments and API answers are never cached, by the worker or by any HTTP cache. When the server answers that it is too busy or failing, the installed app opens its kept shell, which says so in its own words. Signing out removes the snapshot, the cached shell, the drafts and this device's notification subscription, also when the session has already ended (an expired cookie, a replaced token).
 
 ## How the page is protected
 
-- **Tokens** are compared in constant time, and the cookie is `HttpOnly` and `SameSite=Lax`. Sign-in has a small rate budget of its own.
+- **Tokens** are compared in constant time, and the cookie is `HttpOnly` and `SameSite=Lax`. It is marked `Secure` when the request came over HTTPS, which behind a proxy means the proxy sends `X-Forwarded-Proto: https` (see [Behind a reverse proxy](#behind-a-reverse-proxy)); `WEB_COOKIE_SECURE=true` marks it always, for a page that is only ever reached over HTTPS (a browser then keeps no cookie from a plain-HTTP address, loopback included). The cookie is the token itself, so a plain-HTTP request to the same host would carry the credential in clear. Sign-in has a small rate budget of its own.
+- **Every client has a budget**, per minute: the page ten times `MCP_RATE_LIMIT_PER_MINUTE` (1,200 by default), apart from MCP's own, so an MCP client on the same machine does not use up the page's. Over it, the page says so in its own words.
 - **Every request that changes something is a POST, and a POST another site started is refused** (`Sec-Fetch-Site`, then `Origin`), whatever cookie came with it. That includes signing in.
 - **The page runs only its own script.** Each response carries a content policy with a fresh nonce; nothing is loaded from another origin, the page cannot be framed, and a message's markup is never inserted into it (see [Reading a message](#reading-a-message)).
 - **Nothing under `/api` can be loaded as an image, stylesheet or frame**, so a message shown with its images cannot use your session by naming this server as one.
@@ -295,6 +294,14 @@ Message bodies, attachments and API answers are never cached, by the worker or b
 ## Behind a reverse proxy
 
 Set `TRUSTED_PROXY=true`. Otherwise every request arrives from the proxy's address, the per-client limits collapse into one shared budget, and a single noisy caller can lock out your own browser and any MCP client. With it set, the limits and the audit log key on `CF-Connecting-IP`, `X-Real-IP` or the first `X-Forwarded-For` entry. Leave it off when the port is reached directly, since anyone can send those headers.
+
+The proxy has to say two more things. `X-Forwarded-Proto` tells mailsift the page was reached over HTTPS, which is what marks the session cookie `Secure` (or set `WEB_COOKIE_SECURE=true`); nginx does not send it unless told. And the `Host` the browser asked for: a POST whose `Origin` names another host than the one mailsift is told is refused as coming from another site, sign-in included, by a browser that sends no `Sec-Fetch-Site`. For nginx, in the `server` block:
+
+```nginx
+proxy_set_header Host $host;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Real-IP $remote_addr;
+```
 
 The live line is a response that never ends, so the proxy must not buffer it or cut it for being quiet. mailsift sends `X-Accel-Buffering: no`, which nginx honours, and a keep-alive every twenty seconds. If the dot on the status line never appears, turn buffering off for `/api/events` and raise the read timeout:
 

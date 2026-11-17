@@ -74,18 +74,58 @@ const MAIL_DROP = new Set(('script style iframe frame frameset object embed appl
 const MAIL_ATTRS = new Set(('align alt bgcolor border cellpadding cellspacing class color colspan dir face height id lang nowrap '
   + 'rowspan size span start style title type valign width').split(' '));
 const COLOURED = /(^|[;{\s])(color|background(-color|-image)?)\s*:/i;
+// CSS lets any character be written as an escape: u\72l( is url(. One that
+// spells a letter of a name or of an address is read as what it spells, so
+// the checks below see what the browser will; one that stands for a character
+// CSS gives meaning to (a quote, a brace, a parenthesis) stays as written.
+function cssUnescape(css) {
+  return String(css).replace(/\\([0-9a-f]{1,6})[ \t\n\r\f]?|\\([^\n\r\f0-9a-f])/gi, (whole, hex, ch) => {
+    const c = hex ? String.fromCodePoint(Math.min(parseInt(hex, 16), 0x10ffff) || 0xfffd) : ch;
+    return /^[a-z0-9_.:\/-]$/i.test(c) ? c : whole;
+  });
+}
+// Each call of a CSS function, what is between its parentheses (quotes and
+// nested calls included) handed to replace, whose answer takes its place.
+function cssCalls(text, pattern, replace) {
+  const re = new RegExp(pattern, 'gi');
+  let out = '', at = 0, m;
+  while ((m = re.exec(text))) {
+    const open = m.index + m[0].length;
+    let depth = 1, i = open, quote = '';
+    for (; i < text.length && depth; i += 1) {
+      const c = text[i];
+      if (quote) { if (c === '\\') i += 1; else if (c === quote) quote = ''; }
+      else if (c === '"' || c === "'") quote = c;
+      else if (c === '(') depth += 1;
+      else if (c === ')') depth -= 1;
+    }
+    out += text.slice(at, m.index) + replace(text.slice(open, depth ? i : i - 1), m[0]);
+    at = i;
+    re.lastIndex = i;
+  }
+  return out + text.slice(at);
+}
 // What a stylesheet may fetch: an inline image always, a remote one only
 // when the reader asked for this message's images. Everything else is cut
-// from the CSS itself, so the frame's policy never has anything to refuse.
+// from the CSS itself, so the frame's policy never has anything to refuse,
+// and every remote picture is counted, so the note above the message offers
+// to show it. The CSS is read unescaped (cssUnescape).
 function cssUrls(css, imagesOn, out) {
-  return String(css).replace(/url\(([^)]*)\)/gi, (whole, inner) => {
-    const target = inner.trim().replace(/^['"]|['"]$/g, '');
-    if (/^data:image\/(png|jpe?g|gif|webp);/i.test(target)) return whole;
+  const allowed = (target) => {
+    if (RASTER_DATA.test(target)) return true;
     if (/^https?:/i.test(target) && !ownAddress(target)) {
-      if (imagesOn) return whole;
       out.remote += 1;
+      return imagesOn;
     }
-    return 'none';
+    return false;
+  };
+  const unquote = (value) => value.trim().replace(/^(['"])([\s\S]*)\1$/, '$2');
+  const urls = cssCalls(String(css), '(?:url|src)\\(', (inner, head) => (allowed(unquote(inner)) ? head + inner + ')' : 'none'));
+  // image-set() names its pictures as plain strings as well: it stays whole, or goes whole.
+  return cssCalls(urls, '(?:-webkit-)?image-set\\(', (inner, head) => {
+    let ok = true;
+    inner.replace(/(["'])((?:\\[\s\S]|(?!\1)[^\\])*)\1/g, (whole, q, target) => { if (!allowed(target)) ok = false; return whole; });
+    return ok ? head + inner + ')' : 'none';
   });
 }
 const RASTER_DATA = /^data:image\/(png|jpe?g|gif|webp);/i;
@@ -102,32 +142,66 @@ function siteOf(host) {
   const tld = labels[labels.length - 1], second = labels[labels.length - 2];
   return labels.slice(tld.length === 2 && second.length <= 3 ? -3 : -2).join('.');
 }
+// What a link's text says it is, as a host name in its ASCII form: the text
+// read the way the eye reads it (compatibility forms folded, invisible
+// characters and direction marks gone), when it starts with a site's name.
+// '' when it names none. A look-alike letter stays itself, so its site is
+// another than the one it imitates.
+function shownHost(text) {
+  const plain = String(text || '').normalize('NFKC').replace(/[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu, '')
+    .replace(/[。．｡]/g, '.').trim();
+  const m = /^[\s"'«‘“(<\[]*(?:https?:\/\/)?((?:[\p{L}\p{N}-]+\.)+(?:\p{L}{2,}|xn--[a-z0-9-]+))(?=$|[^\p{L}\p{N}-])/iu.exec(plain);
+  if (!m) return '';
+  try { return new URL('http://' + m[1]).hostname; } catch (e) { return ''; }
+}
+// The site a link's text names when the link goes to another one; '' when it does not.
+function misleadingSite(text, hostname) {
+  const shown = shownHost(text);
+  return shown && siteOf(shown) !== siteOf(hostname) ? shown : '';
+}
+// A picture the background attribute of old table layouts names, as a style
+// the frame's policy treats like any other image.
+function backgroundStyle(value) {
+  return 'background-image:url("' + value.replace(/["\\\n\r\f]/g, (c) => '\\' + c.charCodeAt(0).toString(16) + ' ') + '")';
+}
 function cleanMail(html, doc, imagesOn) {
   const parsed = new DOMParser().parseFromString(String(html), 'text/html');
   const out = { body: doc.createDocumentFragment(), styles: [], remote: 0, trackers: 0, deceptive: 0, misleading: [], plain: true };
   for (const sheet of parsed.querySelectorAll('style')) {
     // Remote stylesheets and fonts never load here; drop the rules that ask.
-    const css = cssUrls(String(sheet.textContent || '').replace(/@import[^;]*;?/gi, '').replace(/@font-face\s*\{[^}]*\}/gi, ''), imagesOn, out);
+    const css = cssUrls(cssUnescape(sheet.textContent || '').replace(/@import[^;]*;?/gi, '').replace(/@font-face\s*\{[^}]*\}/gi, ''), imagesOn, out);
     if (!css.trim()) continue;
     out.styles.push(css);
     if (COLOURED.test(css)) out.plain = false;
   }
   const copyAttributes = (from, to) => {
+    let background = '';
     for (const attr of Array.from(from.attributes)) {
       const name = attr.name.toLowerCase();
-      if (name === 'background' && /^https?:/i.test(attr.value.trim())) { out.remote += 1; continue; }
+      if (name === 'background') {
+        // Held with the message's other pictures, and shown with them.
+        const target = attr.value.trim();
+        if (/^https?:/i.test(target) && !ownAddress(target)) {
+          out.remote += 1;
+          if (imagesOn) background = backgroundStyle(target);
+        }
+        continue;
+      }
       if (!MAIL_ATTRS.has(name)) continue;
       // What the sender wrote under a link is not where the link goes; the real address is set below.
       if (name === 'title' && from.localName === 'a') continue;
       let value = attr.value;
       if (name === 'style') {
+        const css = cssUnescape(value);
         // Dead and dangerous CSS from other eras goes; the rest is the sender's layout.
-        if (/expression\s*\(|behavior\s*:|-moz-binding|@import/i.test(value)) continue;
-        if (COLOURED.test(value)) out.plain = false;
-        value = cssUrls(value, imagesOn, out);
+        if (/expression\s*\(|behavior\s*:|-moz-binding|@import/i.test(css)) continue;
+        if (COLOURED.test(css)) out.plain = false;
+        value = cssUrls(css, imagesOn, out);
       } else if (name === 'bgcolor' || name === 'color') out.plain = false;
       to.setAttribute(name, value);
     }
+    // Under the sender's own style, which says the rest of how it is drawn.
+    if (background) to.setAttribute('style', background + ';' + (to.getAttribute('style') || ''));
   };
   const size = (node, name) => {
     const attr = parseInt(node.getAttribute(name) || '', 10);
@@ -168,10 +242,13 @@ function cleanMail(html, doc, imagesOn) {
     if (/^cid:/i.test(src)) return held(node);
     return null;
   };
-  const link = (node, copy) => {
+  // Where a link may go: an http, https, mailto or tel address, or nowhere.
+  const linkTarget = (node) => {
     let url = null;
     try { url = new URL((node.getAttribute('href') || '').trim()); } catch (e) { url = null; }
-    if (!url || ['https:', 'http:', 'mailto:', 'tel:'].indexOf(url.protocol) === -1) return null;
+    return url && ['https:', 'http:', 'mailto:', 'tel:'].indexOf(url.protocol) !== -1 ? url : null;
+  };
+  const link = (url, copy) => {
     copy.setAttribute('href', url.href);
     // Every link leaves the frame for a tab of its own, and takes nothing with it.
     copy.setAttribute('target', '_blank');
@@ -191,19 +268,21 @@ function cleanMail(html, doc, imagesOn) {
       if (depth > 250) continue;
       if (!MAIL_TAGS.has(tag)) { walk(node, to, depth + 1); continue; }
       if (tag === 'img') { const img = image(node); if (img) to.appendChild(img); continue; }
-      const copy = doc.createElement(tag);
+      const url = tag === 'a' ? linkTarget(node) : null;
+      // A link whose address was taken away goes nowhere, and does not look as if it went somewhere.
+      const copy = doc.createElement(tag === 'a' && !url ? 'span' : tag);
       copyAttributes(node, copy);
-      const url = tag === 'a' ? link(node, copy) : null;
+      if (url) link(url, copy);
       walk(node, copy, depth + 1);
       to.appendChild(copy);
       if (!url || url.protocol.indexOf('http') !== 0) continue;
       // Text that names a site, on a link that goes to a different one.
-      const shown = /^(?:https?:\/\/)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?:[\/:?#]|$)/i.exec((node.textContent || '').trim());
-      if (!shown || siteOf(shown[1]) === siteOf(url.hostname)) continue;
+      const shown = misleadingSite(node.textContent, url.hostname);
+      if (!shown) continue;
       out.deceptive += 1;
       // Told twice. Next to the link, where the eye is; and in the page's own
       // note above the message, which no styling inside the message can hide.
-      const pair = shown[1].toLowerCase() + ' → ' + url.hostname;
+      const pair = shown + ' → ' + url.hostname;
       if (out.misleading.length < 4 && out.misleading.indexOf(pair) === -1) out.misleading.push(pair);
       const real = doc.createElement('span');
       real.setAttribute('data-ms-goes', '');

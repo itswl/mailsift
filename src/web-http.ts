@@ -203,10 +203,13 @@ export async function readJsonOrSize(
   }
 }
 
-/** A per-client budget over a one-minute window. */
-export function rateWindow(perMinute: number): (client: string, now?: number) => boolean {
+/**
+ * A per-client budget over a one-minute window. giveBack returns one use to a
+ * client, for a request that turned out to cost nothing the budget is for.
+ */
+export function rateWindow(perMinute: number): ((client: string, now?: number) => boolean) & { giveBack: (client: string) => void } {
   const windows = new Map<string, { startedAt: number; count: number }>();
-  return (client, now = Date.now()) => {
+  const take = (client: string, now = Date.now()): boolean => {
     const current = windows.get(client);
     if (!current || now - current.startedAt >= 60_000) {
       // Bound the table: a spread of client fingerprints must not grow it forever.
@@ -218,6 +221,12 @@ export function rateWindow(perMinute: number): (client: string, now?: number) =>
     current.count += 1;
     return true;
   };
+  return Object.assign(take, {
+    giveBack: (client: string): void => {
+      const current = windows.get(client);
+      if (current && current.count > 0) current.count -= 1;
+    },
+  });
 }
 
 const TIMED_OUT = Symbol('timed out');
