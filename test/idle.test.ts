@@ -117,15 +117,19 @@ describe('IDLE listener', () => {
 
   it('reads how often to ask from IMAP_IDLE_CHECK_SECONDS', () => {
     delete process.env.IMAP_IDLE_CHECK_SECONDS;
-    expect(idleCheckMs()).toBe(60_000);
+    // Unset: a minute for QQ, whose notifications go missing; five for the rest.
+    expect(idleCheckMs('qq')).toBe(60_000);
+    expect(idleCheckMs('outlook')).toBe(300_000);
+    expect(idleCheckMs()).toBe(300_000);
     process.env.IMAP_IDLE_CHECK_SECONDS = '0';
     expect(idleCheckMs()).toBe(0);
     process.env.IMAP_IDLE_CHECK_SECONDS = '5';
     expect(idleCheckMs()).toBe(15_000);
     process.env.IMAP_IDLE_CHECK_SECONDS = '120';
     expect(idleCheckMs()).toBe(120_000);
+    expect(idleCheckMs('outlook')).toBe(120_000);
     process.env.IMAP_IDLE_CHECK_SECONDS = 'often';
-    expect(idleCheckMs()).toBe(60_000);
+    expect(idleCheckMs('qq')).toBe(60_000);
     delete process.env.IMAP_IDLE_CHECK_SECONDS;
   });
 

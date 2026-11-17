@@ -27,17 +27,23 @@ export function idleEnabled(): boolean {
   return (process.env.IMAP_IDLE_ENABLED ?? 'false').toLowerCase() === 'true';
 }
 
+/** Providers whose IDLE is known to miss notifications: asked every minute rather than every five. */
+const MISSES_NOTIFICATIONS = new Set(['qq', 'qq_biz']);
+
 /**
  * How often a listening connection asks the server itself whether its folder
- * has new mail, in milliseconds: IMAP_IDLE_CHECK_SECONDS, 60 unless set, 0 to
- * turn it off, otherwise from 15 to 3600. A server that misses a notification
- * (QQ's does, for some deliveries) would otherwise leave that message to the
- * next poll, up to POLL_INTERVAL_SECONDS later.
+ * has new mail, in milliseconds. A server that misses a notification (QQ's
+ * does, for some deliveries) would otherwise leave that message to the next
+ * poll, up to POLL_INTERVAL_SECONDS later. IMAP_IDLE_CHECK_SECONDS sets it for
+ * every mailbox (0 turns it off, otherwise 15 to 3600); unset, it is a minute
+ * for a provider known to miss notifications and five minutes for the rest,
+ * whose notifications only need a safety net.
  */
-export function idleCheckMs(): number {
+export function idleCheckMs(provider = ''): number {
   const raw = process.env.IMAP_IDLE_CHECK_SECONDS?.trim();
-  const value = raw ? Number(raw) : 60;
-  if (!Number.isFinite(value)) return 60_000;
+  const fallback = MISSES_NOTIFICATIONS.has(provider) ? 60 : 300;
+  const value = raw ? Number(raw) : fallback;
+  if (!Number.isFinite(value)) return fallback * 1000;
   if (value <= 0) return 0;
   return Math.min(3600, Math.max(15, Math.floor(value))) * 1000;
 }
@@ -226,7 +232,7 @@ export class FolderListener {
           checking = false;
         }
       };
-      const every = this.deps.checkMs ?? idleCheckMs();
+      const every = this.deps.checkMs ?? idleCheckMs(this.account.provider);
       const ticker = every > 0 ? setInterval(() => { void check(); }, every) : undefined;
       ticker?.unref?.();
       try {
