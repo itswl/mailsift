@@ -281,6 +281,20 @@ function eachCopy(key, touch) {
 function markHandledLocal(key, at) {
   eachCopy(key, (m) => { m.handledAt = at; });
 }
+// Read, as far as the page knows: every copy of the message, and what the
+// reader kept of it, so its menu offers Mark unread rather than Mark read.
+function seenLocal(key) {
+  const mark = (k) => {
+    flagsByKey.set(k, Object.assign({}, flagsByKey.get(k) || {}, { seen: true }));
+    const data = liveData.get(k);
+    if (data && data.flags) data.flags = Object.assign({}, data.flags, { seen: true });
+  };
+  mark(key);
+  eachCopy(key, (m) => {
+    mark(rowKey(m));
+    if (m.live && m.flags) m.flags = Object.assign({}, m.flags, { seen: true });
+  });
+}
 async function post(path, body, options) {
   try {
     const r = await fetch(path, Object.assign({
@@ -361,8 +375,12 @@ async function complete(key, li, undo) {
     if (!on) unfade(key);
     return at;
   };
+  // Where in the queue it was, for j and k to carry on from (see queueStep).
+  holdQueuePlace(key);
   const asked = apply(handled);
   pendingHandled.set(key, asked);
+  // Done marks it read in its mailbox too, with a write session: the menu says so at once.
+  if (handled && session.writable) seenLocal(key);
   if (handled && li && !reduceMotion()) {
     // The ring fills, the row lets go, and only then does the list close up.
     li.classList.add('completing');
@@ -374,7 +392,11 @@ async function complete(key, li, undo) {
   if (handled) {
     if (navigator.vibrate) navigator.vibrate(8);
     toast(t('done.toast'), false, { label: t('undo'), run: () => complete(key, null, true) });
+    $('#toast').dataset.about = 'done:' + key;
     if (sheet.open && isOpenRow(key)) closeSheet(sheet, false);
+  } else if ($('#toast').dataset.about === 'done:' + key) {
+    // Put back by other means than its Undo: the line that says it is done no longer is so.
+    hideToast();
   }
   const r = await post('/api/handled', { key, handled });
   // Only if nothing newer was asked of this row while the answer was on its way.
@@ -538,7 +560,9 @@ function drawSnooze(row, run) {
     e.preventDefault();
     const at = new Date(input.value);
     note.textContent = isNaN(at) || at <= new Date() ? t('snooze.past') : at > latest ? t('snooze.far') : '';
-    if (!note.textContent) { if (run && popovers.has(snoozeSheet)) closePopover(snoozeSheet, false); go(at); }
+    if (!note.textContent) { if (run && popovers.has(snoozeSheet)) closePopover(snoozeSheet, false); go(at); return; }
+    // A line more: placed again, so it still clears its control (and on a phone the reader's bar).
+    if (popovers.has(snoozeSheet)) placePopover(snoozeSheet);
   };
   const pick = choice(t('snooze.pick'), null, () => {
     pick.hidden = true;
@@ -617,6 +641,8 @@ async function snooze(key, at, undoing) {
   const asked = { until, local: woken ? new Date().toISOString() : until, woken };
   const queued = () => attentionSet.has(key) && needsYou(rowByKey(key) || row);
   const was = queued();
+  // Where in the queue it was, for j and k to carry on from (see queueStep).
+  holdQueuePlace(key);
   const apply = (value, wake) => {
     const inQueue = queued();
     snoozeLocal(key, value, wake);
@@ -1144,6 +1170,9 @@ async function chrome() {
     // An empty list picks its words from the summary, which usually lands
     // after the list: "quiet" is not to be said while a mailbox is unread.
     if (list.querySelector('.empty') && (!hadSummary || failingMailboxes().map((m) => m.address).join() !== downBefore)) renderList();
+    // The offer to search the mailbox names mailboxes the summary brings: a list drawn with a query
+    // before it came (a reload, a shared link) is drawn again with it, once a mailbox it names is picked.
+    const offerOwed = !hadSummary && !liveView && filters.q.value.trim().length >= 2;
     if (!filters.category.dataset.filled) {
       for (const c of s.categories || []) filters.category.appendChild(new Option(word('category.', c), c));
       for (const a of s.accounts || []) filters.account.appendChild(new Option(a.name, a.address));
@@ -1161,6 +1190,7 @@ async function chrome() {
       syncUrl();
       if (dropped) load();
     }
+    if (offerOwed) renderList();
     if (digestAnswer.ok) lastDigest = await digestAnswer.json();
     renderLede();
     renderStatus();
@@ -1240,16 +1270,25 @@ function forgetLocal() {
 let bootKey = keyFromHash(location.hash);
 const bootParams = new URLSearchParams(location.search);
 const wantsCode = bootParams.get('focus') === 'code';
+// Reloaded with the reader open on a phone: its entry is kept, and the reader opens on it again.
+let bootOnEntry = false;
 stripStaleEntry();
 // Stripped even when it does not decode, so a broken link does not survive a reload.
 // So is the mark of a sheet, a popover or a selection that was open when the
 // page was reloaded: it is gone, and an entry that still claims it would
 // swallow the next Back. The folder or search on show is kept, so the entry
 // is still that view's and opening it again adds nothing to the history.
+// The reader's own entry is the exception: it was pushed over the page's,
+// so the reader opens again on it, and closing it steps back as before;
+// opening it on a new entry added one more Back with every reload. A popover
+// or a selection has nothing to open again: the page steps back off its
+// entry, so the next Back is not spent on it.
 function stripStaleEntry() {
   const state = history.state;
   if (location.hash.indexOf('#m=') !== 0 && !(state && (state.sheet || state.popover || state.picking))) return;
+  if (state && state.sheet === 'sheet' && state.depth === 1 && bootKey && state.key === bootKey && !isWide()) { bootOnEntry = true; return; }
   history.replaceState(state && state.live ? { live: state.live } : null, '', location.pathname + location.search);
+  if (state && (state.popover || state.picking) && !state.sheet && history.length > 1) history.back();
 }
 function focusCode() {
   const target = lane.querySelector('.lane-copy');
@@ -1260,7 +1299,9 @@ function afterFirstLoad() {
   if (bootKey) {
     const key = bootKey;
     bootKey = null;
-    openFromLink(key, false);
+    // On the reader's own entry when it was reloaded open; one that cannot be found any more leaves no entry claiming it.
+    openFromLink(key, bootOnEntry, bootOnEntry ? () => stripStaleEntry() : null);
+    bootOnEntry = false;
   }
   if (wantsCode) focusCode();
   syncUrl();

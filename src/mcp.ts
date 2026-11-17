@@ -382,7 +382,7 @@ function pageAnswer(answer: WebResponse): Record<string, unknown> {
       'Only a message mailsift stored is in needs_you, can be put off or has a judgement to correct. browse_folder and ' +
       'search_mailbox give a key for the ones it stored.');
   }
-  if (code === 'searchTimeout' || code === 'timeout') {
+  if (code === 'searchTimeout' || code === 'timeout' || code === 'folderTimeout' || code === 'foldersTimeout') {
     throw new McpToolError('MAILBOX_UNAVAILABLE', said, 'The mailbox was slow to answer. Try again, or narrow the search to one folder.');
   }
   if (code === 'actionNotFound') {

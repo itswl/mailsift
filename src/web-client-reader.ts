@@ -945,6 +945,8 @@ const acting = new Set();
 // Each mailbox's archive, as an archive action answered with where the message went:
 // a message filed there is not offered Archive again.
 const archiveOf = new Map();
+// The same for each mailbox's bin.
+const trashOf = new Map();
 async function mailAction(key, action, destination) {
   if (!requireWrite()) return;
   if (menuSheet.open) closeSheet(menuSheet, false);
@@ -964,6 +966,9 @@ async function mailAction(key, action, destination) {
   }
   applyRow(r.data.row);
   if (action === 'archive' && r.data.row && r.data.row.folder) archiveOf.set(r.data.row.account, r.data.row.folder);
+  if (action === 'trash' && r.data.row && r.data.row.folder) trashOf.set(r.data.row.account, r.data.row.folder);
+  // Where it is now, for a stored message that stays open on a desk: its line says the folder it went to.
+  const movedHere = Boolean(r.data.row && r.data.row.folder && listedIn && r.data.row.folder !== listedIn);
   liveData.delete(key);
   const flags = Object.assign({}, flagsByKey.get(key) || {});
   if (action === 'star' || action === 'unstar') flags.flagged = action === 'star';
@@ -976,6 +981,8 @@ async function mailAction(key, action, destination) {
     if (r.data.moved && r.data.moved.folder !== listedIn) dropLive([key]);
   }
   if (typeof r.data.attention === 'number') attentionCount = r.data.attention;
+  // Moved or marked: the folders' counts the page holds are old now.
+  if (row && action !== 'star' && action !== 'unstar') countsChanged(row.account);
   const said = action === 'move' ? fill('act.moved', { folder: folderName(row ? row.account : '', destination) }) : t(ACTION_SAID[action]);
   // A spam vote that made a rule says so, as the judgement line does.
   const muted = mutedLine(r.data.muted);
@@ -987,7 +994,7 @@ async function mailAction(key, action, destination) {
   // Filed away: the reader goes back to the list on a phone.
   if ((action === 'archive' || action === 'trash' || action === 'spam') && sheet.open && isOpenRow(key)) closeSheet(sheet, false);
   else if (shown && r.data.moved && sheet.open && isOpenRow(key)) closeSheet(sheet, false);
-  else if (action === 'inbox') renderPane(true);
+  else if (action === 'inbox' || (movedHere && isWide() && isOpenRow(key))) renderPane(true);
 }
 // Run once a sheet just closed has gone: the history has stepped back from
 // its entry, and it has finished closing. A popover that takes an entry of
@@ -1044,8 +1051,19 @@ function openMenu(key, anchor) {
   // Spam is a judgement as well as a folder: the triage learns from it either way.
   if (row.inSpam) item('i-inbox', t('act.notSpam'), () => mailAction(key, 'not_spam'));
   else if (!liveIn(row, 'sent') && !liveIn(row, 'drafts')) item('i-alert', t('act.spam'), () => mailAction(key, 'spam'));
-  if (!liveIn(row, 'trash')) item('i-trash', t('act.trash'), () => mailAction(key, 'trash'));
+  if (binnable(row)) item('i-trash', t('act.trash'), () => mailAction(key, 'trash'));
   openSheet(menuSheet, {});
+}
+// Whether Archive applies to a message: not to one in the archive or All Mail
+// already, by the folder's role or by where this page last archived to.
+function archivable(row) {
+  const role = folderRoleOf(row.account, row.folder);
+  return !(liveIn(row, 'archive') || liveIn(row, 'all') || role === 'archive' || role === 'all'
+    || (archiveOf.has(row.account) && archiveOf.get(row.account) === row.folder));
+}
+// Whether Bin applies: not to one in the bin, stored or listed live.
+function binnable(row) {
+  return folderRoleOf(row.account, row.folder) !== 'trash' && !(trashOf.has(row.account) && trashOf.get(row.account) === row.folder);
 }
 function barButton(glyph, label, run, cls) {
   const b = el('button', 'bar-btn' + (cls ? ' ' + cls : ''));
@@ -1068,10 +1086,7 @@ function fillBar(bar, row, wide) {
   bar.appendChild(barButton('i-reply', t('act.reply'), () => startReply(key, 'reply'), markable ? '' : 'primary'));
   if (wide) bar.appendChild(barButton('i-reply-all', t('act.replyAll'), () => startReply(key, 'replyAll'), 'icon-only'));
   // Filed in the archive already, it is not archived again.
-  const role = folderRoleOf(row.account, row.folder);
-  const archived = liveIn(row, 'archive') || liveIn(row, 'all') || role === 'archive' || role === 'all'
-    || (archiveOf.has(row.account) && archiveOf.get(row.account) === row.folder);
-  if (!archived) bar.appendChild(barButton('i-archive', t('act.archive'), () => mailAction(key, 'archive'), wide ? 'icon-only' : ''));
+  if (archivable(row)) bar.appendChild(barButton('i-archive', t('act.archive'), () => mailAction(key, 'archive'), wide ? 'icon-only' : ''));
   if (wide) bar.appendChild(barButton('i-star', t(flags.flagged ? 'act.unstar' : 'act.star'), () => mailAction(key, flags.flagged ? 'unstar' : 'star'), 'icon-only' + (flags.flagged ? ' lit' : '')));
   // On a desk there is room for it beside the star; on a phone it is under "more".
   if (wide && !row.handledAt && markable) {
@@ -1103,11 +1118,32 @@ function renderBars() {
 function visibleKeys() {
   return Array.from(document.querySelectorAll('#queue li.row, #list li.row')).map((li) => li.dataset.key);
 }
+// The queue as it was when the message the keys are on left it (done, or put
+// off), so that j and k carry on through the queue from where it was rather
+// than from its new place in the day's list.
+let queuePlace = null;
+const queueKeysNow = () => Array.from(document.querySelectorAll('#queue li.row')).map((li) => li.dataset.key);
+function holdQueuePlace(key) {
+  const current = isWide() ? selectedKey : openKey;
+  const listed = queueKeysNow();
+  if (current && (current === key || queueKey(rowByKey(current) || {}) === key) && listed.indexOf(current) !== -1) queuePlace = { key: current, keys: listed };
+}
+// The next message for j or k from one that left the queue: the next one of
+// the queue it left that is still in it. null when the keys are elsewhere.
+function queueStep(current, step) {
+  if (!queuePlace || queuePlace.key !== current) return null;
+  const still = queueKeysNow();
+  if (still.indexOf(current) !== -1) return null;
+  const at = queuePlace.keys.indexOf(current);
+  const order = step > 0 ? queuePlace.keys.slice(at + 1) : queuePlace.keys.slice(0, at).reverse();
+  return order.find((k) => still.indexOf(k) !== -1) || null;
+}
 function stepMessage(delta) {
   const keys = visibleKeys();
   if (!keys.length) return;
-  const current = keys.indexOf(isWide() ? selectedKey : openKey);
-  const next = keys[Math.min(keys.length - 1, Math.max(0, current + delta))];
+  const open = isWide() ? selectedKey : openKey;
+  const current = keys.indexOf(open);
+  const next = queueStep(open, delta) || keys[Math.min(keys.length - 1, Math.max(0, current + delta))];
   if (!next || next === (isWide() ? selectedKey : openKey)) return;
   openDetail(next);
   const li = document.querySelector('li.row[data-key="' + CSS.escape(next) + '"]');
@@ -1125,6 +1161,8 @@ function showInSheet(item, key) {
 function openDetail(key, here) {
   const item = findItem(key);
   if (!item) return;
+  // A sheet still on its way out (a link followed from inside it closed it) is closed now, so it can open on this one.
+  finishClosing(sheet);
   openKey = key;
   if (isWide()) {
     selectedKey = key;
@@ -1150,15 +1188,15 @@ $('#sheet-prev').onclick = () => stepMessage(-1);
 $('#sheet-next').onclick = () => stepMessage(1);
 // A message named by a link may lie outside the loaded window; it is fetched
 // on its own then, without its body.
-function openFromLink(key, here) {
+function openFromLink(key, here, missing) {
   if (findItem(key)) { openDetail(key, here); return; }
   fetch('/api/message?id=' + encodeURIComponent(key)).then((r) => (r.ok ? r.json() : null)).then((row) => {
-    if (!row || row.error) return;
+    if (!row || row.error) { if (missing) missing(); return; }
     // A message named by a handle is a row listed live, known by its handle; one the server matched to a record carries its key apart.
     if (row.handle) Object.assign(row, { storedKey: row.stored ? row.dedupKey : null, dedupKey: row.handle, live: true });
     extraRows.set(key, row);
     openDetail(key, here);
-  }).catch(() => {});
+  }).catch(() => { if (missing) missing(); });
 }
 let paneKey;
 function renderPane(force) {

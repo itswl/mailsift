@@ -2275,8 +2275,8 @@ describe('the rest of the mailbox in the page', () => {
   it('gives a live row only what applies to it: no Done or later for a message never stored, no Archive in the archive', () => {
     const script = clientScript();
     expect(script).toContain("if (markable) bar.appendChild(barButton('i-check'");
-    expect(script).toContain("const archived = liveIn(row, 'archive') || liveIn(row, 'all') || role === 'archive' || role === 'all'");
-    expect(script).toContain("if (!archived) bar.appendChild(barButton('i-archive'");
+    expect(script).toContain("return !(liveIn(row, 'archive') || liveIn(row, 'all') || role === 'archive' || role === 'all'");
+    expect(script).toContain("if (archivable(row)) bar.appendChild(barButton('i-archive'");
     // A message the page just archived is not offered Archive again: the answer said where its archive is.
     expect(script).toContain("if (action === 'archive' && r.data.row && r.data.row.folder) archiveOf.set(r.data.row.account, r.data.row.folder);");
     expect(script).toContain("if (e.key === 'e') { if (!markable) return;");
@@ -2307,7 +2307,7 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
       refresh: () => undefined, liveLoad: () => undefined, setTimeout: () => 0,
       toast: (text: string, error: boolean, undo: { run: () => Promise<void> } | null) => { toasts.push({ text, error, undo }); },
       failure: (data: { code: string }) => `refused: ${data.code}`, t: en, fill: fillEn, STRINGS, lang: 'en', DOT: ' · ',
-      folderName: (_account: string, path: string) => path, whenLabel: () => 'tomorrow', crypto: webcrypto,
+      folderName: (_account: string, path: string) => path, whenLabel: () => 'tomorrow', crypto: webcrypto, countsChanged: () => undefined,
     };
     const fns = lifted<{
       bulkAction: (action: string, extra?: Record<string, unknown>) => Promise<void>;
@@ -2924,5 +2924,277 @@ describe('what a QA pass found in the reader and on signing out', () => {
     const signOut = lifted<() => Promise<void>>(['signOut'], 'signOut', context);
     await signOut();
     expect(did).toEqual(['worker signout', 'forgot', 'asked /auth/signout', 'said session.signoutFailed']);
+  });
+});
+
+describe('what a QA pass found in the queue and the mailbox, in the page', () => {
+  const en = (key: string): string => STRINGS.en[key as StringKey] ?? key;
+  const fillEn = (key: string, vars: Record<string, unknown> = {}): string =>
+    Object.entries(vars).reduce((text, [name, value]) => text.split(`{${name}}`).join(String(value)), en(key));
+
+  /**
+   * The page's keyboard, run on its own over a stand-in page: which dialogs
+   * are open, which rows are listed, and what each key ended up asking for.
+   */
+  function keyboard(options: { wide: boolean; sheetOpen?: boolean; otherDialog?: boolean; openKey?: string | null; selectedKey?: string | null; rows: Array<Record<string, unknown>>; queue?: string[] }) {
+    const did: string[] = [];
+    const rows = new Map(options.rows.map((row) => [String(row['dedupKey']), row]));
+    const listed = [...(options.queue ?? []), ...options.rows.map((row) => String(row['dedupKey']))];
+    const sheet = { open: Boolean(options.sheetOpen), classList: { contains: () => false } };
+    const context: Record<string, unknown> = {
+      fineKeys: true, palette: { open: false }, openPalette: () => did.push('palette'), sheet,
+      openKey: options.openKey ?? null, selectedKey: options.selectedKey ?? null, picked: new Set<string>(), liveView: null,
+      queuePlace: null, archiveOf: new Map(), trashOf: new Map(),
+      Element: class {}, CSS: { escape: (value: string) => value },
+      document: {
+        querySelector: (selector: string) => {
+          if (selector === 'dialog[open]') return sheet.open || options.otherDialog ? {} : null;
+          if (selector === 'dialog[open]:not(#sheet)' || selector === 'dialog[open]:not(.popover)') return options.otherDialog ? {} : null;
+          if (selector.startsWith('#sheet-bar')) return { anchor: 'sheet-more' };
+          return null;
+        },
+        querySelectorAll: (selector: string) => (selector === '#queue li.row' ? (options.queue ?? []).map((key) => ({ dataset: { key } })) : []),
+      },
+      visibleKeys: () => listed, isWide: () => options.wide, markSelected: () => undefined,
+      stepMessage: (delta: number) => did.push(`step ${delta}`), openDetail: (key: string) => did.push(`open ${key}`),
+      rowByKey: (key: string) => rows.get(key) ?? null, findItem: () => null, rowOfItem: (item: unknown) => item,
+      complete: (key: string) => did.push(`done ${key}`), startReply: (key: string, mode: string) => did.push(`${mode} ${key}`),
+      startForward: (key: string) => did.push(`forward ${key}`), mailAction: (key: string, action: string) => did.push(`${action} ${key}`),
+      flagsByKey: new Map(), openSnooze: (key: string, anchor: unknown) => did.push(`later ${key} ${JSON.stringify(anchor)}`),
+      showSearch: () => did.push('search'), openKeys: () => did.push('keys'), copyNewestCode: () => did.push('code'),
+      startCompose: () => did.push('compose'), refreshButton: null, pollNow: () => undefined, openFolders: () => did.push('folders'),
+      clearSelection: () => did.push('cleared'), exitLive: () => undefined, togglePick: () => undefined, clearPicks: () => undefined,
+      folderRoleOf: (_account: string, folder: string) => ({ '[Gmail]/All Mail': 'all', '[Gmail]/Trash': 'trash', Archive: 'archive' } as Record<string, string>)[folder] ?? null,
+      liveIn: () => false,
+    };
+    const press = lifted<(e: Record<string, unknown>) => void>(
+      ['rowKey', 'queueKey', 'READER_KEYS', 'queueKeysNow', 'queueStep', 'archivable', 'binnable', 'pageKeydown'], 'pageKeydown', context,
+    );
+    const key = (name: string): void => press({ key: name, preventDefault: () => undefined, target: null });
+    return { key, did, context };
+  }
+  const row = (dedupKey: string, folder = 'INBOX'): Record<string, unknown> => ({ dedupKey, account: 'me@gmail.com', folder, handledAt: null });
+
+  it('steps through the list and acts on the message from the reader open as a sheet in a narrow window', () => {
+    const page = keyboard({ wide: false, sheetOpen: true, openKey: 'mia', rows: [row('mia'), row('airline')] });
+    for (const name of ['j', 'k', 'e', 'r', 'b', '/', 'g', 'n', 'ArrowDown']) page.key(name);
+    expect(page.did).toEqual(['step 1', 'step -1', 'done mia', 'reply mia', 'later mia {"anchor":"sheet-more"}']);
+    // Another dialog over it (the menu, the palette) keeps its keys.
+    const covered = keyboard({ wide: false, sheetOpen: true, otherDialog: true, openKey: 'mia', rows: [row('mia')] });
+    covered.key('j');
+    covered.key('e');
+    expect(covered.did).toEqual([]);
+  });
+
+  it('carries j and k on through the queue from a message that just left it', () => {
+    // Mia was open, and done: the queue no longer has her, the day's list still does.
+    const page = keyboard({ wide: true, selectedKey: 'mia', rows: [row('library'), row('mia'), row('airline')], queue: ['airline', 'cloud'] });
+    page.context['queuePlace'] = { key: 'mia', keys: ['mia', 'airline', 'cloud'] };
+    page.key('j');
+    expect(page.did).toEqual(['open airline']);
+    // Nothing before her in the queue: back to where the keys would go anyway.
+    const back = keyboard({ wide: true, selectedKey: 'mia', rows: [row('library'), row('mia')], queue: ['airline'] });
+    back.context['queuePlace'] = { key: 'mia', keys: ['mia', 'airline'] };
+    back.key('k');
+    expect(back.did).toEqual(['open library']);
+  });
+
+  it('notes where in the queue the open message was when it leaves it', () => {
+    const context: Record<string, unknown> = {
+      queuePlace: null, isWide: () => true, selectedKey: 'mia', openKey: null, rowByKey: () => ({ dedupKey: 'mia' }),
+      document: { querySelectorAll: () => ['mia', 'airline'].map((key) => ({ dataset: { key } })) },
+    };
+    const hold = lifted<(key: string) => void>(['rowKey', 'queueKey', 'queueKeysNow', 'holdQueuePlace'], 'holdQueuePlace', context);
+    hold('airline');
+    expect(context['queuePlace']).toBeNull();
+    hold('mia');
+    expect(context['queuePlace']).toEqual({ key: 'mia', keys: ['mia', 'airline'] });
+    // Done and Remind me both note it, before the row leaves.
+    const script = clientScript();
+    const noted = script.split('holdQueuePlace(key);').length - 1;
+    expect(noted).toBe(2);
+    expect(script.indexOf('holdQueuePlace(key);', script.indexOf('async function snooze('))).toBeLessThan(script.indexOf('apply(asked.local, woken);'));
+  });
+
+  it('archives and bins from the keyboard only where the reader offers it', () => {
+    const page = keyboard({ wide: true, selectedKey: 'x', rows: [row('x', '[Gmail]/All Mail'), row('t', '[Gmail]/Trash'), row('i')] });
+    page.key('y');
+    page.context['selectedKey'] = 't';
+    page.key('#');
+    expect(page.did).toEqual([]);
+    page.context['selectedKey'] = 'i';
+    page.key('y');
+    page.key('#');
+    expect(page.did).toEqual(['archive i', 'trash i']);
+    // A stored message the page just binned is in the bin by where the answer said it went.
+    const binned = keyboard({ wide: true, selectedKey: 'b', rows: [row('b', 'Papierkorb')] });
+    (binned.context['trashOf'] as Map<string, string>).set('me@gmail.com', 'Papierkorb');
+    binned.key('#');
+    expect(binned.did).toEqual([]);
+  });
+
+  it('shows the queue at once when a filter hid it, rather than after the list is read again', () => {
+    const did: string[] = [];
+    let drawn = false;
+    const ring = { focus: () => did.push('focused') };
+    const context: Record<string, unknown> = {
+      filtersActive: () => true, filters: { view: { value: 'mail' } }, clearFilters: () => did.push('cleared'), setFilters: () => undefined,
+      renderList: () => { drawn = true; did.push('drawn'); },
+      queue: { querySelector: () => (drawn ? ring : null), scrollIntoView: () => did.push('scrolled') },
+    };
+    lifted<() => void>(['showQueue'], 'showQueue', context)();
+    expect(did).toEqual(['cleared', 'drawn', 'scrolled', 'focused']);
+  });
+
+  it('says a message done is read, in every copy and in what the reader kept of it', () => {
+    const live = { dedupKey: 'live:h', storedKey: 'k1', live: true, flags: { seen: false } };
+    const context: Record<string, unknown> = {
+      flagsByKey: new Map([['k1', { seen: false, flagged: true }]]), liveData: new Map([['k1', { flags: { seen: false } }]]),
+      eachCopy: (_key: string, touch: (m: Record<string, unknown>) => void) => { touch({ dedupKey: 'k1' }); touch(live); },
+    };
+    lifted<(key: string) => void>(['rowKey', 'seenLocal'], 'seenLocal', context)('k1');
+    const flags = context['flagsByKey'] as Map<string, Record<string, boolean>>;
+    expect(flags.get('k1')).toEqual({ seen: true, flagged: true });
+    expect(flags.get('live:h')).toEqual({ seen: true });
+    expect((context['liveData'] as Map<string, { flags: { seen: boolean } }>).get('k1')!.flags.seen).toBe(true);
+    expect(live.flags.seen).toBe(true);
+    expect(clientScript()).toContain('if (handled && session.writable) seenLocal(key);');
+  });
+
+  it('takes the Done line away when the message is put back by other means than its Undo', () => {
+    const script = clientScript();
+    expect(script).toContain("$('#toast').dataset.about = 'done:' + key;");
+    expect(script).toContain("} else if ($('#toast').dataset.about === 'done:' + key) {");
+    // Any other line said since is left alone: a toast says what it is about, afresh each time.
+    expect(script).toContain("node.dataset.about = '';");
+  });
+
+  it('opens the reader again on its own entry after a reload, and steps back off a popover\'s', () => {
+    const calls: string[] = [];
+    const run = (state: Record<string, unknown> | null, hash: string, wide = false) => {
+      calls.length = 0;
+      const context: Record<string, unknown> = {
+        bootKey: hash.startsWith('#m=') ? decodeURIComponent(hash.slice(3)) : null, bootOnEntry: false, isWide: () => wide,
+        history: { state, length: 4, replaceState: () => calls.push('replace'), back: () => calls.push('back') },
+        location: { hash, pathname: '/', search: '' },
+      };
+      lifted<() => void>(['stripStaleEntry'], 'stripStaleEntry', context)();
+      return context['bootOnEntry'];
+    };
+    expect(run({ sheet: 'sheet', depth: 1, key: 'preview-03', hash: '#m=preview-03' }, '#m=preview-03')).toBe(true);
+    expect(calls).toEqual([]);
+    // A shared link, with no entry of the reader's: as before, the entry is plain and the reader takes one of its own.
+    expect(run(null, '#m=preview-03')).toBe(false);
+    expect(calls).toEqual(['replace']);
+    // A popover left open by the reload: nothing to open again, and the next Back is not spent on its entry.
+    run({ popover: 'notify-sheet' }, '');
+    expect(calls).toEqual(['replace', 'back']);
+    // On a desk the reader is no sheet: the entry is made plain.
+    expect(run({ sheet: 'sheet', depth: 1, key: 'preview-03' }, '#m=preview-03', true)).toBe(false);
+  });
+
+  it('closes at once a sheet still on its way out, so a link followed from inside it opens the message', () => {
+    const did: string[] = [];
+    const dialog = {
+      open: true, id: 'sheet', style: { transform: '' },
+      classList: { add: () => undefined, remove: () => undefined, contains: () => false },
+      addEventListener: () => undefined, close: () => { dialog.open = false; did.push('closed'); },
+    };
+    const context: Record<string, unknown> = {
+      sheetStack: [{ dialog, back: null }], rehomeToast: () => undefined, reduceMotion: () => false, setTimeout: () => 0,
+      filterSheet: {}, sheetClosed: () => did.push('sheetClosed'), takeOwedFocus: () => null, oweBack: () => undefined,
+      filtersOpen: { setAttribute: () => undefined },
+    };
+    const page = lifted<{ closeSheet: (d: unknown, viaHistory: boolean) => void; finishClosing: (d: unknown) => void }>(
+      ['closingSheets', 'finishClosing', 'closeSheet'], '({ closeSheet, finishClosing })', context,
+    );
+    page.closeSheet(dialog, true);
+    expect(did).toEqual([]);
+    page.finishClosing(dialog);
+    expect(did).toEqual(['closed', 'sheetClosed']);
+    // Its own end, when it comes, does nothing more.
+    page.finishClosing(dialog);
+    expect(did).toEqual(['closed', 'sheetClosed']);
+    expect(clientScript()).toContain('  finishClosing(sheet);\n  openKey = key;');
+  });
+
+  it('keeps the error line under a picked date inside its panel, over the reader\'s bar', () => {
+    expect(clientScript()).toContain('if (popovers.has(snoozeSheet)) placePopover(snoozeSheet);');
+  });
+
+  it('says in Chinese that the other device was removed, not this one', () => {
+    expect(STRINGS['zh-CN']['notify.removed']).toContain('那台设备');
+    expect(STRINGS['zh-CN']['notify.removed']).not.toContain('这台设备');
+  });
+
+  it('draws the list again with the offer to search the mailbox once the summary names the mailboxes', () => {
+    const script = clientScript();
+    expect(script).toContain('const offerOwed = !hadSummary && !liveView && filters.q.value.trim().length >= 2;');
+    expect(script).toContain('    if (offerOwed) renderList();');
+  });
+
+  it('says a batch did not move what was already where it puts it', async () => {
+    const posted: unknown[] = [];
+    const toasts: string[] = [];
+    const rows = [{ dedupKey: 'k1', account: 'me@qq.com', folder: 'Junk', handledAt: null }, { dedupKey: 'k2', account: 'me@qq.com', folder: 'INBOX', handledAt: null }];
+    const byKey = new Map(rows.map((m) => [m.dedupKey, m]));
+    const context: Record<string, unknown> = {
+      session: { writable: true, canMark: true }, requireWrite: () => undefined, bulkBusy: false,
+      picked: new Set(['k1', 'k2']), pickAnchor: null, history: { state: null },
+      post: async (_path: string, body: unknown) => {
+        posted.push(body);
+        return { ok: true, data: { done: 2, skipped: 0, failed: 0, results: [{ key: 'k1', status: 'done', already: true }, { key: 'k2', status: 'done' }] } };
+      },
+      rowByKey: (key: string) => byKey.get(key), findItem: () => null, rowOfItem: () => null,
+      pickedRows: () => rows, applyRow: () => undefined, liveData: new Map(), flagsByKey: new Map(), liveView: null, liveRows: new Map(),
+      extraRows: new Map(), dropLive: () => undefined, attentionCount: 0, oweBack: () => undefined, pickChanged: () => undefined,
+      renderPickBar: () => undefined, loadAttention: () => undefined, renderList: () => undefined, renderLede: () => undefined,
+      renderBars: () => undefined, updateBadge: () => undefined, refresh: () => undefined, liveLoad: () => undefined, setTimeout: () => 0,
+      toast: (text: string) => toasts.push(text), failure: () => '', t: en, fill: fillEn, STRINGS, lang: 'en', DOT: ' · ',
+      folderName: (_account: string, path: string) => path, whenLabel: () => '', crypto: webcrypto, countsChanged: () => undefined,
+    };
+    const bulk = lifted<(action: string) => Promise<void>>(
+      ['rowKey', 'mailRef', 'queueKey', 'bulkId', 'snoozeUndoTo', 'mutedLine', 'liveShown', 'bulkAction', 'bulkUndo', 'undoBulkSnooze'], 'bulkAction', context,
+    );
+    await bulk('spam');
+    expect(toasts.at(-1)).toBe(`${fillEn('bulk.spam', { count: 1 })} · ${fillEn('bulk.already', { count: 1 })}`);
+    expect(STRINGS['zh-CN']['bulk.already']).toBeTruthy();
+  });
+
+  it('words a folder or folder list that was slow as that, in both languages', () => {
+    for (const key of ['error.folderTimeout', 'error.foldersTimeout'] as const) {
+      expect(STRINGS.en[key]).toMatch(/folder/);
+      expect(STRINGS.en[key]).not.toMatch(/message/);
+      expect(STRINGS['zh-CN'][key]).toContain('文件夹');
+    }
+  });
+
+  it('does not show folder counts the owner\'s own action made old, and reads them again where they are on show', () => {
+    const did: string[] = [];
+    const folderLists = new Map([['me@gmail.com', { at: Date.now(), folders: [{ path: 'Receipts', messages: 18, unseen: 4 }] }]]);
+    const context: Record<string, unknown> = {
+      folderLists, liveView: { account: 'me@gmail.com', folder: 'Receipts' }, folderSheet: { open: false }, folderPick: { account: null },
+      renderLiveHead: () => did.push('line'), drawFolderList: () => did.push('panel'), loadFolders: (account: string, force: boolean) => did.push(`load ${account} ${force}`),
+    };
+    const page = lifted<{ countsChanged: (account: string) => void; countsStale: (account: string) => boolean }>(
+      ['countsChanged', 'countsStale'], '({ countsChanged, countsStale })', context,
+    );
+    expect(page.countsStale('me@gmail.com')).toBe(false);
+    page.countsChanged('me@gmail.com');
+    expect(page.countsStale('me@gmail.com')).toBe(true);
+    expect(did).toEqual(['line', 'load me@gmail.com true']);
+    // Read again, the list has no mark of being old.
+    const script = clientScript();
+    expect(script).toContain("if (info && info.unseen && !countsStale(view.account)) parts.push(fill('live.unseen'");
+    expect(script).toContain("if (row && action !== 'star' && action !== 'unstar') countsChanged(row.account);");
+  });
+
+  it('runs the command named by what was typed before one that only ends with it', () => {
+    const rank = lifted<(found: Array<{ label: string }>, q: string) => Array<{ label: string }>>(['rankCommands'], 'rankCommands');
+    const labels = ['Go to critical', 'Only from spam folders', 'Folders…', 'Threads'].map((label) => ({ label }));
+    expect(rank(labels.filter((c) => c.label.toLowerCase().includes('folders')), 'folders').map((c) => c.label)).toEqual(['Folders…', 'Only from spam folders']);
+    expect(rank(labels.filter((c) => c.label.toLowerCase().includes('folder')), 'folder').map((c) => c.label)).toEqual(['Folders…', 'Only from spam folders']);
+    // Nothing typed: the order they are declared in.
+    expect(rank(labels, '').map((c) => c.label)).toEqual(labels.map((c) => c.label));
   });
 });

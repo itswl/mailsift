@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
 import type { IncomingMessage } from 'node:http';
 import { EventEmitter } from 'node:events';
@@ -147,6 +147,21 @@ describe('listing the rest of the mailbox', () => {
     // Nothing listed live is stored.
     expect(store.getMail('<old@x>')).toBeUndefined();
     expect((await call(store, '/api/folder?account=me%40qq.com')).json).toMatchObject({ code: 'badRequest' });
+  });
+
+  it('says a folder or a folder list that took too long is slow to list, not that a message was', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const store = seeded();
+      const slow = fake({ browse: () => new Promise(() => undefined), folders: () => new Promise(() => undefined) });
+      const page = call(store, '/api/folder?account=me%40qq.com&folder=Travel%2F2025', {}, slow);
+      const list = call(store, '/api/folders?account=me%40qq.com', {}, slow);
+      await vi.advanceTimersByTimeAsync(26_000);
+      expect((await page).json).toMatchObject({ code: 'folderTimeout' });
+      expect((await list).json).toMatchObject({ code: 'foldersTimeout' });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('says a folder that is gone, or that changed under the pages already shown, in words of its own', async () => {
@@ -470,6 +485,31 @@ describe('many messages at once', () => {
     expect((await post(store, '/api/bulk', { items: ['k1'], action: 'move' }, mailbox)).json).toMatchObject({ code: 'badRequest' });
     expect((await post(store, '/api/bulk', { items: ['k1'], action: 'delete' }, mailbox)).json).toMatchObject({ code: 'badRequest' });
     expect(asked).toEqual([]);
+  });
+
+  it('says which of a batch were where the action puts them already, so the page does not say they moved', async () => {
+    const store = stored();
+    const { mailbox } = batches({
+      bulk: async (account, targets, action, _options, each) => targets.map((target, index) => {
+        const there = target.messageId === '<two@x>';
+        const outcome = {
+          done: {
+            action, account: account.username, messageId: target.messageId, sourceFolder: there ? 'Junk' : 'INBOX',
+            destinationFolder: 'Junk', destinationIsSpam: true, ...(there ? { already: true } : {}),
+          },
+        };
+        each?.(index, outcome);
+        return outcome;
+      }),
+    });
+    const { json } = await post(store, '/api/bulk', { items: ['k2', 'k3'], action: 'spam' }, mailbox);
+    expect(json).toMatchObject({ done: 2 });
+    expect(json['results']).toEqual([
+      expect.objectContaining({ key: 'k2', status: 'done', already: true }),
+      expect.not.objectContaining({ already: true }),
+    ]);
+    // Counted done, as docs/mcp.md and the reader say, and not a second vote against the sender.
+    expect(store.feedbackSummary()['spam']).toBe(1);
   });
 
   it('says a mailbox has no spam folder, for each message, and changes nothing', async () => {

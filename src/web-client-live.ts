@@ -465,11 +465,24 @@ function matches(label, q) {
   const text = label.toLowerCase();
   return q.toLowerCase().split(/\s+/).filter(Boolean).every((part) => text.indexOf(part) !== -1);
 }
+// The commands that match, the one whose name begins with the query first,
+// then one with a word that does, then the rest, each in the order declared:
+// "folders" is Folders…, not the spam filter that ends with the word.
+function rankCommands(found, q) {
+  const asked = q.trim().toLowerCase();
+  if (!asked) return found;
+  const rank = (label) => {
+    const text = label.toLowerCase();
+    if (text.indexOf(asked) === 0) return 0;
+    return text.split(/[\s·/,(]+/).some((word) => word.indexOf(asked) === 0) ? 1 : 2;
+  };
+  return found.map((c, i) => ({ c, i, r: rank(c.label) })).sort((a, b) => a.r - b.r || a.i - b.i).map((x) => x.c);
+}
 const QUESTION = /[?？]\s*$|^(what|when|who|whom|which|how|why|did|does|do|is|are|was|were|has|have|any)\b|什么|哪|谁|怎么|为什么|多少|是否|有没有|吗/i;
 function drawPalette() {
   const q = paletteInput.value.trim();
   const items = [];
-  const found = commands().filter((c) => !q || matches(c.label, q));
+  const found = rankCommands(commands().filter((c) => !q || matches(c.label, q)), q);
   const asks = q && session.assistant
     ? [{ section: 'ask', glyph: 'i-sparkle', label: fill('palette.ask', { q }), run: () => ask(q) }] : [];
   const mail = paletteMail.map((m) => ({
@@ -578,6 +591,8 @@ function copyNewestCode() {
 // ---- The keyboard, where there is one ----
 const fineKeys = matchMedia('(pointer: fine)').matches;
 const macKeys = /Mac|iPhone|iPad/.test(navigator.platform || '');
+// The keys that work while the reader is open as a sheet: the message's own, and moving to the next.
+const READER_KEYS = ['j', 'k', 'e', 'r', 'a', 'f', 'y', 's', '#', 'b'];
 const KEY_LIST = [
   ['j k', 'keys.move'], ['⏎', 'keys.open'], ['e', 'keys.done'], ['r a', 'keys.reply'], ['f', 'keys.forward'], ['y', 'keys.archive'],
   ['s', 'keys.star'], ['#', 'keys.trash'], ['b', 'keys.snooze'], ['x', 'keys.pick'], ['g', 'keys.folders'], ['n', 'keys.compose'], ['c', 'keys.code'], ['/', 'keys.search'],
@@ -600,7 +615,7 @@ if (fineKeys) {
   hint.textContent = macKeys ? '⌘K' : 'Ctrl K';
   hint.hidden = false;
 }
-document.addEventListener('keydown', (e) => {
+function pageKeydown(e) {
   if (e.isComposing || e.defaultPrevented) return;
   // The palette opens from anywhere, a field included.
   if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'k') {
@@ -611,15 +626,24 @@ document.addEventListener('keydown', (e) => {
   if (!fineKeys || e.metaKey || e.ctrlKey || e.altKey) return;
   const target = e.target;
   const editable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable);
-  if (editable || document.querySelector('dialog[open]')) return;
+  // The reader in a narrow window is a sheet: its message is the one the keys
+  // act on, and j and k step to the next and previous, as its header's arrows
+  // do. Any other dialog keeps its keys to itself.
+  const reading = sheet.open && !sheet.classList.contains('closing') && Boolean(openKey) && !document.querySelector('dialog[open]:not(#sheet)');
+  if (editable || (document.querySelector('dialog[open]') && !reading)) return;
+  if (reading && READER_KEYS.indexOf(e.key) === -1) return;
   const keys = visibleKeys();
-  const current = selectedKey;
+  const current = reading ? openKey : selectedKey;
   const onControl = target instanceof Element && target !== document.body && target.closest('button, a[href], summary, [role="button"]');
-  if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'j' || e.key === 'k') {
+  if (reading && (e.key === 'j' || e.key === 'k')) {
+    e.preventDefault();
+    stepMessage(e.key === 'j' ? 1 : -1);
+  } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'j' || e.key === 'k') {
     if (!keys.length) return;
     e.preventDefault();
     const step = e.key === 'ArrowDown' || e.key === 'j' ? 1 : -1;
-    const key = keys[Math.min(keys.length - 1, Math.max(0, keys.indexOf(current) + step))];
+    // From a message that just left the queue (done, put off), on through the queue.
+    const key = queueStep(current, step) || keys[Math.min(keys.length - 1, Math.max(0, keys.indexOf(current) + step))];
     if (isWide()) openDetail(key);
     else { selectedKey = key; markSelected(); }
     const li = document.querySelector('li.row[data-key="' + CSS.escape(key) + '"]');
@@ -681,18 +705,21 @@ document.addEventListener('keydown', (e) => {
     else if (e.key === 'r') { e.preventDefault(); startReply(key, 'reply'); }
     else if (e.key === 'a') { e.preventDefault(); startReply(key, 'replyAll'); }
     else if (e.key === 'f') { e.preventDefault(); startForward(key); }
-    else if (e.key === 'y') { e.preventDefault(); mailAction(key, 'archive'); }
+    // Only where the reader offers them: no Archive in the archive or All Mail, no Bin in the bin.
+    else if (e.key === 'y') { e.preventDefault(); if (archivable(row)) mailAction(key, 'archive'); }
     else if (e.key === 's') { e.preventDefault(); mailAction(key, (flagsByKey.get(key) || {}).flagged ? 'unstar' : 'star'); }
-    else if (e.key === '#') { e.preventDefault(); mailAction(key, 'trash'); }
+    else if (e.key === '#') { e.preventDefault(); if (binnable(row)) mailAction(key, 'trash'); }
     else if (e.key === 'b' && !row.handledAt && markable) {
-      // Under the reader's clock on a desk, under the row itself in a narrow window.
+      // Under the reader's clock on a desk, under its "more" in the sheet, under the row itself in a narrow window.
       e.preventDefault();
       const anchor = (isWide() && document.querySelector('#pane-bar [data-act="snooze"]'))
+        || (reading && document.querySelector('#sheet-bar [data-act="more"]'))
         || document.querySelector('li.row[data-key="' + CSS.escape(current) + '"]');
       if (anchor) openSnooze(queueKey(row), anchor);
     }
   }
-});
+}
+document.addEventListener('keydown', pageKeydown);
 
 // ---- When the theme or the language changes, every part follows ----
 function themeChanged() { redrawMessages(); }

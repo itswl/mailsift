@@ -722,6 +722,10 @@ const en = {
   'compose.untitled': '(no subject)',
   'compose.replyUnreadable': 'The message to answer could not be read: {reason} Close this and answer it again.',
   'compose.sendUnknown': 'mailsift did not answer, so the message may have gone. Look in Sent before sending it again.',
+  // What a QA pass found: the mailbox.
+  'error.folderTimeout': 'The mailbox did not list this folder in time.',
+  'error.foldersTimeout': 'The mailbox did not list its folders in time.',
+  'bulk.already': '{count} already there',
 };
 
 /** Every key the English table has; the other languages must carry the same ones. */
@@ -1371,7 +1375,7 @@ const zhCN: Record<StringKey, string> = {
   'notify.unnamed': '未命名设备',
   'notify.since': '{date} 起',
   'notify.remove': '移除',
-  'notify.removed': '这台设备不会再收到通知',
+  'notify.removed': '那台设备不会再收到通知',
   'session.signout': '退出登录',
   'session.signoutFailed': '退出登录没有成功，请检查网络后再试。',
   'session.readonly': '只读',
@@ -1391,6 +1395,10 @@ const zhCN: Record<StringKey, string> = {
   'compose.untitled': '（无主题）',
   'compose.replyUnreadable': '要回复的邮件没能读取：{reason}请关掉后重新回复。',
   'compose.sendUnknown': 'mailsift 没有给出回应，这封邮件可能已经发出。重发之前请先看一眼“已发送”。',
+  // What a QA pass found: the mailbox.
+  'error.folderTimeout': '邮箱没有及时列出这个文件夹。',
+  'error.foldersTimeout': '邮箱没有及时列出它的文件夹。',
+  'bulk.already': '{count} 封本来就在那里',
 };
 
 export const STRINGS: Record<Language, Record<StringKey, string>> = { en, 'zh-CN': zhCN };
