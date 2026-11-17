@@ -997,7 +997,7 @@ async function startReply(key, mode) {
   if (!row) return;
   // key is what the server finds the message by (a live handle for one listed live); local is the page's own.
   const state = {
-    mode, key: mailRef(row), local: rowKey(row), account: row.account, accountName: row.accountLabel || '',
+    mode, key: mailRef(row), local: queueKey(row), account: row.account, accountName: row.accountLabel || '',
     titleKey: mode === 'replyAll' ? 'act.replyAll' : 'act.reply',
   };
   openCompose(state);
@@ -1020,7 +1020,7 @@ async function startForward(key) {
   const row = rowByKey(key);
   if (!row) return;
   const state = {
-    mode: 'forward', key: mailRef(row), local: rowKey(row), account: row.account, accountName: row.accountLabel || '', titleKey: 'act.forward',
+    mode: 'forward', key: mailRef(row), local: queueKey(row), account: row.account, accountName: row.accountLabel || '', titleKey: 'act.forward',
     files: [], originals: [],
   };
   openCompose(state);
@@ -1299,6 +1299,7 @@ async function deliver(job) {
     const local = job.state.local || job.state.key;
     // The message as the mailbox now has it is read afresh next time.
     liveData.delete(local);
+    liveData.delete(job.state.key);
     // An answered or forwarded message is dealt with, when the server says
     // so: a forward to nobody but the owner's own mailboxes is not.
     if (r.data.handled === true) {
@@ -1307,7 +1308,7 @@ async function deliver(job) {
       if (counted) attentionCount = Math.max(0, attentionCount - 1);
     }
     // Answered from a folder listed live: it carries the flag now.
-    const shown = liveView && liveRows.get(local);
+    const shown = liveView && liveRows.get(job.state.key);
     if (shown && isAnswer(job.state)) shown.flags = Object.assign({}, shown.flags || {}, { answered: true });
   }
   if (typeof r.data.attention === 'number') attentionCount = r.data.attention;

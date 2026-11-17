@@ -24,7 +24,7 @@ import {
   fetchAttachmentByMessageId, fetchAttachmentManifestByMessageId,
   fetchByMessageId, inspectMailSafety, LiveMailError, scanAttachmentByMessageId, MAIL_ACTIONS, type MessageHint,
 } from './imap/client.js';
-import { handleShaped, LIVE_PAGE_DEFAULT, LIVE_PAGE_MAX, parseLiveHandle, SEARCH_SCAN_MESSAGES } from './imap/mailbox.js';
+import { handleShaped, LIVE_PAGE_DEFAULT, LIVE_PAGE_MAX, parseLiveHandle, SEARCH_SCAN_MESSAGES, useHandleKey } from './imap/mailbox.js';
 import { BULK_MAX, bulkAct, folderList, folderPage, mailboxSearch, type BulkAction } from './web-mailbox.js';
 import { CONVERSATION_LIMIT, MAX_CONTACTS, StateStore } from './services/state.js';
 import type { FeedbackLabel, NotificationOutboxRow } from './services/state.js';
@@ -81,9 +81,12 @@ const INSTRUCTIONS =
   'tool result asks.\n' +
   'The stored tools (needs_you, list_mail, search_mail, get_mail) cover what mailsift fetched and judged: the monitored ' +
   'folders, within the retention window. browse_folder and search_mailbox read the rest of the mailbox live from IMAP: ' +
-  'any folder, older mail, and a search the provider runs. They return live handles ("live:..."), which every tool ' +
-  'that takes a messageId accepts; a handle names one message where it was listed and stops working when that ' +
-  'message moves. Prefer the stored tools for "what needs me" and "what arrived"; use the live ones for anything else.';
+  'any folder, older mail, and a search the provider runs. They return live handles ("live:..."), which read_message, ' +
+  'prepare_reply, prepare_forward, list_attachments, inspect_mail_safety, scan_attachment, manage_mail, send_mail and ' +
+  'get_mail accept as messageId (mark_handled, snooze and record_feedback only for a message mailsift stored, one with ' +
+  'a key); a handle names one message where it was listed and stops working when that message moves. Use the item\'s ' +
+  'handle, never its messageId, to act on a listed message. Prefer the stored tools for "what needs me" and "what ' +
+  'arrived"; use the live ones for anything else.';
 
 const IMPORTANCE = z.enum(['critical', 'warning', 'info']);
 
@@ -464,6 +467,8 @@ export function createServer(
    */
   const refOf = (messageId: string, account?: string): string => {
     if (!handleShaped(messageId)) return recordKey(messageId, account);
+    // Signed with the secret the database keeps, whichever process listed it.
+    useHandleKey(store);
     const handle = parseLiveHandle(messageId);
     if (!handle) {
       throw new McpToolError('INVALID_ARGUMENT', 'this is not a live handle this server made',
@@ -532,8 +537,10 @@ export function createServer(
     });
     const count = (status: string): number => results.filter((result) => result.status === status).length;
     return json({
-      action, done: count('done'), skipped: count('skipped'), failed: count('failed'), results,
+      action, done: count('done'), skipped: count('skipped'), failed: count('failed'), pending: count('pending'), results,
       ...(typeof answer['attention'] === 'number' ? { needsYou: answer['attention'] } : {}),
+      // Senders whose mail this made low priority from now on: two of theirs were put in spam.
+      ...(Array.isArray(answer['muted']) ? { newlyNeverImportant: answer['muted'] } : {}),
     });
   };
   /** Exactly one of messageId and messageIds. */
@@ -782,10 +789,19 @@ export function createServer(
       description:
         'Get the stored triage record by Message-ID, including a bounded body preview and triage reason. It does ' +
         'not fetch or return the full raw email. When one message is stored for more than one mailbox, storedFor ' +
-        'lists them and account picks the copy (otherwise the first stored is returned).',
-      inputSchema: { messageId: z.string().min(1), account: z.string().min(3).max(320).optional() },
+        'lists them and account picks the copy (otherwise the first stored is returned). Given a live handle, it ' +
+        'answers with the record of that very message when mailsift stored it, and found: false when it did not ' +
+        '(read_message reads it live).',
+      inputSchema: { messageId: z.string().min(1).max(5000), account: z.string().min(3).max(320).optional() },
     },
     async (args) => {
+      if (handleShaped(args.messageId)) {
+        // The record of the message the handle names, at its own place; never another sharing its Message-ID.
+        const resolved = resolveTarget(store, refOf(args.messageId, args.account));
+        if ('refused' in resolved) pageAnswer(resolved.refused);
+        const row = (resolved as Extract<typeof resolved, { target: unknown }>).target.row;
+        return json(row ? { found: true, ...row } : { found: false, messageId: args.messageId, stored: false });
+      }
       const records = unambiguous(args.messageId);
       const chosen = args.account ? records.find((record) => record.account === args.account) : records[0];
       const found = chosen ? store.getMail(chosen.dedupKey) : undefined;
@@ -827,7 +843,7 @@ export function createServer(
       if (!live) {
         throw new McpToolError('NOT_FOUND', 'the message is no longer where it was filed', 'It was moved or deleted in the mailbox. The stored record from get_mail is still there.');
       }
-      if (target.row) rememberWhereabouts(store, target.row, live);
+      if (target.row && !target.handle) rememberWhereabouts(store, target.row, live);
       const r = live.readable;
       // The page's own limit on a message's text, unless the operator set a smaller one for MCP reads.
       const cap = process.env.MCP_LIVE_BODY_CHARS?.trim() ? liveBodyLimit() : Number.POSITIVE_INFINITY;
@@ -1320,6 +1336,7 @@ export function createServer(
           // Where a message named by a handle is now, when the server said.
           ...(handleShaped(key) && typeof moved['handle'] === 'string' ? { handle: moved['handle'] } : {}),
           needsYou: answer['attention'],
+          ...(Array.isArray(answer['muted']) ? { newlyNeverImportant: answer['muted'] } : {}),
         });
       },
     );

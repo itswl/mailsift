@@ -1,13 +1,14 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import './setup.js';
 import type { IncomingMessage } from 'node:http';
+import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { LiveMailError, MailActionError, type LiveMessage, type MessageHint } from '../src/imap/client.js';
 import { liveHandle, SearchCancelled, type LiveItem, type LivePage, type SearchPage } from '../src/imap/mailbox.js';
 import type { ReadableMessage } from '../src/imap/readable.js';
 import { StateStore } from '../src/services/state.js';
 import { forgetLive, forgetSends, type WebBackend } from '../src/web-actions.js';
-import { forgetBulk } from '../src/web-mailbox.js';
+import { forgetBulk, waitForBatches } from '../src/web-mailbox.js';
 import { routeWeb, SESSION_COOKIE, type WebResponse } from '../src/web.js';
 
 /**
@@ -31,8 +32,10 @@ function request(options: { method?: string; url?: string; body?: unknown; as?: 
 function seeded(): StateStore {
   const state = new StateStore(':memory:');
   state.markSeen('k1', 'me@qq.com', 'subject k1');
+  // Stored where the poller found it: the third message of Archive, whose UIDVALIDITY is 5.
   state.recordOutcome('k1', 'critical', true, {
-    messageId: '<one@x>', category: 'Finance', sender: 'billing@vendor.com', senderName: 'Vendor', summary: 'summary of k1', folder: 'INBOX',
+    messageId: '<one@x>', category: 'Finance', sender: 'billing@vendor.com', senderName: 'Vendor', summary: 'summary of k1', folder: 'Archive',
+    uid: 3, uidValidity: '5',
   });
   return state;
 }
@@ -190,6 +193,52 @@ describe('listing the rest of the mailbox', () => {
     expect(stopped.status).toBe(409);
     expect(JSON.parse(String(stopped.body))).toMatchObject({ code: 'superseded' });
   });
+
+  it('stops a search only for a newer one from the same tab, not from another tab on the same address', async () => {
+    const store = seeded();
+    const stopped: string[] = [];
+    const waiting: Array<() => void> = [];
+    const slow = fake({
+      search: (_account, options) => new Promise<SearchPage>((resolve, reject) => {
+        options.signal?.addEventListener('abort', () => { stopped.push(options.query); reject(new SearchCancelled()); });
+        waiting.push(() => resolve({ account: 'me@qq.com', query: options.query, folders: [], items: [], total: 0, next: null }));
+      }),
+    });
+    const ask = (q: string, tab: string) => {
+      const path = `/api/search?account=me%40qq.com&q=${q}&tab=${tab}`;
+      return routeWeb(request({ url: path }), url(path), READ, store, '203.0.113.9', { writeToken: WRITE, backend: slow.backend });
+    };
+    const left = ask('invoice', 'tab-left-1');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const right = ask('receipt', 'tab-right-2');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(stopped).toEqual([]);
+    const leftAgain = ask('invoices', 'tab-left-1');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(stopped).toEqual(['invoice']);
+    for (const go of waiting) go();
+    expect((await left).status).toBe(409);
+    expect((await right).status).toBe(200);
+    expect((await leftAgain).status).toBe(200);
+  });
+
+  it('gives up a search the page stops waiting for', async () => {
+    const store = seeded();
+    let stopped = false;
+    const slow = fake({
+      search: (_account, options) => new Promise<SearchPage>((_resolve, reject) => {
+        options.signal?.addEventListener('abort', () => { stopped = true; reject(new SearchCancelled()); });
+      }),
+    });
+    const path = '/api/search?account=me%40qq.com&q=invoice';
+    const socket = new EventEmitter();
+    const req = Object.assign(request({ url: path }), { socket });
+    const asked = routeWeb(req, url(path), READ, store, 'page', { writeToken: WRITE, backend: slow.backend });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    socket.emit('close');
+    await asked;
+    expect(stopped).toBe(true);
+  });
 });
 
 describe('a message named by its handle', () => {
@@ -329,7 +378,8 @@ describe('many messages at once', () => {
                 done: {
                   action, account: account.username, messageId: target.messageId, sourceFolder: 'INBOX',
                   ...(action === 'spam' ? { destinationFolder: 'Junk', destinationIsSpam: true }
-                    : action === 'move' ? { destinationFolder: options.destination!, destinationIsSpam: false } : {}),
+                    : action === 'not_spam' ? { destinationFolder: 'INBOX', destinationIsSpam: false }
+                      : action === 'move' ? { destinationFolder: options.destination!, destinationIsSpam: false } : {}),
                 },
               };
           each?.(index, outcome);
@@ -390,11 +440,15 @@ describe('many messages at once', () => {
     const again = await post(store, '/api/bulk', { items: ['k1'], action: 'done' }, mailbox);
     expect(again.json['results']).toEqual([expect.objectContaining({ status: 'skipped', code: 'unchanged' })]);
     const later = new Date(Date.now() + 3_600_000).toISOString();
+    // k2 was marked done above: a reminder for the batch does not bring it back.
     const snoozed = await post(store, '/api/bulk', { items: ['k2', 'k3'], action: 'snooze', until: later }, mailbox);
-    expect(snoozed.json).toMatchObject({ done: 2 });
+    expect(snoozed.json).toMatchObject({ done: 1, skipped: 1 });
+    expect((snoozed.json['results'] as Array<Record<string, unknown>>)[0]).toMatchObject({ key: 'k2', status: 'skipped', code: 'alreadyDone' });
+    expect(store.getMail('k2')).toMatchObject({ snoozedUntil: null });
+    expect(store.getMail('k2')?.handledAt).not.toBeNull();
     expect(store.getMail('k3')?.snoozedUntil).toBe(later);
     expect((await post(store, '/api/bulk', { items: ['k3'], action: 'snooze', until: '2020-01-01T00:00:00Z' }, mailbox)).json).toMatchObject({ code: 'snoozePast' });
-    expect(store.listMcpAudit(20).filter((row) => row.action === 'web:snooze')).toHaveLength(2);
+    expect(store.listMcpAudit(20).filter((row) => row.action === 'web:snooze')).toHaveLength(1);
   });
 
   it('is done once when the same batch is asked for twice', async () => {
@@ -444,5 +498,100 @@ describe('many messages at once', () => {
     expect((await post(store, '/api/action', { key: 'k2', action: 'spam' }, mailbox)).json).toMatchObject({ ok: true, row: { folder: 'Junk', inSpam: true } });
     expect((await post(store, '/api/action', { key: 'k2', action: 'not_spam' }, mailbox)).json).toMatchObject({ ok: true, row: { folder: 'INBOX', inSpam: false } });
     expect(store.feedbackSummary()).toMatchObject({ spam: 1, not_spam: 1 });
+  });
+
+  it('puts a message Not spam takes back where Spam found it in the queue: open if it was open, done if it was done', async () => {
+    const store = stored();
+    const { mailbox } = batches();
+    expect((await post(store, '/api/bulk', { items: ['k3'], action: 'done' }, mailbox)).json).toMatchObject({ done: 1 });
+    const doneAt = store.getMail('k3')?.handledAt;
+    const before = store.attentionCount();
+    expect((await post(store, '/api/bulk', { items: ['k2', 'k3'], action: 'spam' }, mailbox)).json).toMatchObject({ done: 2 });
+    expect(store.getMail('k2')?.handledAt).not.toBeNull();
+    expect((await post(store, '/api/bulk', { items: ['k2', 'k3'], action: 'not_spam' }, mailbox)).json).toMatchObject({ done: 2 });
+    // k2 was open before Spam took it: it is open again, and counted again.
+    expect(store.getMail('k2')).toMatchObject({ handledAt: null, inSpam: false });
+    expect(store.attentionCount()).toBe(before);
+    // k3 was done by the owner before: it stays done, as it was.
+    expect(store.getMail('k3')?.handledAt).toBe(doneAt);
+    // Spam and Not spam again, the one-message way, after the owner marked it done in between: done stays.
+    const one = fake({
+      act: async (account, messageId, action) => ({
+        action, account: account.username, messageId, sourceFolder: action === 'not_spam' ? 'Junk' : 'INBOX',
+        destinationFolder: action === 'spam' ? 'Junk' : 'INBOX', destinationIsSpam: action === 'spam',
+      }),
+    });
+    expect((await post(store, '/api/action', { key: 'k2', action: 'spam' }, one)).json).toMatchObject({ ok: true });
+    store.setHandled('k2', false);
+    store.setHandled('k2', true);
+    const marked = store.getMail('k2')?.handledAt;
+    expect((await post(store, '/api/action', { key: 'k2', action: 'not_spam' }, one)).json).toMatchObject({ ok: true });
+    expect(store.getMail('k2')?.handledAt).toBe(marked);
+  });
+
+  it('says which senders a batch put in spam made low priority', async () => {
+    const store = stored();
+    const { mailbox } = batches();
+    const { json } = await post(store, '/api/bulk', { items: ['k2', 'k3'], action: 'spam' }, mailbox);
+    expect(json).toMatchObject({ done: 2, muted: ['promo@shop.example'] });
+    // Already low priority: not said again.
+    store.markSeen('k4', 'me@qq.com', 'subject k4');
+    store.recordOutcome('k4', 'info', false, { messageId: '<four@x>', sender: 'promo@shop.example', folder: 'INBOX' });
+    expect((await post(store, '/api/bulk', { items: ['k4'], action: 'spam' }, mailbox)).json).not.toHaveProperty('muted');
+  });
+
+  it('answers with what is still under way as pending, not failed, and records it when the mailbox answers', async () => {
+    const store = stored();
+    waitForBatches(40);
+    let finish!: () => void;
+    const { mailbox } = batches({
+      bulk: async (account, targets, action, _options, each) => {
+        const outcomes = targets.map((target) => ({
+          done: { action, account: account.username, messageId: target.messageId, sourceFolder: 'INBOX', destinationFolder: 'Archive', destinationIsSpam: false },
+        }));
+        each?.(0, outcomes[0]!);
+        await new Promise<void>((resolve) => { finish = resolve; });
+        outcomes.slice(1).forEach((outcome, index) => each?.(index + 1, outcome));
+        return outcomes;
+      },
+    });
+    const { json } = await post(store, '/api/bulk', { items: ['k2', 'k3'], action: 'archive' }, mailbox);
+    expect(json).toMatchObject({ done: 1, failed: 0, pending: 1 });
+    expect((json['results'] as Array<Record<string, unknown>>).map((r) => r['status'])).toEqual(['done', 'pending']);
+    finish();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(store.getMail('k3')).toMatchObject({ folder: 'Archive' });
+    expect(store.getMail('k3')?.handledAt).not.toBeNull();
+  });
+
+  it('works out which senders spam has muted once, not once for each vote', () => {
+    const store = new StateStore(':memory:');
+    // Many senders, each with mail put in spam and some taken out again.
+    // Six thousand votes: once per vote took most of a second, once in all takes a few milliseconds.
+    for (let n = 0; n < 6000; n += 1) {
+      const sender = `s${n % 500}@spam.example`;
+      store.markSeen(`m${n}`, 'me@qq.com', `subject ${n}`);
+      store.recordOutcome(`m${n}`, 'info', false, { messageId: `<m${n}@x>`, sender, folder: 'INBOX' });
+      store.recordFeedback(`<m${n}@x>`, n % 7 === 0 ? 'not_spam' : 'spam', '', `m${n}`);
+    }
+    const started = performance.now();
+    const hints = store.feedbackRuleHints(2);
+    expect(performance.now() - started).toBeLessThan(150);
+    expect(hints.neverImportant.length).toBeGreaterThan(0);
+  });
+
+  it('counts spam put there after the owner last took a sender\'s mail out of it, and not before', () => {
+    const store = stored();
+    const vote = (key: string, label: 'spam' | 'not_spam'): void => store.recordFeedback(`<${key}@x>`, label, '', key);
+    store.markSeen('k4', 'me@qq.com', 'subject k4');
+    store.recordOutcome('k4', 'info', false, { messageId: '<four@x>', sender: 'PROMO@shop.example', folder: 'INBOX' });
+    vote('k4', 'not_spam');
+    vote('k2', 'spam');
+    expect(store.feedbackRuleHints(2).neverImportant).toEqual([]);
+    vote('k3', 'spam');
+    expect(store.feedbackRuleHints(2).neverImportant).toEqual(['promo@shop.example']);
+    // Taken out of spam again, in another spelling of the address: the votes before it no longer count.
+    vote('k4', 'not_spam');
+    expect(store.feedbackRuleHints(2).neverImportant).toEqual([]);
   });
 });

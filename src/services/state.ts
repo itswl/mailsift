@@ -81,6 +81,9 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
 CREATE INDEX IF NOT EXISTS idx_seen_created ON seen (created_at);
 CREATE INDEX IF NOT EXISTS idx_seen_importance ON seen (importance);
 CREATE INDEX IF NOT EXISTS idx_mail_actions_created ON mail_actions (created_at);
+CREATE TABLE IF NOT EXISTS owner_filed (
+  dedup_key TEXT PRIMARY KEY, account TEXT NOT NULL, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sent_mail (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL, account_label TEXT,
   message_id TEXT NOT NULL, thread_key TEXT NOT NULL, in_reply_to TEXT, answers TEXT,
@@ -691,7 +694,7 @@ export class StateStore {
     for (const [name, definition] of [
       ['attachments_json', 'TEXT'], ['thread_key', 'TEXT'], ['verification_code', 'TEXT'], ['handled_at', 'TEXT'],
       ['uid', 'INTEGER'], ['uid_validity', 'TEXT'], ['snoozed_until', 'TEXT'],
-      ['kept_at', 'TEXT'], ['withheld', 'INTEGER NOT NULL DEFAULT 0'],
+      ['kept_at', 'TEXT'], ['withheld', 'INTEGER NOT NULL DEFAULT 0'], ['done_by_spam', 'INTEGER NOT NULL DEFAULT 0'],
     ] as const) {
       if (seenColumns.some((column) => column['name'] === name)) continue;
       try {
@@ -732,6 +735,8 @@ export class StateStore {
     // A reply found in Sent names the message it answers by Message-ID, and
     // a record is looked up by one; without this each lookup reads every row.
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_seen_message_id ON seen (message_id)');
+    // The rules read feedback by label on every poll.
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_feedback_label ON feedback (label, dedup_key)');
     // Before 0.1.98, code mail mailsift handled itself was labelled
     // 'fallback', which reads as a failed model and made it a candidate for
     // re-triage after an LLM outage, where its stored code was lost. It was
@@ -856,6 +861,22 @@ export class StateStore {
     return this.db.prepare('SELECT 1 FROM seen WHERE dedup_key = ?').get(dedupKey) !== undefined;
   }
 
+  /**
+   * A message mailsift never stored that the owner moved by hand (into spam,
+   * out of it, to the inbox or to any folder) from a folder listed live: the
+   * owner has dealt with it, so where it lands it is not new mail, and the
+   * poll does not judge, notify, queue or digest it. Kept as long as the rest.
+   */
+  fileByOwner(dedupKey: string, account: string): void {
+    this.db.prepare('INSERT OR IGNORE INTO owner_filed (dedup_key, account, created_at) VALUES (?, ?, ?)')
+      .run(dedupKey.slice(0, 1400), account.slice(0, 320), now());
+  }
+
+  /** Whether the owner filed this message by hand (see fileByOwner). */
+  filedByOwner(dedupKey: string): boolean {
+    return this.db.prepare('SELECT 1 FROM owner_filed WHERE dedup_key = ?').get(dedupKey) !== undefined;
+  }
+
   markSeen(dedupKey: string, account: string, subject: string): boolean {
     const result = this.db
       .prepare('INSERT OR IGNORE INTO seen (dedup_key, account, subject, created_at) VALUES (?, ?, ?, ?)')
@@ -935,6 +956,7 @@ export class StateStore {
       'DELETE FROM notification_outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?',
     ).run(cutoff).changes);
     const mcpAudit = Number(this.db.prepare('DELETE FROM mcp_audit WHERE created_at < ?').run(cutoff).changes);
+    this.db.prepare('DELETE FROM owner_filed WHERE created_at < ?').run(cutoff);
     const mailActions = Number(this.db.prepare('DELETE FROM mail_actions WHERE created_at < ?').run(cutoff).changes);
     const digests = Number(this.db.prepare('DELETE FROM digest_log WHERE sent_at < ?').run(cutoff).changes);
     // The owner's own mail goes with the same retention, counted from the day
@@ -1183,13 +1205,15 @@ export class StateStore {
       // message put in the spam folder is a vote that the sender does not
       // matter, as a false positive is, until the owner takes one of the
       // sender's messages out of spam again.
-      `SELECT s.sender, CASE WHEN f.label = 'spam' THEN 'false_positive' ELSE f.label END AS vote, COUNT(DISTINCT f.dedup_key) AS n
+      // The latest not_spam per sender is worked out once, not once per vote.
+      `WITH cleared AS (
+         SELECT lower(t.sender) AS sender, MAX(g.id) AS id FROM feedback g JOIN seen t ON t.dedup_key = g.dedup_key
+         WHERE g.label = 'not_spam' AND t.sender IS NOT NULL GROUP BY lower(t.sender))
+       SELECT s.sender, CASE WHEN f.label = 'spam' THEN 'false_positive' ELSE f.label END AS vote, COUNT(DISTINCT f.dedup_key) AS n
        FROM feedback f JOIN seen s ON s.dedup_key = f.dedup_key
+       LEFT JOIN cleared c ON c.sender = lower(s.sender)
        WHERE s.sender IS NOT NULL AND s.sender != ''
-         AND (f.label IN ('missed', 'false_positive')
-           OR (f.label = 'spam' AND NOT EXISTS (
-             SELECT 1 FROM feedback g JOIN seen t ON t.dedup_key = g.dedup_key
-             WHERE g.label = 'not_spam' AND lower(t.sender) = lower(s.sender) AND g.id > f.id)))
+         AND (f.label IN ('missed', 'false_positive') OR (f.label = 'spam' AND (c.id IS NULL OR c.id < f.id)))
        GROUP BY s.sender, vote HAVING COUNT(DISTINCT f.dedup_key) >= ?`,
     ).all(Math.max(1, minSamples)) as Array<Record<string, unknown>>;
     const alwaysImportant: string[] = [];
@@ -1429,17 +1453,34 @@ export class StateStore {
    * takes the row out of the queue on every device and changes nothing at the
    * provider. Marking twice keeps the first time.
    */
-  setHandled(idOrKey: string, handled: boolean): MailRow | undefined {
+  /**
+   * Done, or not. `bySpam`: it is put in spam, which counts it as done until
+   * it is taken out again (see undoSpamDone). Any other change to whether it
+   * is done, or to its reminder, is the owner's own, and Not spam leaves it.
+   */
+  setHandled(idOrKey: string, handled: boolean, bySpam = false): MailRow | undefined {
     const key = this.keyOf(idOrKey);
     if (key === undefined) return undefined;
     // Putting a message back is the owner's decision that it is still to deal
     // with, and is remembered (kept_at), so that a reply found in Sent later,
     // one written before that decision, does not take it away again.
     const result = handled
-      ? this.db.prepare('UPDATE seen SET handled_at = ? WHERE dedup_key = ? AND handled_at IS NULL').run(now(), key)
-      : this.db.prepare('UPDATE seen SET handled_at = NULL, kept_at = ? WHERE dedup_key = ? AND handled_at IS NOT NULL').run(now(), key);
+      ? this.db.prepare('UPDATE seen SET handled_at = ?, done_by_spam = ? WHERE dedup_key = ? AND handled_at IS NULL').run(now(), bySpam ? 1 : 0, key)
+      : this.db.prepare('UPDATE seen SET handled_at = NULL, kept_at = ?, done_by_spam = 0 WHERE dedup_key = ? AND handled_at IS NOT NULL').run(now(), key);
     if (Number(result.changes) > 0) this.bumpMailRevision();
     return this.getMail(key);
+  }
+
+  /**
+   * Taken out of spam: open again if being put in spam is what made it done,
+   * and nothing changed it since. One the owner marked done stays done.
+   */
+  undoSpamDone(dedupKey: string): MailRow | undefined {
+    const result = this.db.prepare(
+      'UPDATE seen SET handled_at = NULL, kept_at = ?, done_by_spam = 0 WHERE dedup_key = ? AND done_by_spam = 1 AND handled_at IS NOT NULL',
+    ).run(now(), dedupKey);
+    if (Number(result.changes) > 0) this.bumpMailRevision();
+    return this.getMail(dedupKey);
   }
 
   /** When the queue starts; see ATTENTION_SINCE_KEY. Set on first use if an older file lacks it. */
@@ -1576,7 +1617,7 @@ export class StateStore {
     // remembers when, as for a message put back (see setHandled).
     const result = until
       ? this.db.prepare(
-        `UPDATE seen SET snoozed_until = ?, handled_at = NULL, kept_at = ?
+        `UPDATE seen SET snoozed_until = ?, handled_at = NULL, kept_at = ?, done_by_spam = 0
          WHERE dedup_key = ? AND (snoozed_until IS NOT ? OR handled_at IS NOT NULL)`,
       ).run(until, now(), key, until)
       : this.db.prepare('UPDATE seen SET snoozed_until = NULL, kept_at = ? WHERE dedup_key = ? AND snoozed_until IS NOT NULL').run(now(), key);

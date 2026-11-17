@@ -140,13 +140,13 @@ body.live-mode .window,body.live-mode #filters-open,body.live-mode #folders-open
 .live-note p{margin:0}
 .live-mark{font-weight:500}
 .live-limit{margin-top:2px!important;color:var(--warning-text)}
-.mailbox-search{display:flex;flex-wrap:wrap;align-items:center;gap:0 2px;padding:0 10px}
+.mailbox-search{display:flex;flex-wrap:wrap;align-items:center;gap:0 2px;padding:4px 8px 8px;border-top:1px solid var(--line)}
 .mailbox-search .text-btn{display:inline-flex;align-items:center;gap:6px;min-height:36px;padding:6px 8px;font-weight:500}
 .mailbox-search .icon{width:14px;height:14px}
 .mailbox-search-label{padding-left:8px;font-size:13px;color:var(--muted)}
 /* The folders of a mailbox, in a panel under the control that opened them. */
 #folder-sheet.popover .sheet-body{padding:0 8px 8px;overflow:auto}
-.folder-accounts{max-width:none;margin:0 8px 8px}
+#folder-sheet .folder-accounts{max-width:none;margin:0 8px 8px}
 .folder-filter{display:block;width:calc(100% - 16px);min-height:36px;margin:0 8px 6px;padding:6px 10px;border:0;border-radius:8px;background:var(--fill);color:var(--text);font:inherit;font-size:15px}
 .folder-filter::placeholder{color:var(--muted)}
 .folder-filter::-webkit-search-cancel-button{-webkit-appearance:none}
@@ -190,8 +190,17 @@ body.picking .control-line{display:none!important}
   body.picking .pick-box{display:grid}
   body.picking .row>.mark,body.picking .row>.ring{visibility:hidden}
   body.picking .search-line{display:none!important}
-  body.picking .row{-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
+  /* A long press is the way in to picking: neither the system's link menu nor a text selection takes it first. */
+  .row,.row .who{-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
+  .row .digits{user-select:all;-webkit-user-select:all}
+  /* The bar fits a small phone: the count gives way first, the actions keep their icons, Select all is under "more". */
+  .pick-count{min-width:0;overflow:hidden;text-overflow:ellipsis}
+  #pick-all{display:none}
+  .pick-actions .bar-btn span{display:none}
+  .pick-actions .bar-btn.primary{min-width:36px;padding:0 9px}
 }
+/* A narrow window with a mouse: the box shows under the pointer, as on a desk. */
+@media(max-width:899px) and (hover:hover){.row:hover .pick-box{display:grid}}
 
 /* ---- Sheets: the detail on a phone, filters, the install steps ---- */
 .sheet{position:fixed;inset:auto 0 0 0;z-index:20;width:100%;max-width:640px;margin:0 auto;border:0;padding:0;background:var(--surface);color:var(--text);

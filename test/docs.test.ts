@@ -107,3 +107,35 @@ describe('the owner\'s sent mail', () => {
     expect(prose(read('docs/web-view.md'))).not.toContain('What is recorded about a sent message is that one left');
   });
 });
+
+describe('the whole mailbox', () => {
+  it('does not say live mail never goes to the model, and says Draft with AI sends it when pressed', () => {
+    const web = prose(read('docs/web-view.md'));
+    expect(web).not.toContain('nothing of it is stored, judged, sent to the model or put in the queue');
+    expect(web).toContain('nothing of it goes to the model unless you ask, with Draft with AI');
+    expect(web).toContain('Pressing it is asking for the text of the message being answered to go to the model');
+    expect(web).toContain('its text reaches the model then, because you asked, and at no other time');
+  });
+
+  it('says which listed message is a stored record, and that a copy or a look-alike is not', () => {
+    const web = prose(read('docs/web-view.md'));
+    const mcp = prose(read('docs/mcp.md'));
+    const skill = prose(read('.agents/skills/mailsift/SKILL.md'));
+    expect(web).toContain('It is that record only where the record says it is');
+    expect(mcp).toContain('A listed message is the stored record only where the record says it is');
+    expect(mcp).toContain('signed by this server with a key kept in the state database');
+    expect(skill).toContain('Pass the handle, never the item\'s `messageId`');
+    // get_mail takes a handle, as the server's instructions say every messageId tool does.
+    expect(mcp).toContain('A handle can be given wherever a tool takes a `messageId`: `get_mail`');
+  });
+
+  it('says what a batch answers while the mailbox is still at it, and what the owner filing a message does to the poll', () => {
+    const web = prose(read('docs/web-view.md'));
+    const mcp = prose(read('docs/mcp.md'));
+    expect(mcp).toContain('or `pending` when the mailbox had not answered for it');
+    expect(mcp).toContain('`alreadyDone` for a `snooze` of one marked done');
+    expect(web).toContain('is written down as filed by you where it lands');
+    expect(mcp).toContain('is written down as filed by the owner where it lands');
+    expect(web).toContain('Undo acts on the batch it undoes and on nothing else');
+  });
+});

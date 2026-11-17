@@ -443,7 +443,8 @@ export async function handleApi(
       if (timedOut(live)) return json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' });
       if (!live) return json(404, { error: 'the message is no longer where it was filed', code: 'notInMailbox' });
       // Where it was found is kept, so the next opening is a fetch and not a search.
-      if (target.row) rememberWhereabouts(store, target.row, live);
+      // A handle never moves where a record remembers its message to be.
+      if (target.row && !target.handle) rememberWhereabouts(store, target.row, live);
       const r = live.readable;
       // A message nothing was stored about is described by what the mailbox says of it.
       const said = target.row ? {} : {
@@ -857,7 +858,6 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
             <div class="search-field">${icon('search')}<input type="search" name="q" placeholder="${s('search.short')}" aria-label="${s('search')}" data-i18n-label="search" inputmode="search" enterkeyhint="search" autocapitalize="off" autocorrect="off" spellcheck="false"><button id="ask" type="button" class="ask-btn" hidden>${icon('sparkle')}${worded('span', 'ask.button')}</button><kbd id="palette-hint" class="kbd" hidden></kbd></div>
             <button id="search-cancel" type="button" class="text-btn quiet" data-i18n="search.cancel">${s('search.cancel')}</button>
           </div>
-          <div id="mailbox-search" class="mailbox-search" hidden></div>
           <div id="tokens" class="tokens" hidden></div>
           <div id="live-note" class="live-note" role="status" hidden></div>
           <dialog id="filter-sheet" class="sheet" aria-labelledby="filter-title" tabindex="-1">

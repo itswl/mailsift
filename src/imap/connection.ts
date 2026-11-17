@@ -525,6 +525,32 @@ async function onSession<T>(account: Account, work: (client: ImapFlow) => Promis
 }
 
 /**
+ * Do something on a connection of its own, outside the mailbox's queue: for
+ * a search, which can be slow and can be given up on, and must never hold up
+ * reading a message or acting on one. The connection is closed when the work
+ * ends, when it outlasts its time, and at once when `signal` aborts, which
+ * ends a command the server is still working on.
+ */
+export async function withOwnConnection<T>(
+  account: Account,
+  work: (client: ImapFlow) => Promise<T>,
+  options: { timeoutMs: number; signal?: AbortSignal | undefined },
+): Promise<T> {
+  if (options.signal?.aborted) throw new Error('given up on before it began');
+  const client = await connectInteractive(account);
+  const stop = (): void => hangUp(client);
+  if (options.signal?.aborted) stop();
+  options.signal?.addEventListener('abort', stop, { once: true });
+  try {
+    return await bounded(client, work, options.timeoutMs);
+  } finally {
+    options.signal?.removeEventListener('abort', stop);
+    if (client.usable) void client.logout().catch(() => hangUp(client));
+    else hangUp(client);
+  }
+}
+
+/**
  * Do something with a mailbox on its kept connection.
  *
  * Requests for one mailbox run one at a time, in the order they were made:

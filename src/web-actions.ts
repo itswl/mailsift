@@ -38,7 +38,7 @@ import {
   type MessageHint, type WebMailAction, type WebMailActionResult,
 } from './imap/client.js';
 import {
-  browseFolder, handleShaped, liveHandle, mailboxFolders, parseLiveHandle, searchMailbox,
+  browseFolder, handleShaped, liveHandle, mailboxFolders, parseLiveHandle, searchMailbox, useHandleKey,
   type LiveHandle, type LivePage, type MailboxFolder, type SearchPage,
 } from './imap/mailbox.js';
 import {
@@ -230,6 +230,16 @@ function actHint(store: StateStore, row: MailRow): ActHint {
  */
 export function rememberWhereabouts(store: StateStore, row: MailRow, live: LiveMessage | undefined): void {
   if (!live?.uid || !live.uidValidity || live.folder !== row.folder) return;
+  // A read never moves where the record says its message is. A message found
+  // by its Message-ID somewhere else in the folder may be another with the
+  // same one (a copy, or a look-alike a sender wrote); while the folder is
+  // the same version, the place known stays. Where none is known yet, or the
+  // folder was rebuilt, it is learnt only from the record's own sender, as a
+  // listing ties a message to a record (see recordOf).
+  const at = store.placeOf(row.dedupKey);
+  if (at && at.uidValidity === live.uidValidity) return;
+  const from = live.readable.from?.address?.toLowerCase() ?? '';
+  if (!from || from !== (row.sender ?? '').toLowerCase()) return;
   try {
     store.rememberUid(row.dedupKey, live.folder, live.uid, live.uidValidity);
   } catch (error) {
@@ -303,6 +313,65 @@ export interface MailTarget {
   cacheKey: string;
 }
 
+// ---- Which stored record a live message is ----
+
+/**
+ * Live handles a folder listing found to be a stored record's own message by
+ * its folder and its sender, for records that have no remembered place to
+ * compare: what the server read of the mailbox, never what a caller says.
+ */
+const vouched = new Map<string, { key: string; at: number }>();
+const VOUCHED_MS = 30 * 60_000;
+const VOUCHED_MAX = 5000;
+
+/** For tests: nothing vouched for. */
+export function forgetVouched(): void {
+  vouched.clear();
+}
+
+function vouch(handle: string, key: string): void {
+  vouched.delete(handle);
+  vouched.set(handle, { key, at: Date.now() });
+  for (const [known, entry] of vouched) {
+    if (vouched.size <= VOUCHED_MAX && Date.now() - entry.at < VOUCHED_MS) break;
+    vouched.delete(known);
+  }
+}
+
+/**
+ * The stored record a live message is, or undefined when it is not one.
+ *
+ * Two messages in one mailbox can share a Message-ID: the owner's Sent copy
+ * and the one delivered to their inbox, a copy a rule filed elsewhere, or a
+ * sender reusing another message's Message-ID on purpose. A Message-ID alone
+ * names none of them. A live message is a record's own only where the record
+ * says it is: the same folder, and the record's remembered UID and
+ * UIDVALIDITY the same as the message's. A record with no remembered place is
+ * matched in the same folder by its sender, as the listing read it (and the
+ * listing's word is kept for the handle, see vouch); a handle that was not
+ * listed so is not matched. Gmail's own message id would settle it there,
+ * but the store does not keep it.
+ */
+export function recordOf(
+  store: StateStore,
+  account: string,
+  place: { id: string; folder: string; uid: number; uidValidity: string; sender?: string; handle?: string },
+  known?: MailRow,
+): MailRow | undefined {
+  if (!place.id) return undefined;
+  const row = known ?? store.storedFor(account, [place.id]).get(place.id);
+  if (!row || row.folder !== place.folder) return undefined;
+  const at = store.placeOf(row.dedupKey);
+  if (at) return at.uid === place.uid && at.uidValidity === place.uidValidity ? row : undefined;
+  if (place.sender !== undefined) {
+    const same = Boolean(place.sender && row.sender) && place.sender.toLowerCase() === row.sender!.toLowerCase();
+    if (same && place.handle) vouch(place.handle, row.dedupKey);
+    return same ? row : undefined;
+  }
+  const word = place.handle ? vouched.get(place.handle) : undefined;
+  return word && word.key === row.dedupKey && Date.now() - word.at < VOUCHED_MS ? row : undefined;
+}
+
 /** A record made from a handle alone, for a message nothing was stored about. */
 function handleRow(handle: LiveHandle, ref: string, account: Account): MailRow {
   return {
@@ -333,6 +402,7 @@ export function resolveTarget(store: StateStore, ref: string): { target: MailTar
       },
     };
   }
+  useHandleKey(store);
   const handle = parseLiveHandle(ref);
   if (!handle) return { refused: json(400, { error: 'not a live handle this server made', code: 'badHandle' }) };
   if (store.recordsFor(ref.trim()).length) {
@@ -346,7 +416,10 @@ export function resolveTarget(store: StateStore, ref: string): { target: MailTar
   const account = configuredAccounts().find((candidate) => candidate.username === handle.account);
   if (!account) return { refused: json(409, { error: 'this mailbox is not configured', code: 'unconfigured' }) };
   const canonical = liveHandle(handle);
-  const row = handle.messageId ? store.storedFor(account.username, [handle.messageId]).get(handle.messageId) : undefined;
+  // The record of this very message, never of another that shares its Message-ID.
+  const row = recordOf(store, account.username, {
+    id: handle.messageId, folder: handle.folder, uid: handle.uid, uidValidity: handle.uidValidity, handle: canonical,
+  });
   const hint: MessageHint = { folder: handle.folder, uid: handle.uid, uidValidity: handle.uidValidity, exact: true };
   return {
     target: {
@@ -731,9 +804,13 @@ export async function actOnMail(
       db.recordMailAction({ ...audit, success: false, error: 'not found' });
       return json(404, { error: 'message not found in the mailbox', code: 'actionNotFound' });
     }
+    const before = action === 'spam' ? db.feedbackRuleHints(2) : undefined;
     const kept = keepBooks(db, target, action, result, audit);
+    // A vote that made a rule is said, as the judgement line says it: it changes how the sender's mail is judged.
+    const muted = before ? newlyMuted(before, db.feedbackRuleHints(2)) : [];
     return json(200, {
       ok: true, action, ...(kept.after ? { row: ctx.decorate(kept.after) } : {}), attention: db.attentionCount(),
+      ...(muted.length ? { muted } : {}),
       // Where a live message is now, and its handle there when the server said its new UID.
       ...(kept.moved ? { moved: kept.moved } : {}),
     });
@@ -803,13 +880,26 @@ export function keepBooks(
     });
   }
   // Filing a message away is dealing with it, and so is putting it in the bin by the bin's name, or in spam.
-  if (row && (action === 'archive' || action === 'trash' || action === 'spam' || result.destinationIsTrash)) db.setHandled(row.dedupKey, true);
+  if (row && (action === 'archive' || action === 'trash' || action === 'spam' || result.destinationIsTrash)) {
+    // Done because it was put in spam is remembered as that: taken out of spam again, it is open again.
+    db.setHandled(row.dedupKey, true, action === 'spam');
+  }
+  if (row && action === 'not_spam') db.undoSpamDone(row.dedupKey);
   if (row && (action === 'spam' || action === 'not_spam')) {
     // Against this record, by its key: its Message-ID alone could name another one.
     db.recordFeedback(row.messageId ?? row.dedupKey, action, '', row.dedupKey);
   }
+  // A message mailsift never stored, moved by the owner: where it lands it is not new mail to judge.
+  if (!row && result.destinationFolder && result.destinationId) {
+    db.fileByOwner(`${target.account.username}|${result.destinationId}`, target.account.username);
+  }
   const after = row ? db.getMail(row.dedupKey) ?? row : undefined;
   return { ...(after ? { after } : {}), ...(result.destinationFolder ? { moved: movedTo(target, result) } : {}) };
+}
+
+/** Senders whose mail a vote just made low priority: those in the second rule list and not in the first. */
+export function newlyMuted(before: { neverImportant: string[] }, after: { neverImportant: string[] }): string[] {
+  return after.neverImportant.filter((sender) => !before.neverImportant.includes(sender));
 }
 
 /** Where a message is after a move: its folder, and its new handle when the server said where it landed. */
@@ -948,7 +1038,8 @@ async function readTarget(
     const found = await within(liveRead(target, backend), LIVE_TIMEOUT_MS);
     if (timedOut(found)) return { refused: json(504, { error: 'the mailbox did not return this message in time', code: 'timeout' }) };
     if (!found) return { refused: json(404, { error: 'message not found in the mailbox', code: 'actionNotFound' }) };
-    if (target.row) rememberWhereabouts(store, target.row, found);
+    // Only a stored message found its own way is remembered where it was found; a handle never moves the record.
+    if (target.row && !target.handle) rememberWhereabouts(store, target.row, found);
     return { live: found };
   } catch (error) {
     return { refused: mailboxFailure(error, 'readFailed', 'mailbox read failed') };
