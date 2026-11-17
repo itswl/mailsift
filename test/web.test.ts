@@ -3390,7 +3390,7 @@ describe('what the re-test of the QA fixes found', () => {
 
   it('switches the sign-in form\'s language where it was asked for, keeping where signing in goes', async () => {
     const page = String((await routeWeb(request({ url: '/?q=invoice' }), url('/?q=invoice'), 'secret', seeded())).body);
-    const script = page.slice(page.lastIndexOf('<script nonce='), page.lastIndexOf('</script>')).replace(/^<script[^>]*>/, '');
+    const script = page.slice(page.lastIndexOf('<script nonce='), page.lastIndexOf('</script>')).replace(/^<script\b[^>]*>/i, '');
     const run = (path: string, search: string, posted = '') => {
       const did: string[] = [];
       const next = { value: posted };
