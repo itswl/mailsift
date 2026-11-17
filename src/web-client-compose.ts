@@ -153,6 +153,8 @@ function saveDraft() {
     at: Date.now(),
   };
   if (composing.noSignature) fields.noSignature = true;
+  // A letter whose send failed, kept under a name of its own: what it is, so it can be opened again (see keptLetters).
+  if (composing.failed && String(composing.draftKey || '').indexOf('draft:sending:') === 0) fields.letter = letterOf(composing);
   // A forward's own files are references; what was put on or taken off by hand stays so.
   if (composing.mode === 'forward') fields.choice = composing.choice || {};
   if (fields.account) composing.from = fields.account;
@@ -492,12 +494,7 @@ function drawSignature() {
     const save = button('compose.sigSave', () => storeSignature(state, from, area, said, [save, cancel]), true);
     const cancel = button('compose.sigCancel', () => closeSignatureEditor(state));
     line.appendChild(said);
-    area.addEventListener('keydown', (e) => {
-      // Inside the editor these keys are the editor's: saving it, or leaving
-      // it, never sending the letter or closing the sheet.
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); e.stopPropagation(); save.click(); }
-      else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeSignatureEditor(state); }
-    });
+    area.addEventListener('keydown', (e) => signatureKeydown(e, state, save));
     composeSig.appendChild(area);
     composeSig.appendChild(el('p', 'sig-hint', fill('compose.sigHint', { account: from })));
     composeSig.appendChild(line);
@@ -516,6 +513,15 @@ function drawSignature() {
   }
   composeSig.appendChild(line);
 }
+function signatureKeydown(e, state, save) {
+  // Text being composed with an input method keeps its keys: Escape there
+  // takes back the composition, not the signature.
+  if (e.isComposing || e.keyCode === 229) { e.stopPropagation(); return; }
+  // Inside the editor these keys are the editor's: saving it, or leaving
+  // it, never sending the letter or closing the sheet.
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); e.stopPropagation(); save.click(); }
+  else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeSignatureEditor(state); }
+}
 // After a press that redrew the block, the focus goes to its first button
 // rather than to the top of the page.
 function focusSignature() {
@@ -532,6 +538,8 @@ function openSignatureEditor(state) {
 function closeSignatureEditor(state) {
   state.editingSignature = false;
   if (composing !== state) return;
+  // What Send said about it is no longer so.
+  if (composeNote.textContent === t('compose.sigUnsaved')) composeSay('');
   drawSignature();
   focusSignature();
 }
@@ -910,6 +918,8 @@ function openCompose(state) {
   // Said until every one of them is attached again.
   state.lost = lost;
   drawLost();
+  // A letter that could not be sent, kept apart while this one held its place, is offered here.
+  offerKept();
   if (typeof state.signature !== 'string') state.signature = signatureOf(fromOf(state));
   state.editingSignature = false;
   drawSignature();
@@ -1001,16 +1011,24 @@ async function startReply(key, mode) {
     titleKey: mode === 'replyAll' ? 'act.replyAll' : 'act.reply',
   };
   openCompose(state);
+  loadReply(state, rowKey(row));
+}
+// What an answer starts from, read from the message by the server. Why it
+// could not be read is kept, and said again at Send: an answer that knows
+// neither its subject nor its thread does not go.
+async function loadReply(state, listed) {
+  const failed = (why) => { state.replyFailed = why; if (composing === state) composeSay(why, true); };
   try {
-    const r = await fetch('/api/reply?mode=' + mode + '&key=' + encodeURIComponent(state.key));
+    const r = await fetch('/api/reply?mode=' + state.mode + '&key=' + encodeURIComponent(state.key));
     const d = await r.json().catch(() => ({}));
     // This very letter, not another one to the same message opened since:
     // a reply must not be filled in with a reply-all's recipients.
     if (composing !== state) return;
-    if (!r.ok) { composeSay(failure(d), true); if (d.code === 'liveStale' && liveView) forgetStale(rowKey(row)); return; }
+    if (!r.ok) { failed(failure(d)); if (d.code === 'liveStale' && liveView && listed) forgetStale(listed); return; }
+    state.replyFailed = '';
     fillCompose(d);
   } catch (e) {
-    if (composing === state) composeSay(t('detail.networkFailed'), true);
+    if (composing === state) failed(t('detail.networkFailed'));
   }
 }
 // Passing a message on: nobody is filled in, since a forward goes to someone
@@ -1024,6 +1042,9 @@ async function startForward(key) {
     files: [], originals: [],
   };
   openCompose(state);
+  loadForward(state, rowKey(row));
+}
+async function loadForward(state, listed) {
   // Why the message could not be read is kept, to be said again if Send is
   // pressed: nothing is still on its way that waiting would bring.
   const failed = (why) => { state.forwardFailed = why; if (composing === state) composeSay(why, true); };
@@ -1031,7 +1052,7 @@ async function startForward(key) {
     // The forwarded message's header lines in the page's language.
     const r = await fetch('/api/forward?key=' + encodeURIComponent(state.key) + '&language=' + encodeURIComponent(lang));
     const d = await r.json().catch(() => ({}));
-    if (!r.ok) { failed(failure(d)); if (d.code === 'liveStale' && liveView) forgetStale(rowKey(row)); return; }
+    if (!r.ok) { failed(failure(d)); if (d.code === 'liveStale' && liveView && listed) forgetStale(listed); return; }
     if (composing !== state) return;
     fillForward(d);
   } catch (e) {
@@ -1050,10 +1071,24 @@ $('#compose-cc-toggle').onclick = () => {
 };
 
 // ---- A first version from the model ----
-async function aiDraft() {
+// The model never takes the owner's words away. With words of their own in
+// the box, Draft asks before it replaces them (and again if more were typed
+// while the model wrote); once a draft is in, Undo puts back what was there.
+// An empty box is filled at once.
+let draftSeq = 0;
+async function aiDraft(confirmed) {
   const button = $('#compose-draft');
   if (!composing || button.disabled) return;
   const state = composing;
+  // A new letter or a forward's note is written from a line of the owner's: there is nothing to answer.
+  if (!isAnswer(state) && !composeForm.instruction.value.trim()) {
+    composeSay(t('error.draftNeedsLine'), true);
+    composeForm.instruction.focus();
+    return;
+  }
+  const own = composeForm.text.value;
+  if (own.trim() && confirmed !== true) { askReplace(state, () => aiDraft(true), false); return; }
+  const seq = ++draftSeq;
   button.disabled = true;
   button.textContent = t('compose.drafting');
   composeSay('');
@@ -1062,20 +1097,63 @@ async function aiDraft() {
     key: isAnswer(state) ? state.key : '', instruction: composeForm.instruction.value, subject: composeForm.subject.value,
   });
   button.disabled = false;
-  button.textContent = t('compose.redraft');
-  if (composing !== state) return;
+  // "Draft again" only once there is a draft.
+  button.textContent = t(state.drafted ? 'compose.redraft' : 'compose.draft');
+  // Only into the letter it was asked for, while it is open here: not one sent off meanwhile, nor a later ask's.
+  if (seq !== draftSeq || composing !== state || !composeSheet.open || (pendingSend && pendingSend.state === state)) return;
   if (!r.ok) { composeSay(r.data && (r.data.code || r.data.error) ? failure(r.data) : t('error.assistant_failed'), true); return; }
-  writeIn(String(r.data.draft || ''));
+  const draft = String(r.data.draft || '');
+  // Written on while the model wrote: asked again, with the draft ready.
+  if (composeForm.text.value !== own && composeForm.text.value.trim()) { askReplace(state, () => putDraft(state, draft), true); return; }
+  putDraft(state, draft);
+}
+// The question, in the line under the letter: replace, or keep what is there.
+function askReplace(state, run, ready) {
+  composeSay(t(ready ? 'compose.draftReady' : 'compose.replaceAsk'));
+  const yes = el('button', 'text-btn small', t('compose.replace'));
+  yes.type = 'button';
+  yes.onclick = () => { if (composing !== state) return; composeSay(''); run(); };
+  const no = el('button', 'text-btn quiet small', t('compose.keepMine'));
+  no.type = 'button';
+  no.onclick = () => { composeSay(''); composeForm.text.focus(); };
+  composeNote.appendChild(textNode(' '));
+  composeNote.appendChild(yes);
+  composeNote.appendChild(no);
+}
+// The draft in the box, with the way back to what was there before it.
+function putDraft(state, draft) {
+  const before = composeForm.text.value;
+  state.drafted = true;
+  $('#compose-draft').textContent = t('compose.redraft');
+  writeIn(draft);
+  composeSay(t('compose.drafted'));
+  const undo = el('button', 'text-btn quiet small', t('undo'));
+  undo.type = 'button';
+  undo.onclick = () => {
+    if (composing !== state) return;
+    writing += 1;
+    composeForm.text.value = before;
+    growText();
+    saveDraft();
+    composeSay('');
+    composeForm.text.focus();
+  };
+  composeNote.appendChild(textNode(' '));
+  composeNote.appendChild(undo);
 }
 // The draft is written into the field rather than dropped in, so it reads as
-// something that is being offered, and is finished before anyone could tire of it.
+// something that is being offered, and is finished before anyone could tire
+// of it. An Undo meanwhile stops it where it is.
+let writing = 0;
 function writeIn(text) {
   const area = composeForm.text;
-  const finish = () => { area.value = text; growText(); saveDraft(); };
+  const mine = ++writing;
+  const finish = () => { if (mine !== writing) return; area.value = text; growText(); saveDraft(); };
   if (reduceMotion() || !text) { finish(); return; }
   const started = performance.now();
   const total = Math.min(900, 240 + text.length * 2);
   const step = (now) => {
+    if (mine !== writing) return;
     if (!composeSheet.open) { finish(); return; }
     const part = Math.min(1, (now - started) / total);
     area.value = text.slice(0, Math.round(text.length * part));
@@ -1084,10 +1162,16 @@ function writeIn(text) {
   };
   requestAnimationFrame(step);
 }
-$('#compose-draft').onclick = aiDraft;
-composeForm.instruction.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); aiDraft(); }
-});
+$('#compose-draft').onclick = () => aiDraft();
+function instructionKeydown(e) {
+  // Enter that commits text from an input method is the input method's.
+  if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+  // Enter here asks for a draft, with Cmd or Ctrl too: never the letter's Send.
+  e.preventDefault();
+  e.stopPropagation();
+  aiDraft();
+}
+composeForm.instruction.addEventListener('keydown', instructionKeydown);
 
 // ---- Sending: a count of five with a way back, then the server ----
 const SEND_DELAY = 5;
@@ -1114,9 +1198,11 @@ function reclaimDraft(state) {
   if (!own) return;
   state.draftKey = null;
   const home = draftId(state);
+  // Taken by a draft kept there, by files held for one, or by the letter open in the composer now, saved or not.
+  const openThere = composeSheet.open && composing && composing !== state && draftId(composing) === home;
   try {
     const kept = localStorage.getItem(own);
-    if (localStorage.getItem(home) !== null || heldFiles.has(home)) { state.draftKey = own; return; }
+    if (localStorage.getItem(home) !== null || heldFiles.has(home) || openThere) { state.draftKey = own; return; }
     if (kept !== null) { localStorage.setItem(home, kept); localStorage.removeItem(own); }
   } catch (e) {
     state.draftKey = own;
@@ -1130,6 +1216,8 @@ function undoSend(job) {
   clearInterval(job.timer);
   pendingSend = null;
   hideSending();
+  // A letter being written meanwhile is kept, every word of it, before the one taken back takes its place.
+  if (composeSheet.open && composing && composing !== job.state) { clearTimeout(draftTimer); saveDraft(); }
   reclaimDraft(job.state);
   openCompose(job.state);
   composeSay(t('compose.undone'));
@@ -1143,12 +1231,17 @@ function sendCompose() {
   const to = addresses(composeForm.to.value), cc = addresses(composeForm.cc.value), bcc = addresses(composeForm.bcc.value);
   const body = composeForm.text.value.replace(/\s+$/, '');
   const forward = state.mode === 'forward';
-  if (!to.length) { composeSay(t('compose.needTo'), true); composeForm.to.focus(); return; }
+  if (!to.length && !cc.length && !bcc.length) { composeSay(t('compose.needTo'), true); composeForm.to.focus(); return; }
   // A forward may go without a word of its own: the message it carries is the point.
   if (!body.trim() && !forward) { composeSay(t('compose.needBody'), true); composeForm.text.focus(); return; }
   if (forward && !state.quoted) {
     // Read and refused, it will not come by waiting; still on its way, it may.
     composeSay(state.forwardFailed ? fill('compose.forwardUnreadable', { reason: state.forwardFailed }) : t('compose.forwardMissing'), true);
+    return;
+  }
+  // An answer to a message that could not be read would go untitled and unquoted: it is begun again from the message.
+  if (isAnswer(state) && state.replyFailed) {
+    composeSay(fill('compose.replyUnreadable', { reason: state.replyFailed }), true);
     return;
   }
   // The signature on show is the one in the editor, not the one the letter
@@ -1261,18 +1354,120 @@ function sendFailure(d, status) {
     // never arrived whole, so nothing was sent, and the mail server was not
     // asked anything.
     if (status === 408) return t('compose.uploadTooSlow');
-    return t('error.send_connection');
+    // No answer of mailsift's own: the connection dropped, or something in
+    // front of it answered instead. The letter may have gone all the same,
+    // since the server sends what it was handed: never said as not sent.
+    return t('compose.sendUnknown');
   }
   if (d.code === 'send_too_large' && d.file) return fill('compose.tooLarge', { file: d.file, maxBytes: sizeLabel(d.maxBytes) });
   if (d.code === 'forward_attachment_unavailable' && d.file) return fill('compose.forwardFileUnavailable', { file: d.file });
   return failure(d);
 }
-// Back to the letter, with the reason, and everything that was written.
+// Back to the letter, with the reason, and everything that was written. When
+// another letter is open meanwhile, that one stays open: this one is kept as
+// a draft (of its message where that is free, else under its own name, see
+// keptLetters), and the page says so, with a way to it.
 function backToLetter(job, said) {
   hideToast();
-  reclaimDraft(job.state);
-  openCompose(job.state);
+  const state = job.state;
+  state.failed = true;
+  reclaimDraft(state);
+  if (composeSheet.open && composing && composing !== state) {
+    keepLetter(state);
+    toast(fill('compose.failedKept', { reason: said }), true, { label: t('compose.openIt'), run: () => reopenLetter(state) }, 0);
+    return;
+  }
+  openCompose(state);
   composeSay(said, true);
+  if (state.draftKey) keepLetter(state);
+}
+// What a letter whose send failed is, kept with its words so that it can be
+// opened again after this page is gone: the message it answers or forwards,
+// and where its draft belongs.
+function letterOf(state) {
+  return {
+    home: homeId(state), mode: state.mode, key: state.key || '', local: state.local || '', account: state.account || '',
+    accountName: state.accountName || '', titleKey: state.titleKey || 'compose.new',
+  };
+}
+// Failed letters kept under a name of their own, while this page is open, by that name.
+const keptStates = new Map();
+function keepLetter(state) {
+  const id = draftId(state);
+  if (id.indexOf('draft:sending:') !== 0) return;
+  keptStates.set(id, state);
+  try {
+    const kept = JSON.parse(localStorage.getItem(id) || 'null');
+    if (kept) localStorage.setItem(id, JSON.stringify(Object.assign(kept, { letter: letterOf(state), at: Date.now() })));
+  } catch (e) {}
+}
+// Every failed letter kept under its own name, but one on its way out.
+function keptLetters() {
+  const out = [];
+  try {
+    for (const id of Object.keys(localStorage)) {
+      if (id.indexOf('draft:sending:') !== 0) continue;
+      if (pendingSend && draftId(pendingSend.state) === id) continue;
+      let kept = null;
+      try { kept = JSON.parse(localStorage.getItem(id) || 'null'); } catch (e) { kept = null; }
+      if (kept && kept.letter && typeof kept.letter.home === 'string') out.push({ id, kept });
+    }
+  } catch (e) {}
+  return out;
+}
+// A kept letter whose message has no draft of its own any more becomes that
+// draft again: answered or written from where it began, as any draft is.
+function settleKept() {
+  for (const { id, kept } of keptLetters()) {
+    // Not the one being written: it stays under the name it was opened under until it is closed.
+    if (composing && composeSheet.open && draftId(composing) === id) continue;
+    const home = kept.letter.home;
+    // Nor into the place of the letter being written, which is that letter's whether it was saved yet or not.
+    if (composing && composeSheet.open && draftId(composing) === home) continue;
+    try {
+      if (localStorage.getItem(home) !== null || heldFiles.has(home)) continue;
+      const own = Object.assign({}, kept);
+      delete own.letter;
+      localStorage.setItem(home, JSON.stringify(own));
+      localStorage.removeItem(id);
+    } catch (e) { continue; }
+    const held = heldFiles.get(id);
+    if (held) { heldFiles.delete(id); heldFiles.set(home, held); }
+    const state = keptStates.get(id);
+    if (state) { state.draftKey = null; keptStates.delete(id); }
+  }
+}
+// Opening a kept letter: the one in the composer is kept first, as closing it would.
+function reopenLetter(stateOrId) {
+  const id = typeof stateOrId === 'string' ? stateOrId : draftId(stateOrId);
+  let kept = null;
+  try { kept = JSON.parse(localStorage.getItem(id) || 'null'); } catch (e) { kept = null; }
+  if (composing && composeSheet.open && draftId(composing) !== id) { clearTimeout(draftTimer); saveDraft(); }
+  let state = typeof stateOrId === 'string' ? keptStates.get(id) : stateOrId;
+  if (!state) {
+    const meta = kept && kept.letter;
+    if (!meta) return;
+    state = {
+      mode: meta.mode, key: meta.key, local: meta.local, account: meta.account, accountName: meta.accountName,
+      titleKey: meta.titleKey, draftKey: id, failed: true, files: [], originals: [],
+    };
+  }
+  openCompose(state);
+  // An answer or a forward opened in a new page reads its message again: its subject, its thread, its files.
+  if (isAnswer(state) && !state.references) loadReply(state, '');
+  else if (state.mode === 'forward' && !state.quoted) loadForward(state, '');
+}
+// Said in the composer whenever one is kept, so that none is ever out of reach.
+function offerKept() {
+  const kept = keptLetters().filter((entry) => !composing || entry.id !== draftId(composing));
+  if (!kept.length) return;
+  const first = kept[0].kept;
+  const what = (first.subject || '').trim() || (first.to || '').trim() || t('compose.untitled');
+  composeAdd(fill('compose.keptLetter', { what }));
+  const open = el('button', 'text-btn quiet small', t('compose.openIt'));
+  open.type = 'button';
+  open.onclick = () => reopenLetter(kept[0].id);
+  composeNote.appendChild(open);
 }
 async function deliver(job) {
   if (pendingSend === job) pendingSend = null;
@@ -1292,6 +1487,9 @@ async function deliver(job) {
   try { localStorage.removeItem(draftId(job.state)); } catch (e) {}
   // Gone with the letter: nothing to attach again.
   heldFiles.delete(draftId(job.state));
+  keptStates.delete(draftId(job.state));
+  // Its place is free: a failed letter kept for the same message is that message's draft again.
+  settleKept();
   const refused = Array.isArray(r.data.rejected) ? r.data.rejected : [];
   toast(refused.length ? fill('compose.partial', { list: refused.join(', ') }) : t(r.data.savedCopy === false ? 'compose.sentNoCopy' : 'compose.sent'),
     refused.length > 0);
@@ -1347,15 +1545,18 @@ window.addEventListener('pagehide', () => {
   } catch (e) {}
 });
 // Drafts of letters that were sent off and never heard of again (the page was
-// closed mid-send) are not kept for ever.
+// closed mid-send) are not kept for ever. One whose send failed is kept until
+// it is sent or discarded, and is its message's draft again once that is free.
 try {
   for (const key of Object.keys(localStorage)) {
     if (key.indexOf('draft:sending:') !== 0) continue;
-    let at = 0;
-    try { at = Number((JSON.parse(localStorage.getItem(key) || '{}') || {}).at) || 0; } catch (e) {}
-    if (Date.now() - at > 24 * 3600 * 1000) localStorage.removeItem(key);
+    let kept = {};
+    try { kept = JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch (e) {}
+    if (kept.letter) continue;
+    if (Date.now() - (Number(kept.at) || 0) > 24 * 3600 * 1000) localStorage.removeItem(key);
   }
 } catch (e) {}
+settleKept();
 composeSend.onclick = sendCompose;
 composeForm.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendCompose(); }

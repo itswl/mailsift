@@ -710,6 +710,18 @@ const en = {
   'login.crossSite': 'This sign-in looked as if another site sent it, so it was refused. Open mailsift at its own address and sign in there.',
   'error.rate_limited': 'This device asked too often just now. Wait a moment and try again.',
   'error.draftNeedsLine': 'Say in a line what the message should say, then press Draft.',
+  // What a QA pass found: the composer.
+  'compose.replaceAsk': 'Draft with AI replaces what you wrote.',
+  'compose.draftReady': 'The draft is ready. It replaces what you wrote.',
+  'compose.replace': 'Replace',
+  'compose.keepMine': 'Keep mine',
+  'compose.drafted': 'Drafted with AI.',
+  'compose.failedKept': 'A letter could not be sent: {reason} It is kept as a draft.',
+  'compose.openIt': 'Open it',
+  'compose.keptLetter': 'A letter that could not be sent is kept: {what}.',
+  'compose.untitled': '(no subject)',
+  'compose.replyUnreadable': 'The message to answer could not be read: {reason} Close this and answer it again.',
+  'compose.sendUnknown': 'mailsift did not answer, so the message may have gone. Look in Sent before sending it again.',
 };
 
 /** Every key the English table has; the other languages must carry the same ones. */
@@ -1367,6 +1379,18 @@ const zhCN: Record<StringKey, string> = {
   'login.crossSite': '这次登录看起来是从其他网站发来的，已被拒绝。请直接打开 mailsift 自己的地址再登录。',
   'error.rate_limited': '这台设备刚才请求太频繁了，请稍等片刻再试。',
   'error.draftNeedsLine': '先用一句话说说要写什么，再按起草。',
+  // What a QA pass found: the composer.
+  'compose.replaceAsk': 'AI 起草会替换你已经写的内容。',
+  'compose.draftReady': '草稿好了，它会替换你已经写的内容。',
+  'compose.replace': '替换',
+  'compose.keepMine': '保留我的',
+  'compose.drafted': '已由 AI 起草。',
+  'compose.failedKept': '有一封邮件没能发出：{reason}它已存为草稿。',
+  'compose.openIt': '打开',
+  'compose.keptLetter': '有一封没能发出的邮件已保存：{what}。',
+  'compose.untitled': '（无主题）',
+  'compose.replyUnreadable': '要回复的邮件没能读取：{reason}请关掉后重新回复。',
+  'compose.sendUnknown': 'mailsift 没有给出回应，这封邮件可能已经发出。重发之前请先看一眼“已发送”。',
 };
 
 export const STRINGS: Record<Language, Record<StringKey, string>> = { en, 'zh-CN': zhCN };
