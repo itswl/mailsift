@@ -27,6 +27,21 @@ export function idleEnabled(): boolean {
   return (process.env.IMAP_IDLE_ENABLED ?? 'false').toLowerCase() === 'true';
 }
 
+/**
+ * How often a listening connection asks the server itself whether its folder
+ * has new mail, in milliseconds: IMAP_IDLE_CHECK_SECONDS, 60 unless set, 0 to
+ * turn it off, otherwise from 15 to 3600. A server that misses a notification
+ * (QQ's does, for some deliveries) would otherwise leave that message to the
+ * next poll, up to POLL_INTERVAL_SECONDS later.
+ */
+export function idleCheckMs(): number {
+  const raw = process.env.IMAP_IDLE_CHECK_SECONDS?.trim();
+  const value = raw ? Number(raw) : 60;
+  if (!Number.isFinite(value)) return 60_000;
+  if (value <= 0) return 0;
+  return Math.min(3600, Math.max(15, Math.floor(value))) * 1000;
+}
+
 export function idleFolderTokens(): string[] {
   return (process.env.IMAP_IDLE_FOLDERS ?? 'INBOX')
     .split(',')
@@ -51,6 +66,8 @@ export interface ListenerDeps {
   connect: (account: Account, purpose?: string) => Promise<ImapFlow>;
   sleep: (ms: number) => Promise<void>;
   debounceMs: number;
+  /** How often to ask the server for new mail while listening (see idleCheckMs); read from the environment when absent. */
+  checkMs?: number;
 }
 
 const DEFAULT_DEPS: ListenerDeps = {
@@ -175,13 +192,48 @@ export class FolderListener {
       this.folder = folder;
 
       const closed = new Promise<void>((resolve) => client.once('close', resolve));
-      await client.mailboxOpen(folder.path, { readOnly: true });
+      const opened = await client.mailboxOpen(folder.path, { readOnly: true });
       // Attach after the open so the SELECT response itself does not count as new mail.
-      client.on('exists', () => this.scheduleWake());
+      let announced = false;
+      client.on('exists', () => { announced = true; this.scheduleWake(); });
       log.info(`[${this.label}] IDLE listening`);
       this.listeningSince = Date.now();
       metrics.addCounter('mailsift.idle.sessions', 1, { provider: this.account.provider });
-      await closed;
+      // A notification the server never sends is a message left to the next poll. So the folder is asked, now and
+      // then, where its next UID stands: grown, it is fetched as a notification would have it fetched. Fetching
+      // twice costs one search that finds nothing; missing one costs up to a poll interval.
+      let known = Number((opened as { uidNext?: unknown } | undefined)?.uidNext ?? 0);
+      let checking = false;
+      const check = async (): Promise<void> => {
+        if (checking || this.stopping || !client.usable) return;
+        checking = true;
+        try {
+          // NOOP first: a server that holds its notifications back sends them now.
+          await client.noop();
+          const status = await client.status(folder.path, { uidNext: true });
+          const next = Number((status && status.uidNext) ?? 0);
+          if (next > known) {
+            if (known > 0) {
+              if (!announced) log.info(`[${this.label}] new mail the server did not announce; fetching it`);
+              this.scheduleWake();
+            }
+            known = next;
+          }
+          announced = false;
+        } catch (error) {
+          log.debug(`[${this.label}] asking the folder for new mail failed: ${imapErrorText(error)}`);
+        } finally {
+          checking = false;
+        }
+      };
+      const every = this.deps.checkMs ?? idleCheckMs();
+      const ticker = every > 0 ? setInterval(() => { void check(); }, every) : undefined;
+      ticker?.unref?.();
+      try {
+        await closed;
+      } finally {
+        if (ticker) clearInterval(ticker);
+      }
       return 'closed';
     } finally {
       if (this.client === client) {
