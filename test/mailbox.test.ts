@@ -810,6 +810,124 @@ describe('which stored record a live message is, through the real routes', () =>
     expect(fake.server.mail.get('Archive')!.map((m) => m.subject)).toEqual(['Q3 numbers']);
   });
 
+  /** Searches a test sent that asked for Message-IDs by header: one each, or several OR'd in one. */
+  const headerSearches = (): number => fake.server.searches.filter((query) => {
+    const q = query as Record<string, unknown>;
+    return q['header'] !== undefined || (Array.isArray(q['or']) && (q['or'] as Array<Record<string, unknown>>).some((part) => part['header'] !== undefined));
+  }).length;
+
+  it('ties every record a page could be, in one search, and keeps the books of each when they are archived together', async () => {
+    const state = store();
+    for (let n = 0; n < 15; n += 1) {
+      put('INBOX', `note ${n}`, { id: `<note-${n}@corp>`, from: 'boss@corp.com' });
+      stored(state, `k${n}`, `<note-${n}@corp>`, 'INBOX', 'boss@corp.com');
+    }
+    const items = await folder(state, 'INBOX');
+    expect(items.filter((item) => item['key']).length).toBe(15);
+    expect(headerSearches()).toBe(1);
+    // Listed again: all of them have a place now, and nothing is asked.
+    await folder(state, 'INBOX');
+    expect(headerSearches()).toBe(1);
+    expect(await call(state, '/api/bulk', { method: 'POST', body: { items: items.map((item) => item['handle']), action: 'archive' } })).toMatchObject({ done: 15 });
+    for (let n = 0; n < 15; n += 1) {
+      expect(state.getMail(`k${n}`)).toMatchObject({ folder: 'Archive' });
+      expect(state.getMail(`k${n}`)?.handledAt).not.toBeNull();
+    }
+  });
+
+  it('decides under the action\'s lock, where no listing could, whether a message is a record\'s, as its key would', async () => {
+    // A server whose header search answers nothing (QQ's does not answer it).
+    const original = fake.ImapFlow.prototype.search;
+    fake.ImapFlow.prototype.search = async function (query: Record<string, unknown>) {
+      const q = query as Record<string, unknown>;
+      if (q['header'] !== undefined || (Array.isArray(q['or']) && (q['or'] as Array<Record<string, unknown>>).some((part) => part['header'] !== undefined))) {
+        fake.server.searches.push(query);
+        return [];
+      }
+      return original.call(this, query);
+    };
+    try {
+      const listed = async (): Promise<{ state: StateStore; items: Array<Record<string, unknown>> }> => {
+        fake.server.mail.set('INBOX', []);
+        fake.server.mail.set('Archive', []);
+        put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com', body: 'the real numbers' });
+        put('INBOX', 'Q3 numbers again', { id: '<q3@corp>', from: 'boss@corp.com', body: 'a later copy' });
+        const state = store();
+        stored(state, 'k', '<q3@corp>', 'INBOX', 'boss@corp.com');
+        return { state, items: await folder(state, 'INBOX') };
+      };
+      const first = await listed();
+      // The listing could not say: none is tied, nothing remembered, and the next listing does not ask again.
+      expect(first.items.map((item) => [item['uid'], item['key'] ?? null])).toEqual([[2, null], [1, null]]);
+      expect(first.state.placeOf('k')).toBeUndefined();
+      const asked = headerSearches();
+      await folder(first.state, 'INBOX');
+      expect(headerSearches()).toBe(asked);
+      // Archived by its handle, the first from the record's sender is the record's, as its key finds it: books kept, place learnt.
+      expect(await call(first.state, '/api/action', { method: 'POST', body: { key: first.items[1]!['handle'], action: 'archive' } })).toMatchObject({ ok: true, row: { dedupKey: 'k', folder: 'Archive' } });
+      expect(first.state.getMail('k')?.handledAt).not.toBeNull();
+      expect(first.state.placeOf('k')).toEqual({ uid: 1, uidValidity: '1' });
+      // The later copy is not: archived, it leaves the record as it was.
+      const later = await listed();
+      expect(await call(later.state, '/api/action', { method: 'POST', body: { key: later.items[0]!['handle'], action: 'archive' } })).toMatchObject({ ok: true });
+      expect(later.state.getMail('k')).toMatchObject({ folder: 'INBOX', handledAt: null });
+      // Starred where it is, the record's own message is placed there.
+      const starred = await listed();
+      expect(await call(starred.state, '/api/action', { method: 'POST', body: { key: starred.items[1]!['handle'], action: 'star' } })).toMatchObject({ ok: true, row: { dedupKey: 'k' } });
+      expect(starred.state.placeOf('k')).toEqual({ uid: 1, uidValidity: '1' });
+    } finally {
+      fake.ImapFlow.prototype.search = original;
+    }
+  });
+
+  it('asks nothing of a mailbox whose header search is known not to answer', async () => {
+    put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com' });
+    const page = await browseFolder(QQ, 'INBOX', { firstOf: (items) => items.map((item) => ({ id: item.messageId, sender: item.from.address })) });
+    expect(Object.values(page.firstUids ?? {})).toEqual([null]);
+    expect(headerSearches()).toBe(0);
+  });
+
+  it('learns a record\'s place again by the key\'s rule once its remembered UID no longer carries its message', async () => {
+    // Moved out by another client and back: a new UID in the same folder.
+    const back = async (): Promise<StateStore> => {
+      fake.server.mail.set('INBOX', []);
+      put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com', body: 'the real numbers', uid: 7 });
+      const state = store();
+      stored(state, 'k', '<q3@corp>', 'INBOX', 'boss@corp.com', 1);
+      return state;
+    };
+    // Read by its key first: found at 7, and learnt there.
+    const read = await back();
+    forgetLive();
+    expect(await call(read, '/api/message?id=k&live=true')).toMatchObject({ text: 'the real numbers' });
+    expect(read.placeOf('k')).toEqual({ uid: 7, uidValidity: '1' });
+    // Listed first: the listing asks, and ties it.
+    const listed = await back();
+    expect((await folder(listed, 'INBOX')).map((item) => [item['uid'], item['key'] ?? null])).toEqual([[7, 'k']]);
+    expect(listed.placeOf('k')).toEqual({ uid: 7, uidValidity: '1' });
+    // Archived by its handle from the folder: the record's books follow.
+    const [item] = await folder(listed, 'INBOX');
+    expect(await call(listed, '/api/action', { method: 'POST', body: { key: item!['handle'], action: 'archive' } })).toMatchObject({ ok: true, row: { dedupKey: 'k', folder: 'Archive' } });
+  });
+
+  it('agrees, listing and key, on a same-sender copy once the record\'s own message left the folder, and on the record\'s own while it is there', async () => {
+    const state = store();
+    put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com', body: 'the real numbers' });
+    put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com', body: 'a copy' });
+    stored(state, 'k', '<q3@corp>', 'INBOX', 'boss@corp.com', 1);
+    // While the remembered UID carries it, only that one is the record's.
+    expect((await folder(state, 'INBOX')).map((item) => [item['uid'], item['key'] ?? null])).toEqual([[2, null], [1, 'k']]);
+    expect(state.placeOf('k')).toEqual({ uid: 1, uidValidity: '1' });
+    // Moved to another folder by another client: the copy is what the key finds, and the listing says the same.
+    const real = fake.server.mail.get('INBOX')!.find((m) => m.uid === 1)!;
+    fake.server.mail.set('INBOX', fake.server.mail.get('INBOX')!.filter((m) => m !== real));
+    fake.server.mail.set('Projects/2026', [{ ...real, uid: 1 }]);
+    expect((await folder(state, 'INBOX')).map((item) => [item['uid'], item['key'] ?? null])).toEqual([[2, 'k']]);
+    forgetLive();
+    expect(await call(state, '/api/message?id=k&live=true')).toMatchObject({ text: 'a copy' });
+    expect(state.placeOf('k')).toEqual({ uid: 2, uidValidity: '1' });
+  });
+
   it('ties nothing from a listing when the mailbox cannot say which message is the record\'s first', async () => {
     const state = store();
     put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com' });

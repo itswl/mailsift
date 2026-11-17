@@ -181,3 +181,19 @@ describe('the whole mailbox, after a third review', () => {
     expect(web).toContain('it never jumps to a message you did not choose');
   });
 });
+
+describe('the whole mailbox, after a fourth review', () => {
+  it('says a listing asks once per page, not where search cannot say, and an action settles it there', () => {
+    const web = prose(read('docs/web-view.md'));
+    const mcp = prose(read('docs/mcp.md'));
+    expect(web).toContain('in one search for the whole page');
+    expect(web).toContain('whether the record\'s own lookup finds this very message, and if so keeps the record\'s books');
+    expect(mcp).toContain('QQ\'s search cannot, so it is not asked there');
+  });
+
+  it('says a stale message is put down on every path, and a narrow window puts down what it no longer shows', () => {
+    const web = prose(read('docs/web-view.md'));
+    expect(web).toContain('whether on an action, a batch, Reply or Forward, or reading it');
+    expect(web).toContain('so keys act only on what is on show');
+  });
+});

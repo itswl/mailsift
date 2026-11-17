@@ -239,7 +239,9 @@ export function rememberWhereabouts(store: StateStore, row: MailRow, live: LiveM
   // folder was rebuilt, it is learnt only from the record's own sender, as a
   // listing ties a message to a record (see recordOf).
   const at = store.placeOf(row.dedupKey);
-  if (at && at.uidValidity === live.uidValidity) return;
+  // Found where it was: nothing to learn. Found at another UID of this folder, the remembered one no longer
+  // carries it (the lookup tries that first): it is learnt, by the same rule as a listing (see recordOf).
+  if (at && at.uidValidity === live.uidValidity && at.uid === live.uid) return;
   const from = live.readable.from?.address?.toLowerCase() ?? '';
   if (!from || from !== (row.sender ?? '').toLowerCase()) return;
   try {
@@ -313,6 +315,8 @@ export interface MailTarget {
   ref: string;
   /** What a live read of it is kept under in memory. */
   cacheKey: string;
+  /** For a handle: a stored record its message may be, which no listing tied; an action decides (see keepBooks). */
+  untied?: MailRow;
 }
 
 // ---- Which stored record a live message is ----
@@ -330,10 +334,11 @@ const MADE_UP_ID = /^<generated-[0-9a-f]{32}@mailsift>$/;
  * says it is: the record whose remembered place (folder, UID, UIDVALIDITY) is
  * the message's, which holds for mail without a Message-ID too.
  *
- * A record with no remembered place in this version of the folder is matched
- * by a listing, in the same folder, only to its first message from its sender
- * there (`first`: the lowest UID of a message with its Message-ID from its
- * sender, which the listing asked the mailbox under its lock, see FirstOf):
+ * A record with no remembered place in this version of the folder, or whose
+ * remembered UID no longer carries its message, is matched by a listing, in
+ * the same folder, only to its first message from its sender there (`first`:
+ * the lowest UID of a message with its Message-ID from its sender, which the
+ * listing asked the mailbox under its lock, see FirstOf):
  * the message the poller stored first, and the one a lookup by the record's
  * key finds and remembers. A later copy from the same sender, or one the
  * listing could not ask about, is not it. The place is then remembered, so a
@@ -355,9 +360,8 @@ export function recordOf(
   if (!place.id) return undefined;
   const row = known === undefined ? store.storedFor(account, [place.id]).get(place.id) : known ?? undefined;
   if (!row || row.folder !== place.folder) return undefined;
-  // Remembered elsewhere in this version of the folder: this is another message with its Message-ID.
-  const at = store.placeOf(row.dedupKey);
-  if (at && at.uidValidity === place.uidValidity) return undefined;
+  // Remembered elsewhere in this version of the folder, this is another message with its Message-ID, unless the
+  // mailbox said (as `first`) that the remembered UID no longer carries it and this is the first from its sender.
   const same = Boolean(place.sender && row.sender) && place.sender!.toLowerCase() === row.sender!.toLowerCase();
   // From the record's sender, and the first such message in the folder, as the mailbox said under the listing's lock.
   if (!same || place.first !== place.uid) return undefined;
@@ -403,6 +407,13 @@ function actedOnRecord(db: StateStore, row: MailRow, result: WebMailActionResult
   if (at && result.sourceFolder === row.folder && at.uid === result.sourceUid && at.uidValidity === result.sourceUidValidity) return true;
   if (!row.sender || result.sourceFrom === undefined) return !row.sender;
   return result.sourceFrom.toLowerCase() === row.sender.toLowerCase();
+}
+
+/** The stored record a handle's message may be, untied: its Message-ID, in its folder, and a sender to check it by. */
+function untiedRecord(store: StateStore, account: string, handle: LiveHandle): MailRow | undefined {
+  if (!handle.messageId || MADE_UP_ID.test(handle.messageId)) return undefined;
+  const row = store.storedFor(account, [handle.messageId]).get(handle.messageId);
+  return row && row.folder === handle.folder && row.sender ? row : undefined;
 }
 
 /** A record made from a handle alone, for a message nothing was stored about. */
@@ -453,11 +464,15 @@ export function resolveTarget(store: StateStore, ref: string): { target: MailTar
   const row = recordOf(store, account.username, {
     id: handle.messageId, folder: handle.folder, uid: handle.uid, uidValidity: handle.uidValidity,
   });
-  const hint: MessageHint = exactHint(handle);
+  // A record with this Message-ID in this folder that no listing tied (it could not ask, or the record's place is
+  // gone): an action decides it under its own lock, with the record's own lookup (see MessageHint.recordHint).
+  const untied = row ? undefined : untiedRecord(store, account.username, handle);
+  const recordHint = untied ? whereabouts(store, untied) : undefined;
+  const hint: MessageHint = { ...exactHint(handle), ...(recordHint ? { recordHint } : {}) };
   return {
     target: {
       row, view: row ?? handleRow(handle, canonical, account), account, messageId: handle.messageId, hint,
-      place: { folderHint: handle.folder, hint }, handle, ref: canonical, cacheKey: canonical,
+      place: { folderHint: handle.folder, hint }, handle, ref: canonical, cacheKey: canonical, ...(untied ? { untied } : {}),
     },
   };
 }
@@ -905,8 +920,14 @@ export function keepBooks(
   });
   forgetLive(target.cacheKey);
   if (target.row) forgetLive(target.row.dedupKey);
+  // An untied record whose own lookup, under the action's lock, picked this very message: it is the record's.
+  const mine = target.row ?? (target.untied && result.recordPicks ? target.untied : undefined);
   // The books are the record's only when the message acted on is the record's own (see actedOnRecord).
-  const row = target.row && actedOnRecord(db, target.row, result) ? target.row : undefined;
+  const row = mine && actedOnRecord(db, mine, result) ? mine : undefined;
+  // Placed where it was found, when the action did not move it (a move records where it landed, below).
+  if (row && !target.row && target.handle && !result.destinationFolder) {
+    db.rememberUid(row.dedupKey, target.handle.folder, target.handle.uid, target.handle.uidValidity);
+  }
   // The row follows the message, so the next read looks where it now is.
   if (row && result.destinationFolder) {
     db.updateMailLocation(row.dedupKey, result.destinationFolder, Boolean(result.destinationIsSpam), {

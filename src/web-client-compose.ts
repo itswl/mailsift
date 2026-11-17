@@ -1007,7 +1007,7 @@ async function startReply(key, mode) {
     // This very letter, not another one to the same message opened since:
     // a reply must not be filled in with a reply-all's recipients.
     if (composing !== state) return;
-    if (!r.ok) { composeSay(failure(d), true); return; }
+    if (!r.ok) { composeSay(failure(d), true); if (d.code === 'liveStale' && liveView) forgetStale(rowKey(row)); return; }
     fillCompose(d);
   } catch (e) {
     if (composing === state) composeSay(t('detail.networkFailed'), true);
@@ -1031,7 +1031,7 @@ async function startForward(key) {
     // The forwarded message's header lines in the page's language.
     const r = await fetch('/api/forward?key=' + encodeURIComponent(state.key) + '&language=' + encodeURIComponent(lang));
     const d = await r.json().catch(() => ({}));
-    if (!r.ok) { failed(failure(d)); return; }
+    if (!r.ok) { failed(failure(d)); if (d.code === 'liveStale' && liveView) forgetStale(rowKey(row)); return; }
     if (composing !== state) return;
     fillForward(d);
   } catch (e) {
