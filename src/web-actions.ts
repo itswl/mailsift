@@ -858,6 +858,7 @@ export async function actOnMail(
     const muted = before ? newlyMuted(before, db.feedbackRuleHints(2)) : [];
     return json(200, {
       ok: true, action, ...(kept.after ? { row: ctx.decorate(kept.after) } : {}), attention: db.attentionCount(),
+      ...(result.already ? { already: true } : {}),
       ...(muted.length ? { muted } : {}),
       // Where a live message is now, and its handle there when the server said its new UID.
       ...(kept.moved ? { moved: kept.moved } : {}),
@@ -941,7 +942,8 @@ export function keepBooks(
     db.setHandled(row.dedupKey, true, action === 'spam');
   }
   if (row && action === 'not_spam') db.undoSpamDone(row.dedupKey);
-  if (row && (action === 'spam' || action === 'not_spam')) {
+  // Once per message: pressed again on a message already in spam, it is not a second vote against its sender.
+  if (row && (action === 'spam' || action === 'not_spam') && !result.already) {
     // Against this record, by its key: its Message-ID alone could name another one.
     db.recordFeedback(row.messageId ?? row.dedupKey, action, '', row.dedupKey);
   }

@@ -548,6 +548,31 @@ describe('remembering where a message is in its mailbox', () => {
     expect(store.placeOf('k3')).toBeUndefined();
   });
 
+  it('takes an archive of a message already in the archive as done, and a second spam press as no second vote', async () => {
+    const store = seeded();
+    store.rememberUid('k1', 'INBOX', 17, '9');
+    // Archived already (by the first press, or by another client): the mailbox moves nothing.
+    const already = backend({
+      act: async (account, messageId, action) => ({
+        action, account: account.username, messageId, sourceFolder: action === 'spam' ? 'Junk' : 'Archive',
+        sourceUid: 17, sourceUidValidity: '9', sourceFrom: 'billing@vendor.com', already: true,
+      }),
+    });
+    const again = await post(store, '/api/action', { key: 'k1', action: 'archive' }, {}, already);
+    expect(again.answer.status).toBe(200);
+    expect(again.json).toMatchObject({ ok: true, already: true });
+    expect(store.getMail('k1')).toMatchObject({ handledAt: expect.any(String) });
+    // Nothing moved, so where it is remembered to be is left alone.
+    expect(store.placeOf('k1')).toEqual({ uid: 17, uidValidity: '9' });
+    expect(store.listMailActions(1)[0]).toMatchObject({ action: 'archive', success: true });
+
+    // Spam pressed on a message already in spam: done, but not another vote against its sender.
+    const votes = (): number => store.feedbackSummary().spam ?? 0;
+    const before = votes();
+    expect((await post(store, '/api/action', { key: 'k3', action: 'spam' }, {}, already)).answer.status).toBe(200);
+    expect(votes()).toBe(before);
+  });
+
   it('tells the mailbox where an answered message is, read before the message was sent', async () => {
     const store = seeded();
     store.rememberUid('k1', 'INBOX', 17, '9');

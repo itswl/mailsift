@@ -1889,7 +1889,10 @@ describe('the rest of the mailbox in the page', () => {
   it('gives a live row only what applies to it: no Done or later for a message never stored, no Archive in the archive', () => {
     const script = clientScript();
     expect(script).toContain("if (markable) bar.appendChild(barButton('i-check'");
-    expect(script).toContain("if (!liveIn(row, 'archive') && !liveIn(row, 'all')) bar.appendChild(barButton('i-archive'");
+    expect(script).toContain("const archived = liveIn(row, 'archive') || liveIn(row, 'all') || role === 'archive' || role === 'all'");
+    expect(script).toContain("if (!archived) bar.appendChild(barButton('i-archive'");
+    // A message the page just archived is not offered Archive again: the answer said where its archive is.
+    expect(script).toContain("if (action === 'archive' && r.data.row && r.data.row.folder) archiveOf.set(r.data.row.account, r.data.row.folder);");
     expect(script).toContain("if (e.key === 'e') { if (!markable) return;");
     expect(script).toContain('const conversation = stored ? conversationSection(box, row) : null;');
   });

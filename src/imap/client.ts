@@ -507,6 +507,8 @@ export interface MailActionResult {
   account: string;
   messageId: string;
   sourceFolder: string;
+  /** The message was in the destination already, so nothing was moved (archived twice, say). */
+  already?: boolean;
   destinationFolder?: string;
   /** Set with destinationFolder: whether the message now sits in a spam folder. */
   destinationIsSpam?: boolean;
@@ -1422,6 +1424,8 @@ async function actOnMessage(
   /** The message acted on: its UID where it was, that folder's UIDVALIDITY and its sender, so the books follow only the right one. */
   source: { uid: number; uidValidity: string; from: string };
   recordPicks?: boolean;
+  /** It was in the destination already: nothing was sent to the mailbox. */
+  already?: boolean;
 } | undefined> {
   for (const folder of folders) {
     const lock = await lockFolder(client, folder, false);
@@ -1448,9 +1452,9 @@ async function actOnMessage(
             : await client.messageFlagsRemove([uid], [change.flag], { uid: true });
           if (!accepted) throw new MailActionError('failed', `IMAP server rejected the ${change.name} operation`);
         } else if (destinationPath) {
-          if (destinationPath === folder.path) {
-            throw new MailActionError('invalid_destination', 'message is already in the destination folder');
-          }
+          // Archived already (a second press, or a message filed there by another client): there is
+          // nothing to move, and it is done all the same, as a mail client archives it twice.
+          if (destinationPath === folder.path) return { sourceFolder: folder.path, source, already: true, ...picked };
           committing();
           const moved = await client.messageMove([uid], destinationPath, { uid: true });
           if (!moved) throw new MailActionError('failed', 'IMAP server rejected the move operation');
@@ -1631,10 +1635,11 @@ export async function applyWebMailAction(
       sourceFolder: acted.sourceFolder,
       sourceUid: acted.source.uid, sourceUidValidity: acted.source.uidValidity, sourceFrom: acted.source.from,
       ...(acted.recordPicks !== undefined ? { recordPicks: acted.recordPicks } : {}),
-      ...(destination ? {
+      ...(destination && !acted.already ? {
         destinationFolder: destination.path, destinationIsSpam: destination.isSpam,
         ...(inBin(entries, destination.path) ? { destinationIsTrash: true } : {}),
       } : {}),
+      ...(acted.already ? { already: true } : {}),
       ...(acted.destinationUid && acted.destinationUidValidity
         ? { destinationUid: acted.destinationUid, destinationUidValidity: acted.destinationUidValidity } : {}),
       ...landedAs(account, destination, acted),
@@ -1747,10 +1752,11 @@ export async function applyMailActions(
                 action, account: account.username, messageId: target.messageId, sourceFolder: acted.sourceFolder,
                 sourceUid: acted.source.uid, sourceUidValidity: acted.source.uidValidity, sourceFrom: acted.source.from,
                 ...(acted.recordPicks !== undefined ? { recordPicks: acted.recordPicks } : {}),
-                ...(destination ? {
+                ...(destination && !acted.already ? {
                   destinationFolder: destination.path, destinationIsSpam: destination.isSpam,
                   ...(inBin(entries, destination.path) ? { destinationIsTrash: true } : {}),
                 } : {}),
+                ...(acted.already ? { already: true } : {}),
                 ...(acted.destinationUid && acted.destinationUidValidity
                   ? { destinationUid: acted.destinationUid, destinationUidValidity: acted.destinationUidValidity } : {}),
                 ...landedAs(account, destination, acted),

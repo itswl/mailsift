@@ -839,9 +839,12 @@ describe('acting on a message from the web view', () => {
     await expect(applyWebMailAction(ME, '<one@x>', 'move')).rejects.toThrow(/requires a destination/);
   });
 
-  it('refuses a move that would go nowhere, and an action it does not know', async () => {
+  it('does nothing for a move to where the message already is, and refuses an action it does not know', async () => {
     put('INBOX', '<one@x>');
-    await expect(applyWebMailAction(ME, '<one@x>', 'inbox')).rejects.toMatchObject({ code: 'invalid_destination' });
+    // Already there (a second press, or filed there by another client): nothing is moved, and it is not an error.
+    const again = await applyWebMailAction(ME, '<one@x>', 'inbox');
+    expect(again).toMatchObject({ action: 'inbox', sourceFolder: 'INBOX', already: true });
+    expect(again).not.toHaveProperty('destinationFolder');
     await expect(applyWebMailAction(ME, '<one@x>', 'delete' as never)).rejects.toMatchObject({ code: 'invalid_action' });
     // Refused before a connection is opened.
     expect(fake.server.calls.filter((call) => call === 'connect')).toHaveLength(1);

@@ -304,9 +304,6 @@ function outcomeResult(key: string, error: unknown): BulkResult {
     return { key, status: 'failed', code: 'liveStale', error: 'the message is no longer where its folder listed it' };
   }
   if (error instanceof MailActionError && error.code === 'not_applicable') return { key, status: 'skipped', code: 'notApplicable', error: error.message };
-  if (error instanceof MailActionError && /already in the destination/.test(error.message)) {
-    return { key, status: 'skipped', code: 'alreadyThere', error: error.message };
-  }
   if (error instanceof MailActionError) return { key, status: 'failed', code: `action_${error.code}`, error: error.message };
   return { key, status: 'failed', code: 'actionFailed', error: String(error).slice(0, 200) };
 }
