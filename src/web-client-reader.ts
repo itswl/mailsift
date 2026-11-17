@@ -45,8 +45,9 @@ function rowByKey(key) {
   for (const m of doneRecent) if (rowKey(m) === key) return m;
   for (const m of snoozedRows) if (rowKey(m) === key) return m;
   if (extraRows.has(key)) return extraRows.get(key);
-  // A stored record known on the page only as a row listed live.
+  // A stored record known on the page only as a row listed live, or opened from a link by its handle.
   for (const m of liveRows.values()) if (m.storedKey === key) return m;
+  for (const m of extraRows.values()) if (m.storedKey === key) return m;
   return null;
 }
 // A row the server sent back after an action replaces every copy of it.
@@ -892,7 +893,8 @@ async function mailAction(key, action, destination) {
   if (typeof r.data.attention === 'number') attentionCount = r.data.attention;
   const said = action === 'move' ? fill('act.moved', { folder: folderName(row ? row.account : '', destination) }) : t(ACTION_SAID[action]);
   // A spam vote that made a rule says so, as the judgement line does.
-  toast(Array.isArray(r.data.muted) && r.data.muted.length ? said + DOT + fill('fb.ruleNever', { sender: r.data.muted.join(', ') }) : said);
+  const muted = mutedLine(r.data.muted);
+  toast(muted ? said + DOT + muted : said);
   renderList();
   renderLede();
   renderBars();

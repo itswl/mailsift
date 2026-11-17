@@ -20,8 +20,8 @@ import { getLogger } from '../logger.js';
 import { withOwnConnection, withSession } from './connection.js';
 import { toFolder } from './folders.js';
 import {
-  exactFolder, firstAddress, folderRole, listFolders, LiveMailError, resolveActionDestination, selectedValidity,
-  type FolderRole,
+  exactFolder, firstAddress, folderRole, listFolders, LiveMailError, messageIdDigest, resolveActionDestination, selectedValidity,
+  type FolderRole, type MessageHint,
 } from './client.js';
 import { extractAttachmentManifest, fallbackMessageId, normalizeDate } from './message.js';
 
@@ -45,15 +45,26 @@ const SIGNATURE_CHARS = 22;
  */
 let handleKey: Buffer = randomBytes(32);
 
-/** Sign handles with the secret this database keeps, giving it this process's own when it has none yet. */
-export function useHandleKey(store: { getMeta(key: string): string | undefined; setMeta(key: string, value: string): void }): void {
-  const kept = store.getMeta(HANDLE_KEY_META);
-  const key = kept ? Buffer.from(kept, 'base64') : undefined;
-  if (key && key.length === 32) {
-    handleKey = key;
-    return;
+/**
+ * Sign handles with the secret this database keeps. With none kept yet, this
+ * process's own is offered, only where there still is none (two processes
+ * starting together race to here), and whichever was kept is used: so no
+ * process signs with a key another one overwrote.
+ */
+export function useHandleKey(store: {
+  getMeta(key: string): string | undefined;
+  casMeta(key: string, expected: string | undefined, next: string): boolean;
+}): void {
+  const asKey = (text: string | undefined): Buffer | undefined => {
+    const key = text ? Buffer.from(text, 'base64') : undefined;
+    return key && key.length === 32 ? key : undefined;
+  };
+  let key = asKey(store.getMeta(HANDLE_KEY_META));
+  if (!key) {
+    store.casMeta(HANDLE_KEY_META, undefined, handleKey.toString('base64'));
+    key = asKey(store.getMeta(HANDLE_KEY_META));
   }
-  store.setMeta(HANDLE_KEY_META, handleKey.toString('base64'));
+  if (key) handleKey = key;
 }
 
 /** Where one message is, as the mailbox listed it. */
@@ -62,8 +73,22 @@ export interface LiveHandle {
   folder: string;
   uidValidity: string;
   uid: number;
-  /** The Message-ID as the server has it; '' for a message that has none. */
+  /** The Message-ID as the server has it; '' for a message that has none, or one too long to carry (see idDigest). */
   messageId: string;
+  /** For a Message-ID too long to carry in a handle: its digest (messageIdDigest), which it is told apart by. */
+  idDigest?: string;
+}
+
+/** A Message-ID longer than this (as JSON) is carried in a handle as its digest, so every handle stays short enough to be given back. */
+const ID_INLINE_MAX = 512;
+const DIGEST_CHARS = 43;
+
+/** Where a live handle sends a lookup: that place exactly, told apart by its Message-ID or that id's digest. */
+export function exactHint(handle: LiveHandle): MessageHint {
+  return {
+    folder: handle.folder, uid: handle.uid, uidValidity: handle.uidValidity, exact: true,
+    ...(handle.idDigest ? { idDigest: handle.idDigest } : {}),
+  };
 }
 
 /**
@@ -78,9 +103,18 @@ export function handleShaped(value: string): boolean {
 const sign = (payload: string): string =>
   createHmac('sha256', handleKey).update(`${HANDLE_PREFIX}${payload}`, 'utf8').digest('base64url').slice(0, SIGNATURE_CHARS);
 
-/** The handle of a message: what it names, and this server's signature over it. One message in one place has exactly one. */
+/**
+ * The handle of a message: what it names, and this server's signature over
+ * it. One message in one place has exactly one. A Message-ID too long to
+ * carry (any sender can write one) is carried as its digest, so that every
+ * handle made is one parseLiveHandle takes back.
+ */
 export function liveHandle(handle: LiveHandle): string {
-  const parts = [HANDLE_VERSION, handle.account, handle.folder, handle.uidValidity, handle.uid, handle.messageId];
+  const digest = handle.idDigest
+    ?? (JSON.stringify(handle.messageId).length > ID_INLINE_MAX ? messageIdDigest(handle.messageId) : undefined);
+  const parts = digest
+    ? [HANDLE_VERSION, handle.account, handle.folder, handle.uidValidity, handle.uid, '', digest]
+    : [HANDLE_VERSION, handle.account, handle.folder, handle.uidValidity, handle.uid, handle.messageId];
   const payload = Buffer.from(JSON.stringify(parts), 'utf8').toString('base64url');
   return `${HANDLE_PREFIX}${payload}.${sign(payload)}`;
 }
@@ -100,14 +134,17 @@ export function parseLiveHandle(value: string): LiveHandle | undefined {
   } catch {
     return undefined;
   }
-  if (!Array.isArray(parsed) || parsed.length !== 6 || parsed[0] !== HANDLE_VERSION) return undefined;
-  const [, account, folder, uidValidity, uid, messageId] = parsed as unknown[];
+  if (!Array.isArray(parsed) || (parsed.length !== 6 && parsed.length !== 7) || parsed[0] !== HANDLE_VERSION) return undefined;
+  const [, account, folder, uidValidity, uid, messageId, idDigest] = parsed as unknown[];
   if (typeof account !== 'string' || !account || account.length > 320) return undefined;
   if (typeof folder !== 'string' || !folder || folder.length > 1000) return undefined;
   if (typeof uidValidity !== 'string' || !/^\d{1,20}$/.test(uidValidity)) return undefined;
   if (typeof uid !== 'number' || !Number.isSafeInteger(uid) || uid <= 0 || uid > 0xffffffff) return undefined;
-  if (typeof messageId !== 'string' || messageId.length > 998) return undefined;
-  const handle = { account, folder, uidValidity, uid, messageId };
+  if (typeof messageId !== 'string' || JSON.stringify(messageId).length > ID_INLINE_MAX) return undefined;
+  if (parsed.length === 7 && (messageId !== '' || typeof idDigest !== 'string' || !new RegExp(`^[A-Za-z0-9_-]{${DIGEST_CHARS}}$`).test(idDigest))) {
+    return undefined;
+  }
+  const handle: LiveHandle = { account, folder, uidValidity, uid, messageId, ...(typeof idDigest === 'string' ? { idDigest } : {}) };
   // Spelled as this server spells it, so that one message has one handle to compare and remember by.
   return liveHandle(handle) === text ? handle : undefined;
 }
@@ -383,6 +420,12 @@ export async function browseFolder(
 
 /** How long a search may take on the mailbox, under what the page waits for it. */
 export const SEARCH_IMAP_MS = 25_000;
+let searchImapMs = SEARCH_IMAP_MS;
+
+/** For tests: how long a search may take on the mailbox; null for the usual. */
+export function setSearchTimeout(ms: number | null): void {
+  searchImapMs = ms ?? SEARCH_IMAP_MS;
+}
 
 /**
  * Lists each newest first in its own order, merged by taking the head of
@@ -436,6 +479,18 @@ export class SearchCancelled extends Error {
   constructor() {
     super('a newer search took the place of this one');
     this.name = 'SearchCancelled';
+  }
+}
+
+/**
+ * The mailbox was reached, and took longer to search than a search is given:
+ * a slow search (a large archive, a fallback reading thousands of envelopes),
+ * not a provider that is down. Said as that, with the way to make it quicker.
+ */
+export class SearchTimedOut extends Error {
+  constructor() {
+    super('the mailbox took too long to search');
+    this.name = 'SearchTimedOut';
   }
 }
 
@@ -643,7 +698,7 @@ export async function searchMailbox(
       next: more ? encodeSearchCursor(next) : null,
       ...(limited ? { limited } : {}),
     };
-  }, { timeoutMs: SEARCH_IMAP_MS, signal: options.signal }).catch((error: unknown) => {
+  }, { timeoutMs: searchImapMs, signal: options.signal, late: () => new SearchTimedOut() }).catch((error: unknown) => {
     // Stopped by a newer search, or given up on: said as that, whatever the closed connection said.
     if (options.signal?.aborted) throw new SearchCancelled();
     throw error;

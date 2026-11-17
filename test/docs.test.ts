@@ -139,3 +139,28 @@ describe('the whole mailbox', () => {
     expect(web).toContain('Undo acts on the batch it undoes and on nothing else');
   });
 });
+
+describe('the whole mailbox, after a second review', () => {
+  it('says a stored message is found elsewhere only from its own sender, and a look-alike is not taken for it', () => {
+    const web = prose(read('docs/web-view.md'));
+    const mcp = prose(read('docs/mcp.md'));
+    expect(web).toContain('found anywhere else, a message with its Message-ID is it only when it is from the same sender');
+    expect(mcp).toContain('a look-alike with its Message-ID is answered `NOT_FOUND`');
+  });
+
+  it('says how many search connections a mailbox has, and that a slow search is said as slow', () => {
+    const web = prose(read('docs/web-view.md'));
+    const mcp = prose(read('docs/mcp.md'));
+    expect(web).toContain('A mailbox has at most two such connections');
+    expect(web).toContain('is stopped and said to be slow');
+    expect(mcp).toContain('A mailbox has at most two such connections');
+    expect(mcp).toContain('the hint to narrow the search to one folder');
+  });
+
+  it('says Undo undoes all of a batch, and that a reload adds nothing to the history', () => {
+    const web = prose(read('docs/web-view.md'));
+    expect(web).toContain('and on all of it, whatever the page has loaded or left since');
+    expect(web).toContain('A reload, or the installed app coming back, adds nothing to the history.');
+    expect(prose(read('docs/mcp.md'))).toContain('one audit row for every id asked about');
+  });
+});

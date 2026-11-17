@@ -650,10 +650,12 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault();
     const choices = bulkChoices(pickedRows());
     const more = $('#pick-actions [data-act="bulk-more"]');
-    if (e.key === 'e') bulkAction(choices.includes('done') ? 'done' : 'not_done');
+    // e only where the bar has Done or Not done: messages mailsift never stored have neither.
+    if (e.key === 'e') { if (choices.includes('done')) bulkAction('done'); else if (choices.includes('not_done')) bulkAction('not_done'); }
     else if (e.key === 'y' && choices.includes('archive')) bulkAction('archive');
     else if (e.key === '#' && choices.includes('trash')) bulkAction('trash');
-    else if (e.key === 's') bulkAction('star');
+    // s turns the star on, or off when every one picked has it, as it does for one message.
+    else if (e.key === 's') bulkAction(allStarred(pickedRows()) ? 'unstar' : 'star');
     else if (e.key === 'b' && choices.includes('snooze') && more) openBulkSnooze(more);
   } else if (e.key === 'x' && current) {
     e.preventDefault();

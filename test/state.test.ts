@@ -789,6 +789,8 @@ describe('where a message is in its folder', () => {
     seed(first, 'old');
     first.close();
     const raw = new DatabaseSync(path);
+    // An older release had neither the place nor the index on it.
+    raw.exec('DROP INDEX IF EXISTS idx_seen_place');
     raw.exec('ALTER TABLE seen DROP COLUMN uid');
     raw.exec('ALTER TABLE seen DROP COLUMN uid_validity');
     raw.close();

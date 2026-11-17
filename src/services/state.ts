@@ -737,6 +737,8 @@ export class StateStore {
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_seen_message_id ON seen (message_id)');
     // The rules read feedback by label on every poll.
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_feedback_label ON feedback (label, dedup_key)');
+    // A message listed live is matched to the record stored at its very place.
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_seen_place ON seen (account, folder, uid, uid_validity)');
     // Before 0.1.98, code mail mailsift handled itself was labelled
     // 'fallback', which reads as a failed model and made it a candidate for
     // re-triage after an LLM outage, where its stored code was lost. It was
@@ -1415,6 +1417,21 @@ export class StateStore {
       }
     }
     return found;
+  }
+
+  /**
+   * The record whose message is at exactly this place in a mailbox: one UID
+   * of one folder, in this version of it (its UIDVALIDITY). UIDs are never
+   * given to another message there, so this is that message's record,
+   * whatever its Message-ID says or whether it has one. Two records that
+   * claim one place (left by an older version) are neither believed.
+   */
+  recordAt(account: string, folder: string, uid: number, uidValidity: string): MailRow | undefined {
+    if (!(uid > 0) || !uidValidity) return undefined;
+    const rows = this.db.prepare(
+      `SELECT ${ROW_COLUMNS.join(', ')}, snippet FROM seen WHERE account = ? AND folder = ? AND uid = ? AND uid_validity = ? LIMIT 2`,
+    ).all(account, folder, uid, uidValidity) as Array<Record<string, unknown>>;
+    return rows.length === 1 ? toRow(rows[0]!) : undefined;
   }
 
   getMail(messageId: string): MailRow | undefined {

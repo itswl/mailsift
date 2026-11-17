@@ -529,6 +529,27 @@ describe('many messages at once', () => {
     expect(store.getMail('k2')?.handledAt).toBe(marked);
   });
 
+  it('keeps a record\'s books only when the message a mailbox acted on is the record\'s own', async () => {
+    const store = stored();
+    store.rememberUid('k2', 'INBOX', 4, '1');
+    // The mailbox says what it moved: at the record's place, or from its sender elsewhere, it is the record's.
+    const moved = (sourceUid: number, sourceFrom: string) => fake({
+      act: async (account, messageId, action) => ({
+        action, account: account.username, messageId, sourceFolder: 'INBOX', sourceUid, sourceUidValidity: '1', sourceFrom,
+        destinationFolder: 'Archive', destinationIsSpam: false, destinationUid: 30, destinationUidValidity: '7',
+      }),
+    });
+    expect((await post(store, '/api/action', { key: 'k2', action: 'archive' }, moved(9, 'attacker@evil.example'))).json).toMatchObject({ ok: true });
+    expect(store.getMail('k2')).toMatchObject({ folder: 'INBOX', handledAt: null });
+    expect(store.placeOf('k2')).toEqual({ uid: 4, uidValidity: '1' });
+    expect((await post(store, '/api/action', { key: 'k2', action: 'archive' }, moved(9, 'promo@shop.example'))).json).toMatchObject({ ok: true, row: { folder: 'Archive' } });
+    expect(store.placeOf('k2')).toEqual({ uid: 30, uidValidity: '7' });
+    expect(store.getMail('k2')?.handledAt).not.toBeNull();
+    // At its own place, whatever the envelope says.
+    store.rememberUid('k3', 'INBOX', 5, '1');
+    expect((await post(store, '/api/action', { key: 'k3', action: 'archive' }, moved(5, 'someone@else.example'))).json).toMatchObject({ row: { folder: 'Archive' } });
+  });
+
   it('says which senders a batch put in spam made low priority', async () => {
     const store = stored();
     const { mailbox } = batches();

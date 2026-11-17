@@ -1909,6 +1909,7 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
       session: { writable: true, canMark: true }, requireWrite: () => undefined, bulkBusy: false,
       picked: new Set<string>(), pickAnchor: null, history: { state: null },
       post: async (_path: string, body: Record<string, unknown>) => { posted.push(body); return { ok: true, data: answer(body) }; },
+      // What the page still has: emptied by forget(), as leaving a folder or a reload of the lists does.
       rowByKey: (key: string) => byKey.get(key), findItem: () => null, rowOfItem: () => null,
       pickedRows: () => Array.from(context['picked'] as Set<string>).map((key) => byKey.get(key)).filter(Boolean),
       applyRow: () => undefined, liveData: new Map(), flagsByKey: new Map(), liveView: null, liveRows: new Map(), dropLive: () => undefined,
@@ -1921,8 +1922,9 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
     };
     const fns = lifted<{
       bulkAction: (action: string, extra?: Record<string, unknown>) => Promise<void>;
-    }>(['rowKey', 'mailRef', 'queueKey', 'bulkId', 'snoozeUndoTo', 'bulkAction', 'bulkAgain', 'undoBulkSnooze'], '{ bulkAction }', context);
-    return { ...fns, context, posted, toasts };
+    }>(['rowKey', 'mailRef', 'queueKey', 'bulkId', 'snoozeUndoTo', 'mutedLine', 'bulkAction', 'bulkUndo', 'undoBulkSnooze'], '{ bulkAction }', context);
+    const forget = (): void => { byKey.clear(); (context['liveRows'] as Map<string, unknown>).clear(); };
+    return { ...fns, context, posted, toasts, forget };
   }
   const allDone = (body: Record<string, unknown>) => ({
     results: (body['items'] as string[]).map((key) => ({ key, status: 'done' })), done: (body['items'] as string[]).length, skipped: 0, failed: 0,
@@ -1941,6 +1943,23 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
     expect([...(page.context['picked'] as Set<string>)]).toEqual(['k3']);
   });
 
+  it('undoes every message of a batch, whatever the page has loaded or left since', async () => {
+    // Stored rows listed live: known by their handles, sent by their records' keys.
+    const rows = Array.from({ length: 30 }, (_, n) => ({
+      dedupKey: `live:h${n}`, handle: `live:h${n}`, storedKey: `k${n}`, live: true, stored: true, account: 'me@qq.com', folder: 'INBOX', handledAt: null,
+    }));
+    const page = bulkPage(rows, allDone);
+    for (const row of rows) (page.context['picked'] as Set<string>).add(row.dedupKey);
+    await page.bulkAction('done');
+    const sent = rows.map((row) => row.storedKey);
+    expect(page.posted[0]).toMatchObject({ action: 'done', items: sent });
+    // The folder is left (or the lists reloaded without most of them): no row is found any more.
+    page.forget();
+    page.context['liveView'] = null;
+    await page.toasts[0]!.undo!.run();
+    expect(page.posted[1]).toMatchObject({ action: 'not_done', items: sent });
+  });
+
   it('undoes a batch reminder by giving each message the reminder it had, and leaves out the ones the batch did not change', async () => {
     const soon = new Date(Date.now() + 3 * 3_600_000).toISOString();
     const rows = [
@@ -1954,6 +1973,8 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
     }));
     for (const key of ['k1', 'k2', 'k3']) (page.context['picked'] as Set<string>).add(key);
     await page.bulkAction('snooze', { until: '2027-01-01T09:00:00.000Z' });
+    // Nothing of the batch is on the page any more when Undo is pressed.
+    page.forget();
     await page.toasts[0]!.undo!.run();
     const undo = page.posted.slice(1).map((body) => [body['items'], body['until']]);
     expect(undo).toEqual(expect.arrayContaining([[['k1'], null], [['k2'], soon]]));
@@ -1987,7 +2008,7 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
       visibleKeys: () => ['a', 'b', 'c'], isWide: () => true, selectedKey: 'b', findItem: (key: string) => key !== 'b',
       openDetail: (key: string) => opened.push(key), clearSelection: () => opened.push('cleared'), renderLiveHead: () => undefined,
     };
-    const drop = lifted<(keys: string[]) => void>(['rowKey', 'dropLive'], 'dropLive', context);
+    const drop = lifted<(keys: string[]) => void>(['rowKey', 'moveOnFrom', 'dropLive'], 'dropLive', context);
     drop(['b']);
     expect(opened).toEqual(['c']);
     expect((context['liveView'] as { items: unknown[]; total: number })).toMatchObject({ items: [{ dedupKey: 'a' }, { dedupKey: 'c' }], total: 2 });
@@ -2087,8 +2108,26 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
     expect(phone).toContain('#pick-all{display:none}');
     expect(phone).toContain('.pick-actions .bar-btn span{display:none}');
     expect(phone).toContain('.pick-count{min-width:0;overflow:hidden;text-overflow:ellipsis}');
-    expect(css).toContain('@media(max-width:899px) and (hover:hover){.row:hover .pick-box{display:grid}}');
     expect(css).toContain('#folder-sheet .folder-accounts{max-width:none;margin:0 8px 8px}');
+  });
+
+  it('gives the box its own place in a narrow window with a mouse, never over the ring, the clock or the check', () => {
+    const css = styles();
+    // Not shown in the mark's place under the pointer, where a click meant for the ring would pick the row.
+    expect(css).not.toContain('@media(max-width:899px) and (hover:hover){.row:hover .pick-box{display:grid}}');
+    const narrowMouse = css.slice(css.indexOf('@media(max-width:899px) and (hover:hover) and (pointer:fine){'));
+    const rules = narrowMouse.slice(0, narrowMouse.indexOf('\n}') + 2);
+    // A gutter on the left of the whole column, as on a desk: the box sits in it, outside the row (3-21px of an
+    // 800px window), and the ring keeps its place in the row (38px), clear of the box and of the 10px around it
+    // a click still takes. The groups no longer clip the box; the column clips instead.
+    expect(rules).toContain('main.app-main{padding-left:24px;overflow-x:clip}');
+    expect(rules).toContain('ul.group{overflow-x:visible}');
+    expect(rules).toContain('.pick-box{left:-21px;top:15px}');
+    expect(rules).toContain('.row:hover .pick-box{display:grid}');
+    // While picking, the ring and the mark stay: the box is beside them, not over them.
+    expect(rules).toContain('body.picking .row>.mark,body.picking .row>.ring{visibility:visible}');
+    const gutter = 24, box = -21, width = 18, reach = 10, ring = 16 - 2;
+    expect(gutter + box + width + reach).toBeLessThanOrEqual(gutter + ring);
   });
 
   it('words what a batch did evenly, and says a search was replaced by a newer one, in both languages', () => {
@@ -2099,7 +2138,124 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
       expect(STRINGS.en[key as StringKey], key).toBeTruthy();
       expect(STRINGS['zh-CN'][key as StringKey], key).toBeTruthy();
     }
-    expect(STRINGS['zh-CN']['live.noneFoundLimited' as StringKey]).toContain('{count}');
+    // Said once, above the list; the empty list says only that none of it matched.
+    expect(STRINGS.en['live.noneFoundLimited' as StringKey]).toBe('No subject or sender matches.');
+    expect(STRINGS['zh-CN']['live.noneFoundLimited' as StringKey]).toBe('主题和发件人里都没有匹配的。');
+    expect(STRINGS.en['live.limitedOne' as StringKey]).toContain('in this folder');
+    expect(STRINGS['zh-CN']['live.limitedOne' as StringKey]).toContain('这个文件夹');
+  });
+
+  it('opens a folder from the address over its own entry when a reload or a restore finds it there, adding nothing', () => {
+    const calls: string[] = [];
+    const view = { mode: 'folder', account: 'me@qq.com', folder: 'INBOX', q: '' };
+    const location = { pathname: '/', search: '?in=me%40qq.com&folder=INBOX' };
+    const history = {
+      state: { live: view } as unknown,
+      replaceState(_state: unknown, _title: string, path: string) { calls.push(`replace ${path}`); },
+      pushState(_state: unknown, _title: string, path: string) { calls.push(`push ${path}`); },
+    };
+    const noop = () => undefined;
+    const context: Record<string, unknown> = {
+      location, history, liveView: null, triagedQuery: '', liveAbort: null, liveRows: new Map(), filters: { q: { value: '' } },
+      document: { body: { classList: { add: noop } } }, selectedKey: null, openKey: null, clearSelection: noop, URLSearchParams,
+      syncUrl: noop, renderLiveHead: noop, renderTokens: noop, updateAsk: noop, wordPlaceholders: noop, renderList: noop,
+      liveLoad: noop, loadFolders: noop, window: { scrollTo: noop },
+    };
+    const open = lifted<(view: Record<string, unknown>, how: string) => void>(['liveState', 'sameLive', 'openLive'], 'openLive', context);
+    open(view, 'boot');
+    open(view, 'boot');
+    expect(calls).toEqual([]);
+    // A sheet, a popover or a selection open at the reload is gone; its entry keeps the folder, not the sheet.
+    for (const stale of [{ live: view, sheet: true }, { live: view, picking: true }, { live: view, popover: 'bulk' }]) {
+      const kept: unknown[] = [];
+      const strip = lifted<() => void>(['stripStaleEntry'], 'stripStaleEntry', {
+        location: { pathname: '/', search: '?in=x', hash: '' },
+        history: { state: stale, replaceState: (state: unknown) => kept.push(state) },
+      });
+      strip();
+      expect(kept).toEqual([{ live: view }]);
+    }
+  });
+
+  it('keeps a stored message opened from a link by its handle in step with Done and Remind me', () => {
+    const extraRows = new Map<string, Record<string, unknown>>([['live:a', { dedupKey: 'live:a', storedKey: 'k1', live: true, handledAt: null }]]);
+    const touched: string[] = [];
+    const each = lifted<(key: string, touch: (m: Record<string, unknown>) => void) => void>(['rowKey', 'eachCopy'], 'eachCopy', {
+      lastMail: [], attention: [], doneRecent: [], snoozedRows: [], lastThreads: [], extraRows, liveRows: new Map(),
+    });
+    each('k1', (m) => { m['handledAt'] = '2026-11-17T00:00:00.000Z'; touched.push(String(m['dedupKey'])); });
+    expect(touched).toEqual(['live:a']);
+    expect(extraRows.get('live:a')!['handledAt']).toBe('2026-11-17T00:00:00.000Z');
+    const byKey = lifted<(key: string) => unknown>(['rowKey', 'rowByKey'], 'rowByKey', {
+      liveView: null, liveRows: new Map(), lastMail: [], attention: [], lastThreads: [], doneRecent: [], snoozedRows: [], extraRows,
+    });
+    expect(byKey('k1')).toBe(extraRows.get('live:a'));
+  });
+
+  it('closes the reader on a phone when Done names the open live row by its record\'s key', () => {
+    const row = { dedupKey: 'live:a', storedKey: 'k1', live: true };
+    const isOpen = lifted<(key: string) => boolean>(['rowKey', 'queueKey', 'isOpenRow'], 'isOpenRow', {
+      openKey: 'live:a', findItem: () => ({ row }), rowOfItem: (item: { row: unknown }) => item.row,
+    });
+    expect(isOpen('k1')).toBe(true);
+    expect(isOpen('live:a')).toBe(true);
+    expect(isOpen('k2')).toBe(false);
+  });
+
+  it('lets e act on a selection only where it has Done, and s take the star off when every one picked has it', () => {
+    const script = clientScript();
+    expect(script).toContain("if (e.key === 'e') { if (choices.includes('done')) bulkAction('done'); else if (choices.includes('not_done')) bulkAction('not_done'); }");
+    expect(script).toContain("else if (e.key === 's') bulkAction(allStarred(pickedRows()) ? 'unstar' : 'star');");
+    const flagsByKey = new Map([['a', { flagged: true }], ['b', { flagged: true }], ['c', { flagged: false }]]);
+    const starred = lifted<(rows: unknown[]) => boolean>(['rowKey', 'allStarred'], 'allStarred', { flagsByKey });
+    expect(starred([{ dedupKey: 'a' }, { dedupKey: 'b' }])).toBe(true);
+    expect(starred([{ dedupKey: 'a' }, { dedupKey: 'c' }])).toBe(false);
+    expect(starred([])).toBe(false);
+  });
+
+  it('names a folder in the panel by its own name, where its parent is shown beside it', () => {
+    const folderLists = new Map([['me@qq.com', { folders: [
+      { path: 'Projects/2026', name: '2026', parent: 'Projects', delimiter: '/', role: null },
+      { path: 'Travel/2026', name: '2026', parent: 'Travel', delimiter: '/', role: null },
+    ] }]]);
+    const name = lifted<(account: string, path: string, plain?: boolean) => string>(['folderInfo', 'folderName'], 'folderName',
+      { t: en, lang: 'en', STRINGS, folderLists });
+    expect(name('me@qq.com', 'Projects/2026', true)).toBe('2026');
+    expect(name('me@qq.com', 'Projects/2026')).toBe('Projects / 2026');
+    expect(clientScript()).toContain("const name = el('span', 'folder-name', folderName(account, f.path, true));");
+  });
+
+  it('names one or two senders a vote muted, and counts more, in each language\'s own way', () => {
+    for (const [lang, sep] of [['en', ' and '], ['zh-CN', '、']] as const) {
+      const t = (key: string): string => STRINGS[lang][key as StringKey] ?? key;
+      const fill = (key: string, vars: Record<string, unknown> = {}): string =>
+        Object.entries(vars).reduce((text, [k, v]) => text.split(`{${k}}`).join(String(v)), t(key));
+      const line = lifted<(muted: unknown) => string>(['mutedLine'], 'mutedLine', { t, fill, lang });
+      expect(line(['a@x'])).toBe(fill('fb.ruleNever', { sender: 'a@x' }));
+      expect(line(['a@x', 'b@x'])).toBe(fill('fb.ruleNever', { sender: `a@x${sep}b@x` }));
+      const many = line(Array.from({ length: 12 }, (_, n) => `s${n}@x`));
+      expect(many).toBe(fill('fb.ruleNeverSome', { count: (12).toLocaleString(lang) }));
+      expect(many).not.toContain('@');
+      expect(line([])).toBe('');
+    }
+    expect(clientScript()).toContain('const muted = mutedLine(r.data.muted);\n  toast(muted ? said + DOT + muted : said);');
+  });
+
+  it('moves a desk reader on when the list read again after a batch no longer has its message', () => {
+    const opened: string[] = [];
+    const context: Record<string, unknown> = {
+      isWide: () => true, selectedKey: 'b', findItem: (key: string) => key !== 'b',
+      openDetail: (key: string) => opened.push(key), clearSelection: () => opened.push('cleared'),
+    };
+    const moveOn = lifted<(before: string[], gone?: Set<string>) => void>(['moveOnFrom'], 'moveOnFrom', context);
+    moveOn(['a', 'b', 'c']);
+    expect(opened).toEqual(['c']);
+    context['findItem'] = () => null;
+    moveOn(['a', 'b']);
+    expect(opened).toEqual(['c', 'cleared']);
+    const script = clientScript();
+    expect(script).toContain('if (reset) { listedBefore = visibleKeys(); liveRows.clear(); view.items = []; }');
+    expect(script).toContain('if (listedBefore) moveOnFrom(listedBefore);\n      renderPane();\n      renderBars();');
   });
 });
 
@@ -2158,7 +2314,7 @@ describe('picking many messages in the page', () => {
     expect(script).toContain("} else if (e.key === 'Escape' && picked.size) {");
     expect(script).toContain('if (picked.size && !(history.state && history.state.picking)) clearPicks(true);');
     expect(script).toContain("post('/api/bulk', Object.assign({ items: Array.from(refs.keys()), action, id: bulkId() }, extra || {}))");
-    expect(script).toContain("if (done.length && action === 'done') undo = { label: t('undo'), run: () => bulkAgain(done, 'not_done') };");
+    expect(script).toContain("if (doneRefs.length && action === 'done') undo = { label: t('undo'), run: () => bulkUndo('not_done', doneRefs) };");
     for (const lang of ['en', 'zh-CN'] as const) {
       for (const key of ['pick.count', 'bulk.archive', 'bulk.move', 'bulk.skipped', 'act.moveTo', 'act.spam', 'folders.recent']) {
         expect(STRINGS[lang][key as StringKey], `${lang} ${key}`).toBeTruthy();

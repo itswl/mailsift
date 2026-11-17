@@ -374,7 +374,8 @@ describe('what needs the mailbox owner', () => {
     expect(state.getMail('k1')?.handledAt).toBeTruthy();
     // Done here is done there: the mailbox is told, at the place the record remembers, and that goes on record.
     await vi.waitFor(() => expect(state.listMailActions(5)[0]).toMatchObject({ action: 'mark_read', success: true, client: 'mcp:test' }));
-    expect(box.acted).toEqual([{ messageId: '<one@x>', action: 'mark_read', hint: { folder: 'INBOX', uid: 17, uidValidity: '9' } }]);
+    // With the record's sender: found anywhere but there, a message is the record's only when it is from that sender.
+    expect(box.acted).toEqual([{ messageId: '<one@x>', action: 'mark_read', hint: { folder: 'INBOX', uid: 17, uidValidity: '9', sender: 'billing@vendor.com' } }]);
 
     const back = await call(client, 'mark_handled', { messageId: '<one@x>', handled: false });
     expect(back).toMatchObject({ handled: false, handledAt: null, needsYou: 2 });
@@ -559,7 +560,7 @@ describe('reading a message and answering it', () => {
     });
     // The markup is the page's to draw; a model is given the text.
     expect(message).not.toHaveProperty('html');
-    expect(box.read).toEqual([{ folder: 'INBOX' }]);
+    expect(box.read).toEqual([{ folder: 'INBOX', sender: 'billing@vendor.com' }]);
     expect(state.placeOf('k1')).toEqual({ uid: 17, uidValidity: '9' });
     expect(await (await connect(state)).callTool({ name: 'read_message', arguments: { messageId: '<absent@x>' } })).toMatchObject({ isError: true });
   });
@@ -2113,6 +2114,18 @@ describe('several messages at once, and spam', () => {
       expect.objectContaining({ messageId: '<one@x>', handled: true }), expect.objectContaining({ messageId: '<two@x>', handled: true }),
     ]));
     expect(targets('snooze')).toEqual([expect.objectContaining({ messageId: '<three@x>', until: new Date(later).toISOString() })]);
+  });
+
+  it('puts on record every id a batch was asked to mark or put off, the ones skipped and refused too', async () => {
+    const state = seeded();
+    const client = await connect(state, true, batching(state).backend);
+    state.setHandled('k2', true);
+    await call(client, 'mark_handled', { messageIds: ['<one@x>', '<two@x>', '<absent@x>'] });
+    const rows = state.listMcpAudit(20).filter((row) => row.action === 'mark_handled' && row.target?.includes('outcome'));
+    expect(rows.map((row) => [JSON.parse(row.target!)['messageId'], JSON.parse(row.target!)['outcome'], row.success])).toEqual(expect.arrayContaining([
+      ['<one@x>', 'done', true], ['<two@x>', 'skipped', false], ['<absent@x>', 'failed', false],
+    ]));
+    expect(rows).toHaveLength(3);
   });
 
   it('records spam and not_spam feedback, and offers both actions', async () => {

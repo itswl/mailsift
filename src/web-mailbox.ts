@@ -15,11 +15,12 @@
 import type { IncomingMessage } from 'node:http';
 import type { Account } from './config.js';
 import { LiveMailError, MAIL_ACTIONS, MailActionError, type BulkTarget, type WebMailAction } from './imap/client.js';
-import { SearchCancelled, LIVE_PAGE_MAX, useHandleKey, type LiveItem } from './imap/mailbox.js';
+import { SearchCancelled, SearchTimedOut, LIVE_PAGE_MAX, useHandleKey, type LiveItem } from './imap/mailbox.js';
 import type { MailRow, StateStore } from './services/state.js';
 import { getLogger } from './logger.js';
 import {
-  configuredAccounts, keepBooks, mailAudit, mailboxFailure, newlyMuted, quietly, readOnly, record, recordOf, resolveTarget, snoozeTime,
+  configuredAccounts, fileBeforeMoving, keepBooks, mailAudit, mailboxFailure, newlyMuted, quietly, readOnly, record, recordOf, resolveTarget,
+  snoozeTime,
   type ActionContext, type Life, type MailTarget,
 } from './web-actions.js';
 import { json, readJson, text, timedOut, within, type WebResponse } from './web-http.js';
@@ -57,10 +58,14 @@ export function withStored(items: LiveItem[], store: StateStore, ctx: ActionCont
   }
   return items.map((item) => {
     // Only the record's own message, at the record's own place: a copy or a spoof that shares its Message-ID is not it.
-    const candidate = stored.get(item.storedId);
-    const row = candidate ? recordOf(store, account, {
-      id: item.storedId, folder: item.folder, uid: item.uid, uidValidity: item.uidValidity, sender: item.from.address, handle: item.handle,
-    }, candidate) : undefined;
+    let row: MailRow | undefined;
+    try {
+      row = recordOf(store, account, {
+        id: item.storedId, folder: item.folder, uid: item.uid, uidValidity: item.uidValidity, sender: item.from.address,
+      }, stored.get(item.storedId) ?? null);
+    } catch {
+      // As above: the list without what was judged.
+    }
     // The provider's own link to the message, as a stored row carries one, where the caller is shown links.
     const linked = ctx.origin === 'mcp' || !item.messageId ? {} : ctx.decorate({
       dedupKey: item.handle, messageId: item.messageId, account, threadKey: null, accountLabel: null, subject: null, sender: null,
@@ -198,6 +203,8 @@ export async function mailboxSearch(
   } catch (error) {
     if (error instanceof SearchCancelled) return json(409, { error: 'a newer search took the place of this one', code: 'superseded' });
     audit(false);
+    // Reached, and slow: not a provider that is down, and said with the way to make it quicker.
+    if (error instanceof SearchTimedOut) return json(504, { error: 'the mailbox did not answer the search in time', code: 'searchTimeout' });
     return listingFailure(error, 'the search failed');
   } finally {
     if (slot && searches.get(slot) === controller) searches.delete(slot);
@@ -404,9 +411,8 @@ function bulkQueue(
       results[index] = { key, status: 'failed', code: 'notFound', error: 'not found' };
       continue;
     }
-    // Each on record as one alone is: the page's under its own names, an MCP caller's under the tool's.
+    // Each on record as one alone is: the page's here, an MCP caller's under the tool's name, by the tool, for every id it was asked about.
     if (ctx.origin !== 'mcp') store.recordMcpAudit(audit, ctx.client, true, after.dedupKey);
-    else store.recordMcpAudit(action === 'snooze' ? 'snooze' : 'mark_handled', ctx.client, true, JSON.stringify({ account: after.account, messageId: after.messageId ?? after.dedupKey, ...(action === 'snooze' ? { until: String(until) } : { handled: action === 'done' }) }).slice(0, 1000));
     results[index] = { key, status: 'done', row: ctx.decorate(after) };
   }
   for (const group of reading.values()) {
@@ -438,6 +444,7 @@ async function bulkMailbox(
   }
   await Promise.all([...groups.values()].map(async (group) => {
     const audits = group.indexes.map((index) => mailAudit(targets[index]!, action, ctx.client, destination));
+    for (const index of group.indexes) fileBeforeMoving(store, targets[index]!, action);
     await ctx.backend.bulk(
       group.account,
       group.indexes.map((index) => ({ messageId: targets[index]!.messageId, ...targets[index]!.place })),

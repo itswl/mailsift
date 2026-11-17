@@ -174,12 +174,23 @@ export function setSignInGap(ms: number): void {
   nextStart.clear();
 }
 
-async function inTurn<T>(key: string, work: () => Promise<T>): Promise<T> {
+async function inTurn<T>(key: string, work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
   const now = Date.now();
   const at = Math.max(now, nextStart.get(key) ?? 0);
   nextStart.set(key, at + signInGapMs);
-  if (at > now) await sleep(at - now);
+  if (at > now) await waitUnless(at - now, signal);
+  if (signal?.aborted) throw new Error('given up on before it signed in');
   return work();
+}
+
+/** Wait, unless the signal says the wait is no longer wanted: then at once. */
+function waitUnless(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return sleep(ms);
+  return new Promise((resolve) => {
+    const done = (): void => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+  });
 }
 
 /**
@@ -288,6 +299,13 @@ export interface InteractiveTiming {
   attempts?: number;
 }
 
+export interface InteractiveOptions {
+  /** Given up on: no attempt is started after this, and the ones under way are hung up on at once. */
+  signal?: AbortSignal | undefined;
+  /** Each attempt begins in turn with the mailbox's other sign-ins (see inTurn), as the poller's do. */
+  spaced?: boolean;
+}
+
 /**
  * Connect for someone who is waiting.
  *
@@ -303,8 +321,12 @@ export interface InteractiveTiming {
  * refusal proves nothing; but a password that really is wrong must not be
  * presented three times for every message someone tries to open.
  */
-export async function connectInteractive(account: Account, timing: InteractiveTiming = {}): Promise<ImapFlow> {
+export async function connectInteractive(
+  account: Account, timing: InteractiveTiming = {}, options: InteractiveOptions = {},
+): Promise<ImapFlow> {
   if (stopped) throw new Error('shutting down; no new mailbox connections');
+  const { signal, spaced = false } = options;
+  if (signal?.aborted) throw new Error('given up on before it signed in');
   const auth = await authFor(account);
   const attemptMs = timing.attemptMs ?? INTERACTIVE_ATTEMPT_MS;
   const hedgeAfterMs = timing.hedgeAfterMs ?? HEDGE_AFTER_MS;
@@ -327,10 +349,25 @@ export async function connectInteractive(account: Account, timing: InteractiveTi
       racing.clear();
     };
     let refusals = 0;
+    // Given up on: the attempts under way are hung up on, and none is started after.
+    const giveUp = (): void => {
+      if (settled) return;
+      settle();
+      reject(new Error('given up on before it signed in'));
+    };
+    if (signal) {
+      if (signal.aborted) { giveUp(); return; }
+      signal.addEventListener('abort', giveUp, { once: true });
+    }
     const start = (): void => {
       if (settled || stopped || started >= maxAttempts) return;
       started += 1;
       running += 1;
+      if (!spaced) { launch(); return; }
+      // Begun in turn with the mailbox's other sign-ins; given up on meanwhile, not begun at all.
+      inTurn(account.username, async () => { if (settled) running -= 1; else launch(); }, signal).catch(() => { running -= 1; });
+    };
+    const launch = (): void => {
       const client = newClient(account, auth, { connectionTimeout: attemptMs, greetingTimeout: attemptMs });
       racing.add(client);
       // Out of time: hang up, which fails the attempt, and it is counted as a
@@ -342,11 +379,12 @@ export async function connectInteractive(account: Account, timing: InteractiveTi
         running -= 1;
         racing.delete(client);
         if (settled) {
-          // A slower twin of the one already in use.
+          // A slower twin of the one already in use, or one given up on.
           void client.logout().catch(() => hangUp(client));
           return;
         }
         settle();
+        signal?.removeEventListener('abort', giveUp);
         resolve(client);
       }, (error: unknown) => {
         clearTimeout(deadline);
@@ -360,12 +398,14 @@ export async function connectInteractive(account: Account, timing: InteractiveTi
         if (stopped || refusals >= 2) {
           // Refused, not unreachable: the server answered, and said no.
           settle();
+          signal?.removeEventListener('abort', giveUp);
           reject(new Error(imapErrorText(lastError), { cause: lastError }));
           return;
         }
         if (started < maxAttempts) start();
         else if (running === 0) {
           settle();
+          signal?.removeEventListener('abort', giveUp);
           reject(stalled
             ? new MailboxUnreachableError(imapErrorText(lastError), { cause: lastError })
             : new Error(imapErrorText(lastError), { cause: lastError }));
@@ -415,6 +455,7 @@ export function closeSessions(): void {
   for (const [key, session] of [...sessions]) endSession(key, session, true);
   failures.clear();
   warmed.clear();
+  closeOwnConnections();
 }
 
 /**
@@ -455,7 +496,10 @@ export interface SessionOptions {
 }
 
 /** Run the work, and if it outlasts its time, close the connection under it so it ends. */
-async function bounded<T>(client: ImapFlow, work: (client: ImapFlow) => Promise<T>, ms: number): Promise<T> {
+async function bounded<T>(
+  client: ImapFlow, work: (client: ImapFlow) => Promise<T>, ms: number,
+  late: () => Error = () => new MailboxUnreachableError('the mailbox did not answer in time | ETIMEDOUT'),
+): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const running = work(client);
   // Its late rejection, after the connection was closed under it, is expected.
@@ -466,7 +510,7 @@ async function bounded<T>(client: ImapFlow, work: (client: ImapFlow) => Promise<
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           hangUp(client);
-          reject(new MailboxUnreachableError('the mailbox did not answer in time | ETIMEDOUT'));
+          reject(late());
         }, ms);
       }),
     ]);
@@ -524,29 +568,151 @@ async function onSession<T>(account: Account, work: (client: ImapFlow) => Promis
   }
 }
 
+// ---- Connections of their own, for searches ----
+
+/**
+ * At most this many connections per mailbox for searches, in use or kept.
+ * Providers limit the sessions one account may have (QQ and Outlook among
+ * them), and the listeners, the poll and the reader's session already use
+ * some: a burst of searches must not take the rest.
+ */
+const OWN_CONNECTIONS = 2;
+/** A search's connection is kept this long after it, so the next page of results, or the next search, does not sign in again. */
+const OWN_KEEP_MS = 15_000;
+
+interface OwnPool {
+  /** Connections in use, being made or kept. */
+  open: number;
+  kept: Array<{ client: ImapFlow; timer: NodeJS.Timeout }>;
+  waiting: Array<() => void>;
+}
+const ownPools = new Map<string, OwnPool>();
+
+/** For tests and curiosity: a mailbox's search connections in use, being made or kept. */
+export function ownConnections(account: string): number {
+  return ownPools.get(account)?.open ?? 0;
+}
+
+function ownPool(key: string): OwnPool {
+  let pool = ownPools.get(key);
+  if (!pool) { pool = { open: 0, kept: [], waiting: [] }; ownPools.set(key, pool); }
+  return pool;
+}
+
+/** Someone waiting for a place is told one may be free. */
+function wakeOne(pool: OwnPool): void {
+  pool.waiting.shift()?.();
+}
+
+/** A place among the mailbox's search connections: a kept one, or room to make one; waited for, unless given up on. */
+async function ownPlace(key: string, signal?: AbortSignal): Promise<ImapFlow | undefined> {
+  const pool = ownPool(key);
+  for (;;) {
+    if (signal?.aborted) throw new Error('given up on before it began');
+    while (pool.kept.length) {
+      const kept = pool.kept.pop()!;
+      clearTimeout(kept.timer);
+      if (kept.client.usable) return kept.client;
+      hangUp(kept.client);
+      pool.open = Math.max(0, pool.open - 1);
+    }
+    if (pool.open < OWN_CONNECTIONS) { pool.open += 1; return undefined; }
+    await new Promise<void>((resolve) => {
+      const go = (): void => { signal?.removeEventListener('abort', go); pool.waiting = pool.waiting.filter((one) => one !== go); resolve(); };
+      pool.waiting.push(go);
+      signal?.addEventListener('abort', go, { once: true });
+    });
+  }
+}
+
+/** A search connection given back: kept a few seconds for the next search when it is still good, closed otherwise. */
+function giveBack(key: string, client: ImapFlow, keep: boolean): void {
+  const pool = ownPool(key);
+  if (keep && client.usable && !stopped) {
+    const timer = setTimeout(() => {
+      pool.kept = pool.kept.filter((entry) => entry.client !== client);
+      pool.open = Math.max(0, pool.open - 1);
+      void client.logout().catch(() => hangUp(client));
+      wakeOne(pool);
+    }, OWN_KEEP_MS);
+    timer.unref();
+    pool.kept.push({ client, timer });
+  } else {
+    if (client.usable) void client.logout().catch(() => hangUp(client));
+    else hangUp(client);
+    pool.open = Math.max(0, pool.open - 1);
+  }
+  wakeOne(pool);
+}
+
+/** A place given up before a connection was made in it. */
+function giveUpPlace(key: string): void {
+  const pool = ownPool(key);
+  pool.open = Math.max(0, pool.open - 1);
+  wakeOne(pool);
+}
+
+function closeOwnConnections(): void {
+  for (const [key, pool] of ownPools) {
+    for (const kept of pool.kept) { clearTimeout(kept.timer); void kept.client.logout().catch(() => hangUp(kept.client)); }
+    pool.open -= pool.kept.length;
+    pool.kept = [];
+    if (pool.open <= 0 && !pool.waiting.length) ownPools.delete(key);
+  }
+}
+
 /**
  * Do something on a connection of its own, outside the mailbox's queue: for
  * a search, which can be slow and can be given up on, and must never hold up
- * reading a message or acting on one. The connection is closed when the work
- * ends, when it outlasts its time, and at once when `signal` aborts, which
- * ends a command the server is still working on.
+ * reading a message or acting on one.
+ *
+ * A mailbox has at most OWN_CONNECTIONS of these; a search beyond them waits
+ * for one. A new one signs in in turn with the mailbox's other sign-ins. The
+ * last one used is kept a few seconds for the next search. The connection
+ * is closed when the work outlasts its time (`late` says how that is told),
+ * and at once when `signal` aborts, which ends a command the server is still
+ * working on, or a sign-in still under way.
  */
 export async function withOwnConnection<T>(
   account: Account,
   work: (client: ImapFlow) => Promise<T>,
-  options: { timeoutMs: number; signal?: AbortSignal | undefined },
+  options: { timeoutMs: number; signal?: AbortSignal | undefined; late?: () => Error },
 ): Promise<T> {
-  if (options.signal?.aborted) throw new Error('given up on before it began');
-  const client = await connectInteractive(account);
-  const stop = (): void => hangUp(client);
-  if (options.signal?.aborted) stop();
-  options.signal?.addEventListener('abort', stop, { once: true });
+  const key = account.username;
+  const { signal } = options;
+  if (signal?.aborted) throw new Error('given up on before it began');
+  const keptOne = await ownPlace(key, signal);
+  let client: ImapFlow;
   try {
-    return await bounded(client, work, options.timeoutMs);
+    client = keptOne ?? await connectInteractive(account, {}, { signal, spaced: true });
+  } catch (error) {
+    giveUpPlace(key);
+    throw error;
+  }
+  let reused = Boolean(keptOne);
+  const stop = (): void => hangUp(client);
+  if (signal?.aborted) stop();
+  signal?.addEventListener('abort', stop, { once: true });
+  let good = false;
+  try {
+    try {
+      const result = await bounded(client, work, options.timeoutMs, options.late);
+      good = true;
+      return result;
+    } catch (error) {
+      // A kept connection the server dropped while it waited shows on first use: the search is
+      // only reading, and is done again on a new connection, in the same place.
+      if (!reused || client.usable || signal?.aborted) throw error;
+      hangUp(client);
+      client = await connectInteractive(account, {}, { signal, spaced: true });
+      reused = false;
+      const result = await bounded(client, work, options.timeoutMs, options.late);
+      good = true;
+      return result;
+    }
   } finally {
-    options.signal?.removeEventListener('abort', stop);
-    if (client.usable) void client.logout().catch(() => hangUp(client));
-    else hangUp(client);
+    signal?.removeEventListener('abort', stop);
+    giveBack(key, client, good && !signal?.aborted);
   }
 }
 

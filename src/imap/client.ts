@@ -7,6 +7,7 @@
  * 2. IMAP `UID n:*` returns at least one message, even when its UID is below n.
  *    Filter the search result client-side or the last message repeats every poll.
  */
+import { createHash } from 'node:crypto';
 import type { FetchMessageObject, ImapFlow, ListResponse } from 'imapflow';
 import { connect, imapErrorText, withSession } from './connection.js';
 import { resolveFolders, toFolder, type Folder } from './folders.js';
@@ -164,6 +165,55 @@ export interface MessageHint {
    * longer fits is refused with a LiveMailError, never followed by guess.
    */
   exact?: boolean;
+  /**
+   * The sender of the stored record being looked for, by its key. The record's
+   * message is at its remembered UID (`uid` in `folder`, at `uidValidity`);
+   * found anywhere else by its Message-ID, it is the record's only when its
+   * envelope From is this address. Another message with the same Message-ID
+   * (a copy, or a look-alike a sender wrote) is not taken for it: the lookup
+   * finds nothing rather than the wrong message.
+   */
+  sender?: string;
+  /**
+   * For a live handle to a message whose Message-ID was too long to carry:
+   * the digest of that Message-ID (messageIdDigest), compared instead of it.
+   */
+  idDigest?: string;
+}
+
+/** A Message-ID too long to carry in a live handle, as one fixed-length string. */
+export function messageIdDigest(messageId: string): string {
+  return createHash('sha256').update(messageId, 'utf8').digest('base64url');
+}
+
+/** Whether a message fetched at a live handle's place is the one it names: by its Message-ID, or by that id's digest. */
+function exactlyIt(raw: FetchMessageObject | false | undefined, messageId: string, hint: MessageHint): raw is FetchMessageObject {
+  if (!hint.idDigest) return sameMessage(raw, messageId);
+  return Boolean(raw) && messageIdDigest((raw as FetchMessageObject).envelope?.messageId?.trim() ?? '') === hint.idDigest;
+}
+
+/** The message named, found at a handle's place (exactly it) or by its key (see matchesId). */
+function isTheMessage(account: Account, raw: FetchMessageObject | false | undefined, messageId: string, hint: MessageHint): raw is FetchMessageObject {
+  return hint.exact ? exactlyIt(raw, messageId, hint) : matchesId(account, raw, messageId);
+}
+
+/** A Message-ID the poller made up for a message without one (see fallbackMessageId): it names one UID in one folder. */
+const GENERATED_ID = /^<generated-[0-9a-f]{32}@mailsift>$/;
+
+/**
+ * Whether a fetched message is the one named: by its Message-ID, or, for a
+ * message stored without one, by the id the poller made up for it there.
+ */
+function matchesId(account: Account, raw: FetchMessageObject | false | undefined, messageId: string): raw is FetchMessageObject {
+  if (!raw) return false;
+  const found: FetchMessageObject = raw;
+  if ((found.envelope?.messageId?.trim() ?? '') === messageId) return true;
+  return GENERATED_ID.test(messageId) && pollerIdOf(account, found.envelope, found.uid) === messageId;
+}
+
+/** Whether a message found by its Message-ID away from the record's remembered place is the record's: its From is the record's sender. */
+function fromSender(raw: FetchMessageObject, hint: MessageHint): boolean {
+  return !hint.sender || firstAddress(raw.envelope?.from).address === hint.sender;
 }
 
 /**
@@ -444,6 +494,15 @@ export interface MailActionResult {
    * is not taken for new mail.
    */
   destinationId?: string;
+  /**
+   * The message acted on, as found: its UID in the source folder, that
+   * folder's UIDVALIDITY and the address its envelope is from. A stored
+   * record's books follow the action only when this is the record's own
+   * message (see keepBooks).
+   */
+  sourceUid?: number;
+  sourceUidValidity?: string;
+  sourceFrom?: string;
 }
 
 export class MailActionError extends Error {
@@ -483,7 +542,7 @@ async function extractLargeMessageBody(
 
 /** Find candidate UIDs in the currently selected folder and confirm exact IDs at fetch time. */
 async function searchMessageUids(
-  client: ImapFlow, messageId: string, folder?: Folder, hint: MessageHint = {},
+  client: ImapFlow, account: Account, messageId: string, folder?: Folder, hint: MessageHint = {},
 ): Promise<number[]> {
   // 0. A live handle: that UID, in this folder as it was, carrying that Message-ID, or nothing at all.
   if (hint.exact) return [await exactUid(client, messageId, hint)];
@@ -492,18 +551,31 @@ async function searchMessageUids(
   const remembered = folder ? hintedUid(client, folder, hint) : undefined;
   if (remembered !== undefined) {
     const one = await client.fetchOne(String(remembered), { uid: true, envelope: true }, { uid: true });
-    if (one && one.envelope?.messageId?.trim() === messageId) return [remembered];
+    if (one && matchesId(account, one, messageId)) return [remembered];
   }
+  // A made-up id names the one UID it was made for: no other message, here or anywhere, carries it.
+  if (GENERATED_ID.test(messageId)) return [];
+
+  // Found by its Message-ID away from where the record was, a message is the
+  // record's only when it is from the record's sender (see MessageHint.sender).
+  const fromRecordSender = async (uids: number[]): Promise<number[]> => {
+    if (!hint.sender || !uids.length) return uids;
+    const kept: number[] = [];
+    for await (const raw of client.fetch(uids, { uid: true, envelope: true }, { uid: true })) {
+      if (matchesId(account, raw, messageId) && fromSender(raw, hint)) kept.push(raw.uid);
+    }
+    return kept;
+  };
 
   // 2. The header search, which is exact on the servers that implement it.
   const headerFound = await client.search({ header: { 'message-id': messageId } }, { uid: true });
-  if (Array.isArray(headerFound) && headerFound.length) return headerFound;
+  if (Array.isArray(headerFound) && headerFound.length) return fromRecordSender(headerFound);
 
   // 3. A text search, for servers without a header search. A short answer is
   //    taken as it is; every caller checks the Message-ID of what it fetches.
   const textFound = await client.search({ text: messageId }, { uid: true });
   let candidates = Array.isArray(textFound) ? textFound : [];
-  if (candidates.length > 0 && candidates.length <= TRUSTED_SEARCH_HITS) return candidates;
+  if (candidates.length > 0 && candidates.length <= TRUSTED_SEARCH_HITS) return fromRecordSender(candidates);
 
   const maxCandidates = intEnv('MCP_LIVE_SEARCH_MAX_MESSAGES', 500);
   const overLimit = (): Error => new Error(`live IMAP search exceeds MCP_LIVE_SEARCH_MAX_MESSAGES (${maxCandidates})`);
@@ -530,7 +602,7 @@ async function searchMessageUids(
   // one message in it.
   const matching: number[] = [];
   for await (const raw of client.fetch(candidates, { uid: true, envelope: true }, { uid: true })) {
-    if (raw.envelope?.messageId?.trim() === messageId) matching.push(raw.uid);
+    if (matchesId(account, raw, messageId) && fromSender(raw, hint)) matching.push(raw.uid);
   }
   // Not among the ones looked at is not the same as not there: say the
   // search was too large, as the lookback does, rather than that it is gone.
@@ -553,7 +625,7 @@ async function exactMessage(client: ImapFlow, messageId: string, hint: MessageHi
     throw new LiveMailError('stale', 'the folder was rebuilt since it was listed; its UIDs name other messages now');
   }
   const one = await client.fetchOne(String(hint.uid), { uid: true, envelope: true }, { uid: true });
-  if (!one || one.uid !== hint.uid || !sameMessage(one, messageId)) {
+  if (!one || one.uid !== hint.uid || !exactlyIt(one, messageId, hint)) {
     throw new LiveMailError('moved', 'the message is no longer where the folder listed it');
   }
   return one;
@@ -760,7 +832,9 @@ async function findLiveSource(
   const hint = options.hint ?? {};
   // A live handle is told apart by the Message-ID as the server has it, which may be none.
   const isIt = (raw: FetchMessageObject, message: MailMessage | undefined): boolean =>
-    hint.exact ? sameMessage(raw, messageId) : message?.messageId === messageId;
+    hint.exact ? exactlyIt(raw, messageId, hint) : message?.messageId === messageId;
+  // Not at the remembered place: from the record's sender too (see MessageHint.sender).
+  const elsewhere = (folder: LookupFolder, uid: number): boolean => hintedUid(client, folder, hint) !== uid;
   for (const folder of folders) {
     const lock = await lockFolder(client, folder, true);
     if (!lock) continue;
@@ -799,7 +873,9 @@ async function findLiveSource(
       // A live handle names that place and no other: not there, it is not looked for.
       if (hint.exact && remembered !== undefined) throw new LiveMailError('moved', 'the message is no longer where the folder listed it');
       // The remembered place was tried just above when reading slim; otherwise the search starts with it.
-      const foundUids = await searchMessageUids(client, messageId, folder, slim && !hint.exact ? {} : hint);
+      const foundUids = await searchMessageUids(
+        client, account, messageId, folder, slim && !hint.exact ? (hint.sender ? { sender: hint.sender } : {}) : hint,
+      );
       if (!foundUids.length) continue;
       // Collected before anything else is asked of the server: a command
       // issued while a fetch is still being read would wait on it forever.
@@ -827,6 +903,7 @@ async function findLiveSource(
           raw, account, folder, options.parseBody ? undefined : { body: '', hasAttachments: false }, uidValidity,
         );
         if (!isIt(raw, message)) continue;
+        if (!hint.exact && elsewhere(folder, raw.uid) && !fromSender(raw, hint)) continue;
         if (slim) raw.source = await readingSource(client, raw, maxSourceBytes);
         return { raw, folder, message, uidValidity };
       }
@@ -946,14 +1023,14 @@ export async function fetchAttachmentManifestByMessageId(
       const lock = await lockFolder(client, folder, true);
       if (!lock) continue;
       try {
-        const uids = await searchMessageUids(client, messageId, folder, hintOf(hint));
+        const uids = await searchMessageUids(client, account, messageId, folder, hintOf(hint));
         if (!uids.length) continue;
         for await (const raw of client.fetch(
           uids,
           { uid: true, envelope: true, bodyStructure: true },
           { uid: true },
         )) {
-          if (!sameMessage(raw, messageId)) continue;
+          if (!isTheMessage(account, raw, messageId, hintOf(hint))) continue;
           return { folder: folder.path, manifest: extractAttachmentManifest(raw.bodyStructure) };
         }
       } finally {
@@ -1010,7 +1087,7 @@ export async function scanAttachmentByMessageId(
       const lock = await lockFolder(client, folder, true);
       if (!lock) continue;
       try {
-        const uids = await searchMessageUids(client, messageId, folder, hintOf(hint));
+        const uids = await searchMessageUids(client, account, messageId, folder, hintOf(hint));
         if (!uids.length) continue;
         for (const uid of uids) {
           const raw = await client.fetchOne(
@@ -1018,7 +1095,7 @@ export async function scanAttachmentByMessageId(
             { uid: true, envelope: true, bodyStructure: true },
             { uid: true },
           );
-          if (!sameMessage(raw, messageId)) continue;
+          if (!isTheMessage(account, raw, messageId, hintOf(hint))) continue;
           const metadata = extractAttachmentManifest(raw.bodyStructure).items.find((part) => part.partId === partId);
           if (!metadata) throw new AttachmentNotFoundError(partId);
           const prefix = await downloadDecodedPrefix(client, uid, partId, maxBytes);
@@ -1048,7 +1125,7 @@ export async function inspectMailSafety(
       const lock = await lockFolder(client, folder, true);
       if (!lock) continue;
       try {
-        const uids = await searchMessageUids(client, messageId, folder, hintOf(hint));
+        const uids = await searchMessageUids(client, account, messageId, folder, hintOf(hint));
         if (!uids.length) continue;
         // Use one FETCH at a time because a matching record may need a
         // bounded body-part DOWNLOAD while the read-only lock is held.
@@ -1063,7 +1140,7 @@ export async function inspectMailSafety(
             },
             { uid: true },
           );
-          if (!raw || !sameMessage(raw, messageId)) continue;
+          if (!raw || !isTheMessage(account, raw, messageId, hintOf(hint))) continue;
 
           const values = parseHeaderValues(raw.headers);
           const listId = (values.get('list-id')?.length ?? 0) > 0;
@@ -1235,7 +1312,7 @@ export async function fetchAttachmentByMessageId(
       const lock = await lockFolder(client, folder, true);
       if (!lock) continue;
       try {
-        const uids = await searchMessageUids(client, messageId, folder, hintOf(hint));
+        const uids = await searchMessageUids(client, account, messageId, folder, hintOf(hint));
         if (!uids.length) continue;
         for (const uid of uids) {
           const raw = await client.fetchOne(
@@ -1243,7 +1320,7 @@ export async function fetchAttachmentByMessageId(
             { uid: true, envelope: true, bodyStructure: true },
             { uid: true },
           );
-          if (!sameMessage(raw, messageId)) continue;
+          if (!isTheMessage(account, raw, messageId, hintOf(hint))) continue;
           const metadata = extractAttachmentManifest(raw.bodyStructure).items.find((part) => part.partId === partId);
           if (!metadata) throw new AttachmentNotFoundError(partId);
           const download = await client.download(uid, partId, {
@@ -1290,6 +1367,7 @@ const FLAG_CHANGES = {
  */
 async function actOnMessage(
   client: ImapFlow,
+  account: Account,
   messageId: string,
   folders: readonly LookupFolder[],
   action: WebMailAction,
@@ -1299,6 +1377,8 @@ async function actOnMessage(
   committing: () => void = () => undefined,
 ): Promise<{
   sourceFolder: string; destinationUid?: number; destinationUidValidity?: string; envelope?: FetchMessageObject['envelope'];
+  /** The message acted on: its UID where it was, that folder's UIDVALIDITY and its sender, so the books follow only the right one. */
+  source: { uid: number; uidValidity: string; from: string };
 } | undefined> {
   for (const folder of folders) {
     const lock = await lockFolder(client, folder, false);
@@ -1306,11 +1386,12 @@ async function actOnMessage(
     try {
       // A live handle was told apart by its envelope already: it is not fetched a second time.
       const exact = hint.exact ? await exactMessage(client, messageId, hint) : undefined;
-      const uids = exact ? [exact.uid] : await searchMessageUids(client, messageId, folder, hint);
+      const uids = exact ? [exact.uid] : await searchMessageUids(client, account, messageId, folder, hint);
       if (!uids.length) continue;
       for (const uid of uids) {
         const raw = exact ?? await client.fetchOne(uid, { uid: true, envelope: true }, { uid: true });
-        if (!sameMessage(raw, messageId)) continue;
+        if (!raw || !isTheMessage(account, raw, messageId, hint)) continue;
+        const source = { uid, uidValidity: selectedValidity(client), from: firstAddress(raw.envelope?.from).address };
         const change = action in FLAG_CHANGES ? FLAG_CHANGES[action as keyof typeof FLAG_CHANGES] : undefined;
         // "Not spam" is about a message in the spam folder; anywhere else it is not what was meant.
         if (action === 'not_spam' && !folder.isSpam) throw new MailActionError('not_applicable', 'the message is not in a spam folder');
@@ -1331,11 +1412,11 @@ async function actOnMessage(
           const landed = moved.uidMap?.get(uid);
           const validity = moved.uidValidity !== undefined ? String(moved.uidValidity) : '';
           if (landed && validity) {
-            return { sourceFolder: folder.path, destinationUid: landed, destinationUidValidity: validity, envelope: raw.envelope };
+            return { sourceFolder: folder.path, destinationUid: landed, destinationUidValidity: validity, envelope: raw.envelope, source };
           }
-          return { sourceFolder: folder.path, envelope: raw.envelope };
+          return { sourceFolder: folder.path, envelope: raw.envelope, source };
         }
-        return { sourceFolder: folder.path };
+        return { sourceFolder: folder.path, source };
       }
     } finally {
       lock.release();
@@ -1495,13 +1576,14 @@ export async function applyWebMailAction(
     const folders = hint.exact
       ? [exactFolder(entries, hint.folder)]
       : orderLookupFolders(entries, resolveFolders(entries, account.folders), hint.folder);
-    const acted = await actOnMessage(client, messageId, folders, action, destination?.path, hint, () => { committed = true; });
+    const acted = await actOnMessage(client, account, messageId, folders, action, destination?.path, hint, () => { committed = true; });
     if (acted === undefined) return undefined;
     return {
       action,
       account: account.username,
       messageId,
       sourceFolder: acted.sourceFolder,
+      sourceUid: acted.source.uid, sourceUidValidity: acted.source.uidValidity, sourceFrom: acted.source.from,
       ...(destination ? {
         destinationFolder: destination.path, destinationIsSpam: destination.isSpam,
         ...(inBin(entries, destination.path) ? { destinationIsTrash: true } : {}),
@@ -1612,10 +1694,11 @@ export async function applyMailActions(
           const hint: MessageHint = { ...(target.folderHint ? { folder: target.folderHint } : {}), ...(target.hint ?? {}) };
           try {
             const folders = hint.exact ? [exactFolder(entries, hint.folder)] : orderLookupFolders(entries, configured, hint.folder);
-            const acted = await actOnMessage(client, target.messageId, folders, action, destination?.path, hint, () => { committed = true; });
+            const acted = await actOnMessage(client, account, target.messageId, folders, action, destination?.path, hint, () => { committed = true; });
             settle(index, acted === undefined ? { missing: true } : {
               done: {
                 action, account: account.username, messageId: target.messageId, sourceFolder: acted.sourceFolder,
+                sourceUid: acted.source.uid, sourceUidValidity: acted.source.uidValidity, sourceFrom: acted.source.from,
                 ...(destination ? {
                   destinationFolder: destination.path, destinationIsSpam: destination.isSpam,
                   ...(inBin(entries, destination.path) ? { destinationIsTrash: true } : {}),
