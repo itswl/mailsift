@@ -4,7 +4,7 @@ import './setup.js';
 import type { ImapFlow, ListResponse } from 'imapflow';
 import type { Account } from '../src/config.js';
 import {
-  FolderListener, IdleSupervisor, idleEnabled, idleFolderTokens, reconnectDelayMs, type ListenerDeps,
+  FolderListener, IdleSupervisor, idleCheckMs, idleEnabled, idleFolderTokens, reconnectDelayMs, type ListenerDeps,
 } from '../src/imap/idle.js';
 
 const ACCOUNT: Account = {
@@ -76,6 +76,57 @@ describe('IDLE listener', () => {
 
     await listener.stop();
     expect(client.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it('fetches mail the server never announced, found by asking the folder now and then', async () => {
+    // QQ's IDLE misses some deliveries: without asking, such a message waits for the next poll.
+    const client = new FakeClient();
+    let uidNext = 11;
+    client.mailboxOpen = vi.fn(async (path: string) => ({ path, uidNext: 11 }));
+    const noop = vi.fn(async () => undefined);
+    const status = vi.fn(async () => ({ path: 'INBOX', uidNext }));
+    Object.assign(client, { noop, status });
+    const onWake = vi.fn(async () => undefined);
+    const listener = new FolderListener(ACCOUNT, 'INBOX', onWake, { ...harness([client]).deps, checkMs: 20 });
+    listener.start();
+    await settle(80);
+    expect(status).toHaveBeenCalled();
+    expect(noop).toHaveBeenCalled();
+    expect(onWake).not.toHaveBeenCalled();
+
+    uidNext = 12;
+    await settle(80);
+    expect(onWake).toHaveBeenCalledTimes(1);
+    expect(onWake).toHaveBeenCalledWith(ACCOUNT, expect.objectContaining({ path: 'INBOX' }), client);
+    // Once: the folder stands where it was the last time it was asked.
+    await settle(80);
+    expect(onWake).toHaveBeenCalledTimes(1);
+    await listener.stop();
+  });
+
+  it('does not ask the folder when the check is off', async () => {
+    const client = new FakeClient();
+    const status = vi.fn(async () => ({ path: 'INBOX', uidNext: 99 }));
+    Object.assign(client, { noop: vi.fn(async () => undefined), status });
+    const listener = new FolderListener(ACCOUNT, 'INBOX', vi.fn(async () => undefined), { ...harness([client]).deps, checkMs: 0 });
+    listener.start();
+    await settle(80);
+    expect(status).not.toHaveBeenCalled();
+    await listener.stop();
+  });
+
+  it('reads how often to ask from IMAP_IDLE_CHECK_SECONDS', () => {
+    delete process.env.IMAP_IDLE_CHECK_SECONDS;
+    expect(idleCheckMs()).toBe(60_000);
+    process.env.IMAP_IDLE_CHECK_SECONDS = '0';
+    expect(idleCheckMs()).toBe(0);
+    process.env.IMAP_IDLE_CHECK_SECONDS = '5';
+    expect(idleCheckMs()).toBe(15_000);
+    process.env.IMAP_IDLE_CHECK_SECONDS = '120';
+    expect(idleCheckMs()).toBe(120_000);
+    process.env.IMAP_IDLE_CHECK_SECONDS = 'often';
+    expect(idleCheckMs()).toBe(60_000);
+    delete process.env.IMAP_IDLE_CHECK_SECONDS;
   });
 
   it('fetches once more when notifications arrive during a wake-up', async () => {
