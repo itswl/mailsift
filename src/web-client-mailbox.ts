@@ -42,12 +42,14 @@ function folderInfo(account, path) {
 }
 // A folder as the page calls it: the ones every mailbox has by what they
 // are for, in the page's words; the owner's own as they named them.
-function folderName(account, path) {
+// plain: its own name alone, where the parent is shown beside it already (the folder panel).
+function folderName(account, path, plain) {
   if (!path) return t('live.defaultFolders');
   const info = folderInfo(account, path);
   const role = info ? info.role : (String(path).toUpperCase() === 'INBOX' ? 'inbox' : null);
   if (role && STRINGS[lang]['folder.' + role]) return t('folder.' + role);
   if (!info) return String(path);
+  if (plain) return info.name;
   // Two folders of the same name (Projects/2026, Travel/2026) are told apart by what they are in.
   const known = (folderLists.get(account) || {}).folders || [];
   const twin = info.parent && known.some((f) => f.path !== info.path && String(f.name).toLowerCase() === String(info.name).toLowerCase());
@@ -91,6 +93,8 @@ function openLive(view, how) {
   if (!view || !view.account) return;
   // Opened from the address (a reload, a shared link, the installed app coming back): the history is
   // made as if it had been opened from the triaged view, so Back and closing a sheet stay in mailsift.
+  // A reload, or the installed app restored, finds its entry already holding this view: nothing is added.
+  if (how === 'boot' && history.state && history.state.live && sameLive(history.state.live, view)) how = 'restore';
   if (how === 'boot') {
     const p = new URLSearchParams(location.search);
     for (const name of ['in', 'folder', 'mq']) p.delete(name);
@@ -155,6 +159,8 @@ async function liveLoad(reset) {
   if (view.mode === 'search') { p.set('q', view.q); p.set('tab', tabId()); }
   if (!reset && view.next) p.set('before', view.next);
   p.set('limit', String(LIVE_PAGE));
+  // What was listed before the list was read again from the top, for a reader whose message is gone from it.
+  let listedBefore = null;
   try {
     const r = await fetch((view.mode === 'search' ? '/api/search?' : '/api/folder?') + p.toString(), abort ? { signal: abort.signal } : {});
     if (r.status === 401) { location.reload(); return; }
@@ -167,7 +173,7 @@ async function liveLoad(reset) {
       return;
     }
     const rows = (Array.isArray(d.items) ? d.items : []).map((item) => liveRow(item, view.account));
-    if (reset) { liveRows.clear(); view.items = []; }
+    if (reset) { listedBefore = visibleKeys(); liveRows.clear(); view.items = []; }
     for (const row of rows) {
       if (liveRows.has(rowKey(row))) continue;
       liveRows.set(rowKey(row), row);
@@ -191,7 +197,10 @@ async function liveLoad(reset) {
       view.loading = false;
       renderList();
       renderLiveHead();
+      // Read again (after a batch, say) without the message open on a desk: on to the next, not an empty reader under a live bar.
+      if (listedBefore) moveOnFrom(listedBefore);
       renderPane();
+      renderBars();
     }
   }
 }
@@ -241,7 +250,11 @@ function renderLiveHead() {
   for (const part of parts) line.appendChild(textNode(DOT + part));
   note.appendChild(line);
   // A search the server could not be trusted with says what it covered, every time.
-  if (view.limited) note.appendChild(el('p', 'live-limit', fill('live.limited', { count: Number(view.limited.scanned || 0).toLocaleString(lang) })));
+  if (view.limited) {
+    // One folder searched (a folder's own search, or Gmail's All Mail) is said as one.
+    const one = Boolean(view.folder) || (Array.isArray(view.folders) && view.folders.length === 1);
+    note.appendChild(el('p', 'live-limit', fill(one ? 'live.limitedOne' : 'live.limited', { count: Number(view.limited.scanned || 0).toLocaleString(lang) })));
+  }
 }
 $('#live-where').onclick = () => openFolders($('#live-where'));
 
@@ -259,9 +272,8 @@ function liveEmpty() {
     return box;
   }
   // A search that could read only recent subjects and senders does not say that nothing matches.
-  box.appendChild(el('p', null, view.mode === 'search' && view.limited
-    ? fill('live.noneFoundLimited', { count: Number(view.limited.scanned || 0).toLocaleString(lang) })
-    : t(view.mode === 'search' ? 'live.noneFound' : 'live.emptyFolder')));
+  // The line above already says how little was read; this says only that none of it matched.
+  box.appendChild(el('p', null, t(view.mode === 'search' ? (view.limited ? 'live.noneFoundLimited' : 'live.noneFound') : 'live.emptyFolder')));
   return box;
 }
 function liveMoreButton() {
@@ -327,9 +339,15 @@ function dropLive(keys) {
   }
   liveView.items = liveView.items.filter((m) => !gone.has(rowKey(m)));
   renderLiveHead();
-  if (!isWide() || !selectedKey || !gone.has(selectedKey)) return;
+  moveOnFrom(before, gone);
+}
+// The message open on a desk is no longer listed: the reader goes to the next one that is (or the
+// one before, at the end), or is emptied, and its bar with it. before: the keys listed until now.
+function moveOnFrom(before, gone) {
+  const left = (key) => !(gone && gone.has(key)) && Boolean(findItem(key));
+  if (!isWide() || !selectedKey || left(selectedKey)) return;
   const at = before.indexOf(selectedKey);
-  const after = before.slice(at + 1).concat(before.slice(0, Math.max(0, at)).reverse()).find((key) => !gone.has(key) && findItem(key));
+  const after = (at === -1 ? [] : before.slice(at + 1).concat(before.slice(0, at).reverse())).find(left);
   if (after) openDetail(after); else clearSelection();
 }
 // Whether a message is in the folder an action would move it to.
@@ -489,7 +507,8 @@ function folderChoice(account, f, current, flat) {
   b.setAttribute('role', 'listitem');
   if (f.path === current) b.setAttribute('aria-current', 'true');
   if (!flat) b.style.setProperty('--depth', String(f.role ? 0 : Math.min(f.depth, 4)));
-  const name = el('span', 'folder-name', folderName(account, f.path));
+  // The panel shows where a folder is (indented under its parent, or with it in small type), so its own name is enough here.
+  const name = el('span', 'folder-name', folderName(account, f.path, true));
   if (flat && f.depth && !f.role) name.appendChild(el('small', null, f.parent || ''));
   b.appendChild(name);
   const count = f.unseen ? fill('folders.unread', { count: f.unseen.toLocaleString(lang) })
@@ -665,6 +684,10 @@ function enablePick(li, key) {
   // A long press is the way in to picking; a right click is still a right click.
   li.addEventListener('contextmenu', (e) => { if (touched && !isWide()) e.preventDefault(); });
 }
+// Whether every row has its star, as the page last heard.
+function allStarred(rows) {
+  return rows.length > 0 && rows.every((m) => Boolean((flagsByKey.get(rowKey(m)) || m.flags || {}).flagged));
+}
 // The rows picked, as the page knows them.
 function pickedRows() {
   return Array.from(picked).map((key) => rowByKey(key) || (findItem(key) && rowOfItem(findItem(key)))).filter(Boolean);
@@ -773,32 +796,33 @@ function bulkId() {
   crypto.getRandomValues(bytes);
   return 'b' + Array.from(bytes, (n) => n.toString(16).padStart(2, '0')).join('');
 }
-// opts.rows: what to act on, for an Undo, which acts on exactly the batch it
-// undoes and never on what happens to be picked when it is pressed.
-async function bulkAction(action, extra, opts) {
+async function bulkAction(action, extra) {
   const queue = action === 'done' || action === 'not_done' || action === 'snooze';
   if (queue ? session.canMark === false : !session.writable) { requireWrite(); return; }
-  const undoing = Boolean(opts && opts.rows);
-  if (!undoing && (bulkBusy || !picked.size)) return;
-  const rows = undoing ? opts.rows : pickedRows();
+  if (bulkBusy || !picked.size) return;
+  const rows = pickedRows();
   if (!rows.length) return;
   // The queue's books are kept by the stored record a row is; the mailbox is reached where each was listed.
   const refs = new Map(rows.map((m) => [queue ? queueKey(m) : mailRef(m), rowKey(m)]));
   const pressed = new Set(rows.map(rowKey));
   // Where each was listed, before anything the answer says moves it.
   const listedIn = new Map(rows.map((m) => [rowKey(m), m.folder]));
-  const before = new Map(rows.map((m) => [rowKey(m), { handledAt: m.handledAt || null, snoozedUntil: m.snoozedUntil || null }]));
-  if (!undoing) { bulkBusy = true; renderPickBar(); }
+  // What each had, by the name it is sent under, for an Undo that puts back exactly that.
+  const before = new Map(rows.map((m) => [queue ? queueKey(m) : mailRef(m), { handledAt: m.handledAt || null, snoozedUntil: m.snoozedUntil || null }]));
+  bulkBusy = true;
+  renderPickBar();
   const r = await post('/api/bulk', Object.assign({ items: Array.from(refs.keys()), action, id: bulkId() }, extra || {}));
-  if (!undoing) bulkBusy = false;
+  bulkBusy = false;
   if (!r.ok) { if (picked.size) renderPickBar(); toast(r.data && (r.data.code || r.data.error) ? failure(r.data) : t('act.failed'), true); return; }
-  const done = [], dropped = [];
+  // done: the rows the press changed; doneRefs: the names they were sent under, which an Undo sends back.
+  const done = [], doneRefs = [], dropped = [];
   for (const result of r.data.results || []) {
     const key = refs.get(result.key);
     if (!key) continue;
     if (result.row) applyRow(result.row);
     if (result.status !== 'done') continue;
     done.push(key);
+    doneRefs.push(result.key);
     liveData.delete(key);
     const flags = Object.assign({}, flagsByKey.get(key) || {});
     if (action === 'star' || action === 'unstar') flags.flagged = action === 'star';
@@ -826,7 +850,6 @@ async function bulkAction(action, extra, opts) {
   updateBadge();
   // Some were still under way when the answer came: the list is read again once they will have landed.
   if (r.data.pending) setTimeout(() => { if (liveView) liveLoad(true); else refresh(); }, 5000);
-  if (undoing) return;
   // What happened, in one line, with the one way back where a single message has one.
   const said = [];
   if (done.length) {
@@ -843,28 +866,43 @@ async function bulkAction(action, extra, opts) {
     const one = failures.every((f) => f.code && f.code === failures[0].code) ? failures[0] : null;
     said.push(!done.length && one && STRINGS[lang]['error.' + one.code] ? failure({ code: one.code }) : fill('bulk.failed', { count: failures.length }));
   }
-  if (Array.isArray(r.data.muted) && r.data.muted.length) said.push(fill('fb.ruleNever', { sender: r.data.muted.join(', ') }));
+  const muted = mutedLine(r.data.muted);
+  if (muted) said.push(muted);
   let undo = null;
-  if (done.length && action === 'done') undo = { label: t('undo'), run: () => bulkAgain(done, 'not_done') };
-  if (done.length && action === 'snooze') undo = { label: t('undo'), run: () => undoBulkSnooze(done, before) };
+  if (doneRefs.length && action === 'done') undo = { label: t('undo'), run: () => bulkUndo('not_done', doneRefs) };
+  if (doneRefs.length && action === 'snooze') undo = { label: t('undo'), run: () => undoBulkSnooze(doneRefs, before) };
   toast(said.join(DOT), Boolean(!done.length && failures.length), undo);
 }
-// Undo: the same rows, and only those, the other way.
-async function bulkAgain(keys, action, extra) {
-  const rows = keys.map((key) => rowByKey(key) || (findItem(key) && rowOfItem(findItem(key)))).filter(Boolean);
-  await bulkAction(action, extra, { rows });
+// Senders a vote just made low priority, said in a line that stays short: one or two by name, more by how many.
+function mutedLine(muted) {
+  if (!Array.isArray(muted) || !muted.length) return '';
+  if (muted.length > 2) return fill('fb.ruleNeverSome', { count: muted.length.toLocaleString(lang) });
+  return fill('fb.ruleNever', { sender: muted.join(t('list.and')) });
+}
+// Undo: what the press did, sent back the other way under the names it was sent by. Nothing is
+// looked up again, so it undoes the whole batch whatever the page has loaded, or left, since.
+async function bulkUndo(action, items, extra) {
+  const r = await post('/api/bulk', Object.assign({ items, action, id: bulkId() }, extra || {}));
+  if (!r.ok) { toast(r.data && (r.data.code || r.data.error) ? failure(r.data) : t('act.failed'), true); return; }
+  for (const result of r.data.results || []) if (result.row) applyRow(result.row);
+  if (typeof r.data.attention === 'number') attentionCount = r.data.attention;
+  loadAttention();
+  renderList();
+  renderLede();
+  renderBars();
+  updateBadge();
 }
 // Each message back to the reminder it had: none, the time it had while that is to come, or back now.
-async function undoBulkSnooze(keys, before) {
+async function undoBulkSnooze(refs, before) {
   const groups = new Map();
-  for (const key of keys) {
-    const to = snoozeUndoTo((before.get(key) || {}).snoozedUntil || null);
+  for (const ref of refs) {
+    const to = snoozeUndoTo((before.get(ref) || {}).snoozedUntil || null);
     const until = to === null ? null : to === 'now' ? 'now' : to.toISOString();
-    const group = groups.get(String(until)) || { until, keys: [] };
-    group.keys.push(key);
+    const group = groups.get(String(until)) || { until, refs: [] };
+    group.refs.push(ref);
     groups.set(String(until), group);
   }
-  for (const group of groups.values()) await bulkAgain(group.keys, 'snooze', { until: group.until });
+  for (const group of groups.values()) await bulkUndo('snooze', group.refs, { until: group.until });
 }
 
 // ---- Moving to any folder ----

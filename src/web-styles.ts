@@ -199,8 +199,18 @@ body.picking .control-line{display:none!important}
   .pick-actions .bar-btn span{display:none}
   .pick-actions .bar-btn.primary{min-width:36px;padding:0 9px}
 }
-/* A narrow window with a mouse: the box shows under the pointer, as on a desk. */
-@media(max-width:899px) and (hover:hover){.row:hover .pick-box{display:grid}}
+/* A narrow window with a mouse: the page makes room on its left, as the desk's gutter does, and the box shows
+   there, outside the row, under the pointer and while picking. It never covers the ring, the clock or the
+   check, and everything in the column moves together, so it all still lines up. The column clips sideways
+   instead of each group, so the box shows and a row leaving to the right still does not scroll the page.
+   (main.app-main and ul.group: their own rules come later in the sheet.) */
+@media(max-width:899px) and (hover:hover) and (pointer:fine){
+  main.app-main{padding-left:24px;overflow-x:clip}
+  ul.group{overflow-x:visible}
+  .pick-box{left:-21px;top:15px}
+  .row:hover .pick-box{display:grid}
+  body.picking .row>.mark,body.picking .row>.ring{visibility:visible}
+}
 
 /* ---- Sheets: the detail on a phone, filters, the install steps ---- */
 .sheet{position:fixed;inset:auto 0 0 0;z-index:20;width:100%;max-width:640px;margin:0 auto;border:0;padding:0;background:var(--surface);color:var(--text);

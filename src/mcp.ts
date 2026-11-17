@@ -24,7 +24,9 @@ import {
   fetchAttachmentByMessageId, fetchAttachmentManifestByMessageId,
   fetchByMessageId, inspectMailSafety, LiveMailError, scanAttachmentByMessageId, MAIL_ACTIONS, type MessageHint,
 } from './imap/client.js';
-import { handleShaped, LIVE_PAGE_DEFAULT, LIVE_PAGE_MAX, parseLiveHandle, SEARCH_SCAN_MESSAGES, useHandleKey } from './imap/mailbox.js';
+import {
+  exactHint, handleShaped, LIVE_PAGE_DEFAULT, LIVE_PAGE_MAX, parseLiveHandle, SEARCH_SCAN_MESSAGES, useHandleKey,
+} from './imap/mailbox.js';
 import { BULK_MAX, bulkAct, folderList, folderPage, mailboxSearch, type BulkAction } from './web-mailbox.js';
 import { CONVERSATION_LIMIT, MAX_CONTACTS, StateStore } from './services/state.js';
 import type { FeedbackLabel, NotificationOutboxRow } from './services/state.js';
@@ -535,6 +537,17 @@ export function createServer(
         ...(handleShaped(entry.ref!) && typeof moved['handle'] === 'string' ? { handle: moved['handle'] } : {}),
       };
     });
+    // The queue's tools on record per id asked for, as one call for each would be, whatever came of it:
+    // done, skipped (already so, not stored) or refused. A mailbox action is audited per message by the action itself.
+    if (action === 'done' || action === 'not_done' || action === 'snooze') {
+      for (const result of results) {
+        store.recordMcpAudit(action === 'snooze' ? 'snooze' : 'mark_handled', client, result['status'] === 'done', JSON.stringify({
+          messageId: result['messageId'], ...(result['account'] ? { account: result['account'] } : {}), outcome: result['status'],
+          ...(result['code'] ? { code: result['code'] } : {}),
+          ...(action === 'snooze' ? { until: untilOf(extra['until']) } : { handled: action === 'done' }),
+        }).slice(0, 1000));
+      }
+    }
     const count = (status: string): number => results.filter((result) => result.status === status).length;
     return json({
       action, done: count('done'), skipped: count('skipped'), failed: count('failed'), pending: count('pending'), results,
@@ -542,6 +555,11 @@ export function createServer(
       // Senders whose mail this made low priority from now on: two of theirs were put in spam.
       ...(Array.isArray(answer['muted']) ? { newlyNeverImportant: answer['muted'] } : {}),
     });
+  };
+  /** A reminder time as it is recorded: the moment, whatever spelling it was given in; 'now' and none as they are. */
+  const untilOf = (asked: unknown): string => {
+    if (typeof asked === 'string' && asked !== 'now' && !Number.isNaN(Date.parse(asked))) return new Date(asked).toISOString();
+    return String(asked);
   };
   /** Exactly one of messageId and messageIds. */
   const oneOrMany = (args: { messageId?: string | undefined; messageIds?: string[] | undefined }): string[] | undefined => {
@@ -560,10 +578,7 @@ export function createServer(
   const lookupOf = (account: string, messageId: string): { messageId: string; hint?: MessageHint } => {
     if (!handleShaped(messageId)) return { messageId };
     const handle = parseLiveHandle(refOf(messageId, account))!;
-    return {
-      messageId: handle.messageId,
-      hint: { folder: handle.folder, uid: handle.uid, uidValidity: handle.uidValidity, exact: true },
-    };
+    return { messageId: handle.messageId, hint: exactHint(handle) };
   };
   /** A handle that no longer fits, said as the other tools say it. */
   const liveFailure = (error: unknown, what: string): McpToolError => {

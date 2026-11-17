@@ -718,6 +718,8 @@ describe('acting on a message from the web view', () => {
     put('INBOX', '<one@x>');
     expect(await applyWebMailAction(ME, '<one@x>', 'mark_read')).toEqual({
       action: 'mark_read', account: 'me@qq.com', messageId: '<one@x>', sourceFolder: 'INBOX',
+      // The message acted on, so a stored record's books follow only its own.
+      sourceUid: 1, sourceUidValidity: '1', sourceFrom: 'sender@example.com',
     });
     await applyWebMailAction(ME, '<one@x>', 'star');
     await applyWebMailAction(ME, '<one@x>', 'answered');
@@ -736,6 +738,7 @@ describe('acting on a message from the web view', () => {
       sourceFolder: 'INBOX', destinationFolder: 'Archive', destinationIsSpam: false,
       // What the poller would file it under where it landed.
       destinationId: '<one@x>',
+      sourceUid: 1, sourceUidValidity: '1', sourceFrom: 'sender@example.com',
     });
     expect(idsIn('INBOX')).toEqual([]);
     expect(idsIn('Archive')).toEqual(['<one@x>']);

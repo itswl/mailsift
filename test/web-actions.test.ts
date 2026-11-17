@@ -509,17 +509,17 @@ describe('remembering where a message is in its mailbox', () => {
     const fake = backend({ read: async (_account, _id, hint) => { fake.calls.readHints.push(hint); return live({ uid: 17, uidValidity: '9' }); } });
     const first = await call(store, '/api/message?live=true&id=k1', {}, fake);
     expect(first.answer.status).toBe(200);
-    // Nothing was known, so only the folder could be said.
-    expect(fake.calls.readHints).toEqual([{ folder: 'INBOX' }]);
+    // Nothing was known, so only the folder could be said, and whose message it is.
+    expect(fake.calls.readHints).toEqual([{ folder: 'INBOX', sender: 'billing@vendor.com' }]);
     expect(store.placeOf('k1')).toEqual({ uid: 17, uidValidity: '9' });
     // Where the message sits is the server's business: the page is not sent it.
     expect(first.json).not.toHaveProperty('uid');
     expect(first.json).not.toHaveProperty('uidValidity');
 
     await call(store, '/api/message?live=true&fresh=true&id=k1', {}, fake);
-    expect(fake.calls.readHints[1]).toEqual({ folder: 'INBOX', uid: 17, uidValidity: '9' });
+    expect(fake.calls.readHints[1]).toEqual({ folder: 'INBOX', uid: 17, uidValidity: '9', sender: 'billing@vendor.com' });
     await post(store, '/api/action', { key: 'k1', action: 'star' }, {}, fake);
-    expect(fake.calls.actHints).toEqual([{ folder: 'INBOX', uid: 17, uidValidity: '9' }]);
+    expect(fake.calls.actHints).toEqual([{ folder: 'INBOX', uid: 17, uidValidity: '9', sender: 'billing@vendor.com' }]);
   });
 
   it('does not note a place in a folder the record does not say the message is in', async () => {
@@ -555,7 +555,7 @@ describe('remembering where a message is in its mailbox', () => {
     const sent = await post(store, '/api/send', { account: 'me@qq.com', replyTo: 'k1', to: ['billing@vendor.com'], subject: 'Re: subject k1', text: 'Thanks.' }, {}, fake);
     expect(sent.answer.status).toBe(200);
     await vi.waitFor(() => expect(fake.calls.act).toContainEqual({ messageId: '<one@x>', action: 'answered', folderHint: 'INBOX' }));
-    expect(fake.calls.actHints).toContainEqual({ folder: 'INBOX', uid: 17, uidValidity: '9' });
+    expect(fake.calls.actHints).toContainEqual({ folder: 'INBOX', uid: 17, uidValidity: '9', sender: 'billing@vendor.com' });
   });
 });
 

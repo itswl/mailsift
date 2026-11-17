@@ -274,8 +274,9 @@ function eachCopy(key, touch) {
   for (const m of snoozedRows) one(m);
   for (const th of lastThreads || []) { one(th.latest); for (const m of th.messages || []) one(m); }
   one(extraRows.get(key));
-  // The same message listed live, when the server matched it to this record: its row there follows too.
+  // The same message listed live, or opened from a link by its handle, when the server matched it to this record: that row follows too.
   for (const m of liveRows.values()) if (m.storedKey === key || rowKey(m) === key) touch(m);
+  for (const m of extraRows.values()) if (m.storedKey === key && rowKey(m) !== key) touch(m);
 }
 function markHandledLocal(key, at) {
   eachCopy(key, (m) => { m.handledAt = at; });
@@ -316,7 +317,9 @@ function isOpenRow(key) {
   if (!openKey) return false;
   if (openKey === key) return true;
   const item = findItem(openKey);
-  return Boolean(item && rowKey(rowOfItem(item)) === key);
+  // Done and later name a live row by its stored record's key: that is the open row too.
+  const row = item && rowOfItem(item);
+  return Boolean(row && (rowKey(row) === key || queueKey(row) === key));
 }
 async function complete(key, li, undo) {
   // Where the server keeps this for the write session, say so before the row moves.
@@ -1232,11 +1235,16 @@ function forgetLocal() {
 let bootKey = keyFromHash(location.hash);
 const bootParams = new URLSearchParams(location.search);
 const wantsCode = bootParams.get('focus') === 'code';
+stripStaleEntry();
 // Stripped even when it does not decode, so a broken link does not survive a reload.
-// So is the mark of a sheet or a popover that was open when the page was
-// reloaded: it is gone, and an entry that still claims it would swallow the next Back.
-if (location.hash.indexOf('#m=') === 0 || (history.state && (history.state.sheet || history.state.popover))) {
-  history.replaceState(null, '', location.pathname + location.search);
+// So is the mark of a sheet, a popover or a selection that was open when the
+// page was reloaded: it is gone, and an entry that still claims it would
+// swallow the next Back. The folder or search on show is kept, so the entry
+// is still that view's and opening it again adds nothing to the history.
+function stripStaleEntry() {
+  const state = history.state;
+  if (location.hash.indexOf('#m=') !== 0 && !(state && (state.sheet || state.popover || state.picking))) return;
+  history.replaceState(state && state.live ? { live: state.live } : null, '', location.pathname + location.search);
 }
 function focusCode() {
   const target = lane.querySelector('.lane-copy');
