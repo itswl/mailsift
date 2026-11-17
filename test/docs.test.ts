@@ -164,3 +164,20 @@ describe('the whole mailbox, after a second review', () => {
     expect(prose(read('docs/mcp.md'))).toContain('one audit row for every id asked about');
   });
 });
+
+describe('the whole mailbox, after a third review', () => {
+  it('says a listing ties a record only to its first message from its sender, and MCP reads a record as its key finds it', () => {
+    const web = prose(read('docs/web-view.md'));
+    const mcp = prose(read('docs/mcp.md'));
+    expect(web).toContain('its first message in that folder from its sender');
+    expect(web).toContain('A later copy from the same sender is not it');
+    expect(mcp).toContain('only its first message in that folder from its sender');
+    expect(mcp).toContain('so a look-alike that borrowed its Message-ID is answered as not found');
+  });
+
+  it('says the reader keeps the open message over a reload and never jumps to one nobody chose', () => {
+    const web = prose(read('docs/web-view.md'));
+    expect(web).toContain('the message open in the reader stays open, even when it is no longer on the first page');
+    expect(web).toContain('it never jumps to a message you did not choose');
+  });
+});

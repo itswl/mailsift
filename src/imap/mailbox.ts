@@ -299,6 +299,61 @@ export interface LivePage {
   items: LiveItem[];
   /** Where the next page starts, or null at the oldest. */
   next: string | null;
+  /** What was asked of the folder with firstOf: see FirstOf. */
+  firstUids?: Record<string, number | null>;
+}
+
+/** A stored record's message to look for in a folder: its Message-ID, and the sender it is from. */
+export interface FirstAsked {
+  id: string;
+  sender: string;
+}
+
+/**
+ * Asked by a listing of the items it lists, under its lock: whose first
+ * message in the folder to find. For each, the answer (LivePage.firstUids,
+ * under firstKey) is the lowest UID there of a message with that Message-ID
+ * from that sender, as the lookup by a record's key finds it; null when the
+ * mailbox could not say (no such search, too many answers). The caller may
+ * tie a record to a listed message only when that message is this one.
+ */
+export type FirstOf = (items: LiveItem[]) => FirstAsked[];
+
+/** Where LivePage.firstUids answers one FirstAsked in a folder. */
+export function firstKey(folder: string, id: string, sender: string): string {
+  return `${folder}\n${id}\n${sender.toLowerCase()}`;
+}
+
+/** At most this many asked of one folder per page; each is one search. What is not asked is not tied. */
+const FIRST_MAX_ASKED = 10;
+/** A Message-ID search with more answers than this is not a search for one message (QQ answers with the folder). */
+const FIRST_MAX_HITS = 20;
+
+/** The folder now selected: each record's first message from its sender (see FirstOf). */
+async function firstUidsOf(client: ImapFlow, folder: string, asked: FirstAsked[]): Promise<Record<string, number | null>> {
+  const out: Record<string, number | null> = {};
+  for (const one of asked) {
+    const key = firstKey(folder, one.id, one.sender);
+    if (key in out) continue;
+    if (Object.keys(out).length >= FIRST_MAX_ASKED) break;
+    out[key] = await firstFromSender(client, one.id, one.sender.toLowerCase());
+  }
+  return out;
+}
+
+async function firstFromSender(client: ImapFlow, id: string, sender: string): Promise<number | null> {
+  let found: number[] | false | undefined;
+  try {
+    found = await client.search({ header: { 'message-id': id } }, { uid: true });
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(found) || !found.length || found.length > FIRST_MAX_HITS) return null;
+  const uids: number[] = [];
+  for await (const raw of client.fetch(found, { uid: true, envelope: true }, { uid: true })) {
+    if ((raw.envelope?.messageId?.trim() ?? '') === id && firstAddress(raw.envelope?.from).address === sender) uids.push(raw.uid);
+  }
+  return uids.length ? Math.min(...uids) : null;
 }
 
 export const LIVE_PAGE_DEFAULT = 50;
@@ -381,7 +436,7 @@ async function countBelow(client: ImapFlow, uid: number): Promise<number> {
  * newest of all without one. Envelopes, flags, sizes and structure only.
  */
 export async function browseFolder(
-  account: Account, folder: string, options: { before?: string | null; limit?: number } = {},
+  account: Account, folder: string, options: { before?: string | null; limit?: number; firstOf?: FirstOf } = {},
 ): Promise<LivePage> {
   const limit = Math.max(1, Math.min(options.limit ?? LIVE_PAGE_DEFAULT, LIVE_PAGE_MAX));
   const cursor = options.before ? parseFolderCursor(options.before) : undefined;
@@ -406,9 +461,12 @@ export async function browseFolder(
         .map((raw) => toLiveItem(raw, account, target.path, uidValidity))
         .sort((a, b) => b.uid - a.uid);
       const oldest = items.at(-1);
+      // Asked while the folder is still held, so what is found is the folder as it was listed.
+      const firstUids = options.firstOf ? await firstUidsOf(client, target.path, options.firstOf(items)) : undefined;
       return {
         account: account.username, folder: target.path, uidValidity, total, items,
         next: from > 1 && oldest ? `${uidValidity}.${oldest.uid}` : null,
+        ...(firstUids ? { firstUids } : {}),
       };
     } finally {
       lock.release();
@@ -473,6 +531,8 @@ export interface SearchPage {
   next: string | null;
   /** Set when the search read only the subject and sender of each folder's newest messages. */
   limited?: { reason: SearchLimit; scanned: number };
+  /** What was asked of each folder with firstOf: see FirstOf. */
+  firstUids?: Record<string, number | null>;
 }
 
 export class SearchCancelled extends Error {
@@ -616,7 +676,7 @@ const nonAscii = (value: string): boolean => /[^\x20-\x7e]/.test(value);
  */
 export async function searchMailbox(
   account: Account,
-  options: { query: string; folder?: string | null; before?: string | null; limit?: number; signal?: AbortSignal },
+  options: { query: string; folder?: string | null; before?: string | null; limit?: number; signal?: AbortSignal; firstOf?: FirstOf },
 ): Promise<SearchPage> {
   const query = options.query.trim();
   const limit = Math.max(1, Math.min(options.limit ?? LIVE_PAGE_DEFAULT, LIVE_PAGE_MAX));
@@ -629,6 +689,11 @@ export async function searchMailbox(
     const entries = await listFolders(client);
     const folders = options.folder ? [exactFolder(entries, options.folder).path] : defaultSearchFolders(entries, account);
     const found: Array<{ folder: string; uidValidity: string; hits: number[]; items: LiveItem[] }> = [];
+    const firstUids: Record<string, number | null> = {};
+    // Asked of each folder while it is held (see FirstOf).
+    const askFirst = async (folder: string, items: LiveItem[]): Promise<void> => {
+      if (options.firstOf) Object.assign(firstUids, await firstUidsOf(client, folder, options.firstOf(items)));
+    };
     let limited: SearchPage['limited'];
     let total = 0;
     for (const path of folders) {
@@ -661,6 +726,7 @@ export async function searchMailbox(
           const items = scanned.items.filter((item) => below(item.uid));
           total += items.length;
           found.push({ folder: target.path, uidValidity, hits: items.map((item) => item.uid), items: items.slice(0, limit) });
+          await askFirst(target.path, items.slice(0, limit));
           continue;
         }
         const shown = [...new Set(hits)].filter(below).sort((a, b) => b - a);
@@ -675,6 +741,7 @@ export async function searchMailbox(
         // Highest UID first, as the merge takes them, whatever order the server answered in.
         items.sort((a, b) => b.uid - a.uid);
         found.push({ folder: target.path, uidValidity, hits: shown, items });
+        await askFirst(target.path, items);
       } finally {
         lock.release();
       }
@@ -697,6 +764,7 @@ export async function searchMailbox(
       account: account.username, query, folders, items: merged, total,
       next: more ? encodeSearchCursor(next) : null,
       ...(limited ? { limited } : {}),
+      ...(options.firstOf ? { firstUids } : {}),
     };
   }, { timeoutMs: searchImapMs, signal: options.signal, late: () => new SearchTimedOut() }).catch((error: unknown) => {
     // Stopped by a newer search, or given up on: said as that, whatever the closed connection said.

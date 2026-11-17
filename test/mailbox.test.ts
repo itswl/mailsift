@@ -203,6 +203,9 @@ import { Watcher } from '../src/services/watcher.js';
 import { forgetLive } from '../src/web-actions.js';
 import { routeWeb, SESSION_COOKIE } from '../src/web.js';
 import { makeMessage, RecordingSink } from './helpers.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createServer } from '../src/mcp.js';
 
 const ME: Account = {
   name: 'personal', provider: 'imap', username: 'me@example.org', host: 'mail.example.org', port: 993,
@@ -788,6 +791,97 @@ describe('which stored record a live message is, through the real routes', () =>
     }
   });
 
+  it('ties a record with no place to its first message from its sender, as its key finds it, when a newer copy is listed first', async () => {
+    const state = store();
+    put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com', body: 'the real numbers' });
+    put('INBOX', 'Q3 numbers: wire the money today', { id: '<q3@corp>', from: 'boss@corp.com', body: 'wire the money' });
+    stored(state, 'k', '<q3@corp>', 'INBOX', 'boss@corp.com');
+    // Only the newer copy on the page: not the record's, and nothing is remembered from it.
+    const first = (await call(state, `/api/folder?account=${encodeURIComponent(ME.username)}&folder=INBOX&limit=1`))['items'] as Array<Record<string, unknown>>;
+    expect(first.map((item) => [item['uid'], item['key'] ?? null])).toEqual([[2, null]]);
+    expect(state.placeOf('k')).toBeUndefined();
+    // Both on the page, the newer listed first: the older is the record's, as the poller stored it first.
+    expect((await folder(state, 'INBOX')).map((item) => [item['uid'], item['key'] ?? null])).toEqual([[2, null], [1, 'k']]);
+    expect(state.placeOf('k')).toEqual({ uid: 1, uidValidity: '1' });
+    // And the key finds the same one.
+    forgetLive();
+    expect(await call(state, '/api/message?id=k&live=true')).toMatchObject({ text: 'the real numbers' });
+    expect(await call(state, '/api/action', { method: 'POST', body: { key: 'k', action: 'archive' } })).toMatchObject({ ok: true });
+    expect(fake.server.mail.get('Archive')!.map((m) => m.subject)).toEqual(['Q3 numbers']);
+  });
+
+  it('ties nothing from a listing when the mailbox cannot say which message is the record\'s first', async () => {
+    const state = store();
+    put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com' });
+    stored(state, 'k', '<q3@corp>', 'INBOX', 'boss@corp.com');
+    // A server that refuses the search the listing asks under its lock.
+    fake.server.searching = 'refuse';
+    const original = fake.ImapFlow.prototype.search;
+    fake.ImapFlow.prototype.search = async function (query: Record<string, unknown>) { return query['header'] ? false : original.call(this, query); };
+    try {
+      expect((await folder(state, 'INBOX')).map((item) => item['key'] ?? null)).toEqual([null]);
+      expect(state.placeOf('k')).toBeUndefined();
+    } finally {
+      fake.ImapFlow.prototype.search = original;
+    }
+  });
+
+  it('opens and moves a stored message without a Message-ID by its key after mailsift has moved it', async () => {
+    const state = store();
+    put('INBOX', 'scan from the copier', { id: null, from: 'copier@office.example', body: 'the scan' });
+    const landed = fake.server.mail.get('INBOX')![0]!;
+    const made = fallbackMessageId(ME.username, { date: landed.date.toISOString(), subject: landed.subject, from: landed.from, uid: 1 });
+    stored(state, 'k', made, 'INBOX', 'copier@office.example', 1);
+    put('Archive', 'filler'); put('Archive', 'filler');
+    expect(await call(state, '/api/action', { method: 'POST', body: { key: 'k', action: 'archive' } })).toMatchObject({ ok: true });
+    expect(state.placeOf('k')).toEqual({ uid: 3, uidValidity: '1' });
+    forgetLive();
+    expect(await call(state, '/api/message?id=k&live=true')).toMatchObject({ dedupKey: 'k', text: 'the scan', liveFolder: 'Archive' });
+    // (A server never gives a UID twice; this one would, without another message in the inbox meanwhile.)
+    put('INBOX', 'arrived meanwhile');
+    expect(await call(state, '/api/action', { method: 'POST', body: { key: 'k', action: 'inbox' } })).toMatchObject({ ok: true, row: { folder: 'INBOX' } });
+    expect(fake.server.mail.get('INBOX')!.map((m) => m.subject)).toEqual(['arrived meanwhile', 'scan from the copier']);
+    // Where it landed it has another made-up id: the poll does not take it for new mail there.
+    const back = fake.server.mail.get('INBOX')![1]!;
+    const there = fallbackMessageId(ME.username, { date: back.date.toISOString(), subject: back.subject, from: back.from, uid: back.uid });
+    expect(state.filedByOwner(`${ME.username}|${there}`)).toBe(true);
+  });
+
+  it('does not read a look-alike for an MCP tool or resource that names the record by its Message-ID', async () => {
+    const state = store();
+    put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com' });
+    put('Junk', 'Q3 numbers', { id: '<q3@corp>', from: 'attacker@evil.example' });
+    stored(state, 'k', '<q3@corp>', 'INBOX', 'boss@corp.com', 1);
+    fake.server.mail.set('INBOX', []);
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    const server = createServer({ state, client: 'test', writable: false });
+    const client = new Client({ name: 'mailbox-test', version: '0.0.0' });
+    await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
+    try {
+      const said = async (name: string, args: Record<string, unknown>): Promise<string> => {
+        const result = await client.callTool({ name, arguments: args });
+        return (result.content as Array<{ text: string }>)[0]!.text;
+      };
+      for (const tool of ['list_attachments', 'inspect_mail_safety']) {
+        const answer = await said(tool, { account: ME.username, messageId: '<q3@corp>' });
+        expect(answer, tool).not.toContain('attacker@evil.example');
+        expect(answer, tool).not.toContain('Junk');
+        expect(JSON.parse(answer), tool).toMatchObject({ found: false });
+      }
+      const uri = `mailsift://imap/${encodeURIComponent(ME.username)}/${encodeURIComponent('<q3@corp>')}`;
+      const read = await client.readResource({ uri }).then((r) => JSON.stringify(r), (error: unknown) => String(error));
+      expect(read).not.toContain('attacker@evil.example');
+      // A Message-ID nothing is stored about is still looked for as it is.
+      const unstored = await said('list_attachments', { account: ME.username, messageId: '<junk-1@x>' });
+      expect(JSON.parse(unstored)).toMatchObject({ found: false });
+      put('Junk', 'promo', { id: '<promo@x>', from: 'promo@shop.example' });
+      expect(JSON.parse(await said('list_attachments', { account: ME.username, messageId: '<promo@x>' }))).toMatchObject({ found: true, folder: 'Junk' });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it('remembers where a listing found a record that had no place, so its handle is the record\'s after a restart too', async () => {
     const state = store();
     put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com' });
@@ -864,6 +958,23 @@ describe('searches, on connections of their own', () => {
     expect(answers.every((answer) => answer.total === 1)).toBe(true);
     expect(fake.server.maxOpen).toBeLessThanOrEqual(2);
     expect(fake.server.connects).toBeLessThanOrEqual(2);
+  });
+
+  it('does not sign in again to repeat a search that ran out of time on a kept connection', async () => {
+    put('INBOX', 'invoice');
+    await search('invoice');
+    expect(fake.server.connects).toBe(1);
+    setSearchTimeout(60);
+    fake.server.delay.search = 400;
+    try {
+      const searchesBefore = fake.server.calls.filter((c) => c === 'search').length;
+      const said = await search('invoice').then(() => 'finished', (error: unknown) => (error as Error).name);
+      expect(said).toBe('SearchTimedOut');
+      expect(fake.server.connects).toBe(1);
+      expect(fake.server.calls.filter((c) => c === 'search').length - searchesBefore).toBe(1);
+    } finally {
+      setSearchTimeout(null);
+    }
   });
 
   it('keeps a search\'s connection a moment, so the next page does not sign in again', async () => {

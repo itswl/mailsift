@@ -140,7 +140,10 @@ function exitLive(viaHistory) {
 }
 $('#live-back').onclick = () => exitLive(false);
 
-async function liveLoad(reset) {
+// gone: what the owner's own batch took out of the folder (a move still under way when it answered). Only
+// for those does a reader on a desk move on to the next message. Any other reading of the list from the top
+// (the refresh, the same search again, a page read again) keeps the open message open, with its bar.
+async function liveLoad(reset, gone) {
   const view = liveView;
   if (!view) return;
   if (!reset && (!view.next || view.loading)) return;
@@ -159,8 +162,8 @@ async function liveLoad(reset) {
   if (view.mode === 'search') { p.set('q', view.q); p.set('tab', tabId()); }
   if (!reset && view.next) p.set('before', view.next);
   p.set('limit', String(LIVE_PAGE));
-  // What was listed before the list was read again from the top, for a reader whose message is gone from it.
-  let listedBefore = null;
+  // What was listed before the list was read again from the top, and the message open in the reader then.
+  let listedBefore = null, keep = [];
   try {
     const r = await fetch((view.mode === 'search' ? '/api/search?' : '/api/folder?') + p.toString(), abort ? { signal: abort.signal } : {});
     if (r.status === 401) { location.reload(); return; }
@@ -173,7 +176,12 @@ async function liveLoad(reset) {
       return;
     }
     const rows = (Array.isArray(d.items) ? d.items : []).map((item) => liveRow(item, view.account));
-    if (reset) { listedBefore = visibleKeys(); liveRows.clear(); view.items = []; }
+    if (reset) {
+      listedBefore = visibleKeys();
+      keep = [selectedKey, openKey].filter((k, i, all) => k && all.indexOf(k) === i && liveRows.has(k)).map((k) => [k, liveRows.get(k)]);
+      liveRows.clear();
+      view.items = [];
+    }
     for (const row of rows) {
       if (liveRows.has(rowKey(row))) continue;
       liveRows.set(rowKey(row), row);
@@ -197,8 +205,12 @@ async function liveLoad(reset) {
       view.loading = false;
       renderList();
       renderLiveHead();
-      // Read again (after a batch, say) without the message open on a desk: on to the next, not an empty reader under a live bar.
-      if (listedBefore) moveOnFrom(listedBefore);
+      // The open message, when the list read again does not reach it (it was past the first page, say), stays open,
+      // as one opened from a link does, until the server says it moved. Unless the owner's own batch took it out:
+      // then on to the next, as when that is known at once (see dropLive).
+      const out = new Set(gone ? Array.from(gone).filter((k) => !liveRows.has(k)) : []);
+      for (const [k, row] of keep) if (!liveRows.has(k) && !out.has(k)) extraRows.set(k, row);
+      if (listedBefore && out.size) moveOnFrom(listedBefore, out);
       renderPane();
       renderBars();
     }
@@ -335,6 +347,8 @@ function dropLive(keys) {
   for (const key of gone) {
     const row = liveRows.get(key);
     liveRows.delete(key);
+    // The open message held on to over a reading of the list it was not on (see liveLoad) goes too.
+    if (extraRows.has(key) && extraRows.get(key).live) extraRows.delete(key);
     if (row && typeof liveView.total === 'number') liveView.total = Math.max(0, liveView.total - 1);
   }
   liveView.items = liveView.items.filter((m) => !gone.has(rowKey(m)));
@@ -349,6 +363,23 @@ function moveOnFrom(before, gone) {
   const at = before.indexOf(selectedKey);
   const after = (at === -1 ? [] : before.slice(at + 1).concat(before.slice(0, at).reverse())).find(left);
   if (after) openDetail(after); else clearSelection();
+}
+// A row of the live view on show: listed, or the open message held on to over a reading of the list it was not on.
+function liveShown(key) {
+  if (!liveView) return null;
+  const held = extraRows.get(key);
+  return liveRows.get(key) || (held && held.live ? held : null);
+}
+// A message the server says is no longer where its folder listed it (moved or deleted elsewhere): put down,
+// never swapped for another one the owner did not choose, and the folder listed again.
+function forgetStale(key) {
+  liveRows.delete(key);
+  extraRows.delete(key);
+  if (selectedKey === key || openKey === key) {
+    if (sheet.open) closeSheet(sheet, false);
+    clearSelection();
+  }
+  liveLoad(true);
 }
 // Whether a message is in the folder an action would move it to.
 function liveIn(row, role) {
@@ -828,7 +859,7 @@ async function bulkAction(action, extra) {
     if (action === 'star' || action === 'unstar') flags.flagged = action === 'star';
     if (action === 'mark_read' || action === 'mark_unread') flags.seen = action === 'mark_read';
     flagsByKey.set(key, flags);
-    const shown = liveView && liveRows.get(key);
+    const shown = liveShown(key);
     if (shown) {
       shown.flags = Object.assign({}, shown.flags || {}, flags);
       if (result.moved && result.moved.folder !== listedIn.get(key)) dropped.push(key);
@@ -849,7 +880,12 @@ async function bulkAction(action, extra) {
   renderBars();
   updateBadge();
   // Some were still under way when the answer came: the list is read again once they will have landed.
-  if (r.data.pending) setTimeout(() => { if (liveView) liveLoad(true); else refresh(); }, 5000);
+  // Those this press moved are gone from it by the owner's own doing (see liveLoad).
+  if (r.data.pending) {
+    const moving = ['archive', 'trash', 'move', 'spam', 'not_spam', 'inbox'].includes(action);
+    const underWay = new Set((r.data.results || []).filter((result) => moving && result.status === 'pending' && refs.has(result.key)).map((result) => refs.get(result.key)));
+    setTimeout(() => { if (liveView) liveLoad(true, underWay); else refresh(); }, 5000);
+  }
   // What happened, in one line, with the one way back where a single message has one.
   const said = [];
   if (done.length) {

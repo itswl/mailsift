@@ -183,6 +183,9 @@ body.live-mode .window,body.live-mode #filters-open,body.live-mode #folders-open
 .pick-actions .bar-btn:disabled{opacity:.4;cursor:default}
 /* While anything is picked, the bar takes the controls' line and stays at the top as the list scrolls. */
 body.picking .controls{position:sticky;top:calc(52px + env(safe-area-inset-top));z-index:4;background:var(--bg)}
+/* Where the rows' boxes sit in a gutter left of the column (a desk, a narrow window with a mouse), the bar covers
+   that gutter too: the boxes of rows scrolled under it neither show beside it nor take a click meant for the page. */
+body.picking .controls::before{content:"";position:absolute;top:0;bottom:0;right:100%;width:24px;background:var(--bg)}
 body.picking .control-line{display:none!important}
 #bulk-sheet.popover .sheet-body{padding:0 8px 8px}
 @media(max-width:899px){
@@ -203,9 +206,12 @@ body.picking .control-line{display:none!important}
    there, outside the row, under the pointer and while picking. It never covers the ring, the clock or the
    check, and everything in the column moves together, so it all still lines up. The column clips sideways
    instead of each group, so the box shows and a row leaving to the right still does not scroll the page.
-   (main.app-main and ul.group: their own rules come later in the sheet.) */
+   The column is inset as much on the right, and the header with it, so the page stays centred and lined up;
+   while picking, the sticky bar covers the gutter too (see body.picking .controls::before).
+   (header.app-header, main.app-main and ul.group: their own rules come later in the sheet.) */
 @media(max-width:899px) and (hover:hover) and (pointer:fine){
-  main.app-main{padding-left:24px;overflow-x:clip}
+  header.app-header{padding-left:40px;padding-right:36px}
+  main.app-main{padding-left:24px;padding-right:24px;overflow-x:clip}
   ul.group{overflow-x:visible}
   .pick-box{left:-21px;top:15px}
   .row:hover .pick-box{display:grid}
@@ -669,8 +675,8 @@ a.primary-action{display:inline-flex;align-items:center;justify-content:center;t
   .row.needs{touch-action:auto}
   /* The box beside a row sits in the gutter, outside the row. */
   .group{overflow-x:visible}
-  /* Over the gutter too, where the rows' boxes would otherwise show beside it. */
-  body.picking .controls{top:calc(56px + env(safe-area-inset-top));box-shadow:-24px 0 0 var(--bg)}
+  /* Over the gutter too (see body.picking .controls::before), where the rows' boxes would otherwise show beside it. */
+  body.picking .controls{top:calc(56px + env(safe-area-inset-top))}
   .fresh-pill{left:calc(max(24px,(100vw - 1440px)/2 + 24px) + 220px)}
   .pane{display:flex;flex-direction:column;position:sticky;top:calc(68px + env(safe-area-inset-top));height:calc(100vh - 84px - env(safe-area-inset-top));overflow:hidden;border-radius:16px;background:var(--surface);box-shadow:0 0 0 1px var(--line)}
   .pane-bar{display:flex;flex:none;align-items:center;gap:2px;min-height:52px;padding:6px 10px;border-bottom:1px solid var(--line)}

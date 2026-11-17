@@ -694,19 +694,25 @@ export async function withOwnConnection<T>(
   if (signal?.aborted) stop();
   signal?.addEventListener('abort', stop, { once: true });
   let good = false;
+  // Out of time is the work's own doing, not a connection that died while it was kept: not done again.
+  let outOfTime = false;
+  const late = (): Error => {
+    outOfTime = true;
+    return options.late ? options.late() : new MailboxUnreachableError('the mailbox did not answer in time | ETIMEDOUT');
+  };
   try {
     try {
-      const result = await bounded(client, work, options.timeoutMs, options.late);
+      const result = await bounded(client, work, options.timeoutMs, late);
       good = true;
       return result;
     } catch (error) {
       // A kept connection the server dropped while it waited shows on first use: the search is
       // only reading, and is done again on a new connection, in the same place.
-      if (!reused || client.usable || signal?.aborted) throw error;
+      if (!reused || client.usable || signal?.aborted || outOfTime) throw error;
       hangUp(client);
       client = await connectInteractive(account, {}, { signal, spaced: true });
       reused = false;
-      const result = await bounded(client, work, options.timeoutMs, options.late);
+      const result = await bounded(client, work, options.timeoutMs, late);
       good = true;
       return result;
     }

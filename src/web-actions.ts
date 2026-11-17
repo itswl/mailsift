@@ -39,7 +39,7 @@ import {
 } from './imap/client.js';
 import {
   browseFolder, exactHint, handleShaped, liveHandle, mailboxFolders, parseLiveHandle, searchMailbox, useHandleKey,
-  type LiveHandle, type LivePage, type MailboxFolder, type SearchPage,
+  type FirstOf, type LiveHandle, type LivePage, type MailboxFolder, type SearchPage,
 } from './imap/mailbox.js';
 import {
   askMail, AssistantError, assistantConfigured, draftReply, type AskAnswer, type DraftInput,
@@ -84,7 +84,7 @@ export interface WebBackend {
   /** A mailbox's folders, with their counts where the server gives them cheaply. */
   folders: (account: Account) => Promise<MailboxFolder[]>;
   /** One page of a folder, newest first, live. */
-  browse: (account: Account, folder: string, options: { before?: string | null; limit?: number }) => Promise<LivePage>;
+  browse: (account: Account, folder: string, options: { before?: string | null; limit?: number; firstOf?: FirstOf }) => Promise<LivePage>;
   /**
    * One action on many messages of one mailbox, over one connection; each
    * outcome is told to `each` as it is known.
@@ -96,7 +96,7 @@ export interface WebBackend {
   /** A search of the mailbox, live. */
   search: (
     account: Account,
-    options: { query: string; folder?: string | null; before?: string | null; limit?: number; signal?: AbortSignal },
+    options: { query: string; folder?: string | null; before?: string | null; limit?: number; signal?: AbortSignal; firstOf?: FirstOf },
   ) => Promise<SearchPage>;
   /**
    * A database handle for work that outlives its request. The one a request
@@ -328,19 +328,24 @@ const MADE_UP_ID = /^<generated-[0-9a-f]{32}@mailsift>$/;
  * sender reusing another message's Message-ID on purpose. A Message-ID alone
  * names none of them. A live message is a record's own only where the record
  * says it is: the record whose remembered place (folder, UID, UIDVALIDITY) is
- * the message's, which holds for mail without a Message-ID too. A record with
- * no remembered place in this version of the folder is matched in the same
- * folder by its sender, as a listing read it from the mailbox (`sender`), and
- * its place is then remembered: so a handle to that message finds the record
- * by its place from then on, after a restart and in another process, and no
- * other message is matched to it. A handle alone (no sender read) matches by
- * place only. Gmail's own message id would settle it there too, but the store
- * does not keep it.
+ * the message's, which holds for mail without a Message-ID too.
+ *
+ * A record with no remembered place in this version of the folder is matched
+ * by a listing, in the same folder, only to its first message from its sender
+ * there (`first`: the lowest UID of a message with its Message-ID from its
+ * sender, which the listing asked the mailbox under its lock, see FirstOf):
+ * the message the poller stored first, and the one a lookup by the record's
+ * key finds and remembers. A later copy from the same sender, or one the
+ * listing could not ask about, is not it. The place is then remembered, so a
+ * handle to that message finds the record by its place from then on, after a
+ * restart and in another process. A handle alone matches by place only.
+ * Gmail's own message id would settle it there too, but the store does not
+ * keep it.
  */
 export function recordOf(
   store: StateStore,
   account: string,
-  place: { id: string; folder: string; uid: number; uidValidity: string; sender?: string },
+  place: { id: string; folder: string; uid: number; uidValidity: string; sender?: string; first?: number | null },
   /** The record with this Message-ID when the caller looked it up already; null when there is none. */
   known?: MailRow | null,
 ): MailRow | undefined {
@@ -354,7 +359,8 @@ export function recordOf(
   const at = store.placeOf(row.dedupKey);
   if (at && at.uidValidity === place.uidValidity) return undefined;
   const same = Boolean(place.sender && row.sender) && place.sender!.toLowerCase() === row.sender!.toLowerCase();
-  if (!same) return undefined;
+  // From the record's sender, and the first such message in the folder, as the mailbox said under the listing's lock.
+  if (!same || place.first !== place.uid) return undefined;
   // The listing read it from the record's sender, where the record is: its place, from now on.
   try {
     store.rememberUid(row.dedupKey, place.folder, place.uid, place.uidValidity);
@@ -918,8 +924,9 @@ export function keepBooks(
     // Against this record, by its key: its Message-ID alone could name another one.
     db.recordFeedback(row.messageId ?? row.dedupKey, action, '', row.dedupKey);
   }
-  // A message mailsift never stored, moved by the owner: where it lands it is not new mail to judge.
-  if (!target.row && result.destinationFolder && result.destinationId) {
+  // A message mailsift never stored, moved by the owner: where it lands it is not new mail to judge. Nor is a
+  // stored one without a Message-ID, which the poller would know there by another made-up id (its new UID's).
+  if (result.destinationFolder && result.destinationId && (!target.row || result.destinationId !== target.row.messageId)) {
     db.fileByOwner(`${target.account.username}|${result.destinationId}`, target.account.username);
   }
   const after = row ? db.getMail(row.dedupKey) ?? row : undefined;
