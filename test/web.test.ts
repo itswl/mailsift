@@ -237,6 +237,20 @@ describe('read-only data', () => {
     expect(await body('/api/threads?pushedOnly=true', store)).toMatchObject({ count: 2 });
   });
 
+  it('searches what a person reads of a message, for the words as typed', async () => {
+    const store = seeded();
+    store.markSeen('k4', 'me@qq.com', 'first_last report');
+    store.recordOutcome('k4', 'info', false, { messageId: '<four@x>', threadKey: 'me@qq.com|<four@x>', sender: 'club@example.com', folder: 'INBOX' });
+    // % and _ are characters, not wildcards: each matched every message.
+    expect(await body('/api/mail?q=_', store)).toMatchObject({ count: 1 });
+    expect(await body('/api/mail?q=%25', store)).toMatchObject({ count: 0 });
+    expect(await body('/api/mail?q=first_last', store)).toMatchObject({ count: 1 });
+    expect(await body('/api/mail?q=firstxlast', store)).toMatchObject({ count: 0 });
+    // The mailbox's own address is in every thread key, and a piece of a Message-ID is the sender's machine text.
+    expect(await body('/api/mail?q=qq', store)).toMatchObject({ count: 0 });
+    expect(await body('/api/mail?q=four', store)).toMatchObject({ count: 0 });
+  });
+
   it('bounds the window and the page size rather than trusting the query', async () => {
     const store = seeded();
     const huge = url('/api/mail?limit=99999&hours=-5');

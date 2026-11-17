@@ -20,20 +20,20 @@ interface FilterDoc {
 }
 
 /** One row per filter the mail-listing tools accept, in the order they are applied. */
-const FILTERS: readonly FilterDoc[] = [
+export const FILTERS: readonly FilterDoc[] = [
   {
     name: 'hours',
-    tools: 'list_mail, list_threads, mail_summary',
-    notes: 'How far back to look, in hours. Default 24. Counted from now, not from midnight.',
+    tools: 'list_mail, list_threads, mail_summary, search_mail',
+    notes: 'How far back to look, in hours. Default 24, except for search_mail, which searches everything stored unless given one. Counted from now, not from midnight.',
   },
   {
     name: 'importance',
-    tools: 'list_mail',
+    tools: 'list_mail, list_threads',
     notes: `Exactly one of ${IMPORTANCE.join(', ')}. Omit it for every level.`,
   },
   {
     name: 'category',
-    tools: 'list_mail',
+    tools: 'list_mail, list_threads',
     notes: 'Exact match on one of the categories below. Use search_mail for a substring match.',
   },
   {
@@ -52,15 +52,20 @@ const FILTERS: readonly FilterDoc[] = [
     notes: 'true keeps only what was delivered in real time. Everything else waited for the digest.',
   },
   {
-    name: 'limit / cursor',
+    name: 'limit',
     tools: 'list_mail, search_mail, list_threads',
-    notes: 'Page size, then the opaque nextCursor from the previous page. A full page always returns nextCursor.',
+    notes: 'Page size.',
+  },
+  {
+    name: 'cursor',
+    tools: 'list_mail, search_mail',
+    notes: 'The opaque nextCursor from the previous page, passed back exactly as it was given. A full page always returns nextCursor; a cursor this server did not give is refused. list_threads has no next page: narrow hours or raise limit instead.',
   },
   {
     name: 'query',
-    tools: 'search_mail',
+    tools: 'search_mail, list_threads',
     notes:
-      'Substring match over subject, Message-ID, sender, category, summary, reason, the stored body preview and attachment metadata. One string, no operators.',
+      'Substring match, exactly as typed (% and _ are ordinary characters), over subject, sender, category, summary, reason, the stored body preview and the names and types of attachments; a Message-ID matches only whole. One string, no operators.',
   },
 ];
 
@@ -68,7 +73,7 @@ const FILTERS: readonly FilterDoc[] = [
 const NOT_STORED: readonly string[] = [
   'Full message bodies. Only a bounded preview is stored. Read mailsift://imap/{account}/{messageId} to fetch one body live from the mailbox.',
   'Attachment contents. Only names, MIME types, part ids and sizes are stored; list_attachments fetches a file on demand.',
-  'Verification codes and sign-in links from mail that was judged locally. Those are deliberately kept out of stored text.',
+  'Verification codes and sign-in links. Mail carrying one is judged locally and never reaches the model; its stored subject, summary and preview say only what arrived, and no tool here returns the code. read_message, and mailsift://imap/{account}/{messageId}, read the message itself from the mailbox, code or link included: do that only when the owner asks for that code.',
   'Anything older than STATE_RETENTION_DAYS, which defaults to 90 days.',
 ];
 

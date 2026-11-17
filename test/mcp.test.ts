@@ -270,9 +270,22 @@ describe('queries', () => {
     expect(second['nextCursor']).toBeUndefined();
   });
 
-  it('ignores a malformed cursor instead of failing the call', async () => {
+  it('refuses a cursor it did not give, rather than starting again from the first page', async () => {
+    // Taken for no cursor, a damaged one answered with page 1 again, and a pager read it twice without knowing.
     const client = await connect(seeded());
-    expect(await call(client, 'list_mail', { cursor: 'not-base64url-json' })).toMatchObject({ count: 3 });
+    const first = await call(client, 'list_mail', { limit: 2 });
+    const cut = String(first['nextCursor']).slice(0, 10);
+    for (const cursor of ['not-base64url-json', cut, Buffer.from('{"createdAt":"x","dedupKey":"k"}').toString('base64url')]) {
+      for (const tool of ['list_mail', 'search_mail']) {
+        const result = await client.callTool({ name: tool, arguments: { query: 'subject', limit: 2, cursor } });
+        expect(result, `${tool} ${cursor}`).toMatchObject({ isError: true });
+        const body = JSON.parse((result.content as Array<{ text: string }>)[0]!.text) as { code: string; hint: string };
+        expect(body.code).toBe('INVALID_ARGUMENT');
+        expect(body.hint).toMatch(/nextCursor/);
+      }
+    }
+    // The cursor it gave still works.
+    expect(await call(client, 'list_mail', { limit: 2, cursor: first['nextCursor'] })).toMatchObject({ count: 1 });
   });
 
   it('pages a search too, so a wide match is not silently cut at the limit', async () => {
@@ -478,11 +491,10 @@ describe('what needs the mailbox owner', () => {
     const hour = new Date(Date.now() + 3_600_000).toISOString();
     await refused({ messageId: '<two@x>', until: new Date(Date.now() - 3_600_000).toISOString() }, 'snoozePast');
     await refused({ messageId: '<two@x>', until: new Date(Date.now() + 400 * 86_400_000).toISOString() }, 'snoozeFar');
-    // Refused by the published schema before the call runs, naming the argument:
-    // the handler's own refusal names it too, so the schema's wording is what is checked.
-    await refused({ messageId: '<two@x>', until: '2030-01-01T09:00:00' }, 'Input validation error');
+    // Refused by the published schema before the call runs, naming the argument, in the typed body every failure has.
+    await refused({ messageId: '<two@x>', until: '2030-01-01T09:00:00' }, 'invalid arguments for snooze');
     await refused({ messageId: '<two@x>', until: '2030-01-01T09:00:00' }, 'until');
-    await refused({ messageId: '<two@x>' }, 'Input validation error');
+    await refused({ messageId: '<two@x>' }, 'invalid arguments for snooze');
     await refused({ messageId: '<one@x>', until: hour }, 'more than one mailbox');
     await refused({ messageId: '<absent@x>', until: hour }, 'NOT_FOUND');
     expect(state.snoozed()).toEqual([]);
@@ -1539,6 +1551,16 @@ describe('prompts', () => {
     const { prompts } = await client.listPrompts();
     expect(prompts.map((p) => p.name)).toContain('review_triage');
   });
+
+  it('refuses a window of no hours, which every tool it names would refuse', async () => {
+    const client = await connect(seeded(), true);
+    for (const name of ['catch_up', 'review_triage']) {
+      for (const hours of ['0', '00', '00024', 'abc']) {
+        await expect(client.getPrompt({ name, arguments: { hours } }), `${name} ${hours}`).rejects.toThrow();
+      }
+      await expect(client.getPrompt({ name, arguments: { hours: '24' } })).resolves.toBeDefined();
+    }
+  });
 });
 
 describe('tool errors', () => {
@@ -1598,9 +1620,8 @@ describe('access audit', () => {
     await client.callTool({ name: 'get_mail', arguments: {} });
 
     const getMail = state.mcpAuditByAction().find((row) => row.action === 'get_mail')!;
-    // A schema rejection never reaches the handler, so only the accepted call
-    // is counted; what matters is that a counted call is a real one.
-    expect(getMail).toMatchObject({ calls: 1, failures: 0 });
+    // A call refused for its arguments is a call too, and a failed one.
+    expect(getMail).toMatchObject({ calls: 2, failures: 1 });
   });
 
   it('reports the breakdown through observability', async () => {
@@ -2053,6 +2074,23 @@ describe('the rest of the mailbox, live', () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(box.acted).toContainEqual(expect.objectContaining({ messageId: '<old@x>', action: 'answered', hint: expect.objectContaining({ exact: true }) }));
   });
+  it('titles an answer to a message it can no longer read from its record, and asks for a subject when there is none', async () => {
+    // The handle's message moved away (another client, or manage_mail): it cannot be read where it was listed.
+    const state = placed();
+    const box = live(state);
+    box.backend.read = async () => { throw new LiveMailError('moved', 'gone'); };
+    const client = await connect(state, true, box.backend);
+    // Stored: "Re:" the subject its record has, not "Re:" and nothing.
+    const stored = await call(client, 'send_mail', { replyTo: ONE, text: 'Thanks', to: ['bob@acme.example'], quote: false });
+    expect(stored).toMatchObject({ sent: true, subject: 'Re: subject k1' });
+    expect(box.sent.at(-1)?.subject).toBe('Re: subject k1');
+    // Never stored: nothing says what it was about, so it is not sent until the caller says.
+    const unknown = await failed(client, 'send_mail', { replyTo: OLD, text: 'Thanks', to: ['bob@acme.example'], quote: false });
+    expect(unknown).toMatchObject({ code: 'INVALID_ARGUMENT', hint: expect.stringMatching(/subject/) });
+    expect(box.sent).toHaveLength(1);
+    const titled = await call(client, 'send_mail', { replyTo: OLD, text: 'Thanks', to: ['bob@acme.example'], quote: false, subject: 'Re: Old news' });
+    expect(titled).toMatchObject({ sent: true, subject: 'Re: Old news' });
+  });
 });
 
 describe('several messages at once, and spam', () => {
@@ -2145,5 +2183,168 @@ describe('several messages at once, and spam', () => {
     const manage = tools.find((tool) => tool.name === 'manage_mail')!;
     const actions = ((manage.inputSchema.properties as Record<string, { enum?: string[] }>)['action']!.enum ?? []);
     expect(actions).toEqual(expect.arrayContaining(['spam', 'not_spam']));
+  });
+});
+
+describe('what a QA pass found', () => {
+  /** The typed body a failing tool answers with. */
+  async function failure(client: Client, name: string, args: Record<string, unknown>): Promise<{ code: string; message: string; hint?: string }> {
+    const result = await client.callTool({ name, arguments: args });
+    expect(result, `${name} ${JSON.stringify(args)}`).toMatchObject({ isError: true });
+    const text = (result.content as Array<{ text: string }>)[0]!.text;
+    return JSON.parse(text) as { code: string; message: string; hint?: string };
+  }
+
+  it('answers arguments the schema refuses with the typed body, naming the argument, and audits the call', async () => {
+    process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw';
+    const state = seeded();
+    const client = await connect(state, true, mailbox(state).backend);
+    for (const [name, args, named] of [
+      ['list_mail', { hours: 0 }, 'hours'],
+      ['snooze', { messageId: '<two@x>', until: '2026-11-18T09:00:00' }, 'until'],
+      ['browse_folder', { account: 'me@qq.com', folder: 'INBOX', limit: 101 }, 'limit'],
+      ['search_mail', { query: '' }, 'query'],
+      ['record_feedback', { messageId: '<one@x>', label: 'bogus' }, 'label'],
+    ] as Array<[string, Record<string, unknown>, string]>) {
+      const body = await failure(client, name, args);
+      expect(body.code).toBe('INVALID_ARGUMENT');
+      expect(body.message).toContain(`invalid arguments for ${name}`);
+      expect(body.message).toContain(named);
+      expect(body.hint).toMatch(/schema/);
+    }
+    // On record, as a failed call of that tool.
+    expect(state.mcpAuditByAction().find((row) => row.action === 'snooze')).toMatchObject({ calls: 1, failures: 1 });
+    // A tool this credential does not have is answered the same way.
+    const reader = await connect(state);
+    expect(await failure(reader, 'manage_mail', { messageId: '<one@x>', action: 'star' })).toMatchObject({ code: 'INVALID_ARGUMENT', hint: expect.stringMatching(/tools\/list/) });
+  });
+
+  it('puts back in needs_you a message spam counted as dealt with when it is recorded as not spam', async () => {
+    const state = seeded();
+    const client = await connect(state, true);
+    // Counted done by spam, then brought back to the inbox (by manage_mail inbox, or another client).
+    state.setHandled('k1', true, true);
+    // Marked done by the owner: not spam does not undo that.
+    state.setHandled('k2', true);
+    expect((await call(client, 'needs_you'))['count']).toBe(0);
+    expect(await call(client, 'record_feedback', { messageId: '<one@x>', label: 'not_spam' })).toMatchObject({ recorded: true, handledAt: null });
+    expect(await call(client, 'record_feedback', { messageId: '<two@x>', label: 'not_spam' })).toMatchObject({ recorded: true });
+    expect(state.getMail('k1')?.handledAt).toBeNull();
+    expect(state.getMail('k2')?.handledAt).toBeTruthy();
+    const queue = await call(client, 'needs_you');
+    expect((queue['mail'] as Array<{ messageId: string }>).map((m) => m.messageId)).toEqual(['<one@x>']);
+    // Its description says so, as docs/mcp.md does.
+    const { tools } = await client.listTools();
+    expect(tools.find((tool) => tool.name === 'record_feedback')?.description).toContain('puts back in needs_you');
+  });
+
+  it('describes in the search syntax only the filters each tool takes', async () => {
+    const { FILTERS } = await import('../src/mcp-syntax.js');
+    const client = await connect(seeded());
+    const { tools } = await client.listTools();
+    for (const filter of FILTERS) {
+      for (const tool of filter.tools.split(',').map((name) => name.trim())) {
+        const schema = tools.find((candidate) => candidate.name === tool);
+        expect(schema, tool).toBeDefined();
+        expect(Object.keys(schema!.inputSchema.properties ?? {}), `${filter.name} in ${tool}`).toContain(filter.name);
+      }
+    }
+  });
+
+  it('searches one mailbox when told which', async () => {
+    const state = seeded();
+    state.markSeen('w1', 'me@work.com', 'subject w1');
+    state.recordOutcome('w1', 'info', false, { messageId: '<w1@x>', sender: 'billing@vendor.com', folder: 'INBOX' });
+    const client = await connect(state);
+    const all = await call(client, 'search_mail', { query: 'subject' });
+    expect(all['count']).toBe(4);
+    const one = await call(client, 'search_mail', { query: 'subject', account: 'me@work.com' });
+    expect((one['mail'] as Array<{ dedupKey: string }>).map((m) => m.dedupKey)).toEqual(['w1']);
+  });
+
+  it('never hands a verification code to an MCP caller, however it asks', async () => {
+    process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw';
+    const state = seeded();
+    state.markSeen('code', 'me@qq.com', 'Your sign-in code');
+    state.recordOutcome('code', 'warning', true, {
+      messageId: '<code@x>', threadKey: 'me@qq.com|<code@x>', sender: 'noreply@github.com', category: 'Security',
+      summary: 'A verification code arrived.', folder: 'INBOX', verificationCode: '482913',
+    });
+    state.setSnoozed('code', new Date(Date.now() - 60_000).toISOString());
+    // The page still has it, for its code lane.
+    expect(state.getMail('code')?.verificationCode).toBe('482913');
+    const client = await connect(state, true, mailbox(state).backend);
+    const answers = [
+      await call(client, 'get_mail', { messageId: '<code@x>' }),
+      await call(client, 'list_mail'),
+      await call(client, 'list_threads'),
+      await call(client, 'search_mail', { query: 'code' }),
+      await call(client, 'needs_you', { includeDone: true, includeSnoozed: true }),
+      await call(client, 'mark_handled', { messageId: '<code@x>' }),
+      await call(client, 'needs_you', { includeDone: true }),
+    ];
+    for (const answer of answers) {
+      const text = JSON.stringify(answer);
+      expect(text).not.toContain('482913');
+      expect(text).not.toContain('verificationCode');
+    }
+    expect(JSON.stringify(answers[0])).toContain('A verification code arrived.');
+  });
+
+  it('matches what was typed literally, and not the record\'s own bookkeeping', async () => {
+    const state = seeded();
+    state.markSeen('pct', 'me@qq.com', 'Save 50% on report_q3.pdf');
+    state.recordOutcome('pct', 'info', false, {
+      messageId: '<pct@mail.example>', threadKey: 'me@qq.com|<pct@mail.example>', sender: 'shop@example.com', folder: 'INBOX',
+      attachmentManifest: { items: [{ partId: '2', filename: 'report_q3.pdf', contentType: 'application/pdf', inline: false }], truncated: false },
+    });
+    const client = await connect(state);
+    const keys = async (query: string): Promise<string[]> =>
+      ((await call(client, 'search_mail', { query }))['mail'] as Array<{ dedupKey: string }>).map((m) => m.dedupKey).sort();
+    expect(await keys('%')).toEqual(['pct']);
+    expect(await keys('_')).toEqual(['pct']);
+    expect(await keys('50%')).toEqual(['pct']);
+    expect(await keys('report_q3')).toEqual(['pct']);
+    expect(await keys('report-q3')).toEqual([]);
+    // Not the mailbox's own address in every thread key, nor the attachment list's field names.
+    expect(await keys('me@qq')).toEqual([]);
+    expect(await keys('filename')).toEqual([]);
+    // A file's name and type still are.
+    expect(await keys('application/pdf')).toEqual(['pct']);
+    // A Message-ID whole, with or without its brackets, but not a piece of one.
+    expect(await keys('<pct@mail.example>')).toEqual(['pct']);
+    expect(await keys('pct@mail.example')).toEqual(['pct']);
+    expect(await keys('mail.example')).toEqual([]);
+  });
+
+  it('says which of a message\'s files is too large or not there, rather than that the mailbox is down', async () => {
+    // test/mcp-attachments.test.ts runs this through the real resource and scan paths; here, the advertised types.
+    const client = await connect(seeded());
+    const { resourceTemplates } = await client.listResourceTemplates();
+    expect(resourceTemplates.find((template) => template.name === 'mail-source')).toMatchObject({ mimeType: 'application/json' });
+  });
+
+  it('refuses a mailbox search with nothing to search for in its own argument\'s name', async () => {
+    process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw';
+    const client = await connect(seeded());
+    const body = await failure(client, 'search_mailbox', { account: 'me@qq.com', query: '   ' });
+    expect(body.code).toBe('INVALID_ARGUMENT');
+    expect(body.message).toContain('query');
+    expect(body.message).not.toMatch(/\bq\b/);
+  });
+
+  it('puts on record whether a message was marked done or put back, and the label a judgement was given', async () => {
+    process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw';
+    const state = seeded();
+    const client = await connect(state, true, mailbox(state).backend);
+    await call(client, 'mark_handled', { messageId: '<one@x>' });
+    await call(client, 'mark_handled', { messageId: '<one@x>', handled: false });
+    await call(client, 'record_feedback', { messageId: '<two@x>', label: 'missed' });
+    const targets = (action: string) => state.listMcpAudit(20).filter((row) => row.action === action)
+      .map((row) => JSON.parse(row.target!) as Record<string, unknown>);
+    expect(targets('mark_handled')).toEqual(expect.arrayContaining([
+      { messageId: '<one@x>', handled: 'true' }, { messageId: '<one@x>', handled: 'false' },
+    ]));
+    expect(targets('record_feedback')).toEqual([{ messageId: '<two@x>', label: 'missed' }]);
   });
 });
