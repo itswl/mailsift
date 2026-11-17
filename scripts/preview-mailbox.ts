@@ -267,7 +267,8 @@ export class PreviewMailbox {
           : action === 'spam' ? byRole('junk')
             : action === 'inbox' || action === 'not_spam' ? byRole('inbox') : undefined;
     if (!target) throw new MailActionError('invalid_destination', action === 'archive' ? 'this mailbox has no archive folder' : 'destination folder not found');
-    if (target === folder) throw new MailActionError('invalid_destination', 'message is already in the destination folder');
+    // There already, as the real mailbox answers: nothing moves, and it is not an error.
+    if (target === folder) return { action, account: account.username, messageId, sourceFolder: folder.path, already: true };
     folder.messages = folder.messages.filter((m) => m !== message);
     // All Mail already holds what the inbox does; archiving there is only leaving the inbox.
     let moved = target.messages.find((m) => m.messageId === message.messageId);

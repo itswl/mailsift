@@ -863,6 +863,9 @@ const ACTION_SAID = {
 };
 // One of each at a time: a held key or a second tap is the same request.
 const acting = new Set();
+// Each mailbox's archive, as an archive action answered with where the message went:
+// a message filed there is not offered Archive again.
+const archiveOf = new Map();
 async function mailAction(key, action, destination) {
   if (!requireWrite()) return;
   if (menuSheet.open) closeSheet(menuSheet, false);
@@ -881,6 +884,7 @@ async function mailAction(key, action, destination) {
     return;
   }
   applyRow(r.data.row);
+  if (action === 'archive' && r.data.row && r.data.row.folder) archiveOf.set(r.data.row.account, r.data.row.folder);
   liveData.delete(key);
   const flags = Object.assign({}, flagsByKey.get(key) || {});
   if (action === 'star' || action === 'unstar') flags.flagged = action === 'star';
@@ -985,7 +989,10 @@ function fillBar(bar, row, wide) {
   bar.appendChild(barButton('i-reply', t('act.reply'), () => startReply(key, 'reply'), markable ? '' : 'primary'));
   if (wide) bar.appendChild(barButton('i-reply-all', t('act.replyAll'), () => startReply(key, 'replyAll'), 'icon-only'));
   // Filed in the archive already, it is not archived again.
-  if (!liveIn(row, 'archive') && !liveIn(row, 'all')) bar.appendChild(barButton('i-archive', t('act.archive'), () => mailAction(key, 'archive'), wide ? 'icon-only' : ''));
+  const role = folderRoleOf(row.account, row.folder);
+  const archived = liveIn(row, 'archive') || liveIn(row, 'all') || role === 'archive' || role === 'all'
+    || (archiveOf.has(row.account) && archiveOf.get(row.account) === row.folder);
+  if (!archived) bar.appendChild(barButton('i-archive', t('act.archive'), () => mailAction(key, 'archive'), wide ? 'icon-only' : ''));
   if (wide) bar.appendChild(barButton('i-star', t(flags.flagged ? 'act.unstar' : 'act.star'), () => mailAction(key, flags.flagged ? 'unstar' : 'star'), 'icon-only' + (flags.flagged ? ' lit' : '')));
   // On a desk there is room for it beside the star; on a phone it is under "more".
   if (wide && !row.handledAt && markable) {

@@ -1333,8 +1333,9 @@ export function createServer(
           'which future triage learns from (refused where the mailbox has no spam folder); not_spam moves a message ' +
           'out of the spam folder to the inbox and records the opposite. Archiving, binning (by trash, or by a move ' +
           'into the bin) and spam count the message as dealt with. messageIds (up to ' + BULK_MAX + ') acts on several in ' +
-          'one call, one connection per mailbox, and answers with a result for each: done, skipped (the action does ' +
-          'not apply, as not_spam outside the spam folder, or a message already there) or failed, with why. ' +
+          'one call, one connection per mailbox, and answers with a result for each: done (a message already where ' +
+          'the action puts it is left there and counts as done), skipped (the action does not apply, as not_spam ' +
+          'outside the spam folder) or failed, with why. ' +
           'messageId is a stored Message-ID or key, or a live handle from browse_folder or ' +
           'search_mailbox, which is acted on exactly where it was listed and refused once the message is no longer ' +
           'there; after a move the answer\'s handle names it where it went, when the server said. account (an ' +
@@ -1367,6 +1368,8 @@ export function createServer(
           ...(handleShaped(key) && typeof moved['handle'] === 'string' ? { handle: moved['handle'] } : {}),
           needsYou: answer['attention'],
           ...(Array.isArray(answer['muted']) ? { newlyNeverImportant: answer['muted'] } : {}),
+          // It was where the action would put it already: nothing moved.
+          ...(answer['already'] ? { already: true } : {}),
         });
       },
     );
