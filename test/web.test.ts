@@ -3,7 +3,7 @@ import './setup.js';
 import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
 import {
-  allowAuthAttempt, handleApi, LANGUAGE_COOKIE, languageFromHeader, readCookie, routeWeb, SESSION_COOKIE, signInTarget,
+  allowAuthAttempt, handleApi, LANGUAGE_COOKIE, languageFromHeader, publicAsset, readCookie, routeWeb, SESSION_COOKIE, signInTarget,
   tokenMatches, webRateLimited, webUiEnabled, webVersion,
 } from '../src/web.js';
 import { SERVICE_WORKER } from '../src/web-worker.js';
@@ -1253,6 +1253,59 @@ describe('the composer', () => {
     expect(JSON.parse(stored.get('draft:new')!).text).toBe('Letter B, typed just now.');
   });
 
+  it('leaves a letter taken back over an empty composer for its place as that place\'s draft', () => {
+    const { page, context, stored, form, write, fresh } = composer();
+    fresh();
+    write({ to: 'ann.lee@studio.example', subject: 'Letter A', text: 'Important letter A.' });
+    page.sendCompose();
+    const job = context['pendingSend'];
+    // n during the count: an empty letter, nothing typed.
+    fresh();
+    page.undoSend(job);
+    expect(form.subject.value).toBe('Letter A');
+    // Closed, it is the new letter's draft, as "Your draft is kept" says: n brings it back.
+    page.saveDraft();
+    expect(JSON.parse(stored.get('draft:new')!)).toMatchObject({ subject: 'Letter A', text: 'Important letter A.' });
+    expect([...stored.keys()].filter((key) => key.startsWith('draft:sending:'))).toEqual([]);
+  });
+
+  it('keeps a letter taken back over another one with words, offered, rather than under a name nothing reaches', () => {
+    const { page, context, stored, write, fresh } = composer();
+    fresh();
+    write({ to: 'ann.lee@studio.example', subject: 'Letter A', text: 'Important letter A.' });
+    page.sendCompose();
+    const job = context['pendingSend'];
+    fresh();
+    write({ text: 'Letter B, with words.' });
+    page.undoSend(job);
+    page.saveDraft();
+    expect(JSON.parse(stored.get('draft:new')!).text).toBe('Letter B, with words.');
+    expect(page.keptLetters().map((entry) => entry.kept['subject'])).toEqual(['Letter A']);
+  });
+
+  it('stops keeping and offering a letter kept apart once its draft is discarded', () => {
+    const { page, context, form, write, fresh, note } = composer();
+    fresh();
+    write({ to: 'ann.lee@studio.example', subject: 'Letter A', text: 'Important letter A.' });
+    page.sendCompose();
+    const job = context['pendingSend'];
+    fresh();
+    write({ text: 'Letter B being written' });
+    page.saveDraft();
+    context['pendingSend'] = null;
+    page.backToLetter(job, 'Refused.');
+    const kept = page.keptLetters();
+    expect(kept).toHaveLength(1);
+    page.reopenLetter(kept[0]!.id);
+    // Discard draft, under "Draft restored": its words go, and with them its keeping.
+    const discard = (note['children'] as Array<Record<string, unknown>>).find((child) => typeof child['onclick'] === 'function')!;
+    (discard['onclick'] as () => void)();
+    expect(form.text.value).toBe('');
+    page.saveDraft();
+    (context['composeSheet'] as { open: boolean }).open = false;
+    expect(page.keptLetters()).toEqual([]);
+  });
+
   it('opens a letter whose send failed again when nothing else is being written, as before', () => {
     const { page, context, form, write, fresh, toasts } = composer();
     const a = fresh();
@@ -1277,13 +1330,13 @@ describe('the composer', () => {
     const element = (_tag: string, _cls?: string, text?: string): Record<string, unknown> => ({ ...node(), textContent: text ?? '' });
     const context: Record<string, unknown> = {
       $: () => button, composeForm: form, composeNote: note, composeSheet: { open: true }, pendingSend: null, composing: state,
-      t, fill, el: element, textNode: (value: string) => ({ textContent: value }), draftSeq: 0, writing: 0,
+      t, fill, el: element, textNode: (value: string) => ({ textContent: value }), draftSeq: 0, writing: 0, draftUndo: null,
       composeSay: (text: string, failed?: boolean) => { note['textContent'] = text; note['children'] = []; note['failed'] = Boolean(failed); },
       post: async (_path: string, body: Record<string, unknown>) => { posted.push(body); return answer(body); },
       failure: (d: { code: string }) => `failure:${d.code}`, reduceMotion: () => true, growText: () => undefined, saveDraft: () => undefined,
     };
-    const page = lifted<{ aiDraft: (confirmed?: boolean) => Promise<void> }>(
-      ['isAnswer', 'aiDraft', 'askReplace', 'putDraft', 'writeIn'], '({ aiDraft })', context,
+    const page = lifted<{ aiDraft: (confirmed?: boolean) => Promise<void>; dropDraftUndo: () => void }>(
+      ['isAnswer', 'aiDraft', 'askReplace', 'putDraft', 'dropDraftUndo', 'writeIn'], '({ aiDraft, dropDraftUndo })', context,
     );
     /** Presses the button in the line under the letter that says this. */
     const press = (key: string): void => {
@@ -1332,6 +1385,27 @@ describe('the composer', () => {
     expect(typing.form.text.value).toBe('Model text.');
     typing.press('undo');
     expect(typing.form.text.value).toBe('Something I typed while waiting.');
+  });
+
+  it('takes the draft\'s Undo away once the owner writes in it, and never undoes their own words', async () => {
+    const reply = { mode: 'reply', key: 'k1' };
+    // Rewritten, as the composer hears it: the line with Undo goes.
+    const typed = drafting(reply);
+    await typed.page.aiDraft();
+    const undo = (typed.note['children'] as Array<Record<string, unknown>>).find((child) => child['textContent'] === t('undo'))!;
+    typed.form.text.value = 'Completely rewritten by me: I will be at gate 27 by 9:40.';
+    typed.page.dropDraftUndo();
+    expect(typed.note['textContent']).toBe('');
+    // A press that still reaches the old button changes nothing.
+    (undo['onclick'] as () => void)();
+    expect(typed.form.text.value).toBe('Completely rewritten by me: I will be at gate 27 by 9:40.');
+    // Rewritten without the composer hearing it: Undo still sees that the box no longer holds the draft.
+    const unheard = drafting(reply);
+    await unheard.page.aiDraft();
+    unheard.form.text.value = 'My own words.';
+    unheard.press('undo');
+    expect(unheard.form.text.value).toBe('My own words.');
+    expect(clientScript()).toContain('if (e.target === composeForm.text) { growText(); dropDraftUndo(); }');
   });
 
   it('writes a draft only into the letter it was asked for while it is open, never into one sent off meanwhile', async () => {
@@ -1578,11 +1652,21 @@ describe('the composer', () => {
       attentionSet: new Set(['k1']), rowByKey: () => ({ handledAt: null }), markHandledLocal: (key: string) => marked.push(key),
       attentionCount: 3, liveData: new Map(), renderList: () => undefined, renderLede: () => undefined,
       renderBars: () => undefined, updateBadge: () => undefined, refreshConversations: () => { redrawn += 1; },
-      liveView: null, settleKept: () => undefined,
+      liveView: null, settleKept: () => undefined, navigator: { onLine: true },
     };
     let redrawn = 0;
     const deliver = lifted<(job: unknown) => Promise<void>>(['homeId', 'draftId', 'heldFiles', 'keptStates', 'deliver'], 'deliver', context);
     const job = () => ({ payload: { forwardOf: 'k1' }, files: [], state: { mode: 'forward', key: 'k1', draftKey: 'draft:sending:x' } });
+    // With no connection the request is not even tried: the letter was not sent, and is back.
+    const back: string[] = [];
+    context['navigator'] = { onLine: false };
+    context['backToLetter'] = (_job: unknown, said: string) => back.push(said);
+    const before = marked.length;
+    await deliver(job());
+    expect(back).toEqual([t('compose.sendOffline')]);
+    expect(marked.length).toBe(before);
+    context['navigator'] = { onLine: true };
+    context['backToLetter'] = () => undefined;
     // Forwarded to another of the owner's own mailboxes: still to be dealt with.
     answer = { sent: true, rejected: [], handled: false, attention: 3 };
     await deliver(job());
@@ -2856,7 +2940,7 @@ describe('what a QA pass found in the reader and on signing out', () => {
       cssUrls: (css: string, imagesOn: boolean, out: { remote: number }) => string;
       cssUnescape: (css: string) => string;
       backgroundStyle: (value: string) => string;
-    }>(['siteOf', 'ownAddress', 'RASTER_DATA', 'shownHost', 'misleadingSite', 'cssUnescape', 'cssCalls', 'cssUrls', 'backgroundStyle'],
+    }>(['siteOf', 'ownAddress', 'RASTER_DATA', 'shownHost', 'misleadingSite', 'cssUnescape', 'CSS_CALL', 'cssCalls', 'cssUrls', 'backgroundStyle'],
       '({ misleadingSite, cssUrls, cssUnescape, backgroundStyle })', context);
   };
 
@@ -2864,7 +2948,7 @@ describe('what a QA pass found in the reader and on signing out', () => {
     const { misleadingSite } = reader();
     for (const shown of [
       'paypal.com', 'PayPal.com', 'paypal.com\u200b', 'paypal.com\u00ad', '\u200bpaypal.com', 'paypal.com!', 'paypal.com.',
-      '\u202epaypal.com', '\uff50\uff41\uff59\uff50\uff41\uff4c\uff0e\uff43\uff4f\uff4d', 'https://www.paypal.com/signin', '«paypal.com»', 'paypal.com is where you pay',
+      '\u202epaypal.com', '\uff50\uff41\uff59\uff50\uff41\uff4c\uff0e\uff43\uff4f\uff4d', 'https://www.paypal.com/signin', '«paypal.com»', 'paypal\u3002com',
     ]) {
       expect(misleadingSite(shown, 'evil.example'), JSON.stringify(shown)).toBe(shown.includes('www.') ? 'www.paypal.com' : 'paypal.com');
     }
@@ -2874,11 +2958,20 @@ describe('what a QA pass found in the reader and on signing out', () => {
     // Text that goes where it says, or names no site, is left alone.
     expect(misleadingSite('paypal.com', 'www.paypal.com')).toBe('');
     expect(misleadingSite('Pay your invoice', 'evil.example')).toBe('');
+    // Nor is honest text that only starts with a dotted word, or Chinese that runs on from a name or has a full stop in it.
+    for (const [text, host] of [
+      ['Node.js 22 is now available', 'nodejs.org'], ['invoice-4821.pdf (34 KB)', 'files.stripe.com'],
+      ['taobao.com\u9996\u9875', 'www.taobao.com'], ['stripe.com\u8d26\u5355\u8be6\u60c5', 'dashboard.stripe.com'],
+      ['\u8ba2\u5355\u5df2\u53d1\u8d27\u3002\u70b9\u51fb\u67e5\u770b\u7269\u6d41\u8be6\u60c5', 'www.jd.com'],
+      ['ASP.NET Core 9 release notes', 'learn.microsoft.com'], ['README.md on GitHub', 'github.com'], ['Next.js Conf: tickets', 'nextjs.org'],
+      ['\u8bf7\u8bbf\u95eepaypal.com', 'www.paypal.com'], ['\u60a8\u597d\u3002\u8bf7\u67e5\u770b', 'x.example'],
+      ['m\u00fcnchen.de', 'xn--mnchen-3ya.de'], ['paypal.com is where you pay', 'www.paypal.com'],
+    ]) expect(misleadingSite(text!, host!), JSON.stringify(text)).toBe('');
   });
 
   it('cuts every remote picture from CSS however it is written, counts each, and keeps them when images are shown', () => {
     const { cssUrls, cssUnescape } = reader();
-    const css = cssUnescape('.a{background-image:u\\72l(https://cssescape.example/a.png)}'
+    const css = ('.a{background-image:u\\72l(https://cssescape.example/a.png)}'
       + '.b{background-image:image-set("https://imageset.example/b.png" 1x, url(https://imageset.example/c.png) 2x)}'
       + '.c{background:url("https://quoted.example/a)b.png")}'
       + '.d{background:URL( h\\74tps://upper.example/d.png )}'
@@ -2894,10 +2987,29 @@ describe('what a QA pass found in the reader and on signing out', () => {
       expect(kept, host).toContain(host);
     }
     expect(on.remote).toBe(5);
+    // Shown, the sender's CSS is exactly what was sent.
+    expect(kept).toBe(css);
     // An escape that stands for a quote or a brace stays as written, so a string keeps its meaning.
     expect(cssUnescape('content:"\\22"; a\\7d b')).toBe('content:"\\22"; a\\7d b');
     // This server's own addresses never load, images on or not.
     expect(cssUrls('a{background:url(https://mail.example/api/x)}', true, { remote: 0 })).not.toContain('mail.example');
+  });
+
+  it('keeps the sender\'s stylesheet as written, escaped selectors and media queries included', () => {
+    const page = lifted<{ cssUrls: (css: string, imagesOn: boolean, out: { remote: number }) => string; cssWithoutLoads: (css: string) => string }>(
+      ['RASTER_DATA', 'ownAddress', 'cssUnescape', 'CSS_CALL', 'cssCalls', 'cssUrls', 'cssWithoutLoads'], '({ cssUrls, cssWithoutLoads })',
+      { URL, location: { origin: 'https://mail.example' } },
+    );
+    // Built by Tailwind or Maizzle: its selectors are escaped, and mean nothing once the escapes are gone.
+    const tailwind = '.sm\\:big{font-size:40px;color:rgb(200,0,0)} .w-1\\/2{width:50%} .p-0\\.5{padding-left:33px} .\\31 0x{font-weight:900} '
+      + '@media (min-width:1px){.md\\:under{text-decoration:underline}} @media (max-width:600px){.sm\\:w-full{width:100% !important}}';
+    for (const imagesOn of [false, true]) expect(page.cssUrls(tailwind, imagesOn, { remote: 0 })).toBe(tailwind);
+    expect(page.cssWithoutLoads(tailwind)).toBe(tailwind);
+    // A rule that would load a stylesheet or a font goes, however it is spelled; the rest stays as it was.
+    const loads = '@\\69mport url(https://x.example/a.css); .a\\:b{color:red} @font-face{font-family:X;src:url(https://x.example/f.woff)} .c{color:blue}';
+    expect(page.cssWithoutLoads(loads)).toBe(' .a\\:b{color:red}  .c{color:blue}');
+    expect(clientScript()).toContain("const css = cssUrls(cssWithoutLoads(sheet.textContent || ''), imagesOn, out);");
+    expect(clientScript()).toContain('value = cssUrls(value, imagesOn, out);');
   });
 
   it('shows a background picture of an old table layout with the rest, as a style the frame treats like any image', () => {
@@ -2965,7 +3077,7 @@ describe('what a QA pass found in the queue and the mailbox, in the page', () =>
       startCompose: () => did.push('compose'), refreshButton: null, pollNow: () => undefined, openFolders: () => did.push('folders'),
       clearSelection: () => did.push('cleared'), exitLive: () => undefined, togglePick: () => undefined, clearPicks: () => undefined,
       folderRoleOf: (_account: string, folder: string) => ({ '[Gmail]/All Mail': 'all', '[Gmail]/Trash': 'trash', Archive: 'archive' } as Record<string, string>)[folder] ?? null,
-      liveIn: () => false,
+      liveIn: () => false, withFolderRoles: (_account: string, run: () => void) => run(),
     };
     const press = lifted<(e: Record<string, unknown>) => void>(
       ['rowKey', 'queueKey', 'READER_KEYS', 'queueKeysNow', 'queueStep', 'archivable', 'binnable', 'pageKeydown'], 'pageKeydown', context,
@@ -3196,5 +3308,103 @@ describe('what a QA pass found in the queue and the mailbox, in the page', () =>
     expect(rank(labels.filter((c) => c.label.toLowerCase().includes('folder')), 'folder').map((c) => c.label)).toEqual(['Folders…', 'Only from spam folders']);
     // Nothing typed: the order they are declared in.
     expect(rank(labels, '').map((c) => c.label)).toEqual(labels.map((c) => c.label));
+  });
+});
+
+describe('what the re-test of the QA fixes found', () => {
+  it('shows the message the reader\'s own entry names when Back lands on another of its entries', () => {
+    const opened: Array<[string, boolean]> = [];
+    const sheet = { open: true };
+    const context: Record<string, unknown> = {
+      history: { state: { sheet: 'sheet', depth: 1, key: 'preview-07', hash: '#m=preview-07' } },
+      location: { hash: '#m=preview-07' }, sheet, sheetStack: [{ dialog: sheet }], openKey: 'preview-06',
+      topSheet: () => sheet, closeSheet: () => undefined, filterSheet: { open: false }, popovers: new Map(), picked: new Set(),
+      liveFromHistory: () => undefined, syncUrl: () => undefined, keyFromHash: () => 'preview-07',
+      openFromLink: (key: string, here: boolean) => opened.push([key, here]),
+    };
+    lifted<() => void>(['historyMoved'], 'historyMoved', context)();
+    expect(opened).toEqual([['preview-07', true]]);
+    // The entry of the message on show: nothing to do.
+    context['openKey'] = 'preview-07';
+    lifted<() => void>(['historyMoved'], 'historyMoved', context)();
+    expect(opened).toHaveLength(1);
+  });
+
+  it('learns what each folder is for once, where the page acts on a mailbox\'s mail, and waits for it before y or #', () => {
+    const loads: string[] = [];
+    const timers: Array<() => void> = [];
+    const folderLists = new Map<string, Record<string, unknown>>();
+    const context: Record<string, unknown> = {
+      folderLists, session: { writable: true }, setTimeout: (run: () => void) => timers.push(run),
+      loadFolders: (account: string) => { loads.push(account); folderLists.set(account, { loading: true }); },
+    };
+    const page = lifted<{ knowFolderRoles: (account: string) => void; withFolderRoles: (account: string, run: () => void) => void }>(
+      ['knowFolderRoles', 'withFolderRoles'], '({ knowFolderRoles, withFolderRoles })', context,
+    );
+    page.knowFolderRoles('me@gmail.com');
+    page.knowFolderRoles('me@gmail.com');
+    expect(loads).toEqual(['me@gmail.com']);
+    // A read session acts on nothing: it does not list a mailbox's folders for this.
+    context['session'] = { writable: false };
+    page.knowFolderRoles('me@qq.com');
+    expect(loads).toEqual(['me@gmail.com']);
+    // y or # while the list is on its way: run once it is here.
+    const ran: string[] = [];
+    page.withFolderRoles('me@gmail.com', () => ran.push('archive'));
+    expect(ran).toEqual([]);
+    folderLists.set('me@gmail.com', { folders: [{ path: '[Gmail]/Trash', role: 'trash' }] });
+    timers.shift()!();
+    expect(ran).toEqual(['archive']);
+    const script = clientScript();
+    expect(script).toContain('  knowFolderRoles(row.account);');
+    expect(script).toContain('  // What each folder is for decides whether the reader offers Archive and Bin.\n  renderBars();');
+    expect(script).toContain("withFolderRoles(row.account, () => { if (binnable(row)) mailAction(key, 'trash'); });");
+  });
+
+  it('says a server that is busy is busy, not that it cannot be reached', () => {
+    const nodes = new Map<string, Record<string, unknown>>();
+    const node = (id: string) => nodes.get(id) ?? nodes.set(id, { hidden: true, textContent: '', classList: { toggle: () => undefined } }).get(id)!;
+    const context: Record<string, unknown> = {
+      $: (selector: string) => node(selector), t: (key: string) => STRINGS.en[key as StringKey] ?? key, navigator: { onLine: true },
+      connectionProblem: false, serverBusy: false, announce: () => undefined, renderStatus: () => undefined,
+      document: { body: { classList: { toggle: () => undefined } } },
+    };
+    const page = lifted<{ setNetworkIssue: (active: boolean, busy?: boolean) => void; answerFailed: (r: { status: number }) => { busy: boolean } }>(
+      ['answerFailed', 'setNetworkIssue'], '({ setNetworkIssue, answerFailed })', context,
+    );
+    expect(page.answerFailed({ status: 429 }).busy).toBe(true);
+    expect(page.answerFailed({ status: 502 }).busy).toBe(false);
+    page.setNetworkIssue(true, true);
+    expect(node('#network-text')['textContent']).toBe(STRINGS.en['network.busy']);
+    page.setNetworkIssue(true, false);
+    expect(node('#network-text')['textContent']).toBe(STRINGS.en['network.unavailable']);
+    expect(clientScript()).toContain("fill(serverBusy ? 'status.busy' : 'status.offline', { time })");
+    expect(STRINGS['zh-CN']['network.busy']).toBeTruthy();
+    expect(STRINGS['zh-CN']['status.busy']).toBeTruthy();
+  });
+
+  it('keeps the page\'s mark and files outside its budget', () => {
+    for (const path of ['/icon-192.png', '/sw.js', '/manifest.webmanifest', '/favicon.ico']) expect(publicAsset(path), path).toBe(true);
+    for (const path of ['/', '/api/mail', '/auth', '/icon-192.png.html']) expect(publicAsset(path), path).toBe(false);
+  });
+
+  it('switches the sign-in form\'s language where it was asked for, keeping where signing in goes', async () => {
+    const page = String((await routeWeb(request({ url: '/?q=invoice' }), url('/?q=invoice'), 'secret', seeded())).body);
+    const script = page.slice(page.lastIndexOf('<script nonce='), page.lastIndexOf('</script>')).replace(/^<script[^>]*>/, '');
+    const run = (path: string, search: string, posted = '') => {
+      const did: string[] = [];
+      const next = { value: posted };
+      const lang: Record<string, unknown> = {};
+      new Script(script).runInNewContext({
+        document: { querySelector: (selector: string) => (selector === '#lang' ? lang : next), cookie: '' },
+        location: { pathname: path, search, hash: '', reload: () => did.push('reload'), replace: (to: string) => did.push(`replace ${to}`) },
+      });
+      (lang['onclick'] as () => void)();
+      return { did, next: next.value };
+    };
+    // The form asked for at a shortcut: loaded again there, so signing in still goes to it.
+    expect(run('/', '?q=invoice')).toEqual({ did: ['reload'], next: '/?q=invoice' });
+    // A refused sign-in, on /auth: not posted again, but sent where it was going.
+    expect(run('/auth', '', '/?focus=code')).toEqual({ did: ['replace /?focus=code'], next: '/?focus=code' });
   });
 });

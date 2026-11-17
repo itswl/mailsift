@@ -37,7 +37,7 @@ import {
 import { retryAttempts } from './services/delivery.js';
 import { HEARTBEAT_KEY, IDLE_WAKE_KEY, type PollStats } from './services/watcher.js';
 import { PushDispatcher } from './services/push-dispatcher.js';
-import { routeWeb, webRateLimited, webUiEnabled } from './web.js';
+import { publicAsset, routeWeb, webRateLimited, webUiEnabled } from './web.js';
 import {
   actOnMail, asWriteSession, awaitEarlierSend, configuredAccounts, defaultBackend, earlierSend, forwardDraft, letterText,
   liveRead, markHandled, rememberWhereabouts, replyDraft, requestTimeoutMs, resolveTarget, saveSignature, sendMessage,
@@ -2225,8 +2225,11 @@ export async function startMcpHttp(
   const httpServer = createHttpServer((req, res) => {
     void (async () => {
       const client = clientFingerprint(clientAddress(req));
-      const forMcp = (req.url ?? '/').split('?')[0] === '/mcp';
-      if (!(forMcp ? allowMcpRequest(client) : allowWebRequest(client))) {
+      const path = (req.url ?? '/').split('?')[0] ?? '/';
+      const forMcp = path === '/mcp';
+      // The icons, the worker and the manifest come from memory and cost nothing: outside the page's budget,
+      // so the page that says the budget is spent still shows its mark.
+      if (!(forMcp ? allowMcpRequest(client) : publicAsset(path) || allowWebRequest(client))) {
         if (forMcp || !webUiEnabled()) {
           res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '60' }).end('{"error":"rate_limited","code":"rate_limited"}');
           return;

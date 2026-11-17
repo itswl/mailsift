@@ -431,6 +431,24 @@ function countsChanged(account) {
 function countsStale(account) {
   return Boolean((folderLists.get(account) || {}).stale);
 }
+// What each folder of a mailbox is for (its archive, All Mail, its bin): read
+// once, where a session that acts on its mail opens one of its messages, so
+// that after a reload the reader still knows a message in the bin is there.
+function knowFolderRoles(account) {
+  if (account && session.writable && !folderLists.has(account)) loadFolders(account);
+}
+// Runs once a mailbox's folders are known, or could not be read, or after five seconds whatever happened.
+function withFolderRoles(account, run) {
+  let waited = 0;
+  const ready = () => {
+    const known = folderLists.get(account);
+    if ((known && !known.loading) || waited >= 50) { run(); return; }
+    if (!known) loadFolders(account);
+    waited += 1;
+    setTimeout(ready, 100);
+  };
+  ready();
+}
 async function loadFolders(account, force) {
   const known = folderLists.get(account);
   if (known && known.loading) return;
@@ -448,6 +466,8 @@ async function loadFolders(account, force) {
     next = { at: 0, folders: known && known.folders, error: {} };
   }
   folderLists.set(account, next);
+  // What each folder is for decides whether the reader offers Archive and Bin.
+  renderBars();
   if (folderSheet.open && folderPick.account === account) drawFolderList();
   if (liveView && liveView.account === account) {
     renderLiveHead();

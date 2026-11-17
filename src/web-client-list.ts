@@ -1032,7 +1032,7 @@ async function load(reset = true) {
   try {
     const r = await fetch(dataPath() + '?' + p.toString());
     if (r.status === 401) { location.reload(); return; }
-    if (!r.ok) throw new Error('http ' + r.status);
+    if (!r.ok) throw answerFailed(r);
     const data = await r.json();
     if (requestId !== mailRequestId) return;
     if (filters.view.value === 'threads') {
@@ -1054,7 +1054,7 @@ async function load(reset = true) {
     setNetworkIssue(false);
   } catch (e) {
     if (requestId === mailRequestId) {
-      if (reset) { loadFailed = true; setNetworkIssue(true); } else loadMoreFailed = true;
+      if (reset) { loadFailed = true; setNetworkIssue(true, e && e.busy); } else loadMoreFailed = true;
     }
   } finally {
     if (requestId === mailRequestId) {
@@ -1083,7 +1083,7 @@ async function refresh() {
   try {
     const r = await fetch(dataPath() + '?' + p.toString());
     if (r.status === 401) { location.reload(); return; }
-    if (!r.ok) throw new Error('http ' + r.status);
+    if (!r.ok) throw answerFailed(r);
     const data = await r.json();
     if (requestId !== mailRequestId) return;
     const page = Array.isArray(data.mail) ? data.mail : [];
@@ -1098,7 +1098,7 @@ async function refresh() {
     lastFetchAt = new Date();
     setNetworkIssue(false);
   } catch (e) {
-    if (requestId === mailRequestId) setNetworkIssue(true);
+    if (requestId === mailRequestId) setNetworkIssue(true, e && e.busy);
   } finally {
     if (requestId === mailRequestId) {
       loadingMail = false;
@@ -1160,7 +1160,7 @@ async function chrome() {
     ]);
     if (summaryAnswer.status === 401) { location.reload(); return; }
     // An error page that happens to be JSON (a proxy's) is not a summary.
-    if (!summaryAnswer.ok) throw new Error('http ' + summaryAnswer.status);
+    if (!summaryAnswer.ok) throw answerFailed(summaryAnswer);
     const s = await summaryAnswer.json();
     const hadSummary = Boolean(lastSummary);
     const downBefore = failingMailboxes().map((m) => m.address).join();
@@ -1199,7 +1199,7 @@ async function chrome() {
     if (healthSheet.open) redrawHealth();
     saveSnapshot();
   } catch (e) {
-    setNetworkIssue(true);
+    setNetworkIssue(true, e && e.busy);
   }
 }
 

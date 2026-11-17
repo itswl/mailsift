@@ -154,7 +154,9 @@ function saveDraft() {
   };
   if (composing.noSignature) fields.noSignature = true;
   // A letter whose send failed, kept under a name of its own: what it is, so it can be opened again (see keptLetters).
-  if (composing.failed && String(composing.draftKey || '').indexOf('draft:sending:') === 0) fields.letter = letterOf(composing);
+  // So are words written in such a letter after it was discarded: the place it was kept under is not its message's.
+  const parked = String(composing.draftKey || '').indexOf('draft:sending:') === 0 && !(pendingSend && pendingSend.state === composing);
+  if (parked && (composing.failed || fields.text.trim() || added.length)) fields.letter = letterOf(composing);
   // A forward's own files are references; what was put on or taken off by hand stays so.
   if (composing.mode === 'forward') fields.choice = composing.choice || {};
   if (fields.account) composing.from = fields.account;
@@ -207,7 +209,7 @@ function readDraft(state) {
 }
 let draftTimer;
 composeForm.addEventListener('input', (e) => {
-  if (e.target === composeForm.text) growText();
+  if (e.target === composeForm.text) { growText(); dropDraftUndo(); }
   // The model's instruction and the signature being edited are not the letter.
   if (e.target === composeForm.instruction || composeSig.contains(e.target)) return;
   clearTimeout(draftTimer);
@@ -905,6 +907,15 @@ function openCompose(state) {
         composeForm.text.value = '';
         state.files = [];
         state.lost = [];
+        // A letter kept apart is no longer kept: not offered again, and its message's draft again where that place is free.
+        if (state.failed) {
+          state.failed = false;
+          keptStates.delete(draftId(state));
+          const home = homeId(state);
+          let free = false;
+          try { free = localStorage.getItem(home) === null && !heldFiles.has(home); } catch (e) { free = false; }
+          if (free && state.draftKey) { try { localStorage.removeItem(state.draftKey); } catch (e) {} state.draftKey = null; }
+        }
         drawFiles();
         drawLost();
         saveDraft();
@@ -1120,7 +1131,10 @@ function askReplace(state, run, ready) {
   composeNote.appendChild(yes);
   composeNote.appendChild(no);
 }
-// The draft in the box, with the way back to what was there before it.
+// The draft in the box, with the way back to what was there before it. The
+// way back lasts while the box holds the draft: once the owner writes in it,
+// what is there is theirs, and Undo is taken away rather than undo their words.
+let draftUndo = null;
 function putDraft(state, draft) {
   const before = composeForm.text.value;
   state.drafted = true;
@@ -1129,8 +1143,13 @@ function putDraft(state, draft) {
   composeSay(t('compose.drafted'));
   const undo = el('button', 'text-btn quiet small', t('undo'));
   undo.type = 'button';
+  const mine = { state, draft };
+  draftUndo = mine;
   undo.onclick = () => {
-    if (composing !== state) return;
+    const now = composeForm.text.value;
+    // Only over the draft, or the part of it still being written in.
+    if (composing !== state || draftUndo !== mine || (now !== draft && draft.indexOf(now) !== 0)) { dropDraftUndo(); return; }
+    draftUndo = null;
     writing += 1;
     composeForm.text.value = before;
     growText();
@@ -1140,6 +1159,11 @@ function putDraft(state, draft) {
   };
   composeNote.appendChild(textNode(' '));
   composeNote.appendChild(undo);
+}
+function dropDraftUndo() {
+  if (!draftUndo) return;
+  draftUndo = null;
+  if (composeNote.textContent.indexOf(t('compose.drafted')) === 0) composeSay('');
 }
 // The draft is written into the field rather than dropped in, so it reads as
 // something that is being offered, and is finished before anyone could tire
@@ -1193,13 +1217,14 @@ function hideSending() {
 // message, words and files together, unless another letter was begun there
 // in the meantime: then it keeps the name it was sent off under, and so do
 // its files, and the other letter keeps its own.
-function reclaimDraft(state) {
+// replacing: the letter open now is about to give way to this one (Undo), and was kept first; it holds the place only by what it kept.
+function reclaimDraft(state, replacing) {
   const own = state.draftKey;
   if (!own) return;
   state.draftKey = null;
   const home = draftId(state);
   // Taken by a draft kept there, by files held for one, or by the letter open in the composer now, saved or not.
-  const openThere = composeSheet.open && composing && composing !== state && draftId(composing) === home;
+  const openThere = !replacing && composeSheet.open && composing && composing !== state && draftId(composing) === home;
   try {
     const kept = localStorage.getItem(own);
     if (localStorage.getItem(home) !== null || heldFiles.has(home) || openThere) { state.draftKey = own; return; }
@@ -1218,7 +1243,9 @@ function undoSend(job) {
   hideSending();
   // A letter being written meanwhile is kept, every word of it, before the one taken back takes its place.
   if (composeSheet.open && composing && composing !== job.state) { clearTimeout(draftTimer); saveDraft(); }
-  reclaimDraft(job.state);
+  reclaimDraft(job.state, true);
+  // Its place was taken by a letter with words of its own: kept apart, with what it is, so it is offered and never lost.
+  if (job.state.draftKey) { job.state.failed = true; keepLetter(job.state); }
   openCompose(job.state);
   composeSay(t('compose.undone'));
 }
@@ -1480,6 +1507,8 @@ async function deliver(job) {
     if (read.failed) { backToLetter(job, fill('compose.fileUnreadable', { file: read.failed })); return; }
     payload = Object.assign({}, job.payload, { attachments: read.attachments });
   }
+  // With no connection the request cannot leave: said as not sent, not as perhaps sent.
+  if (navigator.onLine === false) { backToLetter(job, t('compose.sendOffline')); return; }
   // Sent from a page that is being put away, the request is marked to outlive it.
   const leaving = document.hidden && bytesOf(JSON.stringify(payload)) < KEEPALIVE_BYTES;
   const r = await post('/api/send', payload, leaving ? { keepalive: true } : {});

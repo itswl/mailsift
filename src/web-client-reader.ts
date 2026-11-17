@@ -74,22 +74,29 @@ const MAIL_DROP = new Set(('script style iframe frame frameset object embed appl
 const MAIL_ATTRS = new Set(('align alt bgcolor border cellpadding cellspacing class color colspan dir face height id lang nowrap '
   + 'rowspan size span start style title type valign width').split(' '));
 const COLOURED = /(^|[;{\s])(color|background(-color|-image)?)\s*:/i;
-// CSS lets any character be written as an escape: u\72l( is url(. One that
-// spells a letter of a name or of an address is read as what it spells, so
-// the checks below see what the browser will; one that stands for a character
-// CSS gives meaning to (a quote, a brace, a parenthesis) stays as written.
+// CSS lets any character be written as an escape: u\72l( is url(. The
+// checks below read a name or an address the way the browser will, through
+// this; the sender's stylesheet itself is never rewritten with it, since an
+// escaped selector (.sm\:w-full, .w-1\/2, built by Tailwind and its kind)
+// means something else, or nothing, once its escapes are gone. An escape that
+// stands for a character CSS gives meaning to stays as written.
 function cssUnescape(css) {
   return String(css).replace(/\\([0-9a-f]{1,6})[ \t\n\r\f]?|\\([^\n\r\f0-9a-f])/gi, (whole, hex, ch) => {
     const c = hex ? String.fromCodePoint(Math.min(parseInt(hex, 16), 0x10ffff) || 0xfffd) : ch;
     return /^[a-z0-9_.:\/-]$/i.test(c) ? c : whole;
   });
 }
-// Each call of a CSS function, what is between its parentheses (quotes and
-// nested calls included) handed to replace, whose answer takes its place.
-function cssCalls(text, pattern, replace) {
-  const re = new RegExp(pattern, 'gi');
+// A name as CSS writes it, escapes and all, right before a parenthesis.
+const CSS_CALL = /((?:[a-z0-9_-]|\\[0-9a-f]{1,6}[ \t\n\r\f]?|\\[^\n\r\f0-9a-f])+)\(/gi;
+// Each call of one of these CSS functions, found by its name as the browser
+// reads it (u\72l is url), with what is between its parentheses (quotes and
+// nested calls included) handed to replace, as written; its answer takes the
+// call's place. Everything else is left exactly as it was.
+function cssCalls(text, names, replace) {
+  const re = new RegExp(CSS_CALL.source, 'gi');
   let out = '', at = 0, m;
   while ((m = re.exec(text))) {
+    if (names.indexOf(cssUnescape(m[1]).toLowerCase()) === -1) continue;
     const open = m.index + m[0].length;
     let depth = 1, i = open, quote = '';
     for (; i < text.length && depth; i += 1) {
@@ -109,24 +116,43 @@ function cssCalls(text, pattern, replace) {
 // when the reader asked for this message's images. Everything else is cut
 // from the CSS itself, so the frame's policy never has anything to refuse,
 // and every remote picture is counted, so the note above the message offers
-// to show it. The CSS is read unescaped (cssUnescape).
+// to show it. Each address is read unescaped; the CSS is kept as written.
 function cssUrls(css, imagesOn, out) {
   const allowed = (target) => {
-    if (RASTER_DATA.test(target)) return true;
-    if (/^https?:/i.test(target) && !ownAddress(target)) {
+    const plain = cssUnescape(target);
+    if (RASTER_DATA.test(plain)) return true;
+    if (/^https?:/i.test(plain) && !ownAddress(plain)) {
       out.remote += 1;
       return imagesOn;
     }
     return false;
   };
   const unquote = (value) => value.trim().replace(/^(['"])([\s\S]*)\1$/, '$2');
-  const urls = cssCalls(String(css), '(?:url|src)\\(', (inner, head) => (allowed(unquote(inner)) ? head + inner + ')' : 'none'));
+  const urls = cssCalls(String(css), ['url', 'src'], (inner, head) => (allowed(unquote(inner)) ? head + inner + ')' : 'none'));
   // image-set() names its pictures as plain strings as well: it stays whole, or goes whole.
-  return cssCalls(urls, '(?:-webkit-)?image-set\\(', (inner, head) => {
+  return cssCalls(urls, ['image-set', '-webkit-image-set'], (inner, head) => {
     let ok = true;
     inner.replace(/(["'])((?:\\[\s\S]|(?!\1)[^\\])*)\1/g, (whole, q, target) => { if (!allowed(target)) ok = false; return whole; });
     return ok ? head + inner + ')' : 'none';
   });
+}
+// A stylesheet without the rules that would load one (@import) or a font
+// (@font-face), found by their names as the browser reads them; the rest as written.
+function cssWithoutLoads(css) {
+  const text = String(css);
+  const re = /@((?:[a-z-]|\\[0-9a-f]{1,6}[ \t\n\r\f]?|\\[^\n\r\f0-9a-f])+)/gi;
+  let out = '', at = 0, m;
+  while ((m = re.exec(text))) {
+    const name = cssUnescape(m[1]).toLowerCase();
+    let end = -1;
+    if (name === 'import') { const semi = text.indexOf(';', re.lastIndex); end = semi === -1 ? text.length : semi + 1; }
+    else if (name === 'font-face') { const close = text.indexOf('}', re.lastIndex); end = close === -1 ? text.length : close + 1; }
+    if (end === -1) continue;
+    out += text.slice(at, m.index);
+    at = end;
+    re.lastIndex = end;
+  }
+  return out + text.slice(at);
 }
 const RASTER_DATA = /^data:image\/(png|jpe?g|gif|webp);/i;
 // An address on this very server. A message has no business loading one: the
@@ -144,14 +170,20 @@ function siteOf(host) {
 }
 // What a link's text says it is, as a host name in its ASCII form: the text
 // read the way the eye reads it (compatibility forms folded, invisible
-// characters and direction marks gone), when it starts with a site's name.
-// '' when it names none. A look-alike letter stays itself, so its site is
-// another than the one it imitates.
+// characters and direction marks gone), when the whole of it is a site's
+// name, or an address: the name, then nothing but punctuation, or a path,
+// port, query or fragment. '' when it names none. A name ends in a top-level
+// domain of letters (or its xn-- form), so "Node.js 22 is out", a file name
+// with its size, or Chinese that runs on after a name or has a full stop in
+// it are not names; a 。 counts as a dot only between letters of a name. A
+// look-alike letter (Cyrillic а for a) stays itself, so its site is another
+// than the one it imitates.
 function shownHost(text) {
   const plain = String(text || '').normalize('NFKC').replace(/[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu, '')
-    .replace(/[。．｡]/g, '.').trim();
-  const m = /^[\s"'«‘“(<\[]*(?:https?:\/\/)?((?:[\p{L}\p{N}-]+\.)+(?:\p{L}{2,}|xn--[a-z0-9-]+))(?=$|[^\p{L}\p{N}-])/iu.exec(plain);
-  if (!m) return '';
+    .replace(/([a-z0-9-])[。｡]([a-z0-9-])/gi, '$1.$2').trim();
+  const m = /^[\s"'«‘“(<\[]*(?:https?:\/\/)?((?:[\p{L}\p{N}-]+\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]+))(?=[\/:?#]|[\p{P}\p{S}\s]*$)/iu.exec(plain);
+  // Chinese, Japanese and Korean run on without a gap: "请访问paypal.com" is a sentence, not a name.
+  if (!m || /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(m[1])) return '';
   try { return new URL('http://' + m[1]).hostname; } catch (e) { return ''; }
 }
 // The site a link's text names when the link goes to another one; '' when it does not.
@@ -169,7 +201,7 @@ function cleanMail(html, doc, imagesOn) {
   const out = { body: doc.createDocumentFragment(), styles: [], remote: 0, trackers: 0, deceptive: 0, misleading: [], plain: true };
   for (const sheet of parsed.querySelectorAll('style')) {
     // Remote stylesheets and fonts never load here; drop the rules that ask.
-    const css = cssUrls(cssUnescape(sheet.textContent || '').replace(/@import[^;]*;?/gi, '').replace(/@font-face\s*\{[^}]*\}/gi, ''), imagesOn, out);
+    const css = cssUrls(cssWithoutLoads(sheet.textContent || ''), imagesOn, out);
     if (!css.trim()) continue;
     out.styles.push(css);
     if (COLOURED.test(css)) out.plain = false;
@@ -196,7 +228,7 @@ function cleanMail(html, doc, imagesOn) {
         // Dead and dangerous CSS from other eras goes; the rest is the sender's layout.
         if (/expression\s*\(|behavior\s*:|-moz-binding|@import/i.test(css)) continue;
         if (COLOURED.test(css)) out.plain = false;
-        value = cssUrls(css, imagesOn, out);
+        value = cssUrls(value, imagesOn, out);
       } else if (name === 'bgcolor' || name === 'color') out.plain = false;
       to.setAttribute(name, value);
     }
@@ -1078,6 +1110,7 @@ function barButton(glyph, label, run, cls) {
 function fillBar(bar, row, wide) {
   bar.replaceChildren();
   if (!row) return;
+  knowFolderRoles(row.account);
   const key = rowKey(row);
   const flags = flagsByKey.get(key) || {};
   // Done and later are the queue's, so only a stored message has them; one listed live answers to the rest.

@@ -718,7 +718,7 @@ const en = {
   'compose.drafted': 'Drafted with AI.',
   'compose.failedKept': 'A letter could not be sent: {reason} It is kept as a draft.',
   'compose.openIt': 'Open it',
-  'compose.keptLetter': 'A letter that could not be sent is kept: {what}.',
+  'compose.keptLetter': 'A letter that was not sent is kept: {what}.',
   'compose.untitled': '(no subject)',
   'compose.replyUnreadable': 'The message to answer could not be read: {reason} Close this and answer it again.',
   'compose.sendUnknown': 'mailsift did not answer, so the message may have gone. Look in Sent before sending it again.',
@@ -726,6 +726,10 @@ const en = {
   'error.folderTimeout': 'The mailbox did not list this folder in time.',
   'error.foldersTimeout': 'The mailbox did not list its folders in time.',
   'bulk.already': '{count} already there',
+  // What the re-test of the QA fixes found.
+  'network.busy': 'This device asked mailsift too often just now. This is what was here when the page last loaded.',
+  'status.busy': 'Asked too often · showing what was here at {time}',
+  'compose.sendOffline': 'This device is offline, so the message was not sent. Your draft is kept.',
 };
 
 /** Every key the English table has; the other languages must carry the same ones. */
@@ -1391,7 +1395,7 @@ const zhCN: Record<StringKey, string> = {
   'compose.drafted': '已由 AI 起草。',
   'compose.failedKept': '有一封邮件没能发出：{reason}它已存为草稿。',
   'compose.openIt': '打开',
-  'compose.keptLetter': '有一封没能发出的邮件已保存：{what}。',
+  'compose.keptLetter': '有一封还没发出的邮件已保存：{what}。',
   'compose.untitled': '（无主题）',
   'compose.replyUnreadable': '要回复的邮件没能读取：{reason}请关掉后重新回复。',
   'compose.sendUnknown': 'mailsift 没有给出回应，这封邮件可能已经发出。重发之前请先看一眼“已发送”。',
@@ -1399,6 +1403,10 @@ const zhCN: Record<StringKey, string> = {
   'error.folderTimeout': '邮箱没有及时列出这个文件夹。',
   'error.foldersTimeout': '邮箱没有及时列出它的文件夹。',
   'bulk.already': '{count} 封本来就在那里',
+  // What the re-test of the QA fixes found.
+  'network.busy': '这台设备刚才请求 mailsift 太频繁了，这里是上次加载时的内容。',
+  'status.busy': '请求过多 · 显示 {time} 时的内容',
+  'compose.sendOffline': '这台设备处于离线状态，邮件没有发出，草稿还在。',
 };
 
 export const STRINGS: Record<Language, Record<StringKey, string>> = { en, 'zh-CN': zhCN };
