@@ -14,9 +14,10 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { SEARCH_SYNTAX_URI } from './mcp-syntax.js';
 
+// At least one: every tool's hours must be, and a prompt that names hours=0 sends the model into a refusal.
 const hours = z
   .string()
-  .regex(/^\d{1,5}$/, 'a whole number of hours')
+  .regex(/^[1-9]\d{0,4}$/, 'a whole number of hours, 1 or more')
   .describe('How far back to look, in hours. 24 for a day, 168 for a week.');
 
 export const CATCH_UP = 'catch_up';
@@ -46,7 +47,7 @@ export function renderCatchUp(args: { hours: string; focus?: string | undefined 
     '- The summaries are a model\'s judgement of mail it saw once, not fact. Say "judged critical", not "is critical".',
     '- Never guess at a message you did not read. If a summary is unclear, say so and give the Message-ID.',
     '- A record with a snoozedUntil still to come was put off, not dealt with: report it under what they put off, never as done or as missing from the queue.',
-    '- Verification codes and sign-in links are deliberately not stored. Say one arrived; never claim to know the code.',
+    '- No tool here returns a verification code or a sign-in link: a record only says that one arrived. Say that; never claim to know the code, and do not read the message itself for it unless the owner asks for that code.',
     `- Read ${SEARCH_SYNTAX_URI} if you need a filter this does not name.`,
   ]
     .filter((l) => l !== '')

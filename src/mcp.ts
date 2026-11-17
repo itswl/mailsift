@@ -14,6 +14,7 @@ import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mc
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { CallToolRequestSchema, type CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { loadConfig } from './config.js';
 import { McpToolError, toResourceError, toToolError } from './mcp-errors.js';
@@ -21,7 +22,7 @@ import { mailRecordToMarkdown, threadToMarkdown } from './mcp-markdown.js';
 import { registerPrompts } from './mcp-prompts.js';
 import { renderSearchSyntax, SEARCH_SYNTAX_URI } from './mcp-syntax.js';
 import {
-  fetchAttachmentByMessageId, fetchAttachmentManifestByMessageId,
+  AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId, fetchAttachmentManifestByMessageId,
   fetchByMessageId, inspectMailSafety, LiveMailError, scanAttachmentByMessageId, MAIL_ACTIONS, type MessageHint,
 } from './imap/client.js';
 import {
@@ -29,7 +30,7 @@ import {
 } from './imap/mailbox.js';
 import { BULK_MAX, bulkAct, folderList, folderPage, mailboxSearch, type BulkAction } from './web-mailbox.js';
 import { CONVERSATION_LIMIT, doneListDays, MAX_CONTACTS, StateStore } from './services/state.js';
-import type { FeedbackLabel, NotificationOutboxRow } from './services/state.js';
+import type { FeedbackLabel, MailRow, NotificationOutboxRow } from './services/state.js';
 import {
   CATEGORIES, pushThreshold, resolveLlmBaseUrl, spamBonus, spamBonusWarning, suppressSelfForwards,
 } from './services/triage.js';
@@ -143,15 +144,25 @@ function encodeCursor(row: { createdAt: string; dedupKey: string }): string {
   return Buffer.from(JSON.stringify({ createdAt: row.createdAt, dedupKey: row.dedupKey }), 'utf8').toString('base64url');
 }
 
+/**
+ * A cursor handed back as it was given, or a refusal. One that cannot be read
+ * is not taken for no cursor at all: that would answer with the first page
+ * again, and a caller paging through would read it twice without knowing.
+ */
 function decodeCursor(raw: string | undefined): MailCursor | undefined {
   if (!raw) return undefined;
+  let parsed: Partial<MailCursor> | undefined;
   try {
-    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Partial<MailCursor>;
-    if (typeof parsed.createdAt !== 'string' || typeof parsed.dedupKey !== 'string') return undefined;
-    return { createdAt: parsed.createdAt, dedupKey: parsed.dedupKey };
+    parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Partial<MailCursor>;
   } catch {
-    return undefined;
+    parsed = undefined;
   }
+  if (!parsed || typeof parsed.createdAt !== 'string' || typeof parsed.dedupKey !== 'string'
+    || !Number.isFinite(Date.parse(parsed.createdAt))) {
+    throw new McpToolError('INVALID_ARGUMENT', 'cursor is not one this server gave',
+      'Pass nextCursor back exactly as the previous page gave it, or leave cursor out to start from the first page.');
+  }
+  return { createdAt: parsed.createdAt, dedupKey: parsed.dedupKey };
 }
 
 /**
@@ -188,10 +199,12 @@ function auditTarget(value: unknown): string | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const input = value as Record<string, unknown>;
   const target: Record<string, string> = {};
-  for (const key of ['account', 'folder', 'messageId', 'partId', 'deadKey', 'action', 'destination', 'until']) {
+  // What was asked of the message as well as which one: done or put back, and the label a judgement was given.
+  for (const key of ['account', 'folder', 'messageId', 'partId', 'deadKey', 'action', 'destination', 'until', 'label']) {
     const raw = input[key];
     if (typeof raw === 'string' && raw.trim()) target[key] = raw.trim().slice(0, 500);
   }
+  if (typeof input['handled'] === 'boolean') target['handled'] = String(input['handled']);
   return Object.keys(target).length ? JSON.stringify(target) : undefined;
 }
 
@@ -213,6 +226,18 @@ function onServerClock(iso: unknown): string | undefined {
   const { offset } = serverZone(at);
   const local = new Date(at.getTime() - at.getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
   return `${local}${offset}`;
+}
+
+/**
+ * A JSON replacer that leaves out every verification code. The page's code
+ * lane shows one to the owner, who asked for it; an MCP client is a model
+ * holding a token that may be shared, and a one-time code it is handed can
+ * end up anywhere its answers go. A record still says that a code arrived
+ * (its summary), and read_message still reads the message itself, as the
+ * owner can.
+ */
+function withoutCodes(key: string, value: unknown): unknown {
+  return key === 'verificationCode' ? undefined : value;
 }
 
 /** How long a live read of one message may take: what the page allows its own. */
@@ -567,6 +592,12 @@ export function createServer(
     if (!args.messageId && !args.messageIds?.length) throw new McpToolError('INVALID_ARGUMENT', 'give messageId, or messageIds for several');
     return args.messageIds;
   };
+  /** The stored record of the very message a handle names, when mailsift stored it. */
+  const storedOfHandle = (ref: string): MailRow | undefined => {
+    const resolved = resolveTarget(store, ref);
+    if ('refused' in resolved) return undefined;
+    return resolved.target.row ?? resolved.target.untied;
+  };
   /** The mailbox a key or a handle is in. */
   const accountOfRef = (ref: string): string | undefined =>
     handleShaped(ref) ? parseLiveHandle(ref)?.account : store.getMail(ref)?.account;
@@ -596,6 +627,15 @@ export function createServer(
     if (error instanceof LiveMailError) {
       return new McpToolError('NOT_FOUND', `${what}: the message is no longer where it was listed`,
         'It was moved or deleted, or its folder was rebuilt. List the folder or search again and use the handle it gives now.');
+    }
+    // The mailbox answered: about the file asked for, not about itself. Retrying, or looking for an outage, cannot help.
+    if (error instanceof AttachmentTooLargeError) {
+      return new McpToolError('ATTACHMENT_UNSUPPORTED', `${what}: the file is larger than MCP_ATTACHMENT_MAX_BYTES (${error.maxBytes} bytes)`,
+        'The file was not read: it is over the size this server hands out. list_attachments shows each file with its size; scan_attachment can still check its first bytes.');
+    }
+    if (error instanceof AttachmentNotFoundError) {
+      return new McpToolError('NOT_FOUND', `${what}: the message has no attachment with that part id`,
+        'list_attachments lists the parts this message has, each with its partId and resource URI.');
     }
     return new McpToolError('MAILBOX_UNAVAILABLE', `${what}: ${String(error).slice(0, 200)}`);
   };
@@ -628,7 +668,7 @@ export function createServer(
     { instructions: INSTRUCTIONS },
   );
   const json = (value: unknown) => ({
-    content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
+    content: [{ type: 'text' as const, text: JSON.stringify(value, withoutCodes, 2) }],
   });
 
   /**
@@ -638,24 +678,52 @@ export function createServer(
    * request, which cannot answer the one question it exists for: was a
    * state-changing tool ever called, and by whom.
    */
-  const registerTool: typeof server.registerTool = ((name: string, config: unknown, cb: unknown) =>
-    server.registerTool(
-      name as never,
-      config as never,
-      (async (...args: unknown[]) => tracked(async () => {
-        let result: unknown;
-        try {
-          result = await (cb as (...a: unknown[]) => unknown)(...args);
-        } catch (error) {
-          audited(name, false, auditTarget(args[0]));
-          // Every tool failure leaves as a typed body, so no handler has to
-          // build one and no provider message escapes unredacted.
-          return toToolError(error);
-        }
-        audited(name, true, auditTarget(args[0]));
-        return result;
-      })) as never,
-    )) as typeof server.registerTool;
+  const toolCalls = new Map<string, { schema: z.ZodType; run: (args: unknown, extra: unknown) => Promise<unknown> }>();
+  const registerTool: typeof server.registerTool = ((name: string, config: unknown, cb: unknown) => {
+    const run = async (...args: unknown[]) => tracked(async () => {
+      let result: unknown;
+      try {
+        result = await (cb as (...a: unknown[]) => unknown)(...args);
+      } catch (error) {
+        audited(name, false, auditTarget(args[0]));
+        // Every tool failure leaves as a typed body, so no handler has to
+        // build one and no provider message escapes unredacted.
+        return toToolError(error);
+      }
+      audited(name, true, auditTarget(args[0]));
+      return result;
+    });
+    const shape = (config as { inputSchema?: z.ZodRawShape }).inputSchema ?? {};
+    toolCalls.set(name, { schema: z.object(shape), run: (args, extra) => run(args, extra) });
+    return server.registerTool(name as never, config as never, run as never);
+  }) as typeof server.registerTool;
+  /**
+   * Arguments that do not fit a tool's schema, answered like any other
+   * failure: the typed body with INVALID_ARGUMENT and a hint, and an audit
+   * row. The SDK checks them before a handler runs and answers with a line
+   * of its own text, which a caller that branches on the code cannot read;
+   * these are the commonest mistakes a model makes (a time without its
+   * offset, a limit over the maximum), so they are checked here first and
+   * the SDK only ever sees arguments that fit. The listing still publishes
+   * each schema as the SDK renders it.
+   */
+  const callTool = async (request: z.infer<typeof CallToolRequestSchema>, extra: unknown): Promise<CallToolResult> => {
+    const name = request.params.name;
+    const tool = toolCalls.get(name);
+    if (!tool) {
+      return toToolError(new McpToolError('INVALID_ARGUMENT', `there is no tool named ${name.slice(0, 100)}`,
+        'tools/list names every tool this credential may call; the write tools are listed only with the write credential.'));
+    }
+    const parsed = await tool.schema.safeParseAsync(request.params.arguments ?? {});
+    if (!parsed.success) {
+      audited(name, false, auditTarget(request.params.arguments));
+      const said = parsed.error.issues.slice(0, 5)
+        .map((issue) => `${issue.path.length ? `${issue.path.join('.')}: ` : ''}${issue.message}`).join('; ');
+      return toToolError(new McpToolError('INVALID_ARGUMENT', `invalid arguments for ${name}: ${said}`,
+        `Check the argument against the ${name} schema in tools/list and call it again.`));
+    }
+    return await tool.run(parsed.data, extra) as CallToolResult;
+  };
 
   /**
    * registerResource, with the same typed failures as the tools.
@@ -788,12 +856,14 @@ export function createServer(
     'search_mail',
     {
       description:
-        'Search subject, message IDs, sender, triage category, summary, reason, body preview and attachment metadata by keyword. ' +
-        'Use it to answer whether a sender wrote or which messages concern a renewal. ' +
-        'A full page returns nextCursor; pass it back as cursor to continue.',
+        'Search subject, sender, triage category, summary, reason, body preview and the names and types of attachments ' +
+        'for the words exactly as given (% and _ are ordinary characters), or find a message by its whole Message-ID. ' +
+        'Use it to answer whether a sender wrote or which messages concern a renewal. account (an address from ' +
+        'list_accounts) keeps one mailbox\'s mail. A full page returns nextCursor; pass it back as cursor to continue.',
       inputSchema: {
         query: z.string().min(1),
         hours: z.number().int().positive().optional(),
+        account: z.string().optional(),
         limit: z.number().int().positive().max(200).default(30),
         cursor: z.string().optional(),
       },
@@ -803,6 +873,7 @@ export function createServer(
       const mail = store.queryMail({
         search: args.query,
         ...(args.hours ? { sinceHours: args.hours } : {}),
+        ...(args.account ? { account: args.account } : {}),
         limit: args.limit,
         ...(cursor ? { beforeCreatedAt: cursor.createdAt, beforeDedupKey: cursor.dedupKey } : {}),
       });
@@ -1137,8 +1208,9 @@ export function createServer(
     'mail-source',
     new ResourceTemplate('mailsift://imap/{account}/{messageId}', { list: undefined }),
     {
-      mimeType: 'message/rfc822',
-      description: 'Read a bounded normalized email body on demand from the configured IMAP account. Nothing is persisted.',
+      // A JSON object holding the normalized body and its headers, not the message as it travelled.
+      mimeType: 'application/json',
+      description: 'Read a bounded normalized email body on demand from the configured IMAP account, as a JSON object with its headers. Nothing is persisted.',
     },
     async (uri, variables) => {
       const rawAccount = variables['account'];
@@ -1164,8 +1236,7 @@ export function createServer(
       const asked = lookupOf(account.username, messageId);
       const message = await fetchByMessageId(account, asked.messageId, asked.hint).catch((error: unknown) => {
         store.recordMcpAudit('resource:mail-source', client, false, `${accountName}|${messageId}`);
-        if (error instanceof LiveMailError) throw liveFailure(error, `could not read ${accountName}`);
-        throw new McpToolError('MAILBOX_UNAVAILABLE', `could not read ${accountName}: ${String(error)}`);
+        throw liveFailure(error, `could not read ${accountName}`);
       });
       store.recordMcpAudit('resource:mail-source', client, Boolean(message), `${accountName}|${messageId}`);
       if (!message) throw new McpToolError('NOT_FOUND', 'message not found in configured read-only folders');
@@ -1230,8 +1301,7 @@ export function createServer(
       const asked = lookupOf(account.username, messageId);
       const downloaded = await fetchAttachmentByMessageId(account, asked.messageId, partId, asked.hint).catch((error: unknown) => {
         store.recordMcpAudit('resource:mail-attachment', client, false, `${accountName}|${messageId}|${partId}`);
-        if (error instanceof LiveMailError) throw liveFailure(error, `could not read ${accountName}`);
-        throw new McpToolError('MAILBOX_UNAVAILABLE', `could not read ${accountName}: ${String(error)}`);
+        throw liveFailure(error, `could not read ${accountName}`);
       });
       store.recordMcpAudit('resource:mail-attachment', client, Boolean(downloaded), `${accountName}|${messageId}|${partId}`);
       if (!downloaded) throw new McpToolError('NOT_FOUND', 'message not found in configured read-only folders');
@@ -1381,7 +1451,8 @@ export function createServer(
           'Record feedback for a processed message so future rules and triage evaluation can use it: false_positive ' +
           '(notified but not worth it), missed (should have been), correct, handled, spam or not_spam. Two false_positive ' +
           'or spam records for one sender make a never-important rule, two missed an always-important one; a not_spam ' +
-          'for a sender undoes what its earlier spam records counted. spam and not_spam here record the judgement only: ' +
+          'for a sender undoes what its earlier spam records counted, and puts back in needs_you a message that spam ' +
+          'counted as dealt with (one marked done before stays done). spam and not_spam here move nothing: ' +
           'manage_mail with spam or not_spam also moves the message. account ' +
           '(an address from list_accounts) says which copy is meant when one message is stored for more than one mailbox.',
         inputSchema: {
@@ -1395,7 +1466,12 @@ export function createServer(
         const key = storedRef(refOf(args.messageId, args.account));
         const row = store.getMail(key);
         store.recordFeedback(row?.messageId ?? args.messageId, args.label as FeedbackLabel, args.note, key);
-        return json({ recorded: true, messageId: args.messageId, account: row?.account, label: args.label });
+        // Not spam after all: what spam counted as dealt with is open again, as manage_mail's not_spam does.
+        const after = row && args.label === 'not_spam' ? store.undoSpamDone(key) : undefined;
+        return json({
+          recorded: true, messageId: args.messageId, account: row?.account, label: args.label,
+          ...(after ? { handledAt: after.handledAt } : {}),
+        });
       },
     );
 
@@ -1628,8 +1704,9 @@ export function createServer(
 
         const key = args.replyTo ? refOf(args.replyTo, args.account) : undefined;
         const forwardKey = args.forward ? refOf(args.forward, args.account) : undefined;
-        // A stored record, or for a live handle the stored record of that message when there is one.
-        const original = key ? (handleShaped(key) ? undefined : store.getMail(key)) : undefined;
+        // A stored record, or for a live handle the stored record of that very message when there is one
+        // (never another that only shares its Message-ID): what an answer that cannot read it is titled from.
+        const original = key ? (handleShaped(key) ? storedOfHandle(key) : store.getMail(key)) : undefined;
         // The mailbox it leaves from, whose signature it carries.
         const from = (key ? accountOfRef(key) : undefined) ?? args.from ?? (forwardKey ? accountOfRef(forwardKey) : undefined) ?? args.account!;
         let to = args.to?.length ? args.to : [];
@@ -1704,6 +1781,11 @@ export function createServer(
                 : 'This went to the address the message asks answers to be sent to; the message gives no sender address to compare it with.');
             }
           } else {
+            if (!subject && !original) {
+              // Nothing says what it was about: a letter titled "Re:" and nothing after it is not sent.
+              throw new McpToolError('INVALID_ARGUMENT', 'the message being answered could not be read, and mailsift did not store it, so its subject is unknown',
+                'Give subject as well (as "Re: " and the subject the message had), with to and quote=false.');
+            }
             if (!subject) subject = /^\s*(re|回复|答复)\s*[:：]/i.test(original?.subject ?? '') ? (original?.subject ?? '') : `Re: ${original?.subject ?? ''}`.trim();
             notes.push('The message being answered could not be read from its mailbox, so this answer went without it quoted.');
           }
@@ -1914,6 +1996,8 @@ export function createServer(
     },
     async (args) => {
       loadConfig();
+      // Said in this tool's own words: the page's are about its search field.
+      if (!args.query.trim()) throw new McpToolError('INVALID_ARGUMENT', 'query holds nothing to search for', 'Give the words to search for in query.');
       return json(pageAnswer(await asPage((ctx) => mailboxSearch({
         account: args.account, q: args.query, folder: args.folder ?? null, before: args.before ?? null, limit: args.limit,
       }, store, ctx))));
@@ -2062,6 +2146,8 @@ export function createServer(
   );
 
   registerPrompts(server, { writable });
+  // In place of the SDK's own handler for tools/call, now that every tool is registered (see callTool).
+  server.server.setRequestHandler(CallToolRequestSchema, (request, extra) => callTool(request, extra));
 
   return server;
 }

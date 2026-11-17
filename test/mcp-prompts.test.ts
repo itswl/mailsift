@@ -35,8 +35,12 @@ describe('catch_up', () => {
     expect(renderCatchUp({ hours: '24' })).toContain('judged critical');
   });
 
-  it('forbids claiming to know a code, which is never stored', () => {
-    expect(renderCatchUp({ hours: '24' })).toContain('never claim to know the code');
+  it('forbids claiming to know a code, which no tool returns', () => {
+    const text = renderCatchUp({ hours: '24' });
+    expect(text).toContain('never claim to know the code');
+    // What is true: the code is kept for the page, so "not stored" would be false; no MCP answer carries it.
+    expect(text).not.toContain('not stored');
+    expect(text).toContain('No tool here returns a verification code');
   });
 });
 

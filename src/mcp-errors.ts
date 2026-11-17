@@ -105,8 +105,10 @@ export function toToolError(error: unknown): CallToolResult {
 export function toResourceError(error: unknown): McpError {
   if (error instanceof McpError) return error;
   const body = bodyFor(error);
+  // What was asked for cannot be had (an unknown id, a file over the limit): the caller's to change, not a fault here.
   const rpcCode =
     body.code === 'NOT_FOUND' || body.code === 'INVALID_ARGUMENT' || body.code === 'ACCOUNT_UNKNOWN'
+      || body.code === 'ATTACHMENT_UNSUPPORTED'
       ? RpcErrorCode.InvalidParams
       : RpcErrorCode.InternalError;
   return new McpError(rpcCode, `${body.code}: ${body.message}`, body);

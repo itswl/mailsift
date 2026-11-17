@@ -1341,11 +1341,21 @@ export class StateStore {
       params.push(options.account, options.account);
     }
     if (options.search) {
+      // The words as they were typed, % and _ included, in what a person reads of a message: its subject,
+      // sender, judgement, preview and the names and types of its files. Not the fields that only hold
+      // mailsift's own bookkeeping: a thread's key starts with the mailbox's address, and the attachment
+      // list's own field names are in every message that has one, so a search for either named everything.
+      // A Message-ID is the sender's machine text: it is matched whole, with or without its angle brackets.
+      const pattern = `%${likeEscape(options.search)}%`;
+      const like = (column: string): string => `${column} LIKE ? ESCAPE '\\'`;
+      const id = options.search.trim();
       clauses.push(
-        '(subject LIKE ? OR message_id LIKE ? OR thread_key LIKE ? OR sender LIKE ? OR sender_name LIKE ? '
-          + 'OR reason LIKE ? OR category LIKE ? OR summary LIKE ? OR snippet LIKE ? OR attachments_json LIKE ?)',
+        `(${['subject', 'sender', 'sender_name', 'reason', 'category', 'summary', 'snippet'].map(like).join(' OR ')} `
+          + 'OR message_id = ? OR message_id = ? '
+          + "OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(attachments_json) THEN attachments_json END, '$.items') "
+          + `WHERE ${like("json_extract(value, '$.filename')")} OR ${like("json_extract(value, '$.contentType')")}))`,
       );
-      params.push(...Array<string>(10).fill(`%${options.search}%`));
+      params.push(...Array<string>(7).fill(pattern), id, id.startsWith('<') ? id : `<${id}>`, pattern, pattern);
     }
     if (options.beforeCreatedAt) {
       if (options.beforeDedupKey) {
