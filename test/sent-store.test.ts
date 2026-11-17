@@ -56,6 +56,61 @@ describe('storing the owner\'s sent mail', () => {
     expect(state.getSent(first.id)).toMatchObject({ messageId: '<out@qq.com>', text: 'Sounds good.', source: 'poll' });
   });
 
+  it('takes the copy in Sent for the letter stored as it left, under the Message-ID the provider gave it', () => {
+    // Outlook and QQ give a letter sent through them a Message-ID of their own: the copy in Sent carries it,
+    // and so does every answer to it. The letter is stored once, under that id.
+    const state = new StateStore(':memory:');
+    const left = state.recordSent(sent({
+      messageId: '<ours@mailsift>', threadKey: `${ME}|<ours@mailsift>`, inReplyTo: undefined, answers: undefined,
+      subject: 'Plans', date: iso(-10 * MIN), folder: undefined, uid: undefined, uidValidity: undefined, source: 'page',
+    }));
+    const copy = state.recordSent(sent({
+      messageId: '<tencent_ABC@qq.com>', threadKey: `${ME}|<tencent_abc@qq.com>`, inReplyTo: undefined, answers: undefined,
+      subject: 'Plans', date: iso(-10 * MIN + 2000), source: 'poll',
+    }));
+    expect(copy).toEqual({ id: left.id, inserted: false });
+    expect(state.sentCount()).toBe(1);
+    expect(state.getSent(left.id)).toMatchObject({ messageId: '<tencent_ABC@qq.com>', threadKey: `${ME}|<tencent_abc@qq.com>`, folder: 'Sent', source: 'page' });
+    // Another letter, to someone else or about something else, is not it.
+    state.recordSent(sent({ messageId: '<other@mailsift>', subject: 'Plans', to: [{ name: '', address: 'bob@example.org' }], date: iso(-5 * MIN), folder: undefined, uid: undefined, uidValidity: undefined, source: 'page' }));
+    expect(state.recordSent(sent({ messageId: '<tencent_DEF@qq.com>', subject: 'Other plans', date: iso(-5 * MIN), uid: 6 })).inserted).toBe(true);
+    expect(state.sentCount()).toBe(3);
+  });
+
+  it('pairs two like letters sent minutes apart each with its own copy, and makes one of letters stored twice before', () => {
+    const state = new StateStore(':memory:');
+    const page = (id: string, at: number) => state.recordSent(sent({
+      messageId: id, threadKey: `${ME}|${id}`, subject: 'Ping', date: iso(at), folder: undefined, uid: undefined, uidValidity: undefined, source: 'page',
+    }));
+    const a = page('<a@mailsift>', -20 * MIN);
+    const b = page('<b@mailsift>', -12 * MIN);
+    expect(state.recordSent(sent({ messageId: '<B@outlook>', subject: 'Ping', date: iso(-12 * MIN + 1000), uid: 8 })).id).toBe(b.id);
+    expect(state.recordSent(sent({ messageId: '<A@outlook>', subject: 'Ping', date: iso(-20 * MIN + 1000), uid: 7 })).id).toBe(a.id);
+    expect(state.getSent(a.id)?.messageId).toBe('<A@outlook>');
+    expect(state.getSent(b.id)?.messageId).toBe('<B@outlook>');
+
+    // A database where an earlier release stored a letter twice: once as it left, once from Sent.
+    const dir = mkdtempSync(join(tmpdir(), 'mailsift-twins-'));
+    try {
+      const path = join(dir, 'state.db');
+      const before = new StateStore(path);
+      const left = before.recordSent(sent({ messageId: '<ours@mailsift>', subject: 'Twice', date: iso(-30 * MIN), folder: undefined, uid: undefined, uidValidity: undefined, source: 'page' }));
+      db(before).prepare("UPDATE sent_mail SET answered_key = 'k1' WHERE id = ?").run(left.id);
+      db(before).prepare("INSERT INTO sent_mail (account, message_id, thread_key, subject, from_addr, recipients, mail_date, body, attachment_count, attachment_names, folder, uid, uid_validity, source, created_at) SELECT account, '<theirs@outlook>', thread_key, subject, from_addr, recipients, ?, body, 0, '[]', 'Sent', 9, '1', 'poll', created_at FROM sent_mail WHERE id = ?").run(iso(-30 * MIN + 3000), left.id);
+      db(before).prepare("DELETE FROM meta WHERE key = 'merged_sent_twins'").run();
+      expect(before.sentCount()).toBe(2);
+      before.close();
+      const after = new StateStore(path);
+      expect(after.sentCount()).toBe(1);
+      const kept = db(after).prepare('SELECT message_id, folder, answered_key, checked_at FROM sent_mail').get() as Record<string, unknown>;
+      expect(kept).toMatchObject({ message_id: '<theirs@outlook>', folder: 'Sent', answered_key: 'k1' });
+      expect(kept['checked_at']).toEqual(expect.any(String));
+      after.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps the page\'s exact record when the poll finds the same letter in Sent, and fills in where it is', () => {
     const state = new StateStore(':memory:');
     const page = sent({
