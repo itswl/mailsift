@@ -706,6 +706,10 @@ const en = {
   'session.signout': 'Sign out',
   'session.signoutFailed': 'Could not sign out. Check the connection and try again.',
   'session.readonly': 'read-only',
+  // What a QA pass found: the server.
+  'login.crossSite': 'This sign-in looked as if another site sent it, so it was refused. Open mailsift at its own address and sign in there.',
+  'error.rate_limited': 'This device asked too often just now. Wait a moment and try again.',
+  'error.draftNeedsLine': 'Say in a line what the message should say, then press Draft.',
 };
 
 /** Every key the English table has; the other languages must carry the same ones. */
@@ -1359,6 +1363,10 @@ const zhCN: Record<StringKey, string> = {
   'session.signout': '退出登录',
   'session.signoutFailed': '退出登录没有成功，请检查网络后再试。',
   'session.readonly': '只读',
+  // What a QA pass found: the server.
+  'login.crossSite': '这次登录看起来是从其他网站发来的，已被拒绝。请直接打开 mailsift 自己的地址再登录。',
+  'error.rate_limited': '这台设备刚才请求太频繁了，请稍等片刻再试。',
+  'error.draftNeedsLine': '先用一句话说说要写什么，再按起草。',
 };
 
 export const STRINGS: Record<Language, Record<StringKey, string>> = { en, 'zh-CN': zhCN };

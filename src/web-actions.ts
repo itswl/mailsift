@@ -562,9 +562,18 @@ export function resetAssistantBudget(): void {
   assistantDay.used = 0;
 }
 
+/**
+ * The day a budget is counted in: the date on the server's clock (TZ), the
+ * one the page means by "it resets tomorrow". Not the UTC date, which turns
+ * at 08:00 in China and at 19:00 the evening before in New York.
+ */
+function localDay(now: Date): string {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
 /** Take one model call from the budgets, or say which one is spent. */
 function assistantBudget(client: string, now = new Date()): WebResponse | undefined {
-  const day = now.toISOString().slice(0, 10);
+  const day = localDay(now);
   if (assistantDay.day !== day) {
     assistantDay.day = day;
     assistantDay.used = 0;
@@ -578,6 +587,16 @@ function assistantBudget(client: string, now = new Date()): WebResponse | undefi
   assistantDay.used += 1;
   return undefined;
 }
+
+/** Give back a call taken from the budgets that never reached the model: refused, or with nothing to send it. */
+function refundAssistant(client: string, now = new Date()): void {
+  if (assistantDay.day === localDay(now) && assistantDay.used > 0) assistantDay.used -= 1;
+  allowAssistantMinute.giveBack(client);
+}
+
+/** Whether a failed assistant call stopped before the model was asked: nothing to give it, or not to be given. */
+const neverAsked = (error: unknown): boolean =>
+  error instanceof AssistantError && (error.code === 'refused' || error.code === 'unavailable');
 /** Mail leaves under the owner's name; ten a minute is more than a person types. */
 let allowSend = rateWindow(10);
 
@@ -867,6 +886,8 @@ export async function actOnMail(
   const refused = (error: unknown): WebResponse => {
     if (error instanceof LiveMailError) return staleHandle(error);
     if (error instanceof MailActionError) return json(409, { error: error.message, code: `action_${error.code}` });
+    // Said as the reader and the folders say it, not as the connection's own error.
+    if (error instanceof MailboxUnreachableError) return mailboxFailure(error, 'actionFailed', 'the mailbox action failed');
     return json(502, { error: 'the mailbox action failed', code: 'actionFailed', detail: String(error).slice(0, 200) });
   };
   fileBeforeMoving(store, target, action);
@@ -1767,18 +1788,22 @@ async function handleDraft(req: IncomingMessage, store: StateStore, ctx: ActionC
   const body = await readJson(req, 32 * 1024);
   if (!body) return badRequest('a JSON body is required');
   if (!ctx.backend.assistant()) return json(503, { error: 'no model is configured', code: 'assistant_unavailable' });
-  const spent = assistantBudget(ctx.client);
-  if (spent) return spent;
   const instruction = text(body['instruction'], 1000);
   const key = text(body['key'], 5000);
+  // A new letter, or a forward's note, is written from a line of the owner's: without one there is nothing to ask.
+  if (!key && !instruction.trim()) return json(400, { error: 'say what the message should say', code: 'draftNeedsLine' });
+  const spent = assistantBudget(ctx.client);
+  if (spent) return spent;
+  // What is refused before the model is asked costs nothing of the budget.
+  const free = (answer: WebResponse): WebResponse => { refundAssistant(ctx.client); return answer; };
   let input: DraftInput = { subject: text(body['subject'], 300), from: '', text: '', instruction, lang: ctx.lang };
   if (key) {
     const resolved = resolveTarget(store, key);
-    if ('refused' in resolved) return resolved.refused;
+    if ('refused' in resolved) return free(resolved.refused);
     const row = resolved.target.view;
     const account = resolved.target.account;
     const read = await readTarget(resolved.target, store, ctx.backend);
-    if ('refused' in read) return read.refused;
+    if ('refused' in read) return free(read.refused);
     const live = read.live;
     const from = live.readable.from;
     input = {
@@ -1789,8 +1814,6 @@ async function handleDraft(req: IncomingMessage, store: StateStore, ctx: ActionC
       lang: ctx.lang,
       ...(account.fromName ? { selfName: account.fromName } : {}),
     };
-  } else if (!instruction.trim()) {
-    return badRequest('say what the message should say');
   }
   try {
     const result = await within(ctx.backend.draft(input), AI_TIMEOUT_MS);
@@ -1799,7 +1822,7 @@ async function handleDraft(req: IncomingMessage, store: StateStore, ctx: ActionC
     return json(200, { draft: result.draft });
   } catch (error) {
     store.recordMcpAudit('web:draft', ctx.client, false, key || undefined);
-    return assistantFailure(error);
+    return neverAsked(error) ? free(assistantFailure(error)) : assistantFailure(error);
   }
 }
 
@@ -1823,6 +1846,7 @@ async function handleAsk(req: IncomingMessage, store: StateStore, ctx: ActionCon
     return json(200, { answer: result.answer, citations, considered: result.considered });
   } catch (error) {
     store.recordMcpAudit('web:ask', ctx.client, false);
+    if (neverAsked(error)) refundAssistant(ctx.client);
     return assistantFailure(error);
   }
 }

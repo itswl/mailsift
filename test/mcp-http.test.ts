@@ -193,3 +193,43 @@ describe('a letter from the page is one large request', () => {
     expect(sendBodyLimit()).toBeGreaterThan(40 * 1024 * 1024);
   });
 });
+
+describe('the web view on the same port', () => {
+  it('has a budget of its own, says in its words when it is spent, and goes on to where a sign-in was asked for', async () => {
+    process.env.MCP_TOKEN = READ;
+    process.env.WEB_UI_ENABLED = 'true';
+    process.env.MCP_RATE_LIMIT_PER_MINUTE = '2';
+    // An address of its own, so no other test's budget is touched.
+    process.env.TRUSTED_PROXY = 'true';
+    const mcp = await start();
+    const base = mcp.replace(/\/mcp$/, '');
+    const from = { 'x-real-ip': '198.51.100.7' };
+    const tools = () => fetch(mcp, {
+      method: 'POST', headers: { ...from, 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${READ}` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    expect((await tools()).status).toBe(200);
+    expect((await tools()).status).toBe(200);
+    expect((await tools()).status).toBe(429);
+    // The page on the same address is not locked out by its MCP client.
+    const page = () => fetch(`${base}/`, { headers: { ...from, cookie: `mailsift_session=${READ}` }, redirect: 'manual' });
+    expect((await page()).status).toBe(200);
+    // Signing in goes back to the shortcut it came from.
+    const signIn = await fetch(`${base}/auth`, {
+      method: 'POST', redirect: 'manual',
+      headers: { ...from, 'content-type': 'application/x-www-form-urlencoded', 'sec-fetch-site': 'same-origin' },
+      body: `token=${READ}&next=${encodeURIComponent('/?focus=code')}`,
+    });
+    expect(signIn.status).toBe(303);
+    expect(signIn.headers.get('location')).toBe('/?focus=code');
+    // Twenty a minute here (ten times MCP's two): then a page that says so, not a line of JSON.
+    let last: Response | undefined;
+    for (let n = 0; n < 20; n += 1) last = await page();
+    expect(last!.status).toBe(429);
+    const said = await last!.text();
+    expect(last!.headers.get('content-type')).toContain('text/html');
+    expect(said).toContain('This device asked too often just now');
+    const api = await fetch(`${base}/api/summary`, { headers: { ...from, cookie: `mailsift_session=${READ}` } });
+    expect(await api.json()).toMatchObject({ code: 'rate_limited' });
+  });
+});

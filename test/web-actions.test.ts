@@ -741,6 +741,27 @@ describe('reading a message as it was written', () => {
     expect(other.json).toMatchObject({ code: 'readFailed', detail: expect.stringContaining('Mailbox is locked') });
   });
 
+  it('says a provider is not answering in the same words when an action or a batch could not reach it', async () => {
+    const store = seeded();
+    const unreachable = new MailboxUnreachableError('connect ECONNREFUSED 127.0.0.1:9 | ECONNREFUSED');
+    const down = backend({
+      act: async () => { throw unreachable; },
+      // A batch is told of each message's failure as the mailbox's own code tells it, a connection that failed included.
+      bulk: async (_account, items, _action, _options, report) => { items.forEach((_, at) => report?.(at, { error: unreachable })); },
+    });
+    const acted = await post(store, '/api/action', { key: 'k1', action: 'archive' }, { as: 'write' }, down);
+    expect(acted.answer.status).toBe(503);
+    expect(acted.json).toMatchObject({ code: 'mailboxUnreachable' });
+    expect(JSON.stringify(acted.json)).not.toMatch(/ECONNREFUSED|MailboxUnreachableError/);
+    const batch = await post(store, '/api/bulk', { items: ['k1', 'k2'], action: 'star' }, { as: 'write' }, down);
+    const results = batch.json['results'] as Array<{ code: string; error: string }>;
+    expect(results.map((result) => result.code)).toEqual(['mailboxUnreachable', 'mailboxUnreachable']);
+    expect(JSON.stringify(results)).not.toMatch(/ECONNREFUSED/);
+    // The page has words for it in each language.
+    expect(STRINGS.en['error.mailboxUnreachable']).toBeTruthy();
+    expect(STRINGS['zh-CN']['error.mailboxUnreachable']).toBeTruthy();
+  });
+
   it('does not queue a fresh read behind one that hung', async () => {
     const store = seeded();
     let reads = 0;
@@ -785,7 +806,7 @@ describe('reading a message as it was written', () => {
     expect(String(plain.answer.body)).not.toContain('<script');
     // Remote images load only in the frame the reader asked them for.
     const withImages = await call(store, '/mail-frame?images=1');
-    expect(withImages.answer.headers?.['content-security-policy']).toContain('img-src data: https:;');
+    expect(withImages.answer.headers?.['content-security-policy']).toContain('img-src data: https: http:;');
     expect((await call(store, '/mail-frame', { as: 'none' })).answer.status).toBe(401);
   });
 });
@@ -1593,6 +1614,68 @@ describe('asking', () => {
     process.env.WEB_ASSISTANT_DAILY_LIMIT = '1';
     expect((await post(store, '/api/ask', { question: '  ' }, {}, fake)).answer.status).toBe(400);
     expect((await post(store, '/api/ask', { question: 'real' }, {}, fake)).answer.status).toBe(200);
+  });
+});
+
+describe('what the assistant costs', () => {
+  it('asks a new letter or a forward for a line in words of its own, before anything is counted', async () => {
+    process.env.WEB_ASSISTANT_DAILY_LIMIT = '1';
+    const store = seeded();
+    const fake = backend();
+    for (let n = 0; n < 3; n += 1) {
+      const empty = await post(store, '/api/draft', { instruction: '  ', subject: 'Lunch on Friday' }, { as: 'write' }, fake, 'drafter');
+      expect(empty.answer.status).toBe(400);
+      expect(empty.json['code']).toBe('draftNeedsLine');
+    }
+    expect(STRINGS.en['error.draftNeedsLine']).toMatch(/line/);
+    expect(STRINGS['zh-CN']['error.draftNeedsLine']).toBeTruthy();
+    // None of that was a model call: the one the day allows is still there.
+    expect((await post(store, '/api/draft', { instruction: 'say yes', subject: 'Lunch' }, { as: 'write' }, fake, 'drafter')).answer.status).toBe(200);
+    expect(fake.calls.drafted).toHaveLength(1);
+  });
+
+  it('gives back what a draft refused before the model was asked took from the budgets', async () => {
+    process.env.WEB_ASSISTANT_DAILY_LIMIT = '2';
+    const store = seeded();
+    const refusing = backend({ draft: async () => { throw new AssistantError('refused', 'this message is handled locally and is never sent to the LLM'); } });
+    const unreadable = backend({ read: async () => { throw new MailboxUnreachableError('down'); } });
+    // More than the twenty a minute one client may ask, and more than the day allows.
+    for (let n = 0; n < 12; n += 1) {
+      expect((await post(store, '/api/draft', { key: 'k1', instruction: '' }, { as: 'write' }, refusing, 'refused')).json['code']).toBe('assistant_refused');
+      forgetLive();
+      expect((await post(store, '/api/draft', { key: 'k1', instruction: '' }, { as: 'write' }, unreadable, 'refused')).json['code']).toBe('mailboxUnreachable');
+      expect((await post(store, '/api/draft', { key: 'nope', instruction: 'x' }, { as: 'write' }, refusing, 'refused')).answer.status).toBe(404);
+    }
+    const fake = backend();
+    expect((await post(store, '/api/ask', { question: 'what needs me?' }, { as: 'read' }, fake, 'refused')).answer.status).toBe(200);
+    expect((await post(store, '/api/draft', { key: 'k1', instruction: '' }, { as: 'write' }, fake, 'refused')).answer.status).toBe(200);
+    // The day's two were the two that reached the model.
+    expect((await post(store, '/api/ask', { question: 'one more' }, { as: 'read' }, fake, 'refused')).json['code']).toBe('assistant_daily');
+  });
+
+  it('counts the day on the server\'s clock, which is when "it resets tomorrow" comes', async () => {
+    const zone = process.env.TZ;
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      process.env.TZ = 'Asia/Shanghai';
+      process.env.WEB_ASSISTANT_DAILY_LIMIT = '1';
+      const store = seeded();
+      const fake = backend();
+      const ask = async (at: string): Promise<number> => {
+        vi.setSystemTime(new Date(at));
+        return (await post(store, '/api/ask', { question: `at ${at}` }, { as: 'read' }, fake)).answer.status;
+      };
+      // 07:30 and 07:40 in Shanghai on the 18th: the second is over the day's one.
+      expect(await ask('2026-11-17T23:30:00Z')).toBe(200);
+      expect(await ask('2026-11-17T23:40:00Z')).toBe(429);
+      // 08:05 the same morning: a new UTC date, but the same day here.
+      expect(await ask('2026-11-18T00:05:00Z')).toBe(429);
+      // Five past midnight on the 19th: tomorrow.
+      expect(await ask('2026-11-18T16:05:00Z')).toBe(200);
+    } finally {
+      vi.useRealTimers();
+      if (zone === undefined) delete process.env.TZ; else process.env.TZ = zone;
+    }
   });
 });
 

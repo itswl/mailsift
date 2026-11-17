@@ -15,6 +15,7 @@
 import type { IncomingMessage } from 'node:http';
 import type { Account } from './config.js';
 import { LiveMailError, MAIL_ACTIONS, MailActionError, type BulkTarget, type WebMailAction } from './imap/client.js';
+import { MailboxUnreachableError } from './imap/connection.js';
 import {
   firstKey, SearchCancelled, SearchTimedOut, LIVE_PAGE_MAX, useHandleKey, type FirstAsked, type FirstOf, type LiveItem,
 } from './imap/mailbox.js';
@@ -305,6 +306,7 @@ function outcomeResult(key: string, error: unknown): BulkResult {
   }
   if (error instanceof MailActionError && error.code === 'not_applicable') return { key, status: 'skipped', code: 'notApplicable', error: error.message };
   if (error instanceof MailActionError) return { key, status: 'failed', code: `action_${error.code}`, error: error.message };
+  if (error instanceof MailboxUnreachableError) return { key, status: 'failed', code: 'mailboxUnreachable', error: 'the mail provider is not answering right now' };
   return { key, status: 'failed', code: 'actionFailed', error: String(error).slice(0, 200) };
 }
 

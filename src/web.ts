@@ -712,7 +712,7 @@ function providerOf(address: string): string {
  * browser history, proxy logs or a Referer header. One field takes either
  * credential: the token decides what the session may do.
  */
-export function renderLogin(lang: Language, error?: StringKey, nonce = '', upgrade = false): string {
+export function renderLogin(lang: Language, error?: StringKey, nonce = '', upgrade = false, next = ''): string {
   const s = (key: StringKey): string => escapeHtml(t(lang, key));
   // The switch reloads here rather than rewording in place: there is nothing
   // on this page to lose, and the reload goes to a GET so a refused sign-in is
@@ -724,13 +724,18 @@ export function renderLogin(lang: Language, error?: StringKey, nonce = '', upgra
       <p class="muted">${s(upgrade ? 'login.introWrite' : 'login.intro')}</p>
       <input type="text" name="user" value="mailsift" autocomplete="username" readonly aria-label="${s('login.account')}">
       <input type="password" name="token" autocomplete="current-password" placeholder="${s('login.token')}" enterkeyhint="go" autofocus>
+      <input type="hidden" name="next" value="${escapeHtml(next)}">
       <button type="submit">${s('login.open')}</button>
       ${error ? '<p class="error" role="alert">' + s(error) + '</p>' : ''}
       <button type="button" id="lang" class="lang" aria-label="${s('lang.label')}">${s('lang.face')}</button>
       <p class="version">${escapeHtml(webVersion())}</p>
     </form>
     <script nonce="${nonce}">${storeLanguageScript()}
-    document.querySelector('#lang').onclick = () => { storeLanguage('${nextLanguage(lang)}'); location.replace('${upgrade ? '/signin' : '/'}'); };</script>`, nonce);
+    document.querySelector('#lang').onclick = () => { storeLanguage('${nextLanguage(lang)}'); location.replace('${upgrade ? '/signin' : '/'}'); };
+    // Where this form was asked for (a shortcut, a shared link, a message named after #) is where signing in goes.
+    var next = document.querySelector('input[name=next]');
+    var here = location.pathname;
+    if (!next.value && here.indexOf('/auth') !== 0 && here.indexOf('/signin') !== 0) next.value = here + location.search + location.hash;</script>`, nonce);
 }
 
 /**
@@ -1045,10 +1050,43 @@ const PUBLIC_ASSETS: Record<string, { body: string | Buffer; type: string; cache
 /** Six months. Long enough that a browser in regular use is never asked again. */
 const SESSION_MAX_AGE = 180 * 24 * 60 * 60;
 
+/**
+ * Whether the session cookie is marked Secure. The cookie holds the token
+ * itself, so it must never cross plain HTTP where it does not have to.
+ * WEB_COOKIE_SECURE=true marks it always, for a deployment that is only ever
+ * reached over HTTPS; auto (the default) marks it when the request says it
+ * came over TLS, which behind a proxy is the proxy's X-Forwarded-Proto. Not
+ * always by default: a browser keeps no Secure cookie from a plain-HTTP page,
+ * and a deployment reached that way (loopback, a tunnel to it) could no
+ * longer sign in.
+ */
+export function cookieSecure(req: IncomingMessage): boolean {
+  if ((process.env.WEB_COOKIE_SECURE ?? '').trim().toLowerCase() === 'true') return true;
+  return String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim().toLowerCase() === 'https';
+}
+
+/**
+ * Where a sign-in goes once it is through: the address the form was asked
+ * for, on this server, or the page itself. Anything that could leave the site
+ * (another host, a scheme, a path that starts //) is the page itself.
+ */
+export function signInTarget(next: string | null | undefined): string {
+  const asked = String(next ?? '').trim();
+  if (!asked.startsWith('/') || asked.startsWith('//') || asked.startsWith('/\\') || asked.length > 2000) return '/';
+  if (/[\u0000-\u001f\u007f]/.test(asked)) return '/';
+  try {
+    const base = new URL('http://mailsift.invalid');
+    const target = new URL(asked, base);
+    if (target.origin !== base.origin || target.pathname.startsWith('/auth')) return '/';
+    return target.pathname + target.search + target.hash;
+  } catch {
+    return '/';
+  }
+}
+
 function sessionCookie(req: IncomingMessage, token: string, maxAge = SESSION_MAX_AGE): string {
-  // Secure only when the request really arrived over TLS: setting it on plain
-  // HTTP would make the cookie unusable behind a loopback-only setup.
-  const https = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim() === 'https';
+  // Secure when the request arrived over TLS, or always when WEB_COOKIE_SECURE says so (see cookieSecure).
+  const https = cookieSecure(req);
   // Lax, not Strict. Strict withholds the cookie on a navigation that starts
   // outside the site, which is exactly how an installed app launches from a
   // home screen and how a shared link opens, so it asked for the token again
@@ -1085,6 +1123,32 @@ async function handleRefresh(
 
 /** Sent with every response: never guess a content type, never send a referrer. */
 const COMMON_HEADERS = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' };
+
+/**
+ * The answer to a request over the page's budget (see allowWebRequest), in
+ * the page's words: a code its requests word for it, and for a navigation a
+ * page that says what happened, rather than a line of JSON. The installed
+ * app keeps its own copy of the page for this (see SERVICE_WORKER).
+ */
+export function webRateLimited(req: IncomingMessage, path: string): WebResponse {
+  const headers = { ...COMMON_HEADERS, 'retry-after': '60', 'cache-control': 'no-store' };
+  if (path.startsWith('/api/') || req.method !== 'GET') {
+    return { ...json(429, { error: 'too many requests from this device; wait a moment', code: 'rate_limited' }), headers };
+  }
+  const lang = pickLanguage(req);
+  const words = (key: StringKey): string => escapeHtml(t(lang, key));
+  return {
+    status: 429, contentType: 'text/html; charset=utf-8',
+    body: page(lang, 'mailsift', `
+    <div class="login">
+      <img class="brand-mark" src="/icon-192.png?v=3" alt="" aria-hidden="true">
+      <h1>mailsift</h1>
+      <p class="muted" role="alert">${words('error.rate_limited')}</p>
+      <p><a href="">${words('network.retry')}</a></p>
+    </div>`),
+    headers: { ...headers, 'content-security-policy': appPolicy(randomBytes(16).toString('base64')), 'x-frame-options': 'DENY' },
+  };
+}
 
 /**
  * Serve one non-MCP request.
@@ -1161,21 +1225,36 @@ async function route(
 
   if (url.pathname === '/auth' && req.method === 'POST') {
     // Signing a browser in from another site's form would let that site pick
-    // which credential the browser holds, a weaker one included.
-    if (crossSite(req)) return html(403, renderLogin(lang, 'login.rejected', nonce));
+    // which credential the browser holds, a weaker one included. Said as
+    // that, not as a wrong token: the token may well have been right.
+    if (crossSite(req)) return html(403, renderLogin(lang, 'login.crossSite', nonce));
     if (!allowAuthAttempt(client)) {
       return html(429, renderLogin(lang, 'login.tooMany', nonce));
     }
-    let presented = '';
+    let form: URLSearchParams;
     try {
-      presented = new URLSearchParams(await readBody(req)).get('token')?.trim() ?? '';
+      form = new URLSearchParams(await readBody(req));
     } catch {
       return html(413, renderLogin(lang, 'login.tooLarge', nonce));
     }
+    const presented = form.get('token')?.trim() ?? '';
+    const next = signInTarget(form.get('next'));
     // Either credential signs in; which one it was decides what the session may do.
     const writes = writeToken !== '' && presented !== '' && tokenMatches(writeToken, presented);
-    if (!writes && !tokenMatches(token, presented)) return html(401, renderLogin(lang, 'login.rejected', nonce));
-    return { status: 303, body: '', contentType: 'text/html; charset=utf-8', cookie: sessionCookie(req, presented) };
+    // With no read token the page reads without one, so a token typed here was meant for writing, and
+    // is wrong: signing in read-only on it would leave the owner wondering why nothing can be done.
+    const reads = token ? tokenMatches(token, presented) : presented === '' || writeToken === '';
+    if (!writes && !reads) return html(401, renderLogin(lang, 'login.rejected', nonce, false, next));
+    return {
+      status: 303, body: '', contentType: 'text/html; charset=utf-8', cookie: sessionCookie(req, presented),
+      headers: { location: next },
+    };
+  }
+  // Signing out needs no session: one that has ended still leaves this device holding its cookie, which
+  // is cleared here, and the page then forgets what it kept. Still only from this site.
+  if (url.pathname === '/auth/signout' && req.method === 'POST') {
+    if (crossSite(req)) return json(403, { error: 'cross-site request refused', code: 'crossSite' });
+    return { ...json(200, { signedOut: true }), cookie: sessionCookie(req, '', 0), cacheControl: 'no-store' };
   }
 
   const session = sessionOf(req, token, writeToken);
@@ -1198,7 +1277,8 @@ async function route(
     return json(403, { error: 'cross-site request refused', code: 'crossSite' });
   }
 
-  if (url.pathname === '/' && req.method === 'GET') {
+  // HEAD as GET: an uptime check asks for the page without its body, which the server leaves out.
+  if (url.pathname === '/' && (req.method === 'GET' || req.method === 'HEAD')) {
     const answer = html(200, renderApp(lang, Boolean(options.onRefresh), nonce), true);
     // Roll the session forward on each visit, so regular use never expires.
     // Only on the page: doing it on the polling calls would rewrite the cookie
@@ -1218,9 +1298,6 @@ async function route(
         'x-frame-options': 'SAMEORIGIN',
       },
     };
-  }
-  if (url.pathname === '/auth/signout' && req.method === 'POST') {
-    return { ...json(200, { signedOut: true }), cookie: sessionCookie(req, '', 0), cacheControl: 'no-store' };
   }
   if (url.pathname === '/api/events' && req.method === 'GET') {
     // The page's live line: one event when the stored mail changes, one when
@@ -1285,6 +1362,10 @@ async function route(
     // Mail data is never a cache's to keep.
     answer.cacheControl = 'no-store';
     return answer;
+  }
+  // An address that is not a page (an old bookmark, /index.html, a form's address reached by going back) goes to the page.
+  if (!url.pathname.startsWith('/api/') && (req.method === 'GET' || req.method === 'HEAD')) {
+    return { status: 303, body: '', contentType: 'text/html; charset=utf-8', headers: { location: '/' } };
   }
   return json(404, { error: 'not found' });
 }
