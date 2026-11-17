@@ -818,7 +818,7 @@ function renderQueue(items, done, later, now, arriving) {
       }));
     }
     if (done.length) {
-      toggles.push(footToggle('done-toggle', fill('done.recent', { count: done.length }), doneExpanded, () => {
+      toggles.push(footToggle('done-toggle', fill('done.recent', { count: done.length + doneExtra }), doneExpanded, () => {
         doneExpanded = !doneExpanded;
         if (doneExpanded) laterExpanded = false;
         renderList();
@@ -1085,10 +1085,13 @@ async function refresh() {
   }
 }
 
-function setAttention(rows, count, done, later, laterCount) {
+function setAttention(rows, count, done, later, laterCount, doneCount) {
   attention = Array.isArray(rows) ? rows : [];
   // A server that does not say (an older one, during an upgrade) leaves what is known.
-  if (Array.isArray(done)) doneRecent = done;
+  if (Array.isArray(done)) {
+    doneRecent = done;
+    doneExtra = typeof doneCount === 'number' ? Math.max(0, doneCount - done.length) : 0;
+  }
   if (Array.isArray(later)) {
     snoozedRows = later;
     laterExtra = typeof laterCount === 'number' ? Math.max(0, laterCount - later.length) : 0;
@@ -1118,7 +1121,7 @@ async function loadAttention() {
     const r = await fetch('/api/attention');
     if (!r.ok) return;
     const d = await r.json();
-    setAttention(d.mail, d.count, d.done, d.snoozed, d.snoozedCount);
+    setAttention(d.mail, d.count, d.done, d.snoozed, d.snoozedCount, d.doneCount);
   } catch (e) {}
 }
 
@@ -1192,6 +1195,7 @@ function saveSnapshot() {
         mail: lastMail.slice(0, 60).map(plain),
         attention: (attention || []).slice(0, 40).map(plain),
         done: doneRecent.slice(0, 20).map(plain),
+        doneExtra: doneRecent.filter((m) => m.handledAt).length + doneExtra - doneRecent.slice(0, 20).filter((m) => m.handledAt).length,
         later: snoozedRows.slice(0, 20).map(plain),
         // The ones not kept here, which nothing on this device can list.
         laterExtra: snoozedRows.filter(isSnoozed).length + laterExtra - snoozedRows.slice(0, 20).filter(isSnoozed).length,
@@ -1211,6 +1215,7 @@ function restoreSnapshot() {
     lastDigest = snap.digest || null;
     attention = Array.isArray(snap.attention) ? snap.attention : [];
     doneRecent = Array.isArray(snap.done) ? snap.done : [];
+    doneExtra = Math.max(0, Number(snap.doneExtra) || 0);
     snoozedRows = Array.isArray(snap.later) ? snap.later : [];
     laterExtra = Math.max(0, Number(snap.laterExtra) || 0);
     attentionCount = Number(snap.attentionCount) || 0;

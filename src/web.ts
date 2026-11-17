@@ -43,7 +43,7 @@ import { liveHub } from './web-live.js';
 import { LIGHT_BAR, styles } from './web-styles.js';
 import { isLanguage, LANGUAGES, t, type Language, type StringKey } from './web-strings.js';
 import { appPolicy, framePolicy, MAIL_FRAME, SERVICE_WORKER, SHELL_HEADER } from './web-worker.js';
-import { MAX_CONTACTS, type MailRow, type SentRow, type StateStore } from './services/state.js';
+import { doneListDays, MAX_CONTACTS, type MailRow, type SentRow, type StateStore } from './services/state.js';
 
 export { LANGUAGE_COOKIE, readCookie, SESSION_COOKIE, tokenMatches };
 export type { Session, WebBackend, WebResponse };
@@ -337,7 +337,8 @@ export async function handleApi(
     const rows = store.attention(intParam(params, 'limit', 50, 100));
     // And what was dealt with lately, so a message marked done can be found
     // again and put back even when it is older than the list's window.
-    const done = store.recentlyHandled(intParam(params, 'done', 20, 50));
+    // The most recent 50 of them, with how many there are in all (DONE_LIST_DAYS sets how far back).
+    const done = store.recentlyHandled(intParam(params, 'done', 50, 100));
     // And what was put off until later, soonest first: it has left the queue
     // and is coming back, so the page can say when and bring it back sooner.
     const later = store.snoozed(intParam(params, 'snoozed', 50, 100));
@@ -345,6 +346,8 @@ export async function handleApi(
       count: store.attentionCount(),
       mail: rows.map(decorate),
       done: done.map(({ row, queued }) => ({ ...decorate(row), queued })),
+      doneCount: store.recentlyHandledCount(),
+      doneDays: doneListDays(),
       snoozed: later.map(decorate),
       snoozedCount: store.snoozedCount(),
     });

@@ -401,8 +401,17 @@ export interface RowCursor {
 export const ATTENTION_SINCE_KEY = 'attention_since';
 /** A to-do nobody touched for a month has stopped being one. */
 const ATTENTION_WINDOW_DAYS = 30;
-/** How far back "dealt with lately" reaches: long enough to notice a slip, short enough to stay a short list. */
-const RECENTLY_HANDLED_DAYS = 7;
+/**
+ * How far back "dealt with lately" reaches, in days: DONE_LIST_DAYS, 7 unless
+ * set, from 1 to 365. Long enough to notice a slip, short enough to stay a
+ * short list; nothing older than STATE_RETENTION_DAYS is kept to list.
+ */
+export function doneListDays(): number {
+  // An empty line in .env is "not set".
+  const raw = process.env.DONE_LIST_DAYS?.trim();
+  const value = raw ? Number(raw) : NaN;
+  return Number.isFinite(value) && value >= 1 ? Math.min(365, Math.floor(value)) : 7;
+}
 /**
  * Bumped by the changes no aggregate over the rows can see: a message moved
  * between two folders, one marked handled while another is put back, one put
@@ -1576,7 +1585,7 @@ export class StateStore {
    */
   recentlyHandled(limit = 20): Array<{ row: MailRow; queued: boolean }> {
     const rule = this.queueRule();
-    const since = new Date(Date.now() - RECENTLY_HANDLED_DAYS * 86_400_000).toISOString();
+    const since = new Date(Date.now() - doneListDays() * 86_400_000).toISOString();
     return (
       this.db.prepare(
         `SELECT ${ROW_COLUMNS.join(', ')}, (CASE WHEN ${rule.clause} THEN 1 ELSE 0 END) AS would_queue
@@ -1584,6 +1593,14 @@ export class StateStore {
          ORDER BY handled_at DESC, dedup_key DESC LIMIT ?`,
       ).all(...rule.params, since, Math.max(1, Math.min(Math.floor(limit), 100))) as Array<Record<string, unknown>>
     ).map((raw) => ({ row: toRow(raw), queued: Boolean(raw['would_queue']) }));
+  }
+
+  /** How many were dealt with lately: all of them, where recentlyHandled lists the most recent. */
+  recentlyHandledCount(): number {
+    const since = new Date(Date.now() - doneListDays() * 86_400_000).toISOString();
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM seen WHERE handled_at IS NOT NULL AND handled_at >= ?')
+      .get(since) as Record<string, unknown> | undefined;
+    return Number(row?.['n'] ?? 0);
   }
 
   /**
