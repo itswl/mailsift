@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import './setup.js';
 import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
@@ -1024,7 +1024,7 @@ describe('the composer', () => {
       composeForm: { ...node(), to: field(), cc: field(), bcc: field(), subject: field(), text: field() },
       composeNote: note, composeLost: lost, composeSend: { disabled: false }, composeSheet: { open: true },
       session: { assistant: false }, lastSummary: { accounts: [] },
-      readDraft: () => ({ text: 'Here they are.', files: ['report.pdf', 'notes.txt'], at: 1 }),
+      readDraft: () => ({ text: 'Here they are.', files: ['report.pdf', 'notes.txt'], at: 1 }), offerKept: () => undefined,
       t, fill, el: () => node(), composeSay: (text: string) => { note['textContent'] = text; },
       drawChips: () => undefined, showQuoted: () => undefined, showCopies: () => undefined, drawSignature: () => undefined,
       drawFiles: () => undefined, openSheet: () => undefined, growText: () => undefined, setTimeout: () => undefined,
@@ -1104,7 +1104,7 @@ describe('the composer', () => {
       composeSay: (text: string) => said.push(text),
       composeSig: { querySelector: () => ({ focus: () => { focused += 1; } }) },
     };
-    const sendCompose = lifted<() => void>(['addresses', 'sendCompose'], 'sendCompose', context);
+    const sendCompose = lifted<() => void>(['isAnswer', 'addresses', 'sendCompose'], 'sendCompose', context);
     context['composing'] = { mode: 'new', key: '', editingSignature: true, signature: 'Old' };
     sendCompose();
     expect(said.at(-1)).toBe('Save or cancel the signature first.');
@@ -1136,19 +1136,28 @@ describe('the composer', () => {
       reset: () => { for (const name of ['to', 'cc', 'bcc', 'subject', 'text'] as const) form[name].value = ''; },
     };
     let ids = 0;
+    // As the browser's: what is stored is also listed by Object.keys.
+    const localStorage: Record<string, unknown> = Object.create({
+      getItem: (key: string) => stored.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        stored.set(key, String(value));
+        Object.defineProperty(localStorage, key, { value: String(value), enumerable: true, configurable: true, writable: true });
+      },
+      removeItem: (key: string) => { stored.delete(key); delete localStorage[key]; },
+    }) as Record<string, unknown>;
+    const storage = localStorage as unknown as { getItem: (key: string) => string | null; setItem: (key: string, value: string) => void; removeItem: (key: string) => void };
+    const toasts: Array<{ text: string; failed: boolean; action: { label: string; run: () => void } | null }> = [];
     const context: Record<string, unknown> = {
       $: (selector: string) => elements.get(selector) ?? elements.set(selector, node()).get(selector),
       document: { createElement: () => node() }, Option: function Option() { return {}; },
       composeForm: form, composeNote: note, composeLost: lost, composeSend: { disabled: false }, composeSheet: { open: true },
       composeSig: { querySelector: () => null }, sendingNode: node(),
       session: { assistant: false }, lastSummary: { accounts: [{ address: 'me@qq.com', name: 'Me', canSend: true }] },
-      writeStorage: (key: string, value: string) => stored.set(key, value),
-      readStorage: (key: string) => stored.get(key) ?? null,
-      localStorage: {
-        getItem: (key: string) => stored.get(key) ?? null,
-        setItem: (key: string, value: string) => stored.set(key, value),
-        removeItem: (key: string) => stored.delete(key),
-      },
+      writeStorage: (key: string, value: string) => storage.setItem(key, value),
+      readStorage: (key: string) => storage.getItem(key),
+      localStorage,
+      hideToast: () => undefined, toast: (text: string, failed: boolean, action: { label: string; run: () => void } | null) => toasts.push({ text, failed, action }),
+      loadReply: () => undefined, loadForward: () => undefined,
       t, fill, el: () => node(),
       composeSay: (text: string) => { note['textContent'] = text; note['children'] = []; if (text) said.push(text); },
       composeAdd: (text: string) => said.push(text),
@@ -1158,17 +1167,20 @@ describe('the composer', () => {
       letterId: () => `letter${(ids += 1)}`, draftTimer: undefined, clearTimeout: () => undefined, setInterval: () => 1,
       clearInterval: () => undefined, closeSheet: () => undefined, raiseToast: () => undefined, announce: () => undefined,
       hideSending: () => undefined, deliver: (job: unknown) => delivered.push(job), pendingSend: null, composing: null,
-      lang: 'en', closeSuggest: () => false,
+      lang: 'en', closeSuggest: () => false, offerKept: () => undefined, textNode: () => node(),
     };
     const page = lifted<{
       openCompose: (state: Record<string, unknown>) => void; saveDraft: () => void; sendCompose: () => void;
       undoSend: (job: unknown) => void; fillForward: (d: Record<string, unknown>) => void;
       heldFiles: Map<string, { files: unknown[] }>;
+      backToLetter: (job: unknown, said: string) => void; keptLetters: () => Array<{ id: string; kept: Record<string, unknown> }>;
+      settleKept: () => void; reopenLetter: (stateOrId: unknown) => void;
     }>([
       'homeId', 'draftId', 'heldFiles', 'isAnswer', 'choosesFrom', 'addresses', 'letterText', 'letterKey', 'saveDraft',
       'sentenceGap', 'drawLost', 'missingWords', 'readDraft', 'isOn', 'sentOriginals', 'UNSHOWABLE', 'cleanFileName', 'reclaimDraft',
       'undoSend', 'openCompose', 'fillForward', 'SEND_DELAY', 'sendCompose',
-    ], '({ openCompose, saveDraft, sendCompose, undoSend, fillForward, heldFiles })', context);
+      'letterOf', 'keptStates', 'keepLetter', 'keptLetters', 'settleKept', 'reopenLetter', 'backToLetter',
+    ], '({ openCompose, saveDraft, sendCompose, undoSend, fillForward, heldFiles, backToLetter, keptLetters, settleKept, reopenLetter })', context);
     /** A letter written into the open composer, as a person types it. */
     const write = (fields: { to?: string; subject?: string; text?: string }): void => {
       if (fields.to !== undefined) form.to.value = fields.to;
@@ -1183,8 +1195,246 @@ describe('the composer', () => {
     };
     const file = (name: string) => ({ id: name, name, type: 'text/plain', size: 10, at: 1, file: {} });
     const names = (state: Record<string, unknown>): string[] => ((state['files'] ?? []) as Array<{ name: string }>).map((f) => f.name);
-    return { page, context, stored, said, delivered, form, lost, note, write, fresh, file, names };
+    return { page, context, stored, storage, toasts, said, delivered, form, lost, note, write, fresh, file, names };
   }
+
+  it('keeps a letter whose send failed while another was open, offers it, and makes it its message\'s draft once that is free', () => {
+    const { page, context, stored, storage, toasts, form, write, fresh } = composer();
+    const a = fresh();
+    write({ to: 'ann.lee@studio.example', subject: 'Letter A', text: 'Important letter A, long and careful.' });
+    page.sendCompose();
+    const job = context['pendingSend'];
+    // Letter B is begun during the count, and is being typed when A fails.
+    const b = fresh();
+    write({ text: 'Letter B being written' });
+    // As deliver() does: no longer counting, and then refused.
+    context['pendingSend'] = null;
+    page.backToLetter(job, 'The mail server refused the sign-in.');
+    // B stays open, with what is being typed in it; the page says what happened, with a way to A.
+    expect(context['composing']).toBe(b);
+    expect(form.text.value).toBe('Letter B being written');
+    expect(toasts.at(-1)).toMatchObject({ failed: true, action: { label: STRINGS.en['compose.openIt'] } });
+    expect(toasts.at(-1)!.text).toContain('The mail server refused the sign-in.');
+    // B is closed and kept; A is out of reach of n (B holds that place), but kept and offered.
+    page.saveDraft();
+    (context['composeSheet'] as { open: boolean }).open = false;
+    expect(JSON.parse(stored.get('draft:new')!).text).toBe('Letter B being written');
+    const kept = page.keptLetters();
+    expect(kept.map((entry) => entry.kept['subject'])).toEqual(['Letter A']);
+    // Opened again from there: all of A, and B is still the new letter's draft.
+    (context['composeSheet'] as { open: boolean }).open = true;
+    page.reopenLetter(kept[0]!.id);
+    expect(context['composing']).toBe(a);
+    expect([form.to.value, form.subject.value, form.text.value]).toEqual(['ann.lee@studio.example', 'Letter A', 'Important letter A, long and careful.']);
+    expect(JSON.parse(stored.get('draft:new')!).text).toBe('Letter B being written');
+    // Closed again, it is still kept, with what it is, for a page opened later.
+    page.saveDraft();
+    (context['composeSheet'] as { open: boolean }).open = false;
+    expect(page.keptLetters()).toHaveLength(1);
+    // Once B has gone, A is the new letter's draft again, and nothing is kept apart.
+    storage.removeItem('draft:new');
+    page.settleKept();
+    expect(JSON.parse(stored.get('draft:new')!)).toMatchObject({ subject: 'Letter A', text: 'Important letter A, long and careful.' });
+    expect(JSON.parse(stored.get('draft:new')!)).not.toHaveProperty('letter');
+    expect(page.keptLetters()).toEqual([]);
+  });
+
+  it('keeps every word of a letter being written when Undo brings back the one that was counting', () => {
+    const { page, context, stored, form, write, fresh } = composer();
+    fresh();
+    write({ to: 'ann@x.org', subject: 'A', text: 'Letter A.' });
+    page.sendCompose();
+    const job = context['pendingSend'];
+    fresh();
+    // Typed a moment ago: not yet saved by the pause after typing.
+    write({ text: 'Letter B, typed just now.' });
+    page.undoSend(job);
+    expect(form.text.value).toBe('Letter A.');
+    expect(JSON.parse(stored.get('draft:new')!).text).toBe('Letter B, typed just now.');
+  });
+
+  it('opens a letter whose send failed again when nothing else is being written, as before', () => {
+    const { page, context, form, write, fresh, toasts } = composer();
+    const a = fresh();
+    write({ to: 'ann@x.org', subject: 'Hello', text: 'Hi Ann.' });
+    page.sendCompose();
+    (context['composeSheet'] as { open: boolean }).open = false;
+    const job = context['pendingSend'];
+    context['pendingSend'] = null;
+    page.backToLetter(job, 'Refused.');
+    expect(context['composing']).toBe(a);
+    expect(form.text.value).toBe('Hi Ann.');
+    expect(toasts).toEqual([]);
+  });
+
+  /** Draft with AI, its question and its Undo, over a stand-in composer: what is posted, and what the box and the line under it say. */
+  function drafting(state: Record<string, unknown>) {
+    const posted: Array<Record<string, unknown>> = [];
+    let answer: (body: Record<string, unknown>) => Record<string, unknown> = () => ({ ok: true, status: 200, data: { draft: 'Model text.' } });
+    const note = node();
+    const button = { ...node(), disabled: false, textContent: t('compose.draft') };
+    const form = { to: field(), cc: field(), bcc: field(), subject: field(), text: field(), instruction: field() };
+    const element = (_tag: string, _cls?: string, text?: string): Record<string, unknown> => ({ ...node(), textContent: text ?? '' });
+    const context: Record<string, unknown> = {
+      $: () => button, composeForm: form, composeNote: note, composeSheet: { open: true }, pendingSend: null, composing: state,
+      t, fill, el: element, textNode: (value: string) => ({ textContent: value }), draftSeq: 0, writing: 0,
+      composeSay: (text: string, failed?: boolean) => { note['textContent'] = text; note['children'] = []; note['failed'] = Boolean(failed); },
+      post: async (_path: string, body: Record<string, unknown>) => { posted.push(body); return answer(body); },
+      failure: (d: { code: string }) => `failure:${d.code}`, reduceMotion: () => true, growText: () => undefined, saveDraft: () => undefined,
+    };
+    const page = lifted<{ aiDraft: (confirmed?: boolean) => Promise<void> }>(
+      ['isAnswer', 'aiDraft', 'askReplace', 'putDraft', 'writeIn'], '({ aiDraft })', context,
+    );
+    /** Presses the button in the line under the letter that says this. */
+    const press = (key: string): void => {
+      const found = (note['children'] as Array<Record<string, unknown>>).find((child) => child['textContent'] === t(key));
+      expect(found, key).toBeDefined();
+      (found!['onclick'] as () => void)();
+    };
+    return { page, context, posted, note, button, form, press, answerWith: (run: typeof answer) => { answer = run; } };
+  }
+
+  it('never puts the model\'s draft in place of words the owner wrote without asking, and always offers the way back', async () => {
+    const reply = { mode: 'reply', key: 'k1' };
+    // An empty box is filled at once, and can be emptied again.
+    const empty = drafting(reply);
+    await empty.page.aiDraft();
+    expect(empty.form.text.value).toBe('Model text.');
+    expect(empty.note['textContent']).toBe(t('compose.drafted'));
+    empty.press('undo');
+    expect(empty.form.text.value).toBe('');
+
+    // Words of the owner's own: asked first, and nothing goes to the model until the answer is yes.
+    const own = drafting(reply);
+    own.form.text.value = 'I have a long careful answer here that took me ten minutes to write.';
+    own.form.instruction.value = t('chip.thanks');
+    await own.page.aiDraft();
+    expect(own.posted).toEqual([]);
+    expect(own.note['textContent']).toBe(t('compose.replaceAsk'));
+    own.press('compose.keepMine');
+    expect(own.form.text.value).toBe('I have a long careful answer here that took me ten minutes to write.');
+    expect(own.posted).toEqual([]);
+    await own.page.aiDraft();
+    own.press('compose.replace');
+    await vi.waitFor(() => expect(own.form.text.value).toBe('Model text.'));
+    expect(own.posted).toHaveLength(1);
+    // And the way back gives back exactly what was there.
+    own.press('undo');
+    expect(own.form.text.value).toBe('I have a long careful answer here that took me ten minutes to write.');
+
+    // Typed on while the model wrote: asked again, with the draft ready, and nothing replaced meanwhile.
+    const typing = drafting(reply);
+    typing.answerWith(() => { typing.form.text.value = 'Something I typed while waiting.'; return { ok: true, status: 200, data: { draft: 'Model text.' } }; });
+    await typing.page.aiDraft();
+    expect(typing.form.text.value).toBe('Something I typed while waiting.');
+    expect(typing.note['textContent']).toBe(t('compose.draftReady'));
+    typing.press('compose.replace');
+    expect(typing.form.text.value).toBe('Model text.');
+    typing.press('undo');
+    expect(typing.form.text.value).toBe('Something I typed while waiting.');
+  });
+
+  it('writes a draft only into the letter it was asked for while it is open, never into one sent off meanwhile', async () => {
+    const letter = { mode: 'reply', key: 'k1' };
+    const page = drafting(letter);
+    page.form.text.value = '';
+    // Cmd+Enter pressed in the instruction once sent the letter too: here it is sent off while the model writes.
+    page.answerWith(() => { page.context['pendingSend'] = { state: letter }; return { ok: true, status: 200, data: { draft: 'Model text.' } }; });
+    await page.page.aiDraft();
+    expect(page.form.text.value).toBe('');
+  });
+
+  it('asks a new letter or a forward for a line instead of asking the server, and says Draft again only after a draft', async () => {
+    const fresh = drafting({ mode: 'new', key: '' });
+    fresh.form.subject.value = 'Lunch on Friday';
+    await fresh.page.aiDraft();
+    expect(fresh.posted).toEqual([]);
+    expect(fresh.note['textContent']).toBe(t('error.draftNeedsLine'));
+    expect(fresh.button['textContent']).toBe(t('compose.draft'));
+    const forward = drafting({ mode: 'forward', key: 'k1' });
+    await forward.page.aiDraft();
+    expect(forward.posted).toEqual([]);
+    // Refused: nothing was drafted, so the button still says Draft.
+    const refused = drafting({ mode: 'reply', key: 'k1' });
+    refused.answerWith(() => ({ ok: false, status: 422, data: { code: 'assistant_refused' } }));
+    await refused.page.aiDraft();
+    expect(refused.note['textContent']).toBe('failure:assistant_refused');
+    expect(refused.button['textContent']).toBe(t('compose.draft'));
+    await drafting({ mode: 'reply', key: 'k1' }).page.aiDraft();
+  });
+
+  it('keeps Enter in the instruction to drafting, Cmd or Ctrl with it too, and leaves an input method its Enter', () => {
+    const drafted: number[] = [];
+    const keydown = lifted<(e: Record<string, unknown>) => void>(['instructionKeydown'], 'instructionKeydown', { aiDraft: () => drafted.push(1) });
+    const press = (extra: Record<string, unknown>) => {
+      const did: string[] = [];
+      keydown({ key: 'Enter', preventDefault: () => did.push('prevent'), stopPropagation: () => did.push('stop'), ...extra });
+      return did;
+    };
+    // Cmd+Enter does not reach the form, where it would send the letter.
+    expect(press({ metaKey: true })).toEqual(['prevent', 'stop']);
+    expect(press({ ctrlKey: true })).toEqual(['prevent', 'stop']);
+    expect(drafted).toHaveLength(2);
+    // Committing pinyin or kana: the input method's own Enter, not a draft.
+    expect(press({ isComposing: true })).toEqual([]);
+    expect(press({ keyCode: 229 })).toEqual([]);
+    expect(drafted).toHaveLength(2);
+  });
+
+  it('leaves the signature open on an Escape that only takes back an input method\'s composition', () => {
+    const closed: unknown[] = [];
+    const keydown = lifted<(e: Record<string, unknown>, state: unknown, save: unknown) => void>(['signatureKeydown'], 'signatureKeydown', {
+      closeSignatureEditor: (state: unknown) => closed.push(state),
+    });
+    const noop = () => undefined;
+    keydown({ key: 'Escape', isComposing: true, preventDefault: noop, stopPropagation: noop }, 'letter', {});
+    keydown({ key: 'Escape', keyCode: 229, preventDefault: noop, stopPropagation: noop }, 'letter', {});
+    expect(closed).toEqual([]);
+    keydown({ key: 'Escape', preventDefault: noop, stopPropagation: noop }, 'letter', {});
+    expect(closed).toEqual(['letter']);
+  });
+
+  it('stops saying the signature must be saved once it is, and does not send an answer whose message could not be read', () => {
+    const note = { textContent: t('compose.sigUnsaved') };
+    const state: Record<string, unknown> = { editingSignature: true };
+    const withState = lifted<(state: Record<string, unknown>) => void>(['closeSignatureEditor'], 'closeSignatureEditor', {
+      composeNote: note, t, composing: state, composeSay: (text: string) => { note.textContent = text; },
+      drawSignature: () => undefined, focusSignature: () => undefined,
+    });
+    withState(state);
+    expect(note.textContent).toBe('');
+    // Anything else said there stays.
+    note.textContent = 'Something else.';
+    state['editingSignature'] = true;
+    withState(state);
+    expect(note.textContent).toBe('Something else.');
+
+    const said: string[] = [];
+    const sendCompose = lifted<() => void>(['isAnswer', 'addresses', 'sendCompose'], 'sendCompose', {
+      composeSend: { disabled: false }, pendingSend: null, t, fill,
+      composeForm: { to: field('someone@example.org'), cc: field(), bcc: field(), subject: field(''), text: field('Hello') },
+      composeSay: (text: string) => said.push(text),
+      composing: { mode: 'reply', key: 'live:x', replyFailed: 'This message is no longer where the folder listed it.' },
+    });
+    sendCompose();
+    expect(said.at(-1)).toBe(fill('compose.replyUnreadable', { reason: 'This message is no longer where the folder listed it.' }));
+  });
+
+  it('sends a letter that has recipients only in Cc or Bcc', () => {
+    const { page, context, form, write, fresh, said } = composer();
+    fresh();
+    write({ subject: 'Hello', text: 'For you both.' });
+    form.bcc.value = 'ann.lee@studio.example, bob@acme.example';
+    page.sendCompose();
+    expect(said).not.toContain(STRINGS.en['compose.needTo']);
+    expect((context['pendingSend'] as { payload: { to: string[]; bcc: string[] } }).payload).toMatchObject({ to: [], bcc: ['ann.lee@studio.example', 'bob@acme.example'] });
+    // Nobody at all is still asked for.
+    fresh();
+    write({ subject: 'Hello', text: 'For nobody.' });
+    context['pendingSend'] = null;
+    page.sendCompose();
+    expect(said.at(-1)).toBe(STRINGS.en['compose.needTo']);
+  });
 
   it('never gives a letter begun during another\'s count that other letter\'s files when it comes back', () => {
     for (const secondHasFiles of [true, false]) {
@@ -1328,10 +1578,10 @@ describe('the composer', () => {
       attentionSet: new Set(['k1']), rowByKey: () => ({ handledAt: null }), markHandledLocal: (key: string) => marked.push(key),
       attentionCount: 3, liveData: new Map(), renderList: () => undefined, renderLede: () => undefined,
       renderBars: () => undefined, updateBadge: () => undefined, refreshConversations: () => { redrawn += 1; },
-      liveView: null,
+      liveView: null, settleKept: () => undefined,
     };
     let redrawn = 0;
-    const deliver = lifted<(job: unknown) => Promise<void>>(['homeId', 'draftId', 'heldFiles', 'deliver'], 'deliver', context);
+    const deliver = lifted<(job: unknown) => Promise<void>>(['homeId', 'draftId', 'heldFiles', 'keptStates', 'deliver'], 'deliver', context);
     const job = () => ({ payload: { forwardOf: 'k1' }, files: [], state: { mode: 'forward', key: 'k1', draftKey: 'draft:sending:x' } });
     // Forwarded to another of the owner's own mailboxes: still to be dealt with.
     answer = { sent: true, rejected: [], handled: false, attention: 3 };
@@ -1355,7 +1605,10 @@ describe('the composer', () => {
     expect(sendFailure({}, 413)).toContain('before it reached mailsift');
     expect(sendFailure({}, 504)).toBe(t('error.send_timeout'));
     expect(sendFailure({}, 524)).toBe(t('error.send_timeout'));
-    expect(sendFailure({}, 0)).toBe(t('error.send_connection'));
+    // No answer of mailsift's own (the connection dropped, a proxy's own error page): it may have gone.
+    for (const status of [0, 500, 502, 503]) expect(sendFailure({}, status), String(status)).toBe(t('compose.sendUnknown'));
+    expect(t('compose.sendUnknown')).toContain('Look in Sent');
+    expect(sendFailure({ code: 'send_connection' }, 502)).toBe('failure:send_connection');
     // Cut off while it was still arriving: the upload took too long, and the mail server was never asked.
     expect(sendFailure({}, 408)).toBe(t('compose.uploadTooSlow'));
     expect(t('compose.uploadTooSlow')).toContain('took too long to upload');
@@ -2464,8 +2717,9 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
     expect(forgotten.slice(1)).toEqual(['cleared', 'load']);
     // Reply, forward and the reader's own read do the same with a stale answer.
     const script = clientScript();
-    expect(script).toContain("if (!r.ok) { composeSay(failure(d), true); if (d.code === 'liveStale' && liveView) forgetStale(rowKey(row)); return; }");
-    expect(script).toContain("if (!r.ok) { failed(failure(d)); if (d.code === 'liveStale' && liveView) forgetStale(rowKey(row)); return; }");
+    expect(script).toContain("if (!r.ok) { failed(failure(d)); if (d.code === 'liveStale' && liveView && listed) forgetStale(listed); return; }");
+    expect(script).toContain('loadReply(state, rowKey(row));');
+    expect(script).toContain('loadForward(state, rowKey(row));');
     expect(script).toContain("if (!r.ok && d.code === 'liveStale' && liveView && row.live) { clearTimeout(slow); toast(failure(d), true); forgetStale(rowKey(row)); return; }");
   });
 

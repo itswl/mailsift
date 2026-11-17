@@ -8,6 +8,8 @@ import { simpleParser } from 'mailparser';
 import { createTransport } from 'nodemailer';
 import { ConfigError, loadConfig, type Account } from '../src/config.js';
 import { findQuoteStart } from '../src/imap/body.js';
+import { threadKeyOf } from '../src/imap/client.js';
+import { outgoingRecord } from '../src/imap/sent.js';
 import {
   addressed, attachmentCharset, attachmentContentType, attachmentFilename, attachmentLimitBytes, describeBytes, forwardEnvelope,
   isSendableAddress, replyEnvelope, savesSentCopy, scopeAllowsSending, SendError, sendingStatus, sendMail,
@@ -636,10 +638,30 @@ describe('replying', () => {
     const reply = replyEnvelope(original({ references: chain, text: 'x'.repeat(60_000) }), self, 'reply');
     expect(reply.references).toHaveLength(20);
     expect(reply.references.at(-1)).toBe('<original@example.org>');
-    expect(reply.references[0]).toBe('<m21@example.org>');
+    // Cut from the middle: the thread's first message, by which it is grouped, stays first.
+    expect(reply.references[0]).toBe('<m0@example.org>');
+    expect(reply.references[1]).toBe('<m22@example.org>');
     const lines = reply.quoted.split('\n');
     expect(lines.at(-1)).toBe('> […]');
     expect(reply.quoted.length).toBeLessThan(51_000);
+  });
+
+  it('keeps a long thread\'s first message on the wire, so the reply is stored in the conversation it answers', async () => {
+    const { port } = await serving();
+    const chain = Array.from({ length: 26 }, (_, n) => `<r${n}@example.org>`);
+    const reply = replyEnvelope(original({ messageId: '<r26@example.org>', references: chain }), self, 'reply');
+    // What the page and send_mail do: the original's chain, with the original itself last.
+    const sent = await sendMail(mailbox(), {
+      to: ['ann@example.org'], subject: reply.subject, text: 'Yes.', inReplyTo: reply.inReplyTo, references: reply.references,
+    }, { transport: transportTo(port) });
+    const parsed = await simpleParser(sent.raw);
+    const refs = Array.isArray(parsed.references) ? parsed.references : [parsed.references];
+    expect(refs[0]).toBe('<r0@example.org>');
+    expect(refs.at(-1)).toBe('<r26@example.org>');
+    expect(refs).toHaveLength(20);
+    const record = outgoingRecord(mailbox(), { to: ['ann@example.org'], subject: reply.subject, text: 'Yes.' }, sent, 'page');
+    // The received message's conversation: keyed by the first id of its own References.
+    expect(record.threadKey).toBe(threadKeyOf('me@example.com', `References: ${chain.join(' ')}`, '<r25@example.org>', '<r26@example.org>'));
   });
 
   it('threads onto the original when the reply is sent', async () => {

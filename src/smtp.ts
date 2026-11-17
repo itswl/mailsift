@@ -447,13 +447,18 @@ function messageIdOrNothing(value: unknown): string | undefined {
   return `<${inner}>`;
 }
 
-function referenceChain(values: unknown): string[] {
+/**
+ * A References line of at most MAX_REFERENCES ids, cut from the middle as
+ * RFC 5322 suggests: the thread's first message, which is what clients (and
+ * mailsift's own conversations) group a thread by, and the latest ones.
+ */
+export function referenceChain(values: unknown): string[] {
   const chain: string[] = [];
   for (const value of Array.isArray(values) ? values : []) {
     const id = messageIdOrNothing(value);
     if (id && !chain.includes(id)) chain.push(id);
   }
-  return chain.slice(-MAX_REFERENCES);
+  return chain.length > MAX_REFERENCES ? [chain[0]!, ...chain.slice(-(MAX_REFERENCES - 1))] : chain;
 }
 
 function oneLine(value: string): string {
