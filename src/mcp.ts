@@ -28,7 +28,7 @@ import {
   exactHint, handleShaped, LIVE_PAGE_DEFAULT, LIVE_PAGE_MAX, parseLiveHandle, SEARCH_SCAN_MESSAGES, useHandleKey,
 } from './imap/mailbox.js';
 import { BULK_MAX, bulkAct, folderList, folderPage, mailboxSearch, type BulkAction } from './web-mailbox.js';
-import { CONVERSATION_LIMIT, MAX_CONTACTS, StateStore } from './services/state.js';
+import { CONVERSATION_LIMIT, doneListDays, MAX_CONTACTS, StateStore } from './services/state.js';
 import type { FeedbackLabel, NotificationOutboxRow } from './services/state.js';
 import {
   CATEGORIES, pushThreshold, resolveLlmBaseUrl, spamBonus, spamBonusWarning, suppressSelfForwards,
@@ -691,7 +691,8 @@ export function createServer(
         'and mailsift\'s own notices are not in it unless the owner put one off and its time has come. A message ' +
         'the owner put off (snooze) is out of it until its snoozedUntil, and back in it from then on whatever it ' +
         'was judged, for 30 days from that time. includeDone=true adds what was dealt with ' +
-        'in the last 7 days (marked done, archived, binned, answered or forwarded), most recent first; queued says ' +
+        `in the last ${doneListDays()} days (DONE_LIST_DAYS; marked done, archived, binned, answered or forwarded), ` +
+        'most recent first, the first 50, with recentlyDoneCount saying how many there are in all; queued says ' +
         'whether marking it not done would return it to the queue. includeSnoozed=true adds what is put off and ' +
         'still to come, soonest first, each with the snoozedUntil it comes back at: the first 50, with ' +
         'snoozedCount saying how many there are in all.',
@@ -705,7 +706,10 @@ export function createServer(
       count: store.attentionCount(),
       mail: store.attention(args.limit),
       ...(args.includeDone
-        ? { recentlyDone: store.recentlyHandled(30).map(({ row, queued }) => ({ ...row, queued })) }
+        ? {
+          recentlyDoneCount: store.recentlyHandledCount(),
+          recentlyDone: store.recentlyHandled(50).map(({ row, queued }) => ({ ...row, queued })),
+        }
         : {}),
       ...(args.includeSnoozed ? { snoozedCount: store.snoozedCount(), snoozed: store.snoozed(50) } : {}),
     }),

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import './setup.js';
-import { REJUDGED_KEY, SNOOZE_CHECKED_KEY, StateStore } from '../src/services/state.js';
+import { doneListDays, REJUDGED_KEY, SNOOZE_CHECKED_KEY, StateStore } from '../src/services/state.js';
 import { makeMessage, makeResult } from './helpers.js';
 
 function store(): StateStore {
@@ -369,6 +369,34 @@ describe('the needs-you queue', () => {
     s.setHandled('notified', false);
     expect(s.recentlyHandled().map((entry) => entry.row.dedupKey)).toEqual(['quiet', 'critical']);
     expect(s.attention().map((row) => row.dedupKey).sort()).toEqual(['notified', 'waiting']);
+    expect(s.recentlyHandledCount()).toBe(2);
+  });
+
+  it('reaches as far back as DONE_LIST_DAYS says, and counts everything in that reach', () => {
+    const s = store();
+    const daysAgo = (days: number): string => new Date(Date.now() - days * 86_400_000).toISOString();
+    for (const [key, days] of [['two', 2], ['ten', 10], ['forty', 40]] as const) {
+      seed(s, key, 'critical', true);
+      s.setHandled(key, true);
+      rawRun(s, 'UPDATE seen SET handled_at = ? WHERE dedup_key = ?', daysAgo(days), key);
+    }
+    const listed = (): string[] => s.recentlyHandled().map((entry) => entry.row.dedupKey);
+    // Unset, empty, nonsense or below one: a week.
+    for (const value of [undefined, '', 'soon', '0', '-3']) {
+      if (value === undefined) delete process.env.DONE_LIST_DAYS; else process.env.DONE_LIST_DAYS = value;
+      expect(doneListDays(), String(value)).toBe(7);
+      expect(listed(), String(value)).toEqual(['two']);
+    }
+    process.env.DONE_LIST_DAYS = '30';
+    expect(listed()).toEqual(['two', 'ten']);
+    expect(s.recentlyHandledCount()).toBe(2);
+    expect(s.recentlyHandled(1).map((entry) => entry.row.dedupKey)).toEqual(['two']);
+    // At most a year, and whole days.
+    process.env.DONE_LIST_DAYS = '1000';
+    expect(doneListDays()).toBe(365);
+    expect(listed()).toEqual(['two', 'ten', 'forty']);
+    process.env.DONE_LIST_DAYS = '14.9';
+    expect(doneListDays()).toBe(14);
   });
 
   it('is not a place for codes, sign-in links, health alerts or digests', () => {

@@ -360,6 +360,15 @@ describe('what needs the mailbox owner', () => {
     const done = after['recentlyDone'] as Array<{ messageId: string; queued: boolean; handledAt: string }>;
     expect(done.map((m) => [m.messageId, m.queued]).sort()).toEqual([['<one@x>', true], ['<three@x>', false]]);
     expect(done[0]?.handledAt).toEqual(expect.any(String));
+    expect(after['recentlyDoneCount']).toBe(2);
+  });
+
+  it('says how far back what was dealt with reaches, as the server is set', async () => {
+    process.env.DONE_LIST_DAYS = '30';
+    const tools = (await (await connect(seeded())).listTools()).tools;
+    const said = tools.find((tool) => tool.name === 'needs_you')?.description ?? '';
+    expect(said).toContain('in the last 30 days (DONE_LIST_DAYS');
+    expect(said).toContain('recentlyDoneCount');
   });
 
   it('lets a writer say a message is done, and put it back, as the ring does', async () => {

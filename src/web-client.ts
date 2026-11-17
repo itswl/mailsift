@@ -755,7 +755,8 @@ const extraRows = new Map();
 let attention = null, attentionCount = 0, attentionSet = new Set();
 // What was dealt with lately, most recently first: the way back for a row
 // that has left the queue. Each says whether it would return to the queue.
-let doneRecent = [], doneExpanded = false;
+// doneExtra: how many more were dealt with lately than the server listed.
+let doneRecent = [], doneExtra = 0, doneExpanded = false;
 // What was put off until later, soonest first, each with the time it comes
 // back: out of the queue for now, and listed under it.
 // laterExtra: how many more are put off than the server listed.
