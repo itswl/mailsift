@@ -179,6 +179,13 @@ export interface MessageHint {
    * the digest of that Message-ID (messageIdDigest), compared instead of it.
    */
   idDigest?: string;
+  /**
+   * With `exact`, for an action: the lookup of a stored record this message
+   * may be (a record's whereabouts, with its sender), which no listing tied.
+   * Under the action's lock, the record's own lookup is run with it, and the
+   * result says whether it picks this very message (recordPicks).
+   */
+  recordHint?: MessageHint;
 }
 
 /** A Message-ID too long to carry in a live handle, as one fixed-length string. */
@@ -523,6 +530,8 @@ export interface MailActionResult {
   sourceUid?: number;
   sourceUidValidity?: string;
   sourceFrom?: string;
+  /** Asked with MessageHint.recordHint: whether that record's own lookup picked the message acted on. */
+  recordPicks?: boolean;
 }
 
 export class MailActionError extends Error {
@@ -628,6 +637,18 @@ async function searchMessageUids(
   // search was too large, as the lookback does, rather than that it is gone.
   if (!matching.length && cutShort) throw overLimit();
   return matching;
+}
+
+/** Whether a stored record's own lookup (by its whereabouts and sender, in the folder now selected) picks this UID first. */
+async function picksIt(
+  client: ImapFlow, account: Account, messageId: string, folder: LookupFolder, recordHint: MessageHint, uid: number,
+): Promise<boolean> {
+  try {
+    const uids = await searchMessageUids(client, account, messageId, folder, { ...recordHint, exact: false });
+    return uids.length > 0 && Math.min(...uids) === uid;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1400,6 +1421,7 @@ async function actOnMessage(
   sourceFolder: string; destinationUid?: number; destinationUidValidity?: string; envelope?: FetchMessageObject['envelope'];
   /** The message acted on: its UID where it was, that folder's UIDVALIDITY and its sender, so the books follow only the right one. */
   source: { uid: number; uidValidity: string; from: string };
+  recordPicks?: boolean;
 } | undefined> {
   for (const folder of folders) {
     const lock = await lockFolder(client, folder, false);
@@ -1407,6 +1429,9 @@ async function actOnMessage(
     try {
       // A live handle was told apart by its envelope already: it is not fetched a second time.
       const exact = hint.exact ? await exactMessage(client, messageId, hint) : undefined;
+      // Asked before anything changes, while the folder is held: is this the message the record's own lookup picks?
+      const recordPicks = exact && hint.recordHint ? await picksIt(client, account, messageId, folder, hint.recordHint, exact.uid) : undefined;
+      const picked = recordPicks === undefined ? {} : { recordPicks };
       const uids = exact ? [exact.uid] : await searchMessageUids(client, account, messageId, folder, hint);
       if (!uids.length) continue;
       for (const uid of uids) {
@@ -1433,11 +1458,11 @@ async function actOnMessage(
           const landed = moved.uidMap?.get(uid);
           const validity = moved.uidValidity !== undefined ? String(moved.uidValidity) : '';
           if (landed && validity) {
-            return { sourceFolder: folder.path, destinationUid: landed, destinationUidValidity: validity, envelope: raw.envelope, source };
+            return { sourceFolder: folder.path, destinationUid: landed, destinationUidValidity: validity, envelope: raw.envelope, source, ...picked };
           }
-          return { sourceFolder: folder.path, envelope: raw.envelope, source };
+          return { sourceFolder: folder.path, envelope: raw.envelope, source, ...picked };
         }
-        return { sourceFolder: folder.path, source };
+        return { sourceFolder: folder.path, source, ...picked };
       }
     } finally {
       lock.release();
@@ -1605,6 +1630,7 @@ export async function applyWebMailAction(
       messageId,
       sourceFolder: acted.sourceFolder,
       sourceUid: acted.source.uid, sourceUidValidity: acted.source.uidValidity, sourceFrom: acted.source.from,
+      ...(acted.recordPicks !== undefined ? { recordPicks: acted.recordPicks } : {}),
       ...(destination ? {
         destinationFolder: destination.path, destinationIsSpam: destination.isSpam,
         ...(inBin(entries, destination.path) ? { destinationIsTrash: true } : {}),
@@ -1720,6 +1746,7 @@ export async function applyMailActions(
               done: {
                 action, account: account.username, messageId: target.messageId, sourceFolder: acted.sourceFolder,
                 sourceUid: acted.source.uid, sourceUidValidity: acted.source.uidValidity, sourceFrom: acted.source.from,
+                ...(acted.recordPicks !== undefined ? { recordPicks: acted.recordPicks } : {}),
                 ...(destination ? {
                   destinationFolder: destination.path, destinationIsSpam: destination.isSpam,
                   ...(inBin(entries, destination.path) ? { destinationIsTrash: true } : {}),

@@ -307,6 +307,8 @@ export interface LivePage {
 export interface FirstAsked {
   id: string;
   sender: string;
+  /** The UID the record remembers in this folder, when it has one: while that still carries the id, it is the answer. */
+  saved?: number;
 }
 
 /**
@@ -324,36 +326,53 @@ export function firstKey(folder: string, id: string, sender: string): string {
   return `${folder}\n${id}\n${sender.toLowerCase()}`;
 }
 
-/** At most this many asked of one folder per page; each is one search. What is not asked is not tied. */
-const FIRST_MAX_ASKED = 10;
-/** A Message-ID search with more answers than this is not a search for one message (QQ answers with the folder). */
+/** A Message-ID search answering with more than this (and more than a few per id asked) is not a search for those messages. */
 const FIRST_MAX_HITS = 20;
+/** How long a mailbox whose header search did not answer is not asked again (QQ's answers nothing). */
+const HEADER_BLIND_MS = 6 * 3_600_000;
+const headerBlind = new Map<string, number>();
 
-/** The folder now selected: each record's first message from its sender (see FirstOf). */
-async function firstUidsOf(client: ImapFlow, folder: string, asked: FirstAsked[]): Promise<Record<string, number | null>> {
+/**
+ * The folder now selected: each record's first message from its sender (see
+ * FirstOf), for all of a page at once: one search for every Message-ID asked
+ * about, one fetch of the envelopes it found, and the rest worked out here.
+ * Not asked where a header search is known not to answer: QQ's, or one that
+ * missed a message the page itself lists.
+ */
+async function firstUidsOf(client: ImapFlow, account: Account, folder: string, asked: FirstAsked[]): Promise<Record<string, number | null>> {
   const out: Record<string, number | null> = {};
-  for (const one of asked) {
-    const key = firstKey(folder, one.id, one.sender);
-    if (key in out) continue;
-    if (Object.keys(out).length >= FIRST_MAX_ASKED) break;
-    out[key] = await firstFromSender(client, one.id, one.sender.toLowerCase());
-  }
-  return out;
-}
-
-async function firstFromSender(client: ImapFlow, id: string, sender: string): Promise<number | null> {
+  for (const one of asked) out[firstKey(folder, one.id, one.sender)] = null;
+  const ids = [...new Set(asked.map((one) => one.id))];
+  if (!ids.length || untrustedSearch(account) || (headerBlind.get(account.username) ?? 0) > Date.now()) return out;
+  const terms = ids.map((id) => ({ header: { 'message-id': id } }));
   let found: number[] | false | undefined;
   try {
-    found = await client.search({ header: { 'message-id': id } }, { uid: true });
+    found = await client.search(terms.length === 1 ? terms[0]! : { or: terms }, { uid: true });
   } catch {
-    return null;
+    return out;
   }
-  if (!Array.isArray(found) || !found.length || found.length > FIRST_MAX_HITS) return null;
-  const uids: number[] = [];
-  for await (const raw of client.fetch(found, { uid: true, envelope: true }, { uid: true })) {
-    if ((raw.envelope?.messageId?.trim() ?? '') === id && firstAddress(raw.envelope?.from).address === sender) uids.push(raw.uid);
+  if (!Array.isArray(found) || found.length > Math.max(FIRST_MAX_HITS, ids.length * 4)) return out;
+  const lowest = new Map<string, number>();
+  const carried = new Set<string>();
+  if (found.length) {
+    for await (const raw of client.fetch(found, { uid: true, envelope: true }, { uid: true })) {
+      const id = raw.envelope?.messageId?.trim() ?? '';
+      carried.add(`${id}\n${raw.uid}`);
+      const key = firstKey(folder, id, firstAddress(raw.envelope?.from).address);
+      if (key in out) lowest.set(key, Math.min(lowest.get(key) ?? raw.uid, raw.uid));
+    }
   }
-  return uids.length ? Math.min(...uids) : null;
+  // Every id asked about is listed in this folder: one the search did not find says its header search does not answer.
+  if (ids.some((id) => ![...carried].some((hit) => hit.startsWith(`${id}\n`)))) {
+    headerBlind.set(account.username, Date.now() + HEADER_BLIND_MS);
+    return out;
+  }
+  for (const one of asked) {
+    const key = firstKey(folder, one.id, one.sender);
+    // The UID the record remembers still carries its id: that is its message, as its key finds it.
+    out[key] = one.saved !== undefined && carried.has(`${one.id}\n${one.saved}`) ? one.saved : lowest.get(key) ?? null;
+  }
+  return out;
 }
 
 export const LIVE_PAGE_DEFAULT = 50;
@@ -462,7 +481,7 @@ export async function browseFolder(
         .sort((a, b) => b.uid - a.uid);
       const oldest = items.at(-1);
       // Asked while the folder is still held, so what is found is the folder as it was listed.
-      const firstUids = options.firstOf ? await firstUidsOf(client, target.path, options.firstOf(items)) : undefined;
+      const firstUids = options.firstOf ? await firstUidsOf(client, account, target.path, options.firstOf(items)) : undefined;
       return {
         account: account.username, folder: target.path, uidValidity, total, items,
         next: from > 1 && oldest ? `${uidValidity}.${oldest.uid}` : null,
@@ -625,6 +644,7 @@ function rememberScan(key: string, items: LiveItem[]): void {
 /** For tests: no scan remembered. */
 export function forgetScans(): void {
   scans.clear();
+  headerBlind.clear();
 }
 
 /**
@@ -692,7 +712,7 @@ export async function searchMailbox(
     const firstUids: Record<string, number | null> = {};
     // Asked of each folder while it is held (see FirstOf).
     const askFirst = async (folder: string, items: LiveItem[]): Promise<void> => {
-      if (options.firstOf) Object.assign(firstUids, await firstUidsOf(client, folder, options.firstOf(items)));
+      if (options.firstOf) Object.assign(firstUids, await firstUidsOf(client, account, folder, options.firstOf(items)));
     };
     let limited: SearchPage['limited'];
     let total = 0;

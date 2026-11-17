@@ -163,7 +163,7 @@ async function liveLoad(reset, gone) {
   if (!reset && view.next) p.set('before', view.next);
   p.set('limit', String(LIVE_PAGE));
   // What was listed before the list was read again from the top, and the message open in the reader then.
-  let listedBefore = null, keep = [];
+  let listedBefore = null, keep = [], firstBefore = new Set();
   try {
     const r = await fetch((view.mode === 'search' ? '/api/search?' : '/api/folder?') + p.toString(), abort ? { signal: abort.signal } : {});
     if (r.status === 401) { location.reload(); return; }
@@ -178,7 +178,11 @@ async function liveLoad(reset, gone) {
     const rows = (Array.isArray(d.items) ? d.items : []).map((item) => liveRow(item, view.account));
     if (reset) {
       listedBefore = visibleKeys();
-      keep = [selectedKey, openKey].filter((k, i, all) => k && all.indexOf(k) === i && liveRows.has(k)).map((k) => [k, liveRows.get(k)]);
+      // The first page as it was: only there can a message the new one lacks be known to have gone.
+      firstBefore = new Set(view.items.slice(0, LIVE_PAGE).map(rowKey));
+      // Held only where a reader shows it: the selected message on a desk, the one open in the sheet on a phone.
+      keep = [isWide() ? selectedKey : null, sheet.open ? openKey : null]
+        .filter((k, i, all) => k && all.indexOf(k) === i && liveRows.has(k)).map((k) => [k, liveRows.get(k)]);
       liveRows.clear();
       view.items = [];
     }
@@ -208,9 +212,10 @@ async function liveLoad(reset, gone) {
       // The open message, when the list read again does not reach it (it was past the first page, say), stays open,
       // as one opened from a link does, until the server says it moved. Unless the owner's own batch took it out:
       // then on to the next, as when that is known at once (see dropLive).
-      const out = new Set(gone ? Array.from(gone).filter((k) => !liveRows.has(k)) : []);
+      const out = new Set(gone ? Array.from(gone).filter((k) => firstBefore.has(k) && !liveRows.has(k)) : []);
       for (const [k, row] of keep) if (!liveRows.has(k) && !out.has(k)) extraRows.set(k, row);
       if (listedBefore && out.size) moveOnFrom(listedBefore, out);
+      if (listedBefore) forgetUnlisted();
       renderPane();
       renderBars();
     }
@@ -364,6 +369,14 @@ function moveOnFrom(before, gone) {
   const after = (at === -1 ? [] : before.slice(at + 1).concat(before.slice(0, at).reverse())).find(left);
   if (after) openDetail(after); else clearSelection();
 }
+// After the list was read again: what it no longer lists is put down, the picks and, where no reader shows it
+// (a narrow window), the selected row, so that keys act only on what is on show.
+function forgetUnlisted() {
+  let changed = false;
+  for (const key of Array.from(picked)) if (!liveRows.has(key)) { picked.delete(key); changed = true; }
+  if (changed) pickChanged();
+  if (!isWide() && selectedKey && !liveRows.has(selectedKey) && !(sheet.open && openKey === selectedKey)) { selectedKey = null; markSelected(); }
+}
 // A row of the live view on show: listed, or the open message held on to over a reading of the list it was not on.
 function liveShown(key) {
   if (!liveView) return null;
@@ -372,10 +385,10 @@ function liveShown(key) {
 }
 // A message the server says is no longer where its folder listed it (moved or deleted elsewhere): put down,
 // never swapped for another one the owner did not choose, and the folder listed again.
-function forgetStale(key) {
-  liveRows.delete(key);
-  extraRows.delete(key);
-  if (selectedKey === key || openKey === key) {
+function forgetStale(keys) {
+  const stale = Array.isArray(keys) ? keys : [keys];
+  for (const key of stale) { liveRows.delete(key); extraRows.delete(key); }
+  if (stale.includes(selectedKey) || stale.includes(openKey)) {
     if (sheet.open) closeSheet(sheet, false);
     clearSelection();
   }
@@ -866,6 +879,9 @@ async function bulkAction(action, extra) {
     }
   }
   if (dropped.length) dropLive(dropped);
+  // Some were no longer where the folder listed them: put down, and the folder listed again, as for one (see forgetStale).
+  const stale = (r.data.results || []).filter((result) => result.code === 'liveStale' && refs.has(result.key)).map((result) => refs.get(result.key));
+  if (stale.length && liveView) forgetStale(stale);
   if (typeof r.data.attention === 'number') attentionCount = r.data.attention;
   // What this press acted on is put down; anything picked since stays picked.
   let changed = false;

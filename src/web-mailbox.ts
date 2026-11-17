@@ -104,8 +104,9 @@ function firstOfFor(store: StateStore, account: string): FirstOf {
         if (!row || row.folder !== item.folder || !row.sender) continue;
         if (item.from.address.toLowerCase() !== row.sender.toLowerCase()) continue;
         const at = store.placeOf(row.dedupKey);
-        if (at && at.uidValidity === item.uidValidity) continue;
-        asked.push({ id: item.messageId, sender: row.sender.toLowerCase() });
+        if (at && at.uidValidity === item.uidValidity && at.uid === item.uid) continue;
+        // Remembered elsewhere in this folder: asked too, since that UID may no longer carry it (see FirstAsked.saved).
+        asked.push({ id: item.messageId, sender: row.sender.toLowerCase(), ...(at && at.uidValidity === item.uidValidity ? { saved: at.uid } : {}) });
       }
     } catch {
       // Nothing asked: nothing tied that has no place.

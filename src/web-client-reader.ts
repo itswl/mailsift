@@ -395,6 +395,8 @@ function loadMessage(row, section, hooks, fresh) {
     fetch('/api/message?live=true' + (fresh ? '&fresh=true' : '') + '&id=' + encodeURIComponent(mailRef(row))).then(async (r) => {
       if (r.status === 401) { location.reload(); return; }
       const d = await r.json().catch(() => ({}));
+      // Not where its folder listed it: said, put down and the folder listed again, as for an action (see forgetStale).
+      if (!r.ok && d.code === 'liveStale' && liveView && row.live) { clearTimeout(slow); toast(failure(d), true); forgetStale(rowKey(row)); return; }
       if (!r.ok) { failed(d); return; }
       clearTimeout(slow);
       rememberLive(key, d);
