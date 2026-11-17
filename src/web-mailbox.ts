@@ -144,7 +144,8 @@ export async function folderList(asked: { account: string }, store: StateStore, 
   if (!account) return unconfigured();
   try {
     const folders = await within(ctx.backend.folders(account), BROWSE_TIMEOUT_MS);
-    if (timedOut(folders)) return json(504, { error: 'the mailbox did not list its folders in time', code: 'timeout' });
+    // Said as what was slow: the folders, not a message (the page words each code).
+    if (timedOut(folders)) return json(504, { error: 'the mailbox did not list its folders in time', code: 'foldersTimeout' });
     if (ctx.origin !== 'mcp') store.recordMcpAudit('web:folders', ctx.client, true, account.username);
     return json(200, { account: account.username, name: account.name, folders });
   } catch (error) {
@@ -166,7 +167,7 @@ export async function folderPage(
     const page = await within(ctx.backend.browse(account, asked.folder, {
       ...(asked.before ? { before: asked.before } : {}), ...(limit ? { limit } : {}), firstOf: firstOfFor(store, account.username),
     }), BROWSE_TIMEOUT_MS);
-    if (timedOut(page)) return json(504, { error: 'the mailbox did not list this folder in time', code: 'timeout' });
+    if (timedOut(page)) return json(504, { error: 'the mailbox did not list this folder in time', code: 'folderTimeout' });
     if (ctx.origin !== 'mcp') store.recordMcpAudit('web:folder', ctx.client, true, `${account.username}|${asked.folder}`.slice(0, 500));
     return json(200, {
       account: account.username, folder: page.folder, total: page.total, next: page.next,
@@ -489,7 +490,11 @@ async function bulkMailbox(
         quietly('One action of a batch', () => record(ctx, store, life, (db) => {
           if ('done' in outcome) {
             const kept = keepBooks(db, target, action, outcome.done, audit);
-            results[index] = { key, status: 'done', ...(kept.after ? { row: ctx.decorate(kept.after) } : {}), ...(kept.moved ? { moved: kept.moved } : {}) };
+            // Already where the action puts it: done, and nothing moved, which the page says apart.
+            results[index] = {
+              key, status: 'done', ...(outcome.done.already ? { already: true } : {}),
+              ...(kept.after ? { row: ctx.decorate(kept.after) } : {}), ...(kept.moved ? { moved: kept.moved } : {}),
+            };
             return;
           }
           if ('missing' in outcome) {

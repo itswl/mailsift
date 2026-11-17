@@ -369,6 +369,13 @@ function oweBack() {
     history.go(-steps);
   });
 }
+// Sheets on their way out, each with what finishes closing it.
+const closingSheets = new Map();
+// Closes now a sheet that is still on its way out, so it can be opened again at once.
+function finishClosing(dialog) {
+  const finish = closingSheets.get(dialog);
+  if (finish) finish();
+}
 function closeSheet(dialog, viaHistory) {
   if (!dialog.open || dialog.classList.contains('closing')) return;
   const at = sheetStack.findIndex((entry) => entry.dialog === dialog);
@@ -378,6 +385,7 @@ function closeSheet(dialog, viaHistory) {
   const finish = () => {
     if (done) return;
     done = true;
+    closingSheets.delete(dialog);
     dialog.classList.remove('closing');
     dialog.style.transform = '';
     dialog.close();
@@ -399,6 +407,7 @@ function closeSheet(dialog, viaHistory) {
   };
   if (reduceMotion()) finish();
   else {
+    closingSheets.set(dialog, finish);
     dialog.classList.add('closing');
     dialog.addEventListener('animationend', finish, { once: true });
     setTimeout(finish, 320);
@@ -727,6 +736,8 @@ function toast(text, failed, action, hold) {
   const node = $('#toast');
   announce(text);
   node.replaceChildren(el('span', null, text));
+  // What it is about, for whoever said it to take it back (see complete).
+  node.dataset.about = '';
   if (action) {
     const b = el('button', 'toast-action', action.label);
     b.type = 'button';
@@ -868,8 +879,11 @@ function appendTemplate(node, key, vars, actions) {
 }
 // The sentence: how much needs the reader. Under it, the count of what arrived.
 function showQueue() {
+  const filtered = filtersActive() || filters.view.value !== 'mail';
   clearFilters();
   if (filters.view.value !== 'mail') setFilters({ view: 'mail' });
+  // The queue is drawn from what the page has: on show now, not once the list has been read again.
+  if (filtered) renderList();
   const first = queue.querySelector('.ring, .who');
   if (first) { queue.scrollIntoView({ block: 'start' }); first.focus({ preventScroll: true }); }
 }

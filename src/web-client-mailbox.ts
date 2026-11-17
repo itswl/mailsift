@@ -256,7 +256,8 @@ function renderLiveHead() {
   } else if (typeof view.total === 'number') {
     parts.push(view.total === 1 ? t('live.count1') : fill('live.count', { count: view.total.toLocaleString(lang) }));
     const info = folderInfo(view.account, view.folder);
-    if (info && info.unseen) parts.push(fill('live.unseen', { count: info.unseen.toLocaleString(lang) }));
+    // A count the owner's own action has made old is not said until it is read again.
+    if (info && info.unseen && !countsStale(view.account)) parts.push(fill('live.unseen', { count: info.unseen.toLocaleString(lang) }));
   }
   const said = [lang, view.mode, parts.join('|'), view.limited ? view.limited.reason + view.limited.scanned : ''].join('/');
   if (note.dataset.said === said) return;
@@ -416,6 +417,20 @@ function openFolders(anchor) {
 }
 $('#folders-open').onclick = () => openFolders($('#folders-open'));
 $('#folder-done').onclick = () => closePopover(folderSheet, false);
+// The folders' counts after an action of the owner's own that changes them
+// (a move, a read, a batch): old, so not shown, and read again at once where
+// they are on show (the live line, the panel), else the next time they are.
+function countsChanged(account) {
+  const known = folderLists.get(account);
+  if (!known || !known.folders) return;
+  folderLists.set(account, Object.assign({}, known, { at: 0, stale: true }));
+  if (liveView && liveView.account === account) renderLiveHead();
+  if (folderSheet.open && folderPick.account === account) drawFolderList();
+  if ((liveView && liveView.account === account) || (folderSheet.open && folderPick.account === account)) loadFolders(account, true);
+}
+function countsStale(account) {
+  return Boolean((folderLists.get(account) || {}).stale);
+}
 async function loadFolders(account, force) {
   const known = folderLists.get(account);
   if (known && known.loading) return;
@@ -555,8 +570,9 @@ function folderChoice(account, f, current, flat) {
   const name = el('span', 'folder-name', folderName(account, f.path, true));
   if (flat && f.depth && !f.role) name.appendChild(el('small', null, f.parent || ''));
   b.appendChild(name);
-  const count = f.unseen ? fill('folders.unread', { count: f.unseen.toLocaleString(lang) })
-    : f.messages ? f.messages.toLocaleString(lang) : '';
+  const count = countsStale(account) ? ''
+    : f.unseen ? fill('folders.unread', { count: f.unseen.toLocaleString(lang) })
+      : f.messages ? f.messages.toLocaleString(lang) : '';
   if (count && !folderPick.move) b.appendChild(el('span', 'choice-when' + (f.unseen ? ' unseen' : ''), count));
   b.onclick = () => {
     const move = folderPick.move;
@@ -902,14 +918,21 @@ async function bulkAction(action, extra) {
     const underWay = new Set((r.data.results || []).filter((result) => moving && result.status === 'pending' && refs.has(result.key)).map((result) => refs.get(result.key)));
     setTimeout(() => { if (liveView) liveLoad(true, underWay); else refresh(); }, 5000);
   }
+  // The folders' counts are the mailbox's, and moving or marking messages changed them.
+  if (done.length && action !== 'done' && action !== 'not_done' && action !== 'snooze') {
+    for (const account of new Set(rows.map((m) => m.account))) countsChanged(account);
+  }
   // What happened, in one line, with the one way back where a single message has one.
   const said = [];
-  if (done.length) {
+  // Those already where the action puts them were not moved: said apart, not as moved.
+  const already = (r.data.results || []).filter((result) => result.status === 'done' && result.already).length;
+  if (done.length > already) {
     said.push(fill('bulk.' + action, {
-      count: done.length, folder: extra && extra.destination ? folderName(rows[0].account, extra.destination) : '',
+      count: done.length - already, folder: extra && extra.destination ? folderName(rows[0].account, extra.destination) : '',
       when: action === 'snooze' && extra && extra.until && extra.until !== 'now' ? whenLabel(new Date(extra.until), new Date(), true) : '',
     }));
   }
+  if (already) said.push(fill('bulk.already', { count: already }));
   if (r.data.skipped) said.push(fill('bulk.skipped', { count: r.data.skipped }));
   if (r.data.pending) said.push(fill('bulk.pending', { count: r.data.pending }));
   const failures = (r.data.results || []).filter((result) => result.status === 'failed');
