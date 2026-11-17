@@ -13,10 +13,11 @@
  * must still carry that Message-ID. One that no longer fits is refused. It is
  * never followed to wherever a message with that Message-ID is now.
  */
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { FetchMessageObject, ImapFlow, ListResponse } from 'imapflow';
 import type { Account } from '../config.js';
 import { getLogger } from '../logger.js';
-import { withSession } from './connection.js';
+import { withOwnConnection, withSession } from './connection.js';
 import { toFolder } from './folders.js';
 import {
   exactFolder, firstAddress, folderRole, listFolders, LiveMailError, resolveActionDestination, selectedValidity,
@@ -29,8 +30,31 @@ const log = getLogger('imap');
 // ---- Live handles ----
 
 export const HANDLE_PREFIX = 'live:';
-const HANDLE_VERSION = 1;
+const HANDLE_VERSION = 2;
 const HANDLE_MAX_CHARS = 4096;
+/** Where the secret that signs handles is kept, so every process on one database makes the same ones. */
+export const HANDLE_KEY_META = 'live_handle_key';
+const SIGNATURE_CHARS = 22;
+
+/**
+ * The secret handles are signed with. A sender can write any Message-ID,
+ * one that spells a handle included; without this secret it cannot write one
+ * this server takes as a handle. Kept in the state database (useHandleKey), so
+ * the main process and a standalone MCP server make and accept the same ones;
+ * until a database is at hand, one for this process alone.
+ */
+let handleKey: Buffer = randomBytes(32);
+
+/** Sign handles with the secret this database keeps, giving it this process's own when it has none yet. */
+export function useHandleKey(store: { getMeta(key: string): string | undefined; setMeta(key: string, value: string): void }): void {
+  const kept = store.getMeta(HANDLE_KEY_META);
+  const key = kept ? Buffer.from(kept, 'base64') : undefined;
+  if (key && key.length === 32) {
+    handleKey = key;
+    return;
+  }
+  store.setMeta(HANDLE_KEY_META, handleKey.toString('base64'));
+}
 
 /** Where one message is, as the mailbox listed it. */
 export interface LiveHandle {
@@ -51,21 +75,28 @@ export function handleShaped(value: string): boolean {
   return value.trimStart().startsWith(HANDLE_PREFIX);
 }
 
-/** The handle of a message. One message in one place has exactly one. */
+const sign = (payload: string): string =>
+  createHmac('sha256', handleKey).update(`${HANDLE_PREFIX}${payload}`, 'utf8').digest('base64url').slice(0, SIGNATURE_CHARS);
+
+/** The handle of a message: what it names, and this server's signature over it. One message in one place has exactly one. */
 export function liveHandle(handle: LiveHandle): string {
   const parts = [HANDLE_VERSION, handle.account, handle.folder, handle.uidValidity, handle.uid, handle.messageId];
-  return HANDLE_PREFIX + Buffer.from(JSON.stringify(parts), 'utf8').toString('base64url');
+  const payload = Buffer.from(JSON.stringify(parts), 'utf8').toString('base64url');
+  return `${HANDLE_PREFIX}${payload}.${sign(payload)}`;
 }
 
-/** What a handle says, or undefined when it is not one this server made. */
+/** What a handle says, or undefined when it is not one this server made and signed. */
 export function parseLiveHandle(value: string): LiveHandle | undefined {
   const text = value.trim();
   if (!text.startsWith(HANDLE_PREFIX) || text.length > HANDLE_MAX_CHARS) return undefined;
-  const body = text.slice(HANDLE_PREFIX.length);
-  if (!/^[A-Za-z0-9_-]+$/.test(body)) return undefined;
+  const m = /^([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]{22})$/.exec(text.slice(HANDLE_PREFIX.length));
+  if (!m) return undefined;
+  const [, payload, signature] = m as unknown as [string, string, string];
+  const expected = Buffer.from(sign(payload));
+  if (!timingSafeEqual(expected, Buffer.from(signature))) return undefined;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
   } catch {
     return undefined;
   }
@@ -170,17 +201,20 @@ export async function mailboxFolders(account: Account, options: { counts?: boole
       entries = await client.list({ statusQuery: { messages: true, unseen: true } });
     } else {
       entries = await listFolders(client);
-      if (options.counts) entries = await withStatus(client, entries);
+      if (options.counts) entries = await withStatus(client, entries, account.provider);
     }
     return orderFolders(entries.map((entry) => folderInfo(entry, account.provider)));
   }, { timeoutMs: 30_000 });
 }
 
-async function withStatus(client: ImapFlow, entries: ListResponse[]): Promise<ListResponse[]> {
+async function withStatus(client: ImapFlow, entries: ListResponse[], provider: string): Promise<ListResponse[]> {
   const until = Date.now() + STATUS_BUDGET_MS;
   const out: ListResponse[] = [];
   let asked = 0;
-  for (const entry of entries) {
+  // In the order the panel shows them, so the budget goes to the inbox and the folders every mailbox has first.
+  const shown = orderFolders(entries.map((entry) => folderInfo(entry, provider))).map((folder) => folder.path);
+  const ordered = [...entries].sort((a, b) => shown.indexOf(a.path) - shown.indexOf(b.path));
+  for (const entry of ordered) {
     const copy = { ...entry } as ListResponse & { status?: unknown };
     if (toFolder(entry).selectable && asked < STATUS_MAX_FOLDERS && Date.now() < until) {
       asked += 1;
@@ -347,6 +381,32 @@ export async function browseFolder(
 
 // ---- Searching the mailbox ----
 
+/** How long a search may take on the mailbox, under what the page waits for it. */
+export const SEARCH_IMAP_MS = 25_000;
+
+/**
+ * Lists each newest first in its own order, merged by taking the head of
+ * whichever list has the newest date, until `limit`: each list gives an
+ * unbroken run from its top.
+ */
+export function mergeNewest(lists: LiveItem[][], limit: number): LiveItem[] {
+  const when = (item: LiveItem): number => (item.date ? Date.parse(item.date) : 0) || 0;
+  const at = lists.map(() => 0);
+  const out: LiveItem[] = [];
+  while (out.length < limit) {
+    let best = -1;
+    for (const [n, list] of lists.entries()) {
+      const head = list[at[n]!];
+      if (!head) continue;
+      if (best === -1 || when(head) > when(lists[best]![at[best]!]!)) best = n;
+    }
+    if (best === -1) break;
+    out.push(lists[best]![at[best]!]!);
+    at[best] = at[best]! + 1;
+  }
+  return out;
+}
+
 /** How many of the newest messages of a folder a search that cannot trust the server reads the envelopes of. */
 export const SEARCH_SCAN_MESSAGES = 2_000;
 const SCAN_BATCH = 500;
@@ -508,7 +568,8 @@ export async function searchMailbox(
   const cursor = parseSearchCursor(options.before);
   if (!cursor) throw new LiveMailError('cursor', 'not a place in a search');
   const check = (): void => { if (options.signal?.aborted) throw new SearchCancelled(); };
-  return withSession(account, async (client) => {
+  // On a connection of its own: a slow search, or one given up on, never holds up reading the mailbox.
+  return withOwnConnection(account, async (client) => {
     check();
     const entries = await listFolders(client);
     const folders = options.folder ? [exactFolder(entries, options.folder).path] : defaultSearchFolders(entries, account);
@@ -556,16 +617,18 @@ export async function searchMailbox(
             items.push(toLiveItem(raw, account, target.path, uidValidity));
           }
         }
+        // Highest UID first, as the merge takes them, whatever order the server answered in.
+        items.sort((a, b) => b.uid - a.uid);
         found.push({ folder: target.path, uidValidity, hits: shown, items });
       } finally {
         lock.release();
       }
     }
-    // Newest first across the folders, by the date each says.
-    const when = (item: LiveItem): number => (item.date ? Date.parse(item.date) : 0) || 0;
-    const merged = found.flatMap((entry) => entry.items)
-      .sort((a, b) => when(b) - when(a) || b.uid - a.uid)
-      .slice(0, limit);
+    // Newest first across the folders: each folder gives its hits in its own order, highest UID first,
+    // and the page takes from whichever folder's next hit is the newest. So each folder gives an
+    // unbroken run from the top, and the next page starts below the last one it gave: nothing is
+    // passed over, whatever the dates say (an archive's UIDs follow when mail was archived, not sent).
+    const merged = mergeNewest(found.map((entry) => entry.items), limit);
     const next: SearchCursor = { ...cursor };
     let more = false;
     for (const entry of found) {
@@ -580,5 +643,9 @@ export async function searchMailbox(
       next: more ? encodeSearchCursor(next) : null,
       ...(limited ? { limited } : {}),
     };
-  }, { timeoutMs: 45_000 });
+  }, { timeoutMs: SEARCH_IMAP_MS, signal: options.signal }).catch((error: unknown) => {
+    // Stopped by a newer search, or given up on: said as that, whatever the closed connection said.
+    if (options.signal?.aborted) throw new SearchCancelled();
+    throw error;
+  });
 }

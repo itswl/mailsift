@@ -117,7 +117,7 @@ function highlightInto(node, value) {
   if (at < s.length) node.appendChild(textNode(s.slice(at)));
   return node;
 }
-const needsYou = (m) => attentionSet.has(rowKey(m)) && !m.handledAt && !isSnoozed(m);
+const needsYou = (m) => attentionSet.has(queueKey(m)) && !m.handledAt && !isSnoozed(m);
 function metaLine(m, thread, now) {
   const meta = el('div', 'meta');
   const add = (value, cls) => {
@@ -156,7 +156,7 @@ function ringButton(m) {
   b.title = t('queue.done');
   b.setAttribute('aria-label', t('queue.done'));
   b.appendChild(icon('i-check'));
-  b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); complete(rowKey(m), b.closest('li.row')); };
+  b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); complete(queueKey(m), b.closest('li.row')); };
   return b;
 }
 // The check on a row that was dealt with is the way back: pressing it says
@@ -168,7 +168,7 @@ function doneButton(m) {
   b.setAttribute('aria-label', t('queue.undone'));
   b.setAttribute('aria-pressed', 'true');
   b.appendChild(icon('i-check'));
-  b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); complete(rowKey(m), b.closest('li.row'), true); };
+  b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); complete(queueKey(m), b.closest('li.row'), true); };
   return b;
 }
 // A message that is put off carries a clock where its ring was, here and in
@@ -182,7 +182,7 @@ function laterButton(m) {
   b.setAttribute('aria-haspopup', 'dialog');
   b.setAttribute('aria-expanded', 'false');
   b.appendChild(icon('i-clock'));
-  b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openSnooze(rowKey(m), b); };
+  b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openSnooze(queueKey(m), b); };
   return b;
 }
 // A row of the queue is not under a day's heading, so its time says the day
@@ -204,7 +204,7 @@ function rowOf(item, now, queued) {
   if (needsYou(m)) {
     li.classList.add('needs');
     li.appendChild(ringButton(m));
-    enableSwipe(li, rowKey(m));
+    enableSwipe(li, queueKey(m));
   } else if (m.handledAt) {
     li.classList.add('handled');
     li.appendChild(doneButton(m));
@@ -274,8 +274,8 @@ function eachCopy(key, touch) {
   for (const m of snoozedRows) one(m);
   for (const th of lastThreads || []) { one(th.latest); for (const m of th.messages || []) one(m); }
   one(extraRows.get(key));
-  // The same message listed live, when mailsift stored it: one row, whichever list it is shown in.
-  one(liveRows.get(key));
+  // The same message listed live, when the server matched it to this record: its row there follows too.
+  for (const m of liveRows.values()) if (m.storedKey === key || rowKey(m) === key) touch(m);
 }
 function markHandledLocal(key, at) {
   eachCopy(key, (m) => { m.handledAt = at; });
@@ -326,7 +326,7 @@ async function complete(key, li, undo) {
   // fetched again without it); what was kept of it still says it is done.
   const wasHandled = Boolean((rowByKey(key) || completed.get(key) || {}).handledAt);
   if (handled === wasHandled) return;
-  if (handled && attentionSet.has(key)) completed.set(key, rowByKey(key));
+  if (handled && attentionSet.has(key)) completed.set(key, queueCopy(rowByKey(key)));
   if (!handled && completed.has(key) && !attentionSet.has(key)) {
     attention = [completed.get(key)].concat(attention || []);
     attentionSet.add(key);
@@ -340,7 +340,7 @@ async function complete(key, li, undo) {
   }
   // What is done now leads the list of what was dealt with lately.
   if (handled && !earlier) {
-    const row = rowByKey(key);
+    const row = queueCopy(rowByKey(key));
     if (row) { row.queued = attentionSet.has(key); doneRecent = [row].concat(doneRecent); }
   }
   // Counted by what it does to the queue, which a row that is put off is not in either way.
@@ -444,7 +444,7 @@ const pendingSnooze = new Map();
 // joins the queue here even before the server's list says so.
 function snoozeLocal(key, until, woken) {
   eachCopy(key, (m) => { m.snoozedUntil = until; });
-  const row = rowByKey(key);
+  const row = queueCopy(rowByKey(key));
   snoozedRows = snoozedRows.filter((m) => rowKey(m) !== key);
   if (!row) return;
   if (isSnoozed(row)) snoozedRows = snoozedRows.concat([row]);
@@ -877,6 +877,8 @@ function buildList() {
     const down = failingMailboxes().map((m) => m.address).join();
     const polled = lastSummary && lastSummary.lastPollAt ? hhmm(new Date(lastSummary.lastPollAt)) : '';
     desired.push(cached('empty', [lang, filtersActive(), filters.hours.value, filters.codesOnly.checked, down, polled].join('|'), emptyBlock));
+    const offer = mailboxOffer();
+    if (offer) desired.push(offer);
     patchChildren(list, desired);
     forgetUnused();
     announceShown(0);
@@ -915,6 +917,9 @@ function buildList() {
   });
   if (days.length === 1 && wantInstall) desired.push(install());
   if (!threads && nextCursor) desired.push(loadMoreButton());
+  // Not found here? The mailbox itself, for mail mailsift never kept.
+  const offer = mailboxOffer();
+  if (offer) desired.push(offer);
   patchChildren(list, desired);
   forgetUnused();
   watchForMore();
@@ -976,7 +981,6 @@ function onFiltersChanged() {
   renderTokens();
   syncUrl();
   updateAsk();
-  renderMailboxSearch();
   loadMoreFailed = false;
   queueExpanded = false;
   doneExpanded = false;
@@ -1173,7 +1177,8 @@ const SNAPSHOT_KEY = 'snapshot';
 const SNAPSHOT_MAX_AGE = 7 * 24 * 3600 * 1000;
 let snapshotTimer, fromSnapshot = false;
 function saveSnapshot() {
-  if (fromSnapshot || !lastMail || !lastSummary || filtersActive()) return;
+  // A live view is not the last view of the triaged mail, and its field is not the triaged one's query.
+  if (fromSnapshot || liveView || !lastMail || !lastSummary || filtersActive()) return;
   if (filters.view.value !== 'mail' || filters.hours.value !== '24') return;
   clearTimeout(snapshotTimer);
   snapshotTimer = setTimeout(() => {

@@ -438,6 +438,12 @@ export interface MailActionResult {
   /** Where the message landed, when the server said: its new UID and that folder's UIDVALIDITY. */
   destinationUid?: number;
   destinationUidValidity?: string;
+  /**
+   * The id the poller would store the message under where it landed (see
+   * pollerIdOf), when that can be known: so a message the owner filed there
+   * is not taken for new mail.
+   */
+  destinationId?: string;
 }
 
 export class MailActionError extends Error {
@@ -537,6 +543,11 @@ async function searchMessageUids(
  * to still be that message; a LiveMailError otherwise.
  */
 async function exactUid(client: ImapFlow, messageId: string, hint: MessageHint): Promise<number> {
+  return (await exactMessage(client, messageId, hint)).uid;
+}
+
+/** The same, with the envelope it was told apart by, so whoever acts on it need not fetch it again. */
+async function exactMessage(client: ImapFlow, messageId: string, hint: MessageHint): Promise<FetchMessageObject> {
   if (!hint.uid || hint.uid <= 0 || !hint.uidValidity) throw new LiveMailError('moved', 'the handle names no message');
   if (selectedValidity(client) !== hint.uidValidity) {
     throw new LiveMailError('stale', 'the folder was rebuilt since it was listed; its UIDs name other messages now');
@@ -545,7 +556,21 @@ async function exactUid(client: ImapFlow, messageId: string, hint: MessageHint):
   if (!one || one.uid !== hint.uid || !sameMessage(one, messageId)) {
     throw new LiveMailError('moved', 'the message is no longer where the folder listed it');
   }
-  return hint.uid;
+  return one;
+}
+
+/**
+ * The id the poller stores a message under, were it to fetch it at this UID:
+ * its Message-ID, or the one made up for a message that has none (see
+ * fallbackMessageId), which depends on the UID.
+ */
+export function pollerIdOf(account: Account, envelope: FetchMessageObject['envelope'], uid: number | undefined): string | undefined {
+  const messageId = envelope?.messageId?.trim();
+  if (messageId) return messageId;
+  if (!uid) return undefined;
+  return fallbackMessageId(account.username, {
+    date: normalizeDate(envelope?.date), subject: envelope?.subject ?? '', from: firstAddress(envelope?.from).address, uid,
+  });
 }
 
 /** More hits than this for one Message-ID is not an answer to believe. */
@@ -1272,15 +1297,19 @@ async function actOnMessage(
   hint: MessageHint = {},
   /** Told the moment before the command that changes the mailbox is sent. */
   committing: () => void = () => undefined,
-): Promise<{ sourceFolder: string; destinationUid?: number; destinationUidValidity?: string } | undefined> {
+): Promise<{
+  sourceFolder: string; destinationUid?: number; destinationUidValidity?: string; envelope?: FetchMessageObject['envelope'];
+} | undefined> {
   for (const folder of folders) {
     const lock = await lockFolder(client, folder, false);
     if (!lock) continue;
     try {
-      const uids = await searchMessageUids(client, messageId, folder, hint);
+      // A live handle was told apart by its envelope already: it is not fetched a second time.
+      const exact = hint.exact ? await exactMessage(client, messageId, hint) : undefined;
+      const uids = exact ? [exact.uid] : await searchMessageUids(client, messageId, folder, hint);
       if (!uids.length) continue;
       for (const uid of uids) {
-        const raw = await client.fetchOne(uid, { uid: true, envelope: true }, { uid: true });
+        const raw = exact ?? await client.fetchOne(uid, { uid: true, envelope: true }, { uid: true });
         if (!sameMessage(raw, messageId)) continue;
         const change = action in FLAG_CHANGES ? FLAG_CHANGES[action as keyof typeof FLAG_CHANGES] : undefined;
         // "Not spam" is about a message in the spam folder; anywhere else it is not what was meant.
@@ -1301,7 +1330,10 @@ async function actOnMessage(
           // A server that says where the message landed saves the next lookup a search.
           const landed = moved.uidMap?.get(uid);
           const validity = moved.uidValidity !== undefined ? String(moved.uidValidity) : '';
-          if (landed && validity) return { sourceFolder: folder.path, destinationUid: landed, destinationUidValidity: validity };
+          if (landed && validity) {
+            return { sourceFolder: folder.path, destinationUid: landed, destinationUidValidity: validity, envelope: raw.envelope };
+          }
+          return { sourceFolder: folder.path, envelope: raw.envelope };
         }
         return { sourceFolder: folder.path };
       }
@@ -1476,6 +1508,7 @@ export async function applyWebMailAction(
       } : {}),
       ...(acted.destinationUid && acted.destinationUidValidity
         ? { destinationUid: acted.destinationUid, destinationUidValidity: acted.destinationUidValidity } : {}),
+      ...landedAs(account, destination, acted),
     };
   }, { repeatable: () => !committed });
 }
@@ -1505,6 +1538,18 @@ export function folderRole(entry: ListResponse, provider = ''): FolderRole | nul
   if (entryHasUse(entry, '\\important')) return 'important';
   return null;
 }
+
+/** The id a moved message would be stored under where it landed, when the move told enough to know it. */
+function landedAs(
+  account: Account, destination: { path: string } | undefined, acted: { destinationUid?: number; envelope?: FetchMessageObject['envelope'] },
+): { destinationId?: string } {
+  if (!destination || !acted.envelope) return {};
+  const id = pollerIdOf(account, acted.envelope, acted.destinationUid);
+  return id ? { destinationId: id } : {};
+}
+
+/** A batch gives the mailbox's connection up after this many messages, so reading it is not held up for the whole batch. */
+const BATCH_CHUNK = 8;
 
 /** One message of a batch: what it is called and where to find it, as for one action alone. */
 export interface BulkTarget {
@@ -1544,47 +1589,53 @@ export async function applyMailActions(
     targets.forEach((_, index) => settle(index, { error: refused }));
     return outcomes as BulkOutcome[];
   }
-  // Until a change has been sent, the batch may be begun again on a new connection; after, never.
-  let committed = false;
-  try {
-    await withSession(account, async (client) => {
-      const entries = await listFolders(client);
-      let destination: { path: string; isSpam: boolean } | undefined;
-      try {
-        destination = MOVING_ACTIONS.has(action)
-          ? resolveActionDestination(entries, action as MovingAction, account.provider, options.destination) : undefined;
-      } catch (error) {
-        targets.forEach((_, index) => settle(index, { error }));
-        return;
-      }
-      const configured = resolveFolders(entries, account.folders);
-      for (const [index, target] of targets.entries()) {
-        if (outcomes[index]) continue;
-        const hint: MessageHint = { ...(target.folderHint ? { folder: target.folderHint } : {}), ...(target.hint ?? {}) };
+  // A few messages at a time, each few a request of its own on the mailbox's connection: what else the
+  // owner asks of the mailbox meanwhile (a message opened, a folder listed) goes between them.
+  for (let first = 0; first < targets.length; first += BATCH_CHUNK) {
+    const chunk = targets.slice(first, first + BATCH_CHUNK).map((target, n) => ({ target, index: first + n }));
+    // Until a change has been sent, the chunk may be begun again on a new connection; after, never.
+    let committed = false;
+    try {
+      await withSession(account, async (client) => {
+        const entries = await listFolders(client);
+        let destination: { path: string; isSpam: boolean } | undefined;
         try {
-          const folders = hint.exact ? [exactFolder(entries, hint.folder)] : orderLookupFolders(entries, configured, hint.folder);
-          const acted = await actOnMessage(client, target.messageId, folders, action, destination?.path, hint, () => { committed = true; });
-          settle(index, acted === undefined ? { missing: true } : {
-            done: {
-              action, account: account.username, messageId: target.messageId, sourceFolder: acted.sourceFolder,
-              ...(destination ? {
-                destinationFolder: destination.path, destinationIsSpam: destination.isSpam,
-                ...(inBin(entries, destination.path) ? { destinationIsTrash: true } : {}),
-              } : {}),
-              ...(acted.destinationUid && acted.destinationUidValidity
-                ? { destinationUid: acted.destinationUid, destinationUidValidity: acted.destinationUidValidity } : {}),
-            },
-          });
+          destination = MOVING_ACTIONS.has(action)
+            ? resolveActionDestination(entries, action as MovingAction, account.provider, options.destination) : undefined;
         } catch (error) {
-          // A connection that is gone takes the rest of the batch with it: begun again on a new one
-          // when nothing was changed yet, and otherwise reported as not known to have happened.
-          if (!client.usable) throw error;
-          settle(index, { error });
+          for (const { index } of chunk) if (!outcomes[index]) settle(index, { error });
+          return;
         }
-      }
-    }, { repeatable: () => !committed, timeoutMs: 30_000 + targets.length * 2_000 });
-  } catch (error) {
-    targets.forEach((_, index) => { if (!outcomes[index]) settle(index, { error }); });
+        const configured = resolveFolders(entries, account.folders);
+        for (const { target, index } of chunk) {
+          if (outcomes[index]) continue;
+          const hint: MessageHint = { ...(target.folderHint ? { folder: target.folderHint } : {}), ...(target.hint ?? {}) };
+          try {
+            const folders = hint.exact ? [exactFolder(entries, hint.folder)] : orderLookupFolders(entries, configured, hint.folder);
+            const acted = await actOnMessage(client, target.messageId, folders, action, destination?.path, hint, () => { committed = true; });
+            settle(index, acted === undefined ? { missing: true } : {
+              done: {
+                action, account: account.username, messageId: target.messageId, sourceFolder: acted.sourceFolder,
+                ...(destination ? {
+                  destinationFolder: destination.path, destinationIsSpam: destination.isSpam,
+                  ...(inBin(entries, destination.path) ? { destinationIsTrash: true } : {}),
+                } : {}),
+                ...(acted.destinationUid && acted.destinationUidValidity
+                  ? { destinationUid: acted.destinationUid, destinationUidValidity: acted.destinationUidValidity } : {}),
+                ...landedAs(account, destination, acted),
+              },
+            });
+          } catch (error) {
+            // A connection that is gone takes the rest of the chunk with it: begun again on a new one
+            // when nothing was changed yet, and otherwise reported as not known to have happened.
+            if (!client.usable) throw error;
+            settle(index, { error });
+          }
+        }
+      }, { repeatable: () => !committed, timeoutMs: 30_000 + chunk.length * 2_000 });
+    } catch (error) {
+      for (const { index } of chunk) if (!outcomes[index]) settle(index, { error });
+    }
   }
   return outcomes.map((outcome) => outcome ?? { error: new Error('not reached') });
 }

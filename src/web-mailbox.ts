@@ -15,11 +15,11 @@
 import type { IncomingMessage } from 'node:http';
 import type { Account } from './config.js';
 import { LiveMailError, MAIL_ACTIONS, MailActionError, type BulkTarget, type WebMailAction } from './imap/client.js';
-import { SearchCancelled, LIVE_PAGE_MAX, type LiveItem } from './imap/mailbox.js';
+import { SearchCancelled, LIVE_PAGE_MAX, useHandleKey, type LiveItem } from './imap/mailbox.js';
 import type { MailRow, StateStore } from './services/state.js';
 import { getLogger } from './logger.js';
 import {
-  configuredAccounts, keepBooks, mailAudit, mailboxFailure, quietly, readOnly, record, resolveTarget, snoozeTime,
+  configuredAccounts, keepBooks, mailAudit, mailboxFailure, newlyMuted, quietly, readOnly, record, recordOf, resolveTarget, snoozeTime,
   type ActionContext, type Life, type MailTarget,
 } from './web-actions.js';
 import { json, readJson, text, timedOut, within, type WebResponse } from './web-http.js';
@@ -56,7 +56,11 @@ export function withStored(items: LiveItem[], store: StateStore, ctx: ActionCont
     // Without the store the list is still the mailbox's; it just says nothing of what was judged.
   }
   return items.map((item) => {
-    const row = stored.get(item.storedId);
+    // Only the record's own message, at the record's own place: a copy or a spoof that shares its Message-ID is not it.
+    const candidate = stored.get(item.storedId);
+    const row = candidate ? recordOf(store, account, {
+      id: item.storedId, folder: item.folder, uid: item.uid, uidValidity: item.uidValidity, sender: item.from.address, handle: item.handle,
+    }, candidate) : undefined;
     // The provider's own link to the message, as a stored row carries one, where the caller is shown links.
     const linked = ctx.origin === 'mcp' || !item.messageId ? {} : ctx.decorate({
       dedupKey: item.handle, messageId: item.messageId, account, threadKey: null, accountLabel: null, subject: null, sender: null,
@@ -117,6 +121,7 @@ export async function folderPage(
   const account = accountNamed(asked.account);
   if (!account) return unconfigured();
   if (!asked.folder) return json(400, { error: 'folder is required', code: 'badRequest' });
+  useHandleKey(store);
   const limit = limitOf(asked.limit);
   try {
     const page = await within(ctx.backend.browse(account, asked.folder, {
@@ -146,18 +151,26 @@ const searches = new Map<string, AbortController>();
  * answer says the search read only the subject and sender of recent mail.
  */
 export async function mailboxSearch(
-  asked: { account: string; q: string; folder?: string | null; before?: string | null; limit?: unknown },
-  store: StateStore, ctx: ActionContext,
+  asked: { account: string; q: string; folder?: string | null; before?: string | null; limit?: unknown; tab?: string | null },
+  store: StateStore, ctx: ActionContext, dropped?: AbortSignal,
 ): Promise<WebResponse> {
   const account = accountNamed(asked.account);
   if (!account) return unconfigured();
   const query = asked.q.trim();
   if (!query) return json(400, { error: 'q is required', code: 'badRequest' });
+  useHandleKey(store);
   if (query.length > QUERY_MAX_CHARS) return json(400, { error: `a search is at most ${QUERY_MAX_CHARS} characters`, code: 'badRequest' });
   const limit = limitOf(asked.limit);
   const controller = new AbortController();
-  // Only the page supersedes its own searches; two from an MCP client may be meant to run side by side.
-  const slot = ctx.origin === 'mcp' ? '' : `${ctx.client}|${account.username}`;
+  // The browser gave up on the request: the search stops, and its connection with it.
+  if (dropped) {
+    if (dropped.aborted) controller.abort();
+    else dropped.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+  // Only a page supersedes its own searches, one tab at a time (two tabs on one address do not stop
+  // each other's); two from an MCP client may be meant to run side by side.
+  const tab = /^[A-Za-z0-9_-]{6,40}$/.test(asked.tab ?? '') ? asked.tab : 'page';
+  const slot = ctx.origin === 'mcp' ? '' : `${ctx.client}|${tab}|${account.username}`;
   if (slot) {
     searches.get(slot)?.abort();
     searches.set(slot, controller);
@@ -200,10 +213,14 @@ const QUEUE_ACTIONS = new Set(['done', 'not_done', 'snooze']);
 const BULK_ACTIONS = new Set<string>([...QUEUE_ACTIONS, ...MAIL_ACTIONS]);
 export type BulkAction = 'done' | 'not_done' | 'snooze' | WebMailAction;
 
-/** What became of one message of a batch. A skipped one is one the action does not apply to; nothing was done to it. */
+/**
+ * What became of one message of a batch. A skipped one is one the action
+ * does not apply to; nothing was done to it. A pending one was still under
+ * way when the answer went: what it comes to is recorded when it does.
+ */
 interface BulkResult {
   key: string;
-  status: 'done' | 'skipped' | 'failed';
+  status: 'done' | 'skipped' | 'failed' | 'pending';
   code?: string;
   error?: string;
   row?: Record<string, unknown>;
@@ -218,13 +235,21 @@ interface BulkResult {
 const BULK_MEMORY_MS = 10 * 60_000;
 const bulkJobs = new Map<string, { at: number; outcome: Promise<WebResponse> }>();
 
-/** For tests: no batch remembered. */
+let bulkWaitFor: number | null = null;
+
+/** For tests: no batch remembered, and batches waited for as long as usual. */
 export function forgetBulk(): void {
   bulkJobs.clear();
+  bulkWaitFor = null;
+}
+
+/** For tests: how long any batch is waited for before it is answered, in milliseconds. */
+export function waitForBatches(ms: number): void {
+  bulkWaitFor = ms;
 }
 
 /** How long a batch is waited for: a mailbox action's time, and a little more for each message. */
-const bulkWait = (count: number): number => 30_000 + count * 1_500;
+const bulkWait = (count: number): number => bulkWaitFor ?? 30_000 + count * 1_500;
 
 /** A refusal of one message's name, as its result. */
 function refusedResult(key: string, answer: WebResponse): BulkResult {
@@ -298,14 +323,22 @@ export async function bulkAct(
     }
   }
 
-  const results: BulkResult[] = keys.map((key) => ({ key, status: 'failed', code: 'actionTimeout', error: 'not known yet' }));
+  const results: BulkResult[] = keys.map((key) => ({ key, status: 'pending', error: 'still under way' }));
+  // Spam is a vote; two of one sender's make a rule, which the answer says as the judgement line does.
+  let before: { neverImportant: string[] } | undefined;
+  if (action === 'spam') { try { before = store.feedbackRuleHints(2); } catch { /* said without it */ } }
   const answer = (): WebResponse => {
     const count = (status: BulkResult['status']): number => results.filter((result) => result.status === status).length;
     let attention: number | undefined;
-    try { attention = store.attentionCount(); } catch { /* the handle may be closed by now */ }
+    let muted: string[] = [];
+    try {
+      attention = store.attentionCount();
+      if (before) muted = newlyMuted(before, store.feedbackRuleHints(2));
+    } catch { /* the handle may be closed by now */ }
     return json(200, {
-      action, results: results.map((result) => ({ ...result })), done: count('done'), skipped: count('skipped'), failed: count('failed'),
-      ...(attention !== undefined ? { attention } : {}),
+      action, results: results.map((result) => ({ ...result })),
+      done: count('done'), skipped: count('skipped'), failed: count('failed'), pending: count('pending'),
+      ...(attention !== undefined ? { attention } : {}), ...(muted.length ? { muted } : {}),
     });
   };
   const work = (async (): Promise<WebResponse> => {
@@ -345,6 +378,11 @@ function bulkQueue(
     let after: MailRow | undefined;
     let audit: string;
     if (action === 'snooze') {
+      // A reminder is for what is not done: one marked done is not brought back by a batch it happened to be in.
+      if (row.handledAt && until !== null) {
+        results[index] = { key, status: 'skipped', code: 'alreadyDone', row: ctx.decorate(row) };
+        continue;
+      }
       after = until === 'now' ? store.wakeNow(row.dedupKey) : store.setSnoozed(row.dedupKey, until ?? null);
       audit = until === 'now' ? 'web:wake' : until === null ? 'web:unsnooze' : 'web:snooze';
     } else {
@@ -366,7 +404,9 @@ function bulkQueue(
       results[index] = { key, status: 'failed', code: 'notFound', error: 'not found' };
       continue;
     }
+    // Each on record as one alone is: the page's under its own names, an MCP caller's under the tool's.
     if (ctx.origin !== 'mcp') store.recordMcpAudit(audit, ctx.client, true, after.dedupKey);
+    else store.recordMcpAudit(action === 'snooze' ? 'snooze' : 'mark_handled', ctx.client, true, JSON.stringify({ account: after.account, messageId: after.messageId ?? after.dedupKey, ...(action === 'snooze' ? { until: String(until) } : { handled: action === 'done' }) }).slice(0, 1000));
     results[index] = { key, status: 'done', row: ctx.decorate(after) };
   }
   for (const group of reading.values()) {
@@ -449,10 +489,18 @@ export async function routeMailbox(
       }, store, ctx);
     }
     if (path === '/api/search') {
-      return mailboxSearch({
-        account: text(p.get('account'), 320), q: text(p.get('q'), 1000), folder: p.get('folder'),
-        before: p.get('before'), limit: p.get('limit'),
-      }, store, ctx);
+      // A request the browser drops (a closed tab, a search typed over) stops the search it asked for.
+      const dropped = new AbortController();
+      const drop = (): void => dropped.abort();
+      req.socket?.once?.('close', drop);
+      try {
+        return await mailboxSearch({
+          account: text(p.get('account'), 320), q: text(p.get('q'), 1000), folder: p.get('folder'),
+          before: p.get('before'), limit: p.get('limit'), tab: p.get('tab'),
+        }, store, ctx, dropped.signal);
+      } finally {
+        req.socket?.off?.('close', drop);
+      }
     }
     return undefined;
   })().finally(() => { life.over = true; });

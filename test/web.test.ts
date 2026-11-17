@@ -9,6 +9,8 @@ import {
 import { buildLink } from '../src/links.js';
 import { STRINGS, type StringKey } from '../src/web-strings.js';
 import { clientScript } from '../src/web-client.js';
+import { styles } from '../src/web-styles.js';
+import { webcrypto } from 'node:crypto';
 import { letterText } from '../src/web-actions.js';
 import { attachmentFilename } from '../src/smtp.js';
 import { Script } from 'node:vm';
@@ -1811,8 +1813,10 @@ describe('the rest of the mailbox in the page', () => {
     expect(page).toMatch(/<button id="folders-open" type="button" class="icon-btn" aria-label="Folders"[^>]*aria-controls="folder-sheet"/);
     expect(page).toMatch(/<div id="live-head" class="live-head" hidden><button id="live-back"[^>]*aria-label="Back to the triaged mail"/);
     expect(page).toContain('<div id="live-note" class="live-note" role="status" hidden></div>');
-    expect(page).toContain('<div id="mailbox-search" class="mailbox-search" hidden></div>');
     const script = clientScript();
+    // The offer to search the mailbox is drawn at the end of the list, so typing never moves it in.
+    expect(page).not.toContain('id="mailbox-search"');
+    expect(script).toContain('const offer = mailboxOffer();');
     expect(script).toContain("openPopover(folderSheet, anchor, { width: 340, align: 'start', history: !isWide() });");
     expect(script).toContain("['g', 'keys.folders']");
     expect(script).toContain("fetch((view.mode === 'search' ? '/api/search?' : '/api/folder?') + p.toString(), abort ? { signal: abort.signal } : {})");
@@ -1834,7 +1838,7 @@ describe('the rest of the mailbox in the page', () => {
     }
   });
 
-  it('makes a row of what the mailbox says, keyed by the stored record when there is one', () => {
+  it('makes a row of what the mailbox says, known by its handle, with the record it is carried apart', () => {
     const context = { folderLists: new Map(), accountName: (a: string) => `name of ${a}` };
     const row = lifted<(item: Record<string, unknown>, account: string) => Record<string, unknown>>(
       ['folderInfo', 'folderRoleOf', 'liveRow'], 'liveRow', context,
@@ -1845,7 +1849,11 @@ describe('the rest of the mailbox in the page', () => {
       accountLabel: 'name of me@qq.com', importance: null, handledAt: null, attachments: true });
     const stored = row({ handle: 'live:b', key: 'k1', stored: { importance: 'critical', handledAt: '2026-11-02T00:00:00.000Z' }, folder: 'Archive',
       from: { name: '', address: 'b@x' }, flags: {} }, 'me@qq.com');
-    expect(stored).toMatchObject({ dedupKey: 'k1', handle: 'live:b', stored: true, importance: 'critical', handledAt: '2026-11-02T00:00:00.000Z' });
+    // Known by its handle: two messages that share a Message-ID are two rows. The record the server matched it to is carried apart.
+    expect(stored).toMatchObject({ dedupKey: 'live:b', storedKey: 'k1', handle: 'live:b', stored: true, importance: 'critical', handledAt: '2026-11-02T00:00:00.000Z' });
+    const queue = lifted<(m: Record<string, unknown>) => string>(['rowKey', 'queueKey'], 'queueKey');
+    expect(queue(stored)).toBe('k1');
+    expect(queue(unstored)).toBe('live:a');
     // What the server is asked to find it by: the handle, which says where it is.
     const ref = lifted<(m: Record<string, unknown>) => string>(['rowKey', 'mailRef'], 'mailRef');
     expect(ref(stored)).toBe('live:b');
@@ -1884,6 +1892,214 @@ describe('the rest of the mailbox in the page', () => {
     expect(script).toContain("if (!liveIn(row, 'archive') && !liveIn(row, 'all')) bar.appendChild(barButton('i-archive'");
     expect(script).toContain("if (e.key === 'e') { if (!markable) return;");
     expect(script).toContain('const conversation = stored ? conversationSection(box, row) : null;');
+  });
+});
+
+describe('what a review of the whole-mailbox stage found, in the page', () => {
+  const en = (key: string): string => STRINGS.en[key as StringKey] ?? key;
+  const fillEn = (key: string, vars: Record<string, unknown> = {}): string =>
+    Object.entries(vars).reduce((text, [name, value]) => text.split(`{${name}}`).join(String(value)), en(key));
+
+  /** bulkAction and its Undo, with the page around them stood in for: what is posted, picked and said. */
+  function bulkPage(rows: Array<Record<string, unknown>>, answer: (body: Record<string, unknown>) => Record<string, unknown>) {
+    const posted: Array<Record<string, unknown>> = [];
+    const toasts: Array<{ text: string; error: boolean; undo: { run: () => Promise<void> } | null }> = [];
+    const byKey = new Map(rows.map((row) => [String(row['dedupKey']), row]));
+    const context: Record<string, unknown> = {
+      session: { writable: true, canMark: true }, requireWrite: () => undefined, bulkBusy: false,
+      picked: new Set<string>(), pickAnchor: null, history: { state: null },
+      post: async (_path: string, body: Record<string, unknown>) => { posted.push(body); return { ok: true, data: answer(body) }; },
+      rowByKey: (key: string) => byKey.get(key), findItem: () => null, rowOfItem: () => null,
+      pickedRows: () => Array.from(context['picked'] as Set<string>).map((key) => byKey.get(key)).filter(Boolean),
+      applyRow: () => undefined, liveData: new Map(), flagsByKey: new Map(), liveView: null, liveRows: new Map(), dropLive: () => undefined,
+      attentionCount: 0, oweBack: () => undefined, pickChanged: () => undefined, renderPickBar: () => undefined, loadAttention: () => undefined,
+      renderList: () => undefined, renderLede: () => undefined, renderBars: () => undefined, updateBadge: () => undefined,
+      refresh: () => undefined, liveLoad: () => undefined, setTimeout: () => 0,
+      toast: (text: string, error: boolean, undo: { run: () => Promise<void> } | null) => { toasts.push({ text, error, undo }); },
+      failure: (data: { code: string }) => `refused: ${data.code}`, t: en, fill: fillEn, STRINGS, lang: 'en', DOT: ' · ',
+      folderName: (_account: string, path: string) => path, whenLabel: () => 'tomorrow', crypto: webcrypto,
+    };
+    const fns = lifted<{
+      bulkAction: (action: string, extra?: Record<string, unknown>) => Promise<void>;
+    }>(['rowKey', 'mailRef', 'queueKey', 'bulkId', 'snoozeUndoTo', 'bulkAction', 'bulkAgain', 'undoBulkSnooze'], '{ bulkAction }', context);
+    return { ...fns, context, posted, toasts };
+  }
+  const allDone = (body: Record<string, unknown>) => ({
+    results: (body['items'] as string[]).map((key) => ({ key, status: 'done' })), done: (body['items'] as string[]).length, skipped: 0, failed: 0,
+  });
+
+  it('undoes exactly the batch it undoes, and leaves what was picked since picked', async () => {
+    const rows = ['k1', 'k2', 'k3'].map((dedupKey) => ({ dedupKey, account: 'me@qq.com', folder: 'INBOX', handledAt: null }));
+    const page = bulkPage(rows, allDone);
+    (page.context['picked'] as Set<string>).add('k1').add('k2');
+    await page.bulkAction('done');
+    expect(page.posted[0]).toMatchObject({ action: 'done', items: ['k1', 'k2'] });
+    // Picked since: k3. Undo is pressed.
+    (page.context['picked'] as Set<string>).add('k3');
+    await page.toasts[0]!.undo!.run();
+    expect(page.posted[1]).toMatchObject({ action: 'not_done', items: ['k1', 'k2'] });
+    expect([...(page.context['picked'] as Set<string>)]).toEqual(['k3']);
+  });
+
+  it('undoes a batch reminder by giving each message the reminder it had, and leaves out the ones the batch did not change', async () => {
+    const soon = new Date(Date.now() + 3 * 3_600_000).toISOString();
+    const rows = [
+      { dedupKey: 'k1', account: 'me@qq.com', handledAt: null, snoozedUntil: null },
+      { dedupKey: 'k2', account: 'me@qq.com', handledAt: null, snoozedUntil: soon },
+      { dedupKey: 'k3', account: 'me@qq.com', handledAt: '2026-11-01T00:00:00.000Z', snoozedUntil: null },
+    ];
+    const page = bulkPage(rows, (body) => ({
+      results: (body['items'] as string[]).map((key) => (key === 'k3' ? { key, status: 'skipped', code: 'alreadyDone' } : { key, status: 'done' })),
+      done: (body['items'] as string[]).filter((key) => key !== 'k3').length, skipped: 1, failed: 0,
+    }));
+    for (const key of ['k1', 'k2', 'k3']) (page.context['picked'] as Set<string>).add(key);
+    await page.bulkAction('snooze', { until: '2027-01-01T09:00:00.000Z' });
+    await page.toasts[0]!.undo!.run();
+    const undo = page.posted.slice(1).map((body) => [body['items'], body['until']]);
+    expect(undo).toEqual(expect.arrayContaining([[['k1'], null], [['k2'], soon]]));
+    expect(undo).toHaveLength(2);
+  });
+
+  it('says why a batch went nowhere, in the page\'s words, rather than that none were moved', async () => {
+    const rows = ['k1', 'k2'].map((dedupKey) => ({ dedupKey, account: 'me@qq.com', folder: 'INBOX' }));
+    const page = bulkPage(rows, (body) => ({
+      results: (body['items'] as string[]).map((key) => ({ key, status: 'failed', code: 'action_invalid_destination' })), done: 0, skipped: 0, failed: 2,
+    }));
+    for (const key of ['k1', 'k2']) (page.context['picked'] as Set<string>).add(key);
+    STRINGS.en['error.action_invalid_destination' as StringKey] ??= 'This mailbox has no spam folder.';
+    await page.bulkAction('spam');
+    expect(page.toasts[0]).toMatchObject({ text: 'refused: action_invalid_destination', error: true });
+    // Some went, some are still under way, and a sender was made low priority: each said.
+    const mixed = bulkPage(rows, (body) => ({
+      results: [{ key: 'k1', status: 'done' }, { key: 'k2', status: 'pending' }], done: 1, skipped: 0, failed: 0, pending: 1, muted: ['promo@shop.example'],
+    }));
+    for (const key of ['k1', 'k2']) (mixed.context['picked'] as Set<string>).add(key);
+    await mixed.bulkAction('spam');
+    expect(mixed.toasts[0]!.text).toBe([
+      fillEn('bulk.spam', { count: 1, folder: '', when: '' }), fillEn('bulk.pending', { count: 1 }), fillEn('fb.ruleNever', { sender: 'promo@shop.example' }),
+    ].join(' · '));
+  });
+
+  it('gives the reader on a desk to the next message listed when the open one leaves the folder', () => {
+    const opened: string[] = [];
+    const context: Record<string, unknown> = {
+      liveView: { items: [{ dedupKey: 'a' }, { dedupKey: 'b' }, { dedupKey: 'c' }], total: 3 }, liveRows: new Map([['b', { dedupKey: 'b' }]]),
+      visibleKeys: () => ['a', 'b', 'c'], isWide: () => true, selectedKey: 'b', findItem: (key: string) => key !== 'b',
+      openDetail: (key: string) => opened.push(key), clearSelection: () => opened.push('cleared'), renderLiveHead: () => undefined,
+    };
+    const drop = lifted<(keys: string[]) => void>(['rowKey', 'dropLive'], 'dropLive', context);
+    drop(['b']);
+    expect(opened).toEqual(['c']);
+    expect((context['liveView'] as { items: unknown[]; total: number })).toMatchObject({ items: [{ dedupKey: 'a' }, { dedupKey: 'c' }], total: 2 });
+    context['selectedKey'] = 'c';
+    drop(['a', 'c']);
+    expect(opened).toEqual(['c', 'cleared']);
+  });
+
+  it('opens a folder named by the address over the triaged view, so Back and a closed sheet stay in mailsift', () => {
+    const calls: string[] = [];
+    const location = { pathname: '/', search: '?hours=72&in=me%40qq.com&folder=Archive' };
+    const history = {
+      state: null as unknown,
+      replaceState(state: unknown, _title: string, path: string) { calls.push(`replace ${path}`); this.state = state; location.search = path.slice(1); },
+      pushState(state: unknown, _title: string, path: string) { calls.push(`push ${path}`); this.state = state; },
+    };
+    const noop = () => undefined;
+    const context: Record<string, unknown> = {
+      location, history, liveView: null, triagedQuery: '', liveAbort: null, liveRows: new Map(), filters: { q: { value: '' } },
+      document: { body: { classList: { add: noop } } }, selectedKey: null, openKey: null, clearSelection: noop, URLSearchParams,
+      syncUrl: () => calls.push('sync'), renderLiveHead: noop, renderTokens: noop, updateAsk: noop, wordPlaceholders: noop, renderList: noop,
+      liveLoad: noop, loadFolders: noop, window: { scrollTo: noop },
+    };
+    const open = lifted<(view: Record<string, unknown>, how: string) => void>(['liveState', 'openLive'], 'openLive', context);
+    open({ mode: 'folder', account: 'me@qq.com', folder: 'Archive' }, 'boot');
+    expect(calls).toEqual(['replace /?hours=72', 'push /?hours=72', 'sync']);
+    expect(history.state).toEqual({ live: { mode: 'folder', account: 'me@qq.com', folder: 'Archive', q: '' } });
+  });
+
+  it('opens a message a link names by its handle as a live row: no queue for one never stored, the record\'s key for one that was', async () => {
+    const extraRows = new Map<string, Record<string, unknown>>();
+    let answer: Record<string, unknown> = {};
+    const context = {
+      extraRows, findItem: () => null, openDetail: () => undefined, encodeURIComponent,
+      fetch: async () => ({ ok: true, json: async () => answer }),
+    };
+    const open = lifted<(key: string) => void>(['openFromLink'], 'openFromLink', context);
+    answer = { handle: 'live:a', dedupKey: 'live:a', stored: false, handledAt: null };
+    open('live:a');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(extraRows.get('live:a')).toMatchObject({ dedupKey: 'live:a', storedKey: null, live: true, stored: false });
+    answer = { handle: 'live:b', dedupKey: 'k1', stored: true };
+    open('live:b');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(extraRows.get('live:b')).toMatchObject({ dedupKey: 'live:b', storedKey: 'k1', live: true });
+  });
+
+  it('tells apart two folders of the same name by what they are in', () => {
+    const folderLists = new Map([['me@qq.com', { folders: [
+      { path: 'Projects/2026', name: '2026', parent: 'Projects', delimiter: '/', role: null },
+      { path: 'Travel/2026', name: '2026', parent: 'Travel', delimiter: '/', role: null },
+      { path: 'Receipts', name: 'Receipts', parent: null, delimiter: '/', role: null },
+    ] }]]);
+    const name = lifted<(account: string, path: string) => string>(['folderInfo', 'folderName'], 'folderName',
+      { t: en, lang: 'en', STRINGS, folderLists });
+    expect(name('me@qq.com', 'Projects/2026')).toBe('Projects / 2026');
+    expect(name('me@qq.com', 'Travel/2026')).toBe('Travel / 2026');
+    expect(name('me@qq.com', 'Receipts')).toBe('Receipts');
+  });
+
+  it('does not say nothing matches when a search could read only recent subjects and senders', () => {
+    const el = (tag: string, cls: string | null, text?: string) => ({ tag, cls, text, children: [] as unknown[], appendChild(child: unknown) { this.children.push(child); } });
+    const context: Record<string, unknown> = { el, t: en, fill: fillEn, lang: 'en', failure: () => '', liveLoad: () => undefined };
+    const empty = lifted<() => { children: Array<{ text: string }> }>(['liveEmpty'], 'liveEmpty', context);
+    context['liveView'] = { mode: 'search', failed: null, limited: { reason: 'provider', scanned: 2000 } };
+    expect(empty().children[0]!.text).toBe(fillEn('live.noneFoundLimited', { count: (2000).toLocaleString('en') }));
+    expect(empty().children[0]!.text).not.toBe(en('live.noneFound'));
+    context['liveView'] = { mode: 'search', failed: null, limited: null };
+    expect(empty().children[0]!.text).toBe(en('live.noneFound'));
+  });
+
+  it('keeps a live view out of the snapshot of the triaged mail', () => {
+    let written = 0;
+    const context: Record<string, unknown> = {
+      fromSnapshot: false, liveView: { mode: 'folder' }, lastMail: [{}], lastSummary: {}, filtersActive: () => false,
+      filters: { view: { value: 'mail' }, hours: { value: '24' } }, clearTimeout: () => undefined,
+      setTimeout: (run: () => void) => { run(); return 0; }, writeStorage: () => { written += 1; },
+    };
+    const save = lifted<() => void>(['saveSnapshot'], 'saveSnapshot', context);
+    save();
+    expect(written).toBe(0);
+  });
+
+  it('lets e, y, #, s and b act on what is picked, and keeps right-click a right-click', () => {
+    const script = clientScript();
+    expect(script).toContain("} else if (picked.size && ['e', 'y', '#', 's', 'b'].includes(e.key)) {");
+    expect(script).toContain("li.addEventListener('contextmenu', (e) => { if (touched && !isWide()) e.preventDefault(); });");
+    expect(script).toContain("if (bulkSheet.open) closePopover(bulkSheet, false);");
+    // A search from this tab takes the place only of this tab's own.
+    expect(script).toContain("p.set('tab', tabId());");
+  });
+
+  it('fits the selection bar on a small phone, protects the long press from the link menu, and lines up the mailbox switch', () => {
+    const css = styles();
+    const phone = css.slice(css.indexOf('body.picking .pick-box{display:grid}'));
+    expect(phone).toContain('.row,.row .who{-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}');
+    expect(phone).toContain('#pick-all{display:none}');
+    expect(phone).toContain('.pick-actions .bar-btn span{display:none}');
+    expect(phone).toContain('.pick-count{min-width:0;overflow:hidden;text-overflow:ellipsis}');
+    expect(css).toContain('@media(max-width:899px) and (hover:hover){.row:hover .pick-box{display:grid}}');
+    expect(css).toContain('#folder-sheet .folder-accounts{max-width:none;margin:0 8px 8px}');
+  });
+
+  it('words what a batch did evenly, and says a search was replaced by a newer one, in both languages', () => {
+    expect(STRINGS.en['bulk.not_done']).toBe('Marked {count} not done');
+    expect(STRINGS.en['bulk.snooze']).toBe('Reminders set for {count}: {when}');
+    expect(STRINGS.en['palette.searchMailbox']).toBe('Search {name} for “{q}”');
+    for (const key of ['error.superseded', 'bulk.pending', 'live.noneFoundLimited'] as const) {
+      expect(STRINGS.en[key as StringKey], key).toBeTruthy();
+      expect(STRINGS['zh-CN'][key as StringKey], key).toBeTruthy();
+    }
+    expect(STRINGS['zh-CN']['live.noneFoundLimited' as StringKey]).toContain('{count}');
   });
 });
 

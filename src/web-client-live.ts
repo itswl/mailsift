@@ -644,6 +644,17 @@ document.addEventListener('keydown', (e) => {
   } else if (e.key === 'Escape' && picked.size) {
     // What is picked is put down before anything else is closed.
     clearPicks(false);
+  } else if (picked.size && ['e', 'y', '#', 's', 'b'].includes(e.key)) {
+    // With messages picked, the keys that act on a message act on what is picked, as the bar does.
+    if (e.repeat) return;
+    e.preventDefault();
+    const choices = bulkChoices(pickedRows());
+    const more = $('#pick-actions [data-act="bulk-more"]');
+    if (e.key === 'e') bulkAction(choices.includes('done') ? 'done' : 'not_done');
+    else if (e.key === 'y' && choices.includes('archive')) bulkAction('archive');
+    else if (e.key === '#' && choices.includes('trash')) bulkAction('trash');
+    else if (e.key === 's') bulkAction('star');
+    else if (e.key === 'b' && choices.includes('snooze') && more) openBulkSnooze(more);
   } else if (e.key === 'x' && current) {
     e.preventDefault();
     togglePick(current, false);
@@ -660,7 +671,7 @@ document.addEventListener('keydown', (e) => {
     const key = rowKey(row);
     // Done and later are the queue's: a message listed live that was never stored has neither.
     const markable = !row.live || row.stored;
-    if (e.key === 'e') { if (!markable) return; e.preventDefault(); complete(key, document.querySelector('li.row[data-key="' + CSS.escape(current) + '"]'), Boolean(row.handledAt)); }
+    if (e.key === 'e') { if (!markable) return; e.preventDefault(); complete(queueKey(row), document.querySelector('li.row[data-key="' + CSS.escape(current) + '"]'), Boolean(row.handledAt)); }
     else if (e.key === 'r') { e.preventDefault(); startReply(key, 'reply'); }
     else if (e.key === 'a') { e.preventDefault(); startReply(key, 'replyAll'); }
     else if (e.key === 'f') { e.preventDefault(); startForward(key); }
@@ -672,7 +683,7 @@ document.addEventListener('keydown', (e) => {
       e.preventDefault();
       const anchor = (isWide() && document.querySelector('#pane-bar [data-act="snooze"]'))
         || document.querySelector('li.row[data-key="' + CSS.escape(current) + '"]');
-      if (anchor) openSnooze(key, anchor);
+      if (anchor) openSnooze(queueKey(row), anchor);
     }
   }
 });
@@ -689,6 +700,7 @@ function languageChanged() {
   }
   if (notifySheet.open) renderNotify();
   if (snoozeSheet.open && snoozeKey && rowByKey(snoozeKey)) { drawSnooze(rowByKey(snoozeKey)); placePopover(snoozeSheet); }
+  if (bulkSheet.open) closePopover(bulkSheet, false);
   if (keysSheet.open) { closeSheet(keysSheet, false); }
   if (composeSheet.open && composing) {
     $('#compose-title').textContent = t(composing.titleKey);
@@ -745,6 +757,6 @@ chrome();
 openStream();
 readPush();
 // A folder or a search the address asked for, over the triaged view it returns to.
-if (bootLive) { const view = bootLive; bootLive = null; openLive(view, 'restore'); }
+if (bootLive) { const view = bootLive; bootLive = null; openLive(view, 'boot'); }
 `;
 }

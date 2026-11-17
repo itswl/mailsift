@@ -44,15 +44,21 @@ function rowByKey(key) {
   }
   for (const m of doneRecent) if (rowKey(m) === key) return m;
   for (const m of snoozedRows) if (rowKey(m) === key) return m;
-  return extraRows.get(key) || null;
+  if (extraRows.has(key)) return extraRows.get(key);
+  // A stored record known on the page only as a row listed live.
+  for (const m of liveRows.values()) if (m.storedKey === key) return m;
+  return null;
 }
 // A row the server sent back after an action replaces every copy of it.
 // A copy listed live keeps what the mailbox said of it where it was listed:
-// its folder, its handle and its flags are the place, not the record.
+// its own key (its handle), its folder and its flags are the place, not the record.
 function applyRow(row) {
   if (!row) return;
   eachCopy(rowKey(row), (m) => {
-    const place = m.live ? { live: true, stored: true, handle: m.handle, folder: m.folder, flags: m.flags, subject: m.subject, inSpam: m.inSpam, link: m.link } : null;
+    const place = m.live ? {
+      dedupKey: m.dedupKey, storedKey: m.storedKey, live: true, stored: true, handle: m.handle, folder: m.folder,
+      flags: m.flags, subject: m.subject, inSpam: m.inSpam, link: m.link,
+    } : null;
     Object.assign(m, row, place || {});
   });
 }
@@ -881,10 +887,12 @@ async function mailAction(key, action, destination) {
   const shown = liveView && liveRows.get(key);
   if (shown) {
     shown.flags = Object.assign({}, shown.flags || {}, flags);
-    if (r.data.moved && r.data.moved.folder !== listedIn) dropLive(key);
+    if (r.data.moved && r.data.moved.folder !== listedIn) dropLive([key]);
   }
   if (typeof r.data.attention === 'number') attentionCount = r.data.attention;
-  toast(action === 'move' ? fill('act.moved', { folder: folderName(row ? row.account : '', destination) }) : t(ACTION_SAID[action]));
+  const said = action === 'move' ? fill('act.moved', { folder: folderName(row ? row.account : '', destination) }) : t(ACTION_SAID[action]);
+  // A spam vote that made a rule says so, as the judgement line does.
+  toast(Array.isArray(r.data.muted) && r.data.muted.length ? said + DOT + fill('fb.ruleNever', { sender: r.data.muted.join(', ') }) : said);
   renderList();
   renderLede();
   renderBars();
@@ -935,7 +943,7 @@ function openMenu(key, anchor) {
     item('i-clock', t('act.snooze'), () => {
       closeSheet(menuSheet, false);
       // Under the "more" that opened the menu, or its successor if the bar was drawn again meanwhile.
-      afterBack(() => openSnooze(key, anchor.isConnected ? anchor : document.querySelector((isWide() ? '#pane-bar' : '#sheet-bar') + ' [data-act="more"]')));
+      afterBack(() => openSnooze(queueKey(row), anchor.isConnected ? anchor : document.querySelector((isWide() ? '#pane-bar' : '#sheet-bar') + ' [data-act="more"]')));
     });
   }
   item('i-star', t(flags.flagged ? 'act.unstar' : 'act.star'), () => mailAction(key, flags.flagged ? 'unstar' : 'star'));
@@ -969,7 +977,7 @@ function fillBar(bar, row, wide) {
   const flags = flagsByKey.get(key) || {};
   // Done and later are the queue's, so only a stored message has them; one listed live answers to the rest.
   const markable = !row.live || row.stored;
-  if (markable) bar.appendChild(barButton('i-check', t(row.handledAt ? 'act.undone' : 'act.done'), () => complete(key, null, Boolean(row.handledAt)), 'primary' + (row.handledAt ? ' on' : '')));
+  if (markable) bar.appendChild(barButton('i-check', t(row.handledAt ? 'act.undone' : 'act.done'), () => complete(queueKey(row), null, Boolean(row.handledAt)), 'primary' + (row.handledAt ? ' on' : '')));
   bar.appendChild(barButton('i-reply', t('act.reply'), () => startReply(key, 'reply'), markable ? '' : 'primary'));
   if (wide) bar.appendChild(barButton('i-reply-all', t('act.replyAll'), () => startReply(key, 'replyAll'), 'icon-only'));
   // Filed in the archive already, it is not archived again.
@@ -977,7 +985,7 @@ function fillBar(bar, row, wide) {
   if (wide) bar.appendChild(barButton('i-star', t(flags.flagged ? 'act.unstar' : 'act.star'), () => mailAction(key, flags.flagged ? 'unstar' : 'star'), 'icon-only' + (flags.flagged ? ' lit' : '')));
   // On a desk there is room for it beside the star; on a phone it is under "more".
   if (wide && !row.handledAt && markable) {
-    const later = barButton('i-clock', t('act.snooze'), () => openSnooze(key, later), 'icon-only snooze-btn' + (isSnoozed(row) ? ' lit' : ''));
+    const later = barButton('i-clock', t('act.snooze'), () => openSnooze(queueKey(row), later), 'icon-only snooze-btn' + (isSnoozed(row) ? ' lit' : ''));
     later.dataset.act = 'snooze';
     later.setAttribute('aria-haspopup', 'dialog');
     later.setAttribute('aria-expanded', 'false');
@@ -1056,6 +1064,8 @@ function openFromLink(key, here) {
   if (findItem(key)) { openDetail(key, here); return; }
   fetch('/api/message?id=' + encodeURIComponent(key)).then((r) => (r.ok ? r.json() : null)).then((row) => {
     if (!row || row.error) return;
+    // A message named by a handle is a row listed live, known by its handle; one the server matched to a record carries its key apart.
+    if (row.handle) Object.assign(row, { storedKey: row.stored ? row.dedupKey : null, dedupKey: row.handle, live: true });
     extraRows.set(key, row);
     openDetail(key, here);
   }).catch(() => {});

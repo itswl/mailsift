@@ -1958,9 +1958,15 @@ describe('the rest of the mailbox, live', () => {
     return box;
   }
   beforeEach(() => { process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|secret'; });
+  /** The seeded <one@x> stored where the listing finds it: Archive, UID 3, UIDVALIDITY 5. */
+  const placed = (): StateStore => {
+    const state = seeded();
+    state.updateMailLocation('k1', 'Archive', false, { uid: 3, uidValidity: '5' });
+    return state;
+  };
 
   it('browses a folder and searches the mailbox with the read token, handing out handles and keys', async () => {
-    const state = seeded();
+    const state = placed();
     const client = await connect(state, false, live(state).backend);
     const page = await call(client, 'browse_folder', { account: 'me@qq.com', folder: 'Archive', limit: 2 });
     expect(page).toMatchObject({ folder: 'Archive', total: 2, next: '5.3' });
@@ -2005,8 +2011,19 @@ describe('the rest of the mailbox, live', () => {
     expect(await failed(client, 'read_message', { messageId: OLD, account: 'other@qq.com' })).toMatchObject({ code: 'INVALID_ARGUMENT' });
   });
 
+  it('answers get_mail for a handle with the record of that very message, and with nothing for another sharing its Message-ID', async () => {
+    const state = placed();
+    const client = await connect(state, false, live(state).backend);
+    expect(await call(client, 'get_mail', { messageId: ONE })).toMatchObject({ found: true, dedupKey: 'k1', importance: 'critical' });
+    // Its Message-ID, at another place: not the stored message.
+    const copy = liveHandle({ account: 'me@qq.com', folder: 'Sent', uidValidity: '5', uid: 3, messageId: '<one@x>' });
+    expect(await call(client, 'get_mail', { messageId: copy })).toMatchObject({ found: false, stored: false });
+    expect(await call(client, 'get_mail', { messageId: OLD })).toMatchObject({ found: false });
+    expect(await failed(client, 'get_mail', { messageId: 'live:forged' })).toMatchObject({ code: 'INVALID_ARGUMENT' });
+  });
+
   it('keeps the queue to what mailsift stored', async () => {
-    const state = seeded();
+    const state = placed();
     const client = await connect(state, true, live(state).backend);
     expect(await failed(client, 'mark_handled', { messageId: OLD })).toMatchObject({ code: 'ACTION_REFUSED' });
     expect(await failed(client, 'snooze', { messageId: OLD, until: 'now' })).toMatchObject({ code: 'ACTION_REFUSED' });
@@ -2077,9 +2094,25 @@ describe('several messages at once, and spam', () => {
     const done = await call(client, 'mark_handled', { messageIds: ['<one@x>', '<two@x>'] });
     expect(done).toMatchObject({ action: 'done', done: 1, skipped: 1 });
     const later = '2027-01-04T09:00:00+08:00';
+    // <one@x> was just marked done: a reminder for the batch leaves it done.
     const snoozed = await call(client, 'snooze', { messageIds: ['<one@x>', '<three@x>'], until: later });
-    expect(snoozed).toMatchObject({ action: 'snooze', done: 2 });
+    expect(snoozed).toMatchObject({ action: 'snooze', done: 1, skipped: 1 });
+    expect(state.getMail('k1')).toMatchObject({ snoozedUntil: null });
     expect(state.getMail('k3')?.snoozedUntil).toBe(new Date(later).toISOString());
+  });
+
+  it('puts each message a batch marks done or puts off on record, as one call for it alone would', async () => {
+    const state = seeded();
+    const client = await connect(state, true, batching(state).backend);
+    await call(client, 'mark_handled', { messageIds: ['<one@x>', '<two@x>'] });
+    const later = '2027-01-04T09:00:00+08:00';
+    await call(client, 'snooze', { messageIds: ['<three@x>'], until: later });
+    const targets = (action: string) => state.listMcpAudit(20).filter((row) => row.action === action && row.target?.startsWith('{'))
+      .map((row) => JSON.parse(row.target!) as Record<string, unknown>).filter((target) => 'messageId' in target);
+    expect(targets('mark_handled')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ messageId: '<one@x>', handled: true }), expect.objectContaining({ messageId: '<two@x>', handled: true }),
+    ]));
+    expect(targets('snooze')).toEqual([expect.objectContaining({ messageId: '<three@x>', until: new Date(later).toISOString() })]);
   });
 
   it('records spam and not_spam feedback, and offers both actions', async () => {

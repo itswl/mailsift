@@ -273,7 +273,8 @@ export class Watcher {
     const fresh: MailMessage[] = [];
     for (const message of messages) {
       const key = dedupKey(message);
-      if (batch.has(key) || this.state.isSeen(key)) continue;
+      // Seen, or filed by the owner by hand from a folder listed live: not new mail either way.
+      if (batch.has(key) || this.state.isSeen(key) || this.state.filedByOwner(key)) continue;
       batch.add(key);
       fresh.push(message);
     }

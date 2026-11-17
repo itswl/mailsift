@@ -734,6 +734,8 @@ describe('acting on a message from the web view', () => {
     expect(archived).toEqual({
       action: 'archive', account: 'me@qq.com', messageId: '<one@x>',
       sourceFolder: 'INBOX', destinationFolder: 'Archive', destinationIsSpam: false,
+      // What the poller would file it under where it landed.
+      destinationId: '<one@x>',
     });
     expect(idsIn('INBOX')).toEqual([]);
     expect(idsIn('Archive')).toEqual(['<one@x>']);

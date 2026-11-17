@@ -774,6 +774,17 @@ const rowKey = (m) => m.dedupKey || m.messageId || '';
 // What the server is to find a message by: a message listed live by its
 // handle, which says exactly where it is; any other by its key.
 const mailRef = (m) => (m && m.handle) || rowKey(m);
+// What the queue knows a message by: the stored record's key, which a row
+// listed live carries apart from its own (its handle) when it is one.
+const queueKey = (m) => (m && m.storedKey) || rowKey(m);
+// A row as the queue's own lists keep it: a row listed live gives the
+// record's key, and nothing of the place it was listed in.
+function queueCopy(m) {
+  if (!m || !m.live) return m;
+  const copy = Object.assign({}, m, { dedupKey: m.storedKey });
+  for (const name of ['live', 'stored', 'storedKey', 'handle', 'flags', 'attachments', 'size']) delete copy[name];
+  return copy;
+}
 // Levels are a fixed vocabulary; anything else is shown as stored but styled as info.
 const level = (m) => (m.importance === 'critical' || m.importance === 'warning' ? m.importance : 'info');
 const isThread = (item) => Boolean(item && item.latest);
@@ -1805,7 +1816,6 @@ function renderAll() {
   renderStatus();
   renderTokens();
   renderLiveHead();
-  renderMailboxSearch();
   renderPickBar();
   renderList();
   drawDigest(true);

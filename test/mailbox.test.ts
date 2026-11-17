@@ -20,9 +20,12 @@ const fake = vi.hoisted(() => {
     /** How a search is answered: properly, refused (NO), or matching nothing outside ASCII. */
     searching: 'exact' as 'exact' | 'refuse' | 'ascii',
     searches: [] as unknown[],
+    /** How long some commands take, in milliseconds; a connection closed meanwhile fails them, as a real one does. */
+    delay: { search: 0, fetchOne: 0, move: 0 },
+    connects: 0,
     reset(): void {
       this.folders = []; this.mail = new Map(); this.validity = new Map(); this.capabilities = new Set();
-      this.calls = []; this.searching = 'exact'; this.searches = [];
+      this.calls = []; this.searching = 'exact'; this.searches = []; this.delay = { search: 0, fetchOne: 0, move: 0 }; this.connects = 0;
     },
   };
 
@@ -49,9 +52,17 @@ const fake = vi.hoisted(() => {
     mailbox: { uidValidity: bigint; exists: number } | false = false;
     usable = false;
     get capabilities(): Map<string, boolean> { return new Map([...server.capabilities].map((c) => [c, true])); }
+    private waiting: Array<() => void> = [];
+    private async wait(ms: number): Promise<void> {
+      if (!ms) return;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, ms);
+        this.waiting.push(() => { clearTimeout(timer); reject(new Error('Connection closed')); });
+      });
+    }
     on(): this { return this; }
-    async connect(): Promise<void> { this.usable = true; }
-    close(): void { this.usable = false; }
+    async connect(): Promise<void> { this.usable = true; server.connects += 1; }
+    close(): void { this.usable = false; for (const fail of this.waiting.splice(0)) fail(); }
     async logout(): Promise<void> { this.usable = false; }
 
     private entries(): Array<Record<string, unknown>> {
@@ -86,6 +97,7 @@ const fake = vi.hoisted(() => {
     async search(query: Record<string, unknown>): Promise<number[] | false> {
       server.searches.push(query);
       server.calls.push('search');
+      if (!query['uid']) await this.wait(server.delay.search);
       if (server.searching === 'refuse' && !query['uid'] && !query['header']) return false;
       return this.here().filter((m) => matches(m, query)).map((m) => m.uid);
     }
@@ -114,6 +126,7 @@ const fake = vi.hoisted(() => {
       for (const [i, m] of all.entries()) if (i + 1 >= from! && i + 1 <= to!) yield this.shape(m, i + 1);
     }
     async fetchOne(uid: string | number): Promise<Record<string, unknown> | false> {
+      await this.wait(server.delay.fetchOne);
       const all = this.here();
       const at = all.findIndex((m) => m.uid === Number(uid));
       server.calls.push(`fetchOne ${uid}`);
@@ -129,6 +142,7 @@ const fake = vi.hoisted(() => {
       return true;
     }
     async messageMove(range: number[], destination: string): Promise<{ destination: string; uidMap: Map<number, number>; uidValidity: bigint }> {
+      await this.wait(server.delay.move);
       const moving = this.here().filter((m) => range.includes(m.uid));
       server.mail.set(this.current, (server.mail.get(this.current) ?? []).filter((m) => !range.includes(m.uid)));
       const there = server.mail.get(destination) ?? [];
@@ -152,6 +166,14 @@ import {
   SearchCancelled, untrustedSearch, type LiveHandle,
 } from '../src/imap/mailbox.js';
 import type { Account } from '../src/config.js';
+import type { IncomingMessage } from 'node:http';
+import { Readable } from 'node:stream';
+import { fallbackMessageId } from '../src/imap/message.js';
+import { StateStore } from '../src/services/state.js';
+import { Watcher } from '../src/services/watcher.js';
+import { forgetLive, forgetVouched } from '../src/web-actions.js';
+import { routeWeb, SESSION_COOKIE } from '../src/web.js';
+import { makeMessage, RecordingSink } from './helpers.js';
 
 const ME: Account = {
   name: 'personal', provider: 'imap', username: 'me@example.org', host: 'mail.example.org', port: 993,
@@ -161,14 +183,17 @@ const QQ: Account = { ...ME, name: 'qq', provider: 'qq', username: 'me@qq.com', 
 const GMAIL: Account = { ...ME, name: 'work', provider: 'gmail_pw', username: 'me@gmail.com', host: 'imap.gmail.com' };
 
 let clock = Date.parse('2026-11-01T08:00:00Z');
-function put(folder: string, subject: string, options: { id?: string | null; from?: string; name?: string; body?: string; seen?: boolean; uid?: number } = {}): number {
+function put(
+  folder: string, subject: string,
+  options: { id?: string | null; from?: string; name?: string; body?: string; seen?: boolean; uid?: number; date?: Date } = {},
+): number {
   const list = fake.server.mail.get(folder) ?? [];
   const uid = options.uid ?? Math.max(0, ...list.map((m) => m.uid)) + 1;
   clock += 3_600_000;
   list.push({
     uid, subject, from: options.from ?? 'sender@example.com', ...(options.name ? { name: options.name } : {}),
     ...(options.id === null ? {} : { messageId: options.id ?? `<${folder.toLowerCase().replace(/\W/g, '')}-${uid}@x>` }),
-    body: options.body ?? '', flags: new Set(options.seen ? ['\\Seen'] : []), date: new Date(clock),
+    body: options.body ?? '', flags: new Set(options.seen ? ['\\Seen'] : []), date: options.date ?? new Date(clock),
   });
   fake.server.mail.set(folder, list);
   return uid;
@@ -494,5 +519,223 @@ describe('one action on many messages', () => {
     const outcomes = await applyMailActions(ME, [at('INBOX', 1, '<inbox-1@x>')], 'move', { destination: 'Nowhere' });
     expect((outcomes[0] as { error: unknown }).error).toMatchObject({ code: 'invalid_destination' });
     expect((await applyMailActions(ME, [at('INBOX', 1, '<inbox-1@x>')], 'move'))[0]).toMatchObject({ error: { code: 'invalid_destination' } });
+  });
+});
+
+// ---- What a review of this stage found, each against the fake server above ----
+
+describe('which stored record a live message is, through the real routes', () => {
+  const store = (): StateStore => new StateStore(':memory:');
+  function request(path: string, options: { method?: string; body?: unknown; as?: 'read' | 'write' } = {}): IncomingMessage {
+    const payload = options.body === undefined ? '' : JSON.stringify(options.body);
+    return Object.assign(Readable.from(payload ? [Buffer.from(payload)] : []), {
+      method: options.method ?? 'GET', url: path,
+      headers: { cookie: `${SESSION_COOKIE}=${options.as === 'read' ? 'read-token' : 'write-token'}` },
+    }) as unknown as IncomingMessage;
+  }
+  async function call(state: StateStore, path: string, options: { method?: string; body?: unknown; as?: 'read' | 'write' } = {}): Promise<Record<string, unknown>> {
+    const answer = await routeWeb(request(path, options), new URL(path, 'http://127.0.0.1:8410'), 'read-token', state, 'probe', { writeToken: 'write-token' });
+    return JSON.parse(String(answer.body)) as Record<string, unknown>;
+  }
+  /** A message the poller stored: where it found it, and (unless left out) its UID there. */
+  function stored(state: StateStore, key: string, id: string, folder: string, sender: string, uid?: number): void {
+    state.markSeen(key, ME.username, 'stored');
+    state.recordOutcome(key, 'critical', true, {
+      messageId: id, sender, folder, summary: 'the real one', ...(uid ? { uid, uidValidity: '1' } : {}),
+    });
+  }
+  const folder = async (state: StateStore, path: string): Promise<Array<Record<string, unknown>>> =>
+    (await call(state, `/api/folder?account=${encodeURIComponent(ME.username)}&folder=${encodeURIComponent(path)}`))['items'] as Array<Record<string, unknown>>;
+  const where = (): string[] => [...fake.server.mail.entries()].flatMap(([path, list]) => list.map((m) => `${path}#${m.uid}#${m.from}`)).sort();
+
+  beforeEach(() => {
+    process.env.MAIL_ACCOUNT_1 = `imap|${ME.username}|x|${ME.host}`;
+    forgetLive();
+    forgetVouched();
+  });
+
+  it('leaves a stored message alone when its Sent copy, which shares its Message-ID, is binned, and acts on the message by its key after', async () => {
+    const state = store();
+    put('INBOX', 'note to self', { id: '<note@x>', from: ME.username });
+    put('Sent Messages', 'note to self', { id: '<note@x>', from: ME.username });
+    stored(state, 'k', '<note@x>', 'INBOX', ME.username, 1);
+    const [copy] = await folder(state, 'Sent Messages');
+    // The copy is not the record's message: no key, no judgement.
+    expect(copy).not.toHaveProperty('key');
+    expect(await call(state, '/api/action', { method: 'POST', body: { key: copy!['handle'], action: 'trash' } })).toMatchObject({ ok: true });
+    expect(state.getMail('k')).toMatchObject({ folder: 'INBOX', handledAt: null });
+    expect(state.placeOf('k')).toEqual({ uid: 1, uidValidity: '1' });
+    // By its key, the record's own message is the one archived; the binned copy stays binned.
+    expect(await call(state, '/api/action', { method: 'POST', body: { key: 'k', action: 'archive' } })).toMatchObject({ ok: true });
+    expect(where()).toEqual([`Archive#1#${ME.username}`, `Deleted Messages#1#${ME.username}`]);
+  });
+
+  it('does not let a spoof in the same folder take the record over by being read or binned', async () => {
+    const state = store();
+    put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com' });
+    put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'attacker@evil.example' });
+    stored(state, 'k', '<q3@corp>', 'INBOX', 'boss@corp.com', 1);
+    const items = await folder(state, 'INBOX');
+    expect(items.map((item) => [item['uid'], item['key'] ?? null])).toEqual([[2, null], [1, 'k']]);
+    const spoof = items[0]!['handle'] as string;
+    // Read by a read session: the record still remembers its own message.
+    const read = await call(state, `/api/message?id=${encodeURIComponent(spoof)}&live=true`, { as: 'read' });
+    expect(read).toMatchObject({ stored: false, sender: 'attacker@evil.example' });
+    expect(read['importance']).toBeNull();
+    expect(state.placeOf('k')).toEqual({ uid: 1, uidValidity: '1' });
+    expect((await call(state, '/api/reply?key=k'))['to']).toEqual(['boss@corp.com']);
+    // Binned, and put in spam, as the owner would a spoof: the record is not touched, and its sender is not muted.
+    expect(await call(state, '/api/bulk', { method: 'POST', body: { items: [spoof], action: 'spam' } })).toMatchObject({ done: 1 });
+    expect(state.getMail('k')).toMatchObject({ folder: 'INBOX', handledAt: null });
+    expect(state.feedbackSummary()['spam']).toBeUndefined();
+    expect(state.feedbackRuleHints(1).neverImportant).toEqual([]);
+    expect((await call(state, '/api/reply?key=k'))['to']).toEqual(['boss@corp.com']);
+  });
+
+  it('never moves where a record says its message is because a read by its key found another with its Message-ID', async () => {
+    const state = store();
+    put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'attacker@evil.example' });
+    put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com' });
+    // No place known yet: the look-alike, older, is what the lookup finds first. It is not learnt as the record's place.
+    stored(state, 'k', '<q3@corp>', 'INBOX', 'boss@corp.com');
+    const read = async (on: StateStore): Promise<Record<string, unknown>> => { forgetLive(); return call(on, '/api/message?id=k&live=true'); };
+    expect(await read(state)).toMatchObject({ dedupKey: 'k', from: { address: 'attacker@evil.example' } });
+    expect(state.placeOf('k')).toBeUndefined();
+    // Known: the real one is moved away by another mail client, and the read finds the look-alike. The place stays.
+    state.rememberUid('k', 'INBOX', 2, '1');
+    fake.server.mail.set('INBOX', fake.server.mail.get('INBOX')!.filter((m) => m.uid !== 2));
+    expect(await read(state)).toMatchObject({ from: { address: 'attacker@evil.example' } });
+    expect(state.placeOf('k')).toEqual({ uid: 2, uidValidity: '1' });
+    // The record's own sender, where no place is known: learnt.
+    const other = store();
+    stored(other, 'k', '<q3@corp>', 'INBOX', 'attacker@evil.example');
+    await read(other);
+    expect(other.placeOf('k')).toEqual({ uid: 1, uidValidity: '1' });
+  });
+
+  it('matches a record with no remembered place by its folder and its sender as listed, and keeps its books only then', async () => {
+    const state = store();
+    put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'boss@corp.com' });
+    put('INBOX', 'Q3 numbers', { id: '<q3@corp>', from: 'attacker@evil.example' });
+    stored(state, 'k', '<q3@corp>', 'INBOX', 'boss@corp.com');
+    const items = await folder(state, 'INBOX');
+    expect(items.map((item) => [item['uid'], item['key'] ?? null])).toEqual([[2, null], [1, 'k']]);
+    expect(await call(state, '/api/action', { method: 'POST', body: { key: items[0]!['handle'], action: 'trash' } })).toMatchObject({ ok: true });
+    expect(state.getMail('k')?.handledAt).toBeNull();
+    // The real one, as listed: the record follows it and it is dealt with.
+    expect(await call(state, '/api/action', { method: 'POST', body: { key: items[1]!['handle'], action: 'archive' } })).toMatchObject({ ok: true, row: { dedupKey: 'k', folder: 'Archive' } });
+    expect(state.getMail('k')?.handledAt).not.toBeNull();
+  });
+
+  it('never takes a Message-ID a sender wrote as a handle, however it is spelled', async () => {
+    const state = store();
+    put('INBOX', 'contract', { id: '<contract@x>' });
+    // A handle as an older server spelled it, and one with a made-up signature: both are text a sender can write.
+    const parts = Buffer.from(JSON.stringify([1, ME.username, 'INBOX', '1', 1, '<contract@x>'])).toString('base64url');
+    const signedParts = Buffer.from(JSON.stringify([2, ME.username, 'INBOX', '1', 1, '<contract@x>'])).toString('base64url');
+    for (const forged of [`live:${parts}`, `live:${signedParts}.${'A'.repeat(22)}`]) {
+      put('Work', 'newsletter', { id: forged });
+      fake.server.folders.push({ path: 'Work' });
+      const [item] = await folder(state, 'Work');
+      expect(item!['messageId']).toBe(forged);
+      const answer = await call(state, '/api/bulk', { method: 'POST', body: { items: [item!['messageId']], action: 'trash' } });
+      expect(answer['results']).toEqual([expect.objectContaining({ status: 'failed', code: 'badHandle' })]);
+      expect(fake.server.mail.get('INBOX')).toHaveLength(1);
+      fake.server.mail.delete('Work');
+    }
+  });
+
+  it('files a message mailsift never stored where the owner moves it, so the poll does not take it for new mail', async () => {
+    const state = store();
+    put('Archive', 'old invoice', { id: '<old-invoice@vendor.example>' });
+    const [item] = await folder(state, 'Archive');
+    expect(await call(state, '/api/bulk', { method: 'POST', body: { items: [item!['handle']], action: 'spam' } })).toMatchObject({ done: 1 });
+    expect(fake.server.mail.get('Junk')?.map((m) => m.messageId)).toEqual(['<old-invoice@vendor.example>']);
+    expect(state.filedByOwner(`${ME.username}|<old-invoice@vendor.example>`)).toBe(true);
+    const poller = new Watcher({ accounts: [], rules: { alwaysImportant: [], neverImportant: [], keywords: [], context: '' } }, state, new RecordingSink());
+    const arriving = makeMessage({ account: ME.username, messageId: '<old-invoice@vendor.example>', folder: 'Junk', inSpam: true });
+    expect(poller.filterFresh([arriving])).toEqual([]);
+    // A message without a Message-ID is filed under the id the poller makes up for it where it landed.
+    put('Archive', 'no id', { id: null });
+    const [plain] = await folder(state, 'Archive');
+    expect(await call(state, '/api/action', { method: 'POST', body: { key: plain!['handle'], action: 'not_spam' } })).toMatchObject({ code: 'action_not_applicable' });
+    expect(await call(state, '/api/action', { method: 'POST', body: { key: plain!['handle'], action: 'inbox' } })).toMatchObject({ ok: true });
+    const landed = fake.server.mail.get('INBOX')!.find((m) => m.subject === 'no id')!;
+    const made = fallbackMessageId(ME.username, { date: landed.date.toISOString(), subject: 'no id', from: landed.from, uid: landed.uid });
+    expect(state.filedByOwner(`${ME.username}|${made}`)).toBe(true);
+  });
+});
+
+describe('the mailbox connection, shared fairly', () => {
+  const exactOf = (folder: string, uid: number, id: string) => ({ messageId: id, hint: { folder, uid, uidValidity: '1', exact: true } });
+
+  it('lets reading in between a long batch, which gives the connection up every few messages', async () => {
+    const targets = Array.from({ length: 24 }, (_, n) => { put('INBOX', `m${n}`); return exactOf('INBOX', n + 1, `<inbox-${n + 1}@x>`); });
+    fake.server.delay.fetchOne = 8;
+    fake.server.delay.move = 8;
+    const started = Date.now();
+    let batchDone = 0, readDone = 0;
+    const batch = applyMailActions(ME, targets, 'archive').then((outcomes) => { batchDone = Date.now() - started; return outcomes; });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await mailboxFolders(ME).then(() => { readDone = Date.now() - started; });
+    const outcomes = await batch;
+    expect(outcomes.every((outcome) => 'done' in outcome)).toBe(true);
+    expect(readDone).toBeLessThan(batchDone);
+    // Each message's envelope is fetched once, not again before it is moved.
+    expect(fake.server.calls.filter((call) => call.startsWith('fetchOne'))).toHaveLength(24);
+  });
+
+  it('runs a search on a connection of its own, and closes it when the search is given up on', async () => {
+    put('INBOX', 'invoice');
+    fake.server.delay.search = 400;
+    const stop = new AbortController();
+    const started = Date.now();
+    const search = searchMailbox(ME, { query: 'invoice', folder: 'INBOX', signal: stop.signal }).then(
+      () => 'finished', (error: unknown) => (error instanceof SearchCancelled ? `cancelled at ${Date.now() - started}` : `failed: ${String(error)}`),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    // Reading the mailbox does not wait for the search.
+    const read = await fetchReadableByMessageId(ME, '<inbox-1@x>', { folder: 'INBOX', uid: 1, uidValidity: '1' });
+    expect(read?.readable.subject).toBe('invoice');
+    expect(Date.now() - started).toBeLessThan(300);
+    stop.abort();
+    const said = await search;
+    expect(said).toMatch(/^cancelled at \d+$/);
+    expect(Number(said.split(' ').at(-1))).toBeLessThan(300);
+    expect(fake.server.connects).toBe(2);
+  });
+});
+
+describe('a search across folders, page after page', () => {
+  it('gives every hit once, when an archive\'s UIDs and dates run in different orders', async () => {
+    const day = (n: number): Date => new Date(Date.UTC(2026, 9, n));
+    for (const n of [1, 3, 5, 7]) put('INBOX', `invoice inbox ${n}`, { date: day(n) });
+    // Archived lately, written long ago: the higher the UID, the older.
+    for (const n of [8, 6, 4, 2]) put('Archive', `invoice archive ${n}`, { date: day(n) });
+    const seen: string[] = [];
+    let before: string | null = null;
+    for (let page = 0; page < 6; page += 1) {
+      const answer = await searchMailbox(ME, { query: 'invoice', limit: 2, before });
+      seen.push(...answer.items.map((item) => item.subject));
+      before = answer.next;
+      if (!before) break;
+    }
+    expect(seen.sort()).toEqual([
+      'invoice archive 2', 'invoice archive 4', 'invoice archive 6', 'invoice archive 8',
+      'invoice inbox 1', 'invoice inbox 3', 'invoice inbox 5', 'invoice inbox 7',
+    ]);
+  });
+});
+
+describe('folder counts, within their budget', () => {
+  it('asks for the counts of the folders shown first, wherever the server lists them', async () => {
+    fake.server.folders = [
+      ...Array.from({ length: 70 }, (_, n) => ({ path: `Label ${String(n).padStart(2, '0')}` })),
+      { path: 'INBOX' }, { path: 'Junk', specialUse: '\\Junk' },
+    ];
+    put('INBOX', 'one');
+    const folders = await mailboxFolders(ME, { counts: true });
+    expect(folders[0]).toMatchObject({ path: 'INBOX', messages: 1, unseen: 1 });
+    expect(folders[1]).toMatchObject({ path: 'Junk', messages: 0 });
   });
 });
