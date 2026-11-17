@@ -1912,7 +1912,7 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
       // What the page still has: emptied by forget(), as leaving a folder or a reload of the lists does.
       rowByKey: (key: string) => byKey.get(key), findItem: () => null, rowOfItem: () => null,
       pickedRows: () => Array.from(context['picked'] as Set<string>).map((key) => byKey.get(key)).filter(Boolean),
-      applyRow: () => undefined, liveData: new Map(), flagsByKey: new Map(), liveView: null, liveRows: new Map(), dropLive: () => undefined,
+      applyRow: () => undefined, liveData: new Map(), flagsByKey: new Map(), liveView: null, liveRows: new Map(), extraRows: new Map(), dropLive: () => undefined,
       attentionCount: 0, oweBack: () => undefined, pickChanged: () => undefined, renderPickBar: () => undefined, loadAttention: () => undefined,
       renderList: () => undefined, renderLede: () => undefined, renderBars: () => undefined, updateBadge: () => undefined,
       refresh: () => undefined, liveLoad: () => undefined, setTimeout: () => 0,
@@ -1922,7 +1922,7 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
     };
     const fns = lifted<{
       bulkAction: (action: string, extra?: Record<string, unknown>) => Promise<void>;
-    }>(['rowKey', 'mailRef', 'queueKey', 'bulkId', 'snoozeUndoTo', 'mutedLine', 'bulkAction', 'bulkUndo', 'undoBulkSnooze'], '{ bulkAction }', context);
+    }>(['rowKey', 'mailRef', 'queueKey', 'bulkId', 'snoozeUndoTo', 'mutedLine', 'liveShown', 'bulkAction', 'bulkUndo', 'undoBulkSnooze'], '{ bulkAction }', context);
     const forget = (): void => { byKey.clear(); (context['liveRows'] as Map<string, unknown>).clear(); };
     return { ...fns, context, posted, toasts, forget };
   }
@@ -2004,7 +2004,7 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
   it('gives the reader on a desk to the next message listed when the open one leaves the folder', () => {
     const opened: string[] = [];
     const context: Record<string, unknown> = {
-      liveView: { items: [{ dedupKey: 'a' }, { dedupKey: 'b' }, { dedupKey: 'c' }], total: 3 }, liveRows: new Map([['b', { dedupKey: 'b' }]]),
+      liveView: { items: [{ dedupKey: 'a' }, { dedupKey: 'b' }, { dedupKey: 'c' }], total: 3 }, liveRows: new Map([['b', { dedupKey: 'b' }]]), extraRows: new Map(),
       visibleKeys: () => ['a', 'b', 'c'], isWide: () => true, selectedKey: 'b', findItem: (key: string) => key !== 'b',
       openDetail: (key: string) => opened.push(key), clearSelection: () => opened.push('cleared'), renderLiveHead: () => undefined,
     };
@@ -2120,7 +2120,7 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
     // A gutter on the left of the whole column, as on a desk: the box sits in it, outside the row (3-21px of an
     // 800px window), and the ring keeps its place in the row (38px), clear of the box and of the 10px around it
     // a click still takes. The groups no longer clip the box; the column clips instead.
-    expect(rules).toContain('main.app-main{padding-left:24px;overflow-x:clip}');
+    expect(rules).toContain('main.app-main{padding-left:24px;padding-right:24px;overflow-x:clip}');
     expect(rules).toContain('ul.group{overflow-x:visible}');
     expect(rules).toContain('.pick-box{left:-21px;top:15px}');
     expect(rules).toContain('.row:hover .pick-box{display:grid}');
@@ -2241,6 +2241,91 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
     expect(clientScript()).toContain('const muted = mutedLine(r.data.muted);\n  toast(muted ? said + DOT + muted : said);');
   });
 
+  /** liveLoad, with the page around it stood in for: the open message, what the list read again holds, what the reader did. */
+  function livePage(open: string, onFirstPage: string[]) {
+    const did: string[] = [];
+    const rowOf = (key: string) => ({ dedupKey: key, handle: key, live: true, folder: 'INBOX', flags: {} });
+    const listed = ['live:h48', 'live:h49', 'live:h50', 'live:h69', 'live:h70', 'live:h71'];
+    const context: Record<string, unknown> = {
+      liveView: { mode: 'folder', account: 'me@qq.com', folder: 'INBOX', items: listed.map(rowOf), next: 'x', loading: false },
+      liveSeq: 0, liveAbort: null, window: {}, URLSearchParams, LIVE_PAGE: 50, location: { reload: () => did.push('reload') },
+      liveRows: new Map(listed.map((key) => [key, rowOf(key)])), extraRows: new Map(), flagsByKey: new Map(),
+      fetch: async () => ({ ok: true, status: 200, json: async () => ({ items: onFirstPage.map((key) => ({ key })), next: null, total: 99 }) }),
+      liveRow: (item: { key: string }) => rowOf(item.key), tabId: () => 'tab', holdPending: () => undefined, holdSnoozes: () => undefined,
+      renderList: () => undefined, renderLiveHead: () => undefined, renderPane: () => did.push('pane'), renderBars: () => did.push('bars'),
+      visibleKeys: () => listed, isWide: () => true, selectedKey: open, openKey: null,
+      openDetail: (key: string) => did.push(`open ${key}`), clearSelection: () => did.push('cleared'),
+    };
+    context['findItem'] = (key: string) => (context['liveRows'] as Map<string, unknown>).get(key) ?? (context['extraRows'] as Map<string, unknown>).get(key) ?? null;
+    const load = lifted<(reset: boolean, gone?: Set<string>) => Promise<void>>(['rowKey', 'moveOnFrom', 'liveLoad'], 'liveLoad', context);
+    return { load, context, did };
+  }
+
+  it('keeps the message open on a desk when the list is read again from the top without it', async () => {
+    // Open: the 70th message. The refresh, the same search again, a page read again: page 1 has 50, and not it.
+    const page = livePage('live:h70', ['live:h48', 'live:h49', 'live:h50']);
+    await page.load(true);
+    expect(page.context['selectedKey']).toBe('live:h70');
+    expect(page.did.filter((what) => what.startsWith('open') || what === 'cleared')).toEqual([]);
+    // Still found, so the reader and its bar stay.
+    expect((page.context['findItem'] as (key: string) => unknown)('live:h70')).toMatchObject({ dedupKey: 'live:h70' });
+    expect(page.did).toContain('bars');
+  });
+
+  it('moves a desk reader on only when the owner\'s own batch took the open message out', async () => {
+    const page = livePage('live:h49', ['live:h48', 'live:h50']);
+    await page.load(true, new Set(['live:h49']));
+    expect(page.did).toContain('open live:h50');
+    expect((page.context['extraRows'] as Map<string, unknown>).has('live:h49')).toBe(false);
+    // The batch named it, but it is still listed (the move did not happen): it stays open.
+    const still = livePage('live:h49', ['live:h48', 'live:h49', 'live:h50']);
+    await still.load(true, new Set(['live:h49']));
+    expect(still.did.filter((what) => what.startsWith('open'))).toEqual([]);
+  });
+
+  it('lets the open message held over a reload go when the owner moves it, and puts the reader down rather than pick another', () => {
+    const did: string[] = [];
+    const held = { dedupKey: 'live:h70', live: true };
+    const context: Record<string, unknown> = {
+      liveView: { items: [{ dedupKey: 'live:h1' }], total: 99 }, liveRows: new Map([['live:h1', { dedupKey: 'live:h1' }]]),
+      extraRows: new Map([['live:h70', held]]), visibleKeys: () => ['live:h1'], isWide: () => true, selectedKey: 'live:h70',
+      renderLiveHead: () => undefined, openDetail: (key: string) => did.push(`open ${key}`), clearSelection: () => did.push('cleared'),
+    };
+    context['findItem'] = (key: string) => (context['liveRows'] as Map<string, unknown>).get(key) ?? (context['extraRows'] as Map<string, unknown>).get(key) ?? null;
+    const shown = lifted<(key: string) => unknown>(['liveShown'], 'liveShown', context);
+    expect(shown('live:h70')).toBe(held);
+    const drop = lifted<(keys: string[]) => void>(['rowKey', 'moveOnFrom', 'dropLive'], 'dropLive', context);
+    drop(['live:h70']);
+    expect((context['extraRows'] as Map<string, unknown>).has('live:h70')).toBe(false);
+    expect(did).toEqual(['cleared']);
+  });
+
+  it('puts the open message down when the server says it is no longer where the folder listed it, rather than open another', () => {
+    const did: string[] = [];
+    const context: Record<string, unknown> = {
+      liveRows: new Map([['live:a', {}], ['live:b', {}]]), extraRows: new Map(), selectedKey: 'live:a', openKey: null,
+      sheet: { open: false }, closeSheet: () => did.push('closed'), clearSelection: () => did.push('cleared'),
+      liveLoad: (reset: boolean) => did.push(`load ${reset}`), openDetail: (key: string) => did.push(`open ${key}`),
+    };
+    const forget = lifted<(key: string) => void>(['forgetStale'], 'forgetStale', context);
+    forget('live:a');
+    expect(did).toEqual(['cleared', 'load true']);
+    expect((context['liveRows'] as Map<string, unknown>).has('live:a')).toBe(false);
+    expect(clientScript()).toContain("if (r.data && r.data.code === 'liveStale' && liveView) forgetStale(key);");
+  });
+
+  it('lines the narrow mouse layout up with its header, centred, and covers the gutter beside the selection bar', () => {
+    const css = styles();
+    const narrowMouse = css.slice(css.indexOf('@media(max-width:899px) and (hover:hover) and (pointer:fine){'));
+    const rules = narrowMouse.slice(0, narrowMouse.indexOf('\n}') + 2);
+    // The header moves with the column (16px + 24px on the left, 12px + 24px on the right), and the column is inset on both sides.
+    expect(rules).toContain('header.app-header{padding-left:40px;padding-right:36px}');
+    expect(rules).toContain('main.app-main{padding-left:24px;padding-right:24px;overflow-x:clip}');
+    // The bar covers the gutter beside it, painted and taking the click, in every layout with one.
+    expect(css).toContain('body.picking .controls::before{content:"";position:absolute;top:0;bottom:0;right:100%;width:24px;background:var(--bg)}');
+    expect(css).not.toContain('box-shadow:-24px 0 0 var(--bg)');
+  });
+
   it('moves a desk reader on when the list read again after a batch no longer has its message', () => {
     const opened: string[] = [];
     const context: Record<string, unknown> = {
@@ -2254,8 +2339,7 @@ describe('what a review of the whole-mailbox stage found, in the page', () => {
     moveOn(['a', 'b']);
     expect(opened).toEqual(['c', 'cleared']);
     const script = clientScript();
-    expect(script).toContain('if (reset) { listedBefore = visibleKeys(); liveRows.clear(); view.items = []; }');
-    expect(script).toContain('if (listedBefore) moveOnFrom(listedBefore);\n      renderPane();\n      renderBars();');
+    expect(script).toContain('if (listedBefore && out.size) moveOnFrom(listedBefore, out);\n      renderPane();\n      renderBars();');
   });
 });
 

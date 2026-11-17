@@ -874,8 +874,8 @@ async function mailAction(key, action, destination) {
   acting.delete(name);
   if (!r.ok) {
     toast(r.data && (r.data.code || r.data.error) ? failure(r.data) : t('act.failed'), true);
-    // Not where its folder listed it any more: the list is out of date, and is listed again.
-    if (r.data && r.data.code === 'liveStale' && liveView) liveLoad(true);
+    // Not where its folder listed it any more: put down, and the folder listed again (see forgetStale).
+    if (r.data && r.data.code === 'liveStale' && liveView) forgetStale(key);
     return;
   }
   applyRow(r.data.row);
@@ -885,7 +885,7 @@ async function mailAction(key, action, destination) {
   if (action === 'mark_read' || action === 'mark_unread') flags.seen = action === 'mark_read';
   flagsByKey.set(key, flags);
   // A row listed live shows its flags, and leaves the folder on show when it was moved out of it.
-  const shown = liveView && liveRows.get(key);
+  const shown = liveShown(key);
   if (shown) {
     shown.flags = Object.assign({}, shown.flags || {}, flags);
     if (r.data.moved && r.data.moved.folder !== listedIn) dropLive([key]);

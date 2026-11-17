@@ -40,7 +40,7 @@ import { routeWeb, webUiEnabled } from './web.js';
 import {
   actOnMail, asWriteSession, awaitEarlierSend, configuredAccounts, defaultBackend, earlierSend, forwardDraft, letterText,
   liveRead, markHandled, rememberWhereabouts, replyDraft, requestTimeoutMs, resolveTarget, saveSignature, sendMessage,
-  SIGNATURE_MAX_CHARS, signatureOf, snoozeMail, webPushEnabled, type WebBackend,
+  SIGNATURE_MAX_CHARS, signatureOf, snoozeMail, webPushEnabled, whereabouts, type WebBackend,
 } from './web-actions.js';
 import { timedOut, within, type WebResponse } from './web-http.js';
 import { credentialMark, localHost, secretEquals } from './web-http.js';
@@ -573,12 +573,23 @@ export function createServer(
   /**
    * The mailbox and the place to look for an id given with an account, for the
    * tools that read a message by Message-ID: a handle is looked for exactly
-   * where it says, a Message-ID in the monitored folders as before.
+   * where it says. A Message-ID or key that names a stored record of that
+   * mailbox is looked for as that record is everywhere else (see
+   * whereabouts): at its remembered place, and anywhere else only from its
+   * sender, so a look-alike that borrowed its Message-ID is not read in its
+   * name. Only an id nothing is stored about is searched for as it is, in
+   * the monitored folders.
    */
   const lookupOf = (account: string, messageId: string): { messageId: string; hint?: MessageHint } => {
-    if (!handleShaped(messageId)) return { messageId };
-    const handle = parseLiveHandle(refOf(messageId, account))!;
-    return { messageId: handle.messageId, hint: exactHint(handle) };
+    if (handleShaped(messageId)) {
+      const handle = parseLiveHandle(refOf(messageId, account))!;
+      return { messageId: handle.messageId, hint: exactHint(handle) };
+    }
+    const mine = unambiguous(messageId).find((record) => record.account === account);
+    const row = mine ? store.getMail(mine.dedupKey) : undefined;
+    if (!row?.messageId) return { messageId };
+    const hint = whereabouts(store, row);
+    return { messageId: row.messageId, ...(hint ? { hint } : {}) };
   };
   /** A handle that no longer fits, said as the other tools say it. */
   const liveFailure = (error: unknown, what: string): McpToolError => {

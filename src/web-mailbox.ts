@@ -15,7 +15,9 @@
 import type { IncomingMessage } from 'node:http';
 import type { Account } from './config.js';
 import { LiveMailError, MAIL_ACTIONS, MailActionError, type BulkTarget, type WebMailAction } from './imap/client.js';
-import { SearchCancelled, SearchTimedOut, LIVE_PAGE_MAX, useHandleKey, type LiveItem } from './imap/mailbox.js';
+import {
+  firstKey, SearchCancelled, SearchTimedOut, LIVE_PAGE_MAX, useHandleKey, type FirstAsked, type FirstOf, type LiveItem,
+} from './imap/mailbox.js';
 import type { MailRow, StateStore } from './services/state.js';
 import { getLogger } from './logger.js';
 import {
@@ -49,7 +51,9 @@ function storedPart(row: MailRow): Record<string, unknown> {
  * its handle, and, when the same mailbox has a stored record with its
  * Message-ID, that record's key and how it was judged and dealt with.
  */
-export function withStored(items: LiveItem[], store: StateStore, ctx: ActionContext, account: string): Array<Record<string, unknown>> {
+export function withStored(
+  items: LiveItem[], store: StateStore, ctx: ActionContext, account: string, firstUids?: Record<string, number | null>,
+): Array<Record<string, unknown>> {
   let stored = new Map<string, MailRow>();
   try {
     stored = store.storedFor(account, items.map((item) => item.storedId));
@@ -60,8 +64,10 @@ export function withStored(items: LiveItem[], store: StateStore, ctx: ActionCont
     // Only the record's own message, at the record's own place: a copy or a spoof that shares its Message-ID is not it.
     let row: MailRow | undefined;
     try {
+      // A record with no place is tied only to its first message from its sender, as the mailbox said (see recordOf).
+      const first = firstUids?.[firstKey(item.folder, item.messageId, item.from.address)] ?? null;
       row = recordOf(store, account, {
-        id: item.storedId, folder: item.folder, uid: item.uid, uidValidity: item.uidValidity, sender: item.from.address,
+        id: item.storedId, folder: item.folder, uid: item.uid, uidValidity: item.uidValidity, sender: item.from.address, first,
       }, stored.get(item.storedId) ?? null);
     } catch {
       // As above: the list without what was judged.
@@ -80,6 +86,32 @@ export function withStored(items: LiveItem[], store: StateStore, ctx: ActionCont
       ...(row ? storedPart(row) : {}),
     };
   });
+}
+
+/**
+ * What a listing asks the mailbox under its lock (see FirstOf): for each
+ * listed message that could be a stored record with no remembered place
+ * there (its Message-ID, in the record's folder, from the record's sender),
+ * which message in the folder is that record's first.
+ */
+function firstOfFor(store: StateStore, account: string): FirstOf {
+  return (items) => {
+    const asked: FirstAsked[] = [];
+    try {
+      const stored = store.storedFor(account, items.map((item) => item.messageId));
+      for (const item of items) {
+        const row = item.messageId ? stored.get(item.messageId) : undefined;
+        if (!row || row.folder !== item.folder || !row.sender) continue;
+        if (item.from.address.toLowerCase() !== row.sender.toLowerCase()) continue;
+        const at = store.placeOf(row.dedupKey);
+        if (at && at.uidValidity === item.uidValidity) continue;
+        asked.push({ id: item.messageId, sender: row.sender.toLowerCase() });
+      }
+    } catch {
+      // Nothing asked: nothing tied that has no place.
+    }
+    return asked;
+  };
 }
 
 function accountNamed(address: string): Account | undefined {
@@ -130,13 +162,13 @@ export async function folderPage(
   const limit = limitOf(asked.limit);
   try {
     const page = await within(ctx.backend.browse(account, asked.folder, {
-      ...(asked.before ? { before: asked.before } : {}), ...(limit ? { limit } : {}),
+      ...(asked.before ? { before: asked.before } : {}), ...(limit ? { limit } : {}), firstOf: firstOfFor(store, account.username),
     }), BROWSE_TIMEOUT_MS);
     if (timedOut(page)) return json(504, { error: 'the mailbox did not list this folder in time', code: 'timeout' });
     if (ctx.origin !== 'mcp') store.recordMcpAudit('web:folder', ctx.client, true, `${account.username}|${asked.folder}`.slice(0, 500));
     return json(200, {
       account: account.username, folder: page.folder, total: page.total, next: page.next,
-      items: withStored(page.items, store, ctx, account.username),
+      items: withStored(page.items, store, ctx, account.username, page.firstUids),
     });
   } catch (error) {
     if (ctx.origin !== 'mcp') store.recordMcpAudit('web:folder', ctx.client, false, `${account.username}|${asked.folder}`.slice(0, 500));
@@ -186,7 +218,7 @@ export async function mailboxSearch(
   };
   try {
     const page = await within(ctx.backend.search(account, {
-      query, signal: controller.signal,
+      query, signal: controller.signal, firstOf: firstOfFor(store, account.username),
       ...(asked.folder ? { folder: asked.folder } : {}), ...(asked.before ? { before: asked.before } : {}), ...(limit ? { limit } : {}),
     }), SEARCH_TIMEOUT_MS);
     if (timedOut(page)) {
@@ -198,7 +230,7 @@ export async function mailboxSearch(
     return json(200, {
       account: account.username, query: page.query, folders: page.folders, total: page.total, next: page.next,
       ...(page.limited ? { limited: page.limited } : {}),
-      items: withStored(page.items, store, ctx, account.username),
+      items: withStored(page.items, store, ctx, account.username, page.firstUids),
     });
   } catch (error) {
     if (error instanceof SearchCancelled) return json(409, { error: 'a newer search took the place of this one', code: 'superseded' });

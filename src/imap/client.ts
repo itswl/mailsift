@@ -192,9 +192,29 @@ function exactlyIt(raw: FetchMessageObject | false | undefined, messageId: strin
   return Boolean(raw) && messageIdDigest((raw as FetchMessageObject).envelope?.messageId?.trim() ?? '') === hint.idDigest;
 }
 
-/** The message named, found at a handle's place (exactly it) or by its key (see matchesId). */
-function isTheMessage(account: Account, raw: FetchMessageObject | false | undefined, messageId: string, hint: MessageHint): raw is FetchMessageObject {
-  return hint.exact ? exactlyIt(raw, messageId, hint) : matchesId(account, raw, messageId);
+/**
+ * The message named, found at a handle's place (exactly it) or by its key
+ * (see matchesId). `remembered`: the UID the record remembers in the folder
+ * now selected (hintedUid), where a message stored without a Message-ID is
+ * known by its place (see ownWithoutId).
+ */
+function isTheMessage(
+  account: Account, raw: FetchMessageObject | false | undefined, messageId: string, hint: MessageHint, remembered: number | undefined,
+): raw is FetchMessageObject {
+  if (hint.exact) return exactlyIt(raw, messageId, hint);
+  if (!raw) return false;
+  const found: FetchMessageObject = raw;
+  return matchesId(account, found, messageId) || (found.uid === remembered && ownWithoutId(found, messageId, hint));
+}
+
+/**
+ * A message stored without a Message-ID, found at the record's remembered
+ * place: none there either, and from the record's sender. The id made up for
+ * it was made at the UID it had when it was stored; once mailsift has moved
+ * it, its place is what says it is the same message.
+ */
+function ownWithoutId(raw: FetchMessageObject, messageId: string, hint: MessageHint): boolean {
+  return GENERATED_ID.test(messageId) && Boolean(hint.sender) && !(raw.envelope?.messageId?.trim()) && fromSender(raw, hint);
 }
 
 /** A Message-ID the poller made up for a message without one (see fallbackMessageId): it names one UID in one folder. */
@@ -204,7 +224,7 @@ const GENERATED_ID = /^<generated-[0-9a-f]{32}@mailsift>$/;
  * Whether a fetched message is the one named: by its Message-ID, or, for a
  * message stored without one, by the id the poller made up for it there.
  */
-function matchesId(account: Account, raw: FetchMessageObject | false | undefined, messageId: string): raw is FetchMessageObject {
+function matchesId(account: Account, raw: FetchMessageObject | false | undefined, messageId: string): boolean {
   if (!raw) return false;
   const found: FetchMessageObject = raw;
   if ((found.envelope?.messageId?.trim() ?? '') === messageId) return true;
@@ -551,7 +571,7 @@ async function searchMessageUids(
   const remembered = folder ? hintedUid(client, folder, hint) : undefined;
   if (remembered !== undefined) {
     const one = await client.fetchOne(String(remembered), { uid: true, envelope: true }, { uid: true });
-    if (one && matchesId(account, one, messageId)) return [remembered];
+    if (one && (matchesId(account, one, messageId) || ownWithoutId(one, messageId, hint))) return [remembered];
   }
   // A made-up id names the one UID it was made for: no other message, here or anywhere, carries it.
   if (GENERATED_ID.test(messageId)) return [];
@@ -831,8 +851,9 @@ async function findLiveSource(
   const slim = options.oversize === 'slim';
   const hint = options.hint ?? {};
   // A live handle is told apart by the Message-ID as the server has it, which may be none.
-  const isIt = (raw: FetchMessageObject, message: MailMessage | undefined): boolean =>
-    hint.exact ? exactlyIt(raw, messageId, hint) : message?.messageId === messageId;
+  const isIt = (raw: FetchMessageObject, message: MailMessage | undefined, folder: LookupFolder): boolean =>
+    hint.exact ? exactlyIt(raw, messageId, hint)
+      : message?.messageId === messageId || (raw.uid === hintedUid(client, folder, hint) && ownWithoutId(raw, messageId, hint));
   // Not at the remembered place: from the record's sender too (see MessageHint.sender).
   const elsewhere = (folder: LookupFolder, uid: number): boolean => hintedUid(client, folder, hint) !== uid;
   for (const folder of folders) {
@@ -862,7 +883,7 @@ async function findLiveSource(
         const message = raw
           ? await toMailMessage(raw, account, folder, { body: '', hasAttachments: false }, uidValidity)
           : undefined;
-        if (raw && message && isIt(raw, message)) {
+        if (raw && message && isIt(raw, message, folder)) {
           // One byte more than the bite was asked for, so anything shorter is
           // the whole message. A longer one is read the way a search would
           // have had it read: whole when it fits, slim when it does not.
@@ -902,7 +923,7 @@ async function findLiveSource(
         const message = await toMailMessage(
           raw, account, folder, options.parseBody ? undefined : { body: '', hasAttachments: false }, uidValidity,
         );
-        if (!isIt(raw, message)) continue;
+        if (!isIt(raw, message, folder)) continue;
         if (!hint.exact && elsewhere(folder, raw.uid) && !fromSender(raw, hint)) continue;
         if (slim) raw.source = await readingSource(client, raw, maxSourceBytes);
         return { raw, folder, message, uidValidity };
@@ -1030,7 +1051,7 @@ export async function fetchAttachmentManifestByMessageId(
           { uid: true, envelope: true, bodyStructure: true },
           { uid: true },
         )) {
-          if (!isTheMessage(account, raw, messageId, hintOf(hint))) continue;
+          if (!isTheMessage(account, raw, messageId, hintOf(hint), hintedUid(client, folder, hintOf(hint)))) continue;
           return { folder: folder.path, manifest: extractAttachmentManifest(raw.bodyStructure) };
         }
       } finally {
@@ -1095,7 +1116,7 @@ export async function scanAttachmentByMessageId(
             { uid: true, envelope: true, bodyStructure: true },
             { uid: true },
           );
-          if (!isTheMessage(account, raw, messageId, hintOf(hint))) continue;
+          if (!isTheMessage(account, raw, messageId, hintOf(hint), hintedUid(client, folder, hintOf(hint)))) continue;
           const metadata = extractAttachmentManifest(raw.bodyStructure).items.find((part) => part.partId === partId);
           if (!metadata) throw new AttachmentNotFoundError(partId);
           const prefix = await downloadDecodedPrefix(client, uid, partId, maxBytes);
@@ -1140,7 +1161,7 @@ export async function inspectMailSafety(
             },
             { uid: true },
           );
-          if (!raw || !isTheMessage(account, raw, messageId, hintOf(hint))) continue;
+          if (!raw || !isTheMessage(account, raw, messageId, hintOf(hint), hintedUid(client, folder, hintOf(hint)))) continue;
 
           const values = parseHeaderValues(raw.headers);
           const listId = (values.get('list-id')?.length ?? 0) > 0;
@@ -1320,7 +1341,7 @@ export async function fetchAttachmentByMessageId(
             { uid: true, envelope: true, bodyStructure: true },
             { uid: true },
           );
-          if (!isTheMessage(account, raw, messageId, hintOf(hint))) continue;
+          if (!isTheMessage(account, raw, messageId, hintOf(hint), hintedUid(client, folder, hintOf(hint)))) continue;
           const metadata = extractAttachmentManifest(raw.bodyStructure).items.find((part) => part.partId === partId);
           if (!metadata) throw new AttachmentNotFoundError(partId);
           const download = await client.download(uid, partId, {
@@ -1390,7 +1411,7 @@ async function actOnMessage(
       if (!uids.length) continue;
       for (const uid of uids) {
         const raw = exact ?? await client.fetchOne(uid, { uid: true, envelope: true }, { uid: true });
-        if (!raw || !isTheMessage(account, raw, messageId, hint)) continue;
+        if (!raw || !isTheMessage(account, raw, messageId, hint, hintedUid(client, folder, hint))) continue;
         const source = { uid, uidValidity: selectedValidity(client), from: firstAddress(raw.envelope?.from).address };
         const change = action in FLAG_CHANGES ? FLAG_CHANGES[action as keyof typeof FLAG_CHANGES] : undefined;
         // "Not spam" is about a message in the spam folder; anywhere else it is not what was meant.
