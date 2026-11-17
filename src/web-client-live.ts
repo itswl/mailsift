@@ -706,9 +706,10 @@ function pageKeydown(e) {
     else if (e.key === 'a') { e.preventDefault(); startReply(key, 'replyAll'); }
     else if (e.key === 'f') { e.preventDefault(); startForward(key); }
     // Only where the reader offers them: no Archive in the archive or All Mail, no Bin in the bin.
-    else if (e.key === 'y') { e.preventDefault(); if (archivable(row)) mailAction(key, 'archive'); }
+    // Asked once the mailbox's folders are known: after a reload the page may not know yet which is the bin.
+    else if (e.key === 'y') { e.preventDefault(); withFolderRoles(row.account, () => { if (archivable(row)) mailAction(key, 'archive'); }); }
     else if (e.key === 's') { e.preventDefault(); mailAction(key, (flagsByKey.get(key) || {}).flagged ? 'unstar' : 'star'); }
-    else if (e.key === '#') { e.preventDefault(); if (binnable(row)) mailAction(key, 'trash'); }
+    else if (e.key === '#') { e.preventDefault(); withFolderRoles(row.account, () => { if (binnable(row)) mailAction(key, 'trash'); }); }
     else if (e.key === 'b' && !row.handledAt && markable) {
       // Under the reader's clock on a desk, under its "more" in the sheet, under the row itself in a narrow window.
       e.preventDefault();

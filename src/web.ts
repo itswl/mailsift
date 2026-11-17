@@ -731,11 +731,16 @@ export function renderLogin(lang: Language, error?: StringKey, nonce = '', upgra
       <p class="version">${escapeHtml(webVersion())}</p>
     </form>
     <script nonce="${nonce}">${storeLanguageScript()}
-    document.querySelector('#lang').onclick = () => { storeLanguage('${nextLanguage(lang)}'); location.replace('${upgrade ? '/signin' : '/'}'); };
     // Where this form was asked for (a shortcut, a shared link, a message named after #) is where signing in goes.
     var next = document.querySelector('input[name=next]');
     var here = location.pathname;
-    if (!next.value && here.indexOf('/auth') !== 0 && here.indexOf('/signin') !== 0) next.value = here + location.search + location.hash;</script>`, nonce);
+    if (!next.value && here.indexOf('/auth') !== 0 && here.indexOf('/signin') !== 0) next.value = here + location.search + location.hash;
+    // The switch loads this form again in the other language, where it was asked for. Not by reloading a
+    // refused sign-in (a POST to /auth): that goes to what it was asked for instead, so nothing is posted twice.
+    document.querySelector('#lang').onclick = () => {
+      storeLanguage('${nextLanguage(lang)}');
+      if (here.indexOf('/auth') === 0) location.replace(next.value || '/'); else location.reload();
+    };</script>`, nonce);
 }
 
 /**
@@ -1046,6 +1051,15 @@ const PUBLIC_ASSETS: Record<string, { body: string | Buffer; type: string; cache
   '/apple-touch-icon.png': { body: appleTouch180, type: 'image/png', cache: 'public, max-age=604800, immutable' },
   '/favicon.ico': { body: favicon64, type: 'image/png', cache: 'public, max-age=604800, immutable' },
 };
+
+/**
+ * Whether a path is one of the assets served to anyone, from memory (the
+ * icons, the worker, the manifest): what the page's own words need even when
+ * its budget is spent, such as the mark on the page that says it is.
+ */
+export function publicAsset(path: string): boolean {
+  return path === '/manifest.webmanifest' || Object.hasOwn(PUBLIC_ASSETS, path);
+}
 
 /** Six months. Long enough that a browser in regular use is never asked again. */
 const SESSION_MAX_AGE = 180 * 24 * 60 * 60;

@@ -468,7 +468,7 @@ $('#snooze-done').onclick = () => closePopover(snoozeSheet, false);
 $('#bulk-done').onclick = () => closePopover(bulkSheet, false);
 $('#keys-done').onclick = () => closeSheet(keysSheet, false);
 $('#menu-done').onclick = () => closeSheet(menuSheet, false);
-window.addEventListener('popstate', () => {
+function historyMoved() {
   // Close whatever is open above the entry we came back to.
   const depth = history.state && history.state.sheet ? history.state.depth || 1 : 0;
   while (sheetStack.length > depth) closeSheet(topSheet(), true);
@@ -486,11 +486,16 @@ window.addEventListener('popstate', () => {
     // onto a message: show it, on the entry we are already on.
     const key = keyFromHash(location.hash);
     if (key && key !== openKey) openFromLink(key, true);
+  } else if (topSheet() === sheet && history.state && history.state.sheet === 'sheet' && history.state.key && history.state.key !== openKey) {
+    // Back (or forward) onto another of the reader's own entries, as a link followed from inside it leaves:
+    // the reader shows the message that entry names.
+    openFromLink(history.state.key, true);
   }
   // The entry we came back to predates any filter changed while a sheet was
   // open. The form is the truth, so put it back on the address.
   syncUrl();
-});
+}
+window.addEventListener('popstate', historyMoved);
 // A message key from a #m= link. Keys are percent-encoded message ids, and a
 // link cut off mid-escape must not take the whole page down with it.
 function keyFromHash(hash) {
@@ -661,9 +666,18 @@ $('#filter-clear').onclick = () => { clearFilters(); setFilters({ view: 'mail' }
 let connectionProblem = !navigator.onLine;
 let lastFetchAt = null;
 let pollNarration = null, narrationTimer;
-function setNetworkIssue(active) {
+// busy: the server answered, that this device asks too often (429), which is not being offline.
+let serverBusy = false;
+// A request that was answered, but not with what was asked: busy when the server said this device asks too often.
+function answerFailed(r) {
+  const error = new Error('http ' + r.status);
+  error.busy = r.status === 429;
+  return error;
+}
+function setNetworkIssue(active, busy) {
   const banner = $('#network');
-  const text = active ? t(navigator.onLine ? 'network.unavailable' : 'network.offline') : '';
+  serverBusy = Boolean(active && busy && navigator.onLine);
+  const text = active ? t(serverBusy ? 'network.busy' : navigator.onLine ? 'network.unavailable' : 'network.offline') : '';
   // Spoken through the page's one live region: a region that appears with
   // its words already in place is not reliably announced.
   if (active && (!connectionProblem || $('#network-text').textContent !== text)) announce(text);
@@ -1064,7 +1078,7 @@ function statusLine() {
     // What is shown may be days old; an hour alone would read as today's.
     const today = new Date();
     const time = dayKey(lastFetchAt) === dayKey(today) ? hhmm(lastFetchAt) : dayLabel(lastFetchAt, today) + ' ' + hhmm(lastFetchAt);
-    return [fill('status.offline', { time }), true];
+    return [fill(serverBusy ? 'status.busy' : 'status.offline', { time }), true];
   }
   if (pollNarration) return [pollNarration.text, pollNarration.warn];
   const parts = [];

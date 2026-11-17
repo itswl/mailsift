@@ -229,6 +229,10 @@ describe('the web view on the same port', () => {
     const said = await last!.text();
     expect(last!.headers.get('content-type')).toContain('text/html');
     expect(said).toContain('This device asked too often just now');
+    // Its mark is not refused by the same spent budget.
+    const mark = await fetch(`${base}/icon-192.png?v=3`, { headers: from });
+    expect(mark.status).toBe(200);
+    expect(mark.headers.get('content-type')).toBe('image/png');
     const api = await fetch(`${base}/api/summary`, { headers: { ...from, cookie: `mailsift_session=${READ}` } });
     expect(await api.json()).toMatchObject({ code: 'rate_limited' });
   });
