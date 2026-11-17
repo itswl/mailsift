@@ -58,6 +58,8 @@ A sent message is stored locally, in the state database, like the snippets of th
 
 `SENT_LOOKBACK_DAYS` (default `30`, at most `365`, and never more than `STATE_RETENTION_DAYS`) is how far back the first look at a Sent folder reaches. `0` is no look back: only what is sent from then on is read, and nothing you answered before takes a message off the queue. That look reads the newest messages first, 500 at most, and spreads them over polls: each poll reads at most 50 sent messages per mailbox, new ones before the rest of the look back, on a budget of its own outside `MAX_MESSAGES_PER_POLL_TOTAL`. Of each message it reads the envelope, the References line and the first 64 KB, never a whole attachment. A mailbox without a Sent folder is normal, and one whose Sent folder cannot be read is logged and read again on the next poll; neither makes the mailbox look unhealthy.
 
+A letter sent from mailsift is stored the moment it leaves, and its copy in Sent is the same letter: Outlook and QQ give a letter sent through them a Message-ID of their own, which is the one its recipients see and answer, so the copy is matched to the letter by mailbox, subject and recipients within a quarter of an hour and the letter is kept once, under the provider's id.
+
 `SENT_MAIL_ENABLED=false` stops reading Sent and stops storing what is sent from mailsift. What was stored before stays, and still shows in its conversations, until retention removes it; delete the rows from the `sent_mail` table to remove it sooner.
 
 ## Outputs

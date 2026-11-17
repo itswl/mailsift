@@ -476,6 +476,12 @@ const OWN_COPY = 'EXISTS (SELECT 1 FROM sent_mail o WHERE o.account = seen.accou
 /** Han, kana and hangul: a name in these is matched anywhere in it, not by its words. */
 const CJK = /[぀-ヿ㐀-鿿豈-﫿가-힯]/;
 
+/** The addresses a letter went to (To and Cc; Bcc is not on every copy), as one comparable string. */
+function addressSet(recipients: string): string {
+  const all = sentAddresses(recipients);
+  return [...new Set([...all.to, ...all.cc].map((r) => r.address.trim().toLowerCase()))].sort().join(',');
+}
+
 function sentAddresses(value: unknown): { to: SentAddress[]; cc: SentAddress[]; bcc: SentAddress[] } {
   const out = { to: [] as SentAddress[], cc: [] as SentAddress[], bcc: [] as SentAddress[] };
   let list: unknown;
@@ -682,6 +688,10 @@ function toPushSubscription(raw: Record<string, unknown>): PushSubscriptionRow {
 const LOCAL_LABEL_MIGRATION_KEY = 'migrated_local_labels';
 /** Set once the owner's earlier decisions have been read from the audit into seen.kept_at. */
 const KEPT_BACKFILL_KEY = 'migrated_kept_at';
+/** Set once the letters stored twice before twins were recognised (see mergeStoredTwins) have been made one. */
+const SENT_TWINS_KEY = 'merged_sent_twins';
+/** How far apart a letter as stored when it left and its copy in Sent may be dated and still be one letter. */
+const SENT_TWIN_WINDOW_MS = 15 * 60_000;
 
 export class StateStore {
   private readonly db: DatabaseSync;
@@ -766,6 +776,11 @@ export class StateStore {
     // first look back reads a month) never overrides it.
     if (this.getMeta(KEPT_BACKFILL_KEY) === undefined && this.casMeta(KEPT_BACKFILL_KEY, undefined, now())) {
       this.backfillKeptAt();
+    }
+    // Letters stored twice by 0.1.122 to 0.1.126, once as they left and once from Sent under the id the
+    // provider gave them: made one, once.
+    if (this.getMeta(SENT_TWINS_KEY) === undefined && this.casMeta(SENT_TWINS_KEY, undefined, now())) {
+      this.mergeStoredTwins();
     }
     if (this.getMeta(ATTENTION_SINCE_KEY) === undefined) {
       this.db.prepare('INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)').run(ATTENTION_SINCE_KEY, now());
@@ -2136,6 +2151,21 @@ export class StateStore {
     const find = (): Record<string, unknown> | undefined => this.db.prepare('SELECT id FROM sent_mail WHERE account = ? AND message_id = ?')
       .get(record.account, record.messageId) as Record<string, unknown> | undefined;
     let existing = find();
+    // The copy in Sent of a letter stored as it left, under another Message-ID: Outlook and QQ give a letter
+    // sent through them an id of their own, and that is the one its recipients see and answer. One row, under it.
+    if (!existing && fromPoll) {
+      const twin = this.sentTwinOf(record, recipients);
+      if (twin !== undefined) {
+        this.db.prepare(
+          `UPDATE sent_mail SET message_id = ?, thread_key = ?, folder = ?, uid = ?, uid_validity = ? WHERE id = ?`,
+        ).run(
+          record.messageId.slice(0, 1000), record.threadKey.slice(0, 1400), record.folder ?? null,
+          known ? record.uid! : null, known ? record.uidValidity! : null, twin,
+        );
+        this.bumpMailRevision();
+        return { id: twin, inserted: false };
+      }
+    }
     if (!existing) {
       // OR IGNORE: the poll and a send from the page (two processes) can store the same letter at once.
       const result = this.db.prepare(
@@ -2380,6 +2410,56 @@ export class StateStore {
    * rather than put it back; counted all the same, it can only keep a reply
    * written before it from taking off a message the owner had just looked at.
    */
+  /**
+   * The letter, stored as it left (from the page or MCP) and not yet found in
+   * Sent, that a copy read from Sent is: the same mailbox, subject and
+   * recipients, dated within a quarter of an hour of it; of several, the
+   * nearest in time. Undefined when there is none.
+   */
+  private sentTwinOf(record: SentRecord, recipients: string): number | undefined {
+    if (!record.date || !Number.isFinite(Date.parse(record.date))) return undefined;
+    const at = Date.parse(record.date);
+    const from = new Date(at - SENT_TWIN_WINDOW_MS).toISOString();
+    const to = new Date(at + SENT_TWIN_WINDOW_MS).toISOString();
+    const rows = this.db.prepare(
+      `SELECT id, recipients, mail_date FROM sent_mail
+       WHERE account = ? AND source != 'poll' AND folder IS NULL AND subject = ? AND mail_date BETWEEN ? AND ?`,
+    ).all(record.account, record.subject.slice(0, 1000), from, to) as Array<Record<string, unknown>>;
+    const wanted = addressSet(recipients);
+    const same = rows.filter((row) => addressSet(String(row['recipients'] ?? '[]')) === wanted);
+    same.sort((a, b) => Math.abs(Date.parse(String(a['mail_date'])) - at) - Math.abs(Date.parse(String(b['mail_date'])) - at));
+    return same.length ? Number(same[0]!['id']) : undefined;
+  }
+
+  /**
+   * Letters stored twice before twins were recognised: once as they left,
+   * under the Message-ID mailsift gave them, and once from Sent, under the one
+   * the provider gave them. The copy from Sent is kept (its id is the one
+   * answers name, and it knows where the letter is), with what the first one
+   * had settled; the first goes.
+   */
+  private mergeStoredTwins(): void {
+    const polled = this.db.prepare(
+      `SELECT id, account, subject, recipients, mail_date FROM sent_mail WHERE source = 'poll' AND mail_date IS NOT NULL`,
+    ).all() as Array<Record<string, unknown>>;
+    for (const row of polled) {
+      const at = Date.parse(String(row['mail_date']));
+      if (!Number.isFinite(at)) continue;
+      const twins = (this.db.prepare(
+        `SELECT id, recipients, checked_at, answered_key FROM sent_mail
+         WHERE account = ? AND source != 'poll' AND folder IS NULL AND subject = ? AND mail_date BETWEEN ? AND ?`,
+      ).all(
+        String(row['account']), String(row['subject'] ?? ''), new Date(at - SENT_TWIN_WINDOW_MS).toISOString(), new Date(at + SENT_TWIN_WINDOW_MS).toISOString(),
+      ) as Array<Record<string, unknown>>).filter((twin) => addressSet(String(twin['recipients'] ?? '[]')) === addressSet(String(row['recipients'] ?? '[]')));
+      const twin = twins[0];
+      if (!twin) continue;
+      this.db.prepare(
+        `UPDATE sent_mail SET checked_at = COALESCE(checked_at, ?), answered_key = COALESCE(answered_key, ?) WHERE id = ?`,
+      ).run((twin['checked_at'] as string | null) ?? null, (twin['answered_key'] as string | null) ?? null, Number(row['id']));
+      this.db.prepare('DELETE FROM sent_mail WHERE id = ?').run(Number(twin['id']));
+    }
+  }
+
   private backfillKeptAt(): void {
     this.db.prepare(
       `UPDATE seen SET kept_at = decided.at FROM (
