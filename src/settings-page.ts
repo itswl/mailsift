@@ -54,6 +54,7 @@ const EN: Dict = {
   'common.off': 'Off',
   'common.error': 'Something went wrong.',
   'common.unsaved': 'You have unsaved changes.',
+  'common.switchLose': 'Changes not saved yet on this page will be lost. Switch the language anyway?',
   'secret.keep': 'Saved — type to replace',
   'banner.restarting': 'Applying changes — mailsift is restarting…',
   'banner.slow': 'mailsift has not come back yet. Check the service log.',
@@ -213,6 +214,7 @@ const ZH: Dict = {
   'common.off': '关',
   'common.error': '出了点问题。',
   'common.unsaved': '有未保存的修改。',
+  'common.switchLose': '本页还没保存的修改会丢失，仍要切换语言吗？',
   'secret.keep': '已保存，输入新值以替换',
   'banner.restarting': '正在应用修改，mailsift 正在重启…',
   'banner.slow': 'mailsift 还没有恢复，请查看服务日志。',
@@ -440,16 +442,12 @@ export function renderClaimPage(lang: Language, nonce: string, version: string):
     })();</script>`, nonce);
 }
 
-export function renderSettingsPage(lang: Language, nonce: string, version: string, mode: 'setup' | 'settings'): string {
+/** Everything on the page that depends on the language, for one language. */
+function locale(lang: Language): Record<string, unknown> {
   const d = dict(lang);
   const zh = lang === 'zh-CN';
-  const boot = {
-    mode,
-    lang,
-    nextLang: zh ? 'en' : 'zh-CN',
-    version,
+  return {
     strings: d,
-    minPassword: ADMIN_PASSWORD_MIN,
     sections: SETTINGS_SECTIONS.map((id) => ({ id, title: words(SECTION_TITLES[id], lang) })),
     oauthTitle: words(SECTION_TITLES.oauth, lang),
     fields: SETTING_FIELDS.map((field) => ({
@@ -469,23 +467,43 @@ export function renderSettingsPage(lang: Language, nonce: string, version: strin
     providers: (zh ? ZH_PROVIDER_ORDER : EN_PROVIDER_ORDER)
       .map((id) => [id, (PROVIDER_PRESETS as Record<string, { host?: string; port: number; auth: string }>)[id]!] as const)
       .map(([id, preset]) => ({
-      id,
-      label: (PROVIDER_LABELS[id] ?? [id, id])[zh ? 1 : 0],
-      oauth: preset.auth !== 'password',
-      host: preset.host ?? '',
-      port: preset.port,
-    })),
+        id,
+        label: (PROVIDER_LABELS[id] ?? [id, id])[zh ? 1 : 0],
+        oauth: preset.auth !== 'password',
+        host: preset.host ?? '',
+        port: preset.port,
+      })),
+  };
+}
+
+/**
+ * The settings page, with the current state and both languages in it: the
+ * page draws at once, without a round trip for its data, and the language
+ * switch rewords it in place. Over a slow link every request saved is felt.
+ */
+export function renderSettingsPage(
+  lang: Language, nonce: string, version: string, mode: 'setup' | 'settings', state: unknown, boot: string,
+): string {
+  const d = dict(lang);
+  const bootData = {
+    mode,
+    lang,
+    version,
+    minPassword: ADMIN_PASSWORD_MIN,
+    state,
+    boot,
+    locales: { en: locale('en'), 'zh-CN': locale('zh-CN') },
   };
   const title = mode === 'setup' ? d['nav.setup']! : d['nav.settings']!;
   return shell(lang, title, `
     <header class="st-header">
       <div class="st-header-inner">
         <a class="brand" href="${mode === 'setup' ? '/setup' : '/'}"><img class="brand-mark" src="/icon-192.png?v=3" alt="" aria-hidden="true"><strong>mailsift</strong></a>
-        <span class="st-crumb">${escapeHtml(title)}</span>
+        <span class="st-crumb" id="crumb">${escapeHtml(title)}</span>
         <div class="st-header-actions">
-          ${mode === 'settings' ? `<a class="word-btn" href="/">${escapeHtml(d['nav.back']!)}</a>` : ''}
+          ${mode === 'settings' ? `<a class="word-btn" href="/" id="back">${escapeHtml(d['nav.back']!)}</a>` : ''}
           <button type="button" class="word-btn" id="lang">${escapeHtml(d['lang.face']!)}</button>
-          <button type="button" class="word-btn" id="signout">${escapeHtml(d['nav.signout']!)}</button>
+          <form method="post" action="/auth/signout" class="st-signout"><button type="submit" class="word-btn" id="signout">${escapeHtml(d['nav.signout']!)}</button></form>
         </div>
       </div>
     </header>
@@ -494,7 +512,7 @@ export function renderSettingsPage(lang: Language, nonce: string, version: strin
     <p class="version st-version">mailsift ${escapeHtml(version)}</p>
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
     <dialog class="st-dialog" id="dialog"></dialog>
-    <script type="application/json" id="boot">${embedJson(boot)}</script>
+    <script type="application/json" id="boot">${embedJson(bootData)}</script>
     <script nonce="${nonce}">${storeLanguageScript()}\n${SETTINGS_SCRIPT}</script>`, nonce);
 }
 
@@ -506,6 +524,7 @@ body{min-height:100vh}
 .st-crumb{color:var(--muted);font-size:14px;padding-left:12px;border-left:1px solid var(--line)}
 .st-header-actions{margin-left:auto;display:flex;align-items:center;gap:2px}
 .st-header-actions .word-btn{text-decoration:none;display:inline-grid}
+.st-signout{margin:0;display:contents}
 .st-banner{width:min(1080px,calc(100% - 32px));margin:12px auto 0;padding:10px 14px;border-radius:10px;background:var(--accent-tint);color:var(--text);font-size:14px}
 .st-banner.warn{background:color-mix(in srgb,var(--warning) 16%,var(--surface))}
 .st-banner.ok{background:var(--ok-tint)}
@@ -631,11 +650,27 @@ const SETTINGS_SCRIPT = String.raw`
 (function () {
 'use strict';
 var BOOT = JSON.parse(document.getElementById('boot').textContent);
-var S = BOOT.strings;
 var app = document.getElementById('app');
-var state = null;
-var bootId = null;
+var lang = BOOT.lang;
+var S = null;
+var state = BOOT.state;
+var bootId = BOOT.boot;
 var forms = {};
+// Opened from the mail view's gear: going back returns to it as it was left.
+var cameFromMail = new URLSearchParams(location.search).has('back');
+
+/** Use one language's words; both are in the page, so switching needs no reload. */
+function applyLocale(next) {
+  lang = next;
+  var loc = BOOT.locales[lang];
+  S = loc.strings;
+  BOOT.fields = loc.fields;
+  BOOT.sections = loc.sections;
+  BOOT.providers = loc.providers;
+  BOOT.oauthTitle = loc.oauthTitle;
+  BOOT.nextLang = lang === 'zh-CN' ? 'en' : 'zh-CN';
+}
+applyLocale(lang);
 
 function t(key, vars) {
   var text = S[key] || key;
@@ -1425,6 +1460,16 @@ function renderSettings() {
 
 function watchNav(nav) {
   var links = Array.prototype.slice.call(nav.querySelectorAll('a'));
+  // Jumping between sections replaces the address rather than adding to history, so "Back to mail" is one step.
+  links.forEach(function (link) {
+    link.addEventListener('click', function (event) {
+      var target = document.getElementById(link.getAttribute('href').slice(1));
+      if (!target) return;
+      event.preventDefault();
+      target.scrollIntoView();
+      history.replaceState(null, '', link.getAttribute('href'));
+    });
+  });
   function mark() {
     var current = links[0];
     links.forEach(function (link) {
@@ -1530,11 +1575,30 @@ function renderSetup() {
 // Start
 // ---------------------------------------------------------------------------
 
-async function load() {
-  state = await api('/api/admin/state');
+function render() {
   if (BOOT.mode === 'setup') renderSetup(); else renderSettings();
   app.setAttribute('aria-busy', 'false');
+}
+
+async function load() {
+  state = await api('/api/admin/state');
+  render();
   updateIdleBanner();
+}
+
+function dirtyForms() {
+  return Object.keys(forms).some(function (id) { return id !== 'mb-oauth' && Object.keys(changes(forms[id])).length > 0; });
+}
+
+function relabelHeader() {
+  var title = t(BOOT.mode === 'setup' ? 'nav.setup' : 'nav.settings');
+  document.documentElement.lang = lang;
+  document.title = title + ' · mailsift';
+  document.getElementById('crumb').textContent = title;
+  var back = document.getElementById('back');
+  if (back) back.textContent = t('nav.back');
+  document.getElementById('lang').textContent = t('lang.face');
+  document.getElementById('signout').textContent = t('nav.signout');
 }
 
 function handleReturn() {
@@ -1552,21 +1616,31 @@ function handleReturn() {
   }
 }
 
-document.getElementById('lang').onclick = function () { storeLanguage(BOOT.nextLang); location.reload(); };
-document.getElementById('signout').onclick = async function () {
-  try { await fetch('/auth/signout', { method: 'POST', credentials: 'same-origin' }); } catch (e) { /* signed out locally anyway */ }
-  location.replace('/signin');
+document.getElementById('lang').onclick = function () {
+  if (dirtyForms() && !confirm(t('common.switchLose'))) return;
+  var dialog = document.getElementById('dialog');
+  if (dialog.open) dialog.close();
+  storeLanguage(BOOT.nextLang);
+  applyLocale(BOOT.nextLang);
+  relabelHeader();
+  render();
+  if (!waiting) updateIdleBanner();
+};
+var backLink = document.getElementById('back');
+if (backLink) backLink.onclick = function (event) {
+  if (cameFromMail && history.length > 1) { event.preventDefault(); history.back(); }
 };
 window.addEventListener('beforeunload', function (event) {
-  var dirty = Object.keys(forms).some(function (id) { return forms[id].saveButton && !forms[id].saveButton.disabled && id !== 'mb-oauth' && BOOT.mode === 'settings'; });
-  if (dirty) { event.preventDefault(); event.returnValue = ''; }
+  if (dirtyForms()) { event.preventDefault(); event.returnValue = ''; }
 });
 
 if (BOOT.mode === 'setup') {
   var match = /^#step-([1-4])$/.exec(location.hash);
   if (match) step = Number(match[1]);
 }
-health().then(function (report) { if (report) bootId = report.boot; });
-load().then(handleReturn).catch(function (error) { banner(error.message, 'warn'); });
+render();
+updateIdleBanner();
+handleReturn();
+if (cameFromMail && !location.search.includes('oauth=')) history.replaceState(null, '', location.pathname + location.hash);
 })();
 `;

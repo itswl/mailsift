@@ -742,6 +742,7 @@ export function renderLogin(lang: Language, error?: StringKey, nonce = '', upgra
     <script nonce="${nonce}">${storeLanguageScript()}
     // Where this form was asked for (a shortcut, a shared link, a message named after #) is where signing in goes.
     var next = document.querySelector('input[name=next]');
+    if (location.pathname === '/auth/signout') history.replaceState(null, '', '/signin');
     var here = location.pathname;
     if (!next.value && here.indexOf('/auth') !== 0 && here.indexOf('/signin') !== 0) next.value = here + location.search + location.hash;
     // The switch loads this form again in the other language, where it was asked for. Not by reloading a
@@ -789,7 +790,7 @@ const ICONS: Record<string, string> = {
   sparkle: '<path d="M11 4l1.7 4.3L17 10l-4.3 1.7L11 16l-1.7-4.3L5 10l4.3-1.7z"/><path d="M18 14.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/>',
   send: '<path d="M20 4L4 11l6 2.5L12.5 20z"/><path d="M10 13.5L20 4"/>',
   bell: '<path d="M6 17v-6a6 6 0 1 1 12 0v6l1.5 1.5h-15z"/><path d="M10 21a2 2 0 0 0 4 0"/>',
-  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.8 3.1-.2-.1a1.8 1.8 0 0 0-1.9.1 1.8 1.8 0 0 0-.9 1.6v.2h-3.6v-.2a1.8 1.8 0 0 0-1-1.6 1.8 1.8 0 0 0-1.9-.1l-.2.1-1.8-3.1.1-.1a1.7 1.7 0 0 0 .3-1.9 1.8 1.8 0 0 0-1.6-1H5v-3.6h.3a1.8 1.8 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 1.8-3.1.2.1a1.8 1.8 0 0 0 1.9-.1 1.8 1.8 0 0 0 .9-1.6V2.5h3.6v.2a1.8 1.8 0 0 0 1 1.6 1.8 1.8 0 0 0 1.9.1l.2-.1 1.8 3.1-.1.1a1.7 1.7 0 0 0-.3 1.9 1.8 1.8 0 0 0 1.6 1h.3V14h-.3a1.8 1.8 0 0 0-1.6 1z" transform="translate(0 1) scale(.94)"/>',
+  settings: '<path d="M4 7h9.5"/><path d="M18.5 7H20"/><circle cx="16" cy="7" r="2.5"/><path d="M4 17h1.5"/><path d="M10.5 17H20"/><circle cx="8" cy="17" r="2.5"/>',
   clip: '<path d="M15.5 7.5l-7 7a2 2 0 0 0 2.8 2.8l7.4-7.4a4 4 0 0 0-5.6-5.6L5.6 11.8a6 6 0 0 0 8.5 8.5l6-6"/>',
   shield: '<path d="M12 3.5l7 2.5v5.5c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6z"/><path d="M9 12l2.2 2.2 4-4.2"/>',
   alert: '<path d="M12 4l9 15.5H3z"/><path d="M12 10v4"/><path d="M12 17h.01"/>',
@@ -850,7 +851,7 @@ export function renderApp(lang: Language, canRefresh = false, nonce = '', settin
         <div class="brand"><img class="brand-mark" src="/icon-192.png?v=3" alt="" aria-hidden="true"><strong>mailsift</strong></div>
         <div class="header-actions">
           ${refresh}
-          ${settingsLink ? `<a href="/settings" class="icon-btn" aria-label="${s('settings.title')}" title="${s('settings.title')}" data-i18n-label="settings.title" data-i18n-title="settings.title">${icon('settings')}</a>` : ''}
+          ${settingsLink ? `<a href="/settings?back=1" class="icon-btn" aria-label="${s('settings.title')}" title="${s('settings.title')}" data-i18n-label="settings.title" data-i18n-title="settings.title">${icon('settings')}</a>` : ''}
           ${iconButton('compose-open', 'compose', 'compose.new', 'aria-haspopup="dialog" aria-controls="compose"')}
           ${iconButton('bell', 'bell', 'notify.title', 'aria-haspopup="dialog" aria-controls="notify-sheet" aria-expanded="false"')}
           <button id="lang" type="button" class="word-btn" aria-label="${s('lang.label')}">${s('lang.face')}</button>
@@ -1299,10 +1300,15 @@ async function route(
     if (crossSite(req)) return json(403, { error: 'cross-site request refused', code: 'crossSite' });
     const admin = options.adminAuth ? readCookie(req.headers.cookie, ADMIN_COOKIE_NAME) : '';
     if (admin) endAdminSession(admin);
-    return {
-      ...json(200, { signedOut: true }), cookie: sessionCookie(req, '', 0), cacheControl: 'no-store',
+    const cleared = {
+      cookie: sessionCookie(req, '', 0), cacheControl: 'no-store',
       ...(options.adminAuth ? { extraCookies: [adminCookie(req, '', 0)] } : {}),
     };
+    // A form's sign-out (the settings pages) is answered with the sign-in form itself: one round trip, not two.
+    if (String(req.headers['sec-fetch-mode'] ?? '') === 'navigate' || String(req.headers.accept ?? '').includes('text/html')) {
+      return { ...html(200, renderLogin(lang, undefined, nonce)), ...cleared };
+    }
+    return { ...json(200, { signedOut: true }), ...cleared };
   }
 
   // A browser signed in with the administrator password may do everything a

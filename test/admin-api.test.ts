@@ -120,10 +120,25 @@ describe('the settings API', { timeout: 30_000 }, () => {
     cookie = '';
     const page = await call('/', { headers: { cookie: 'mailsift_session=write-token' } });
     expect(page.answer.status).toBe(200);
-    expect(String(page.answer.body)).toContain('href="/settings"');
+    expect(String(page.answer.body)).toContain('href="/settings?back=1"');
     const settings = await call('/settings', { headers: { cookie: 'mailsift_session=write-token' } });
     expect(settings.answer.status).toBe(303);
     expect(settings.answer.headers?.['location']).toBe('/signin?next=%2Fsettings');
+  });
+
+  it('draws Settings from the page itself, in both languages, and signs out in one trip', async () => {
+    setServerMode('setup');
+    await claim();
+    const page = String((await call('/setup')).answer.body);
+    const boot = JSON.parse(/<script type="application\/json" id="boot">([^<]*)<\/script>/.exec(page)![1]!) as Record<string, any>;
+    expect(boot['state']['setupComplete']).toBe(false);
+    expect(Object.keys(boot['locales'])).toEqual(['en', 'zh-CN']);
+    expect(boot['locales']['zh-CN']['strings']['mb.title']).toBe('邮箱');
+    const out = await call('/auth/signout', { method: 'POST', headers: { 'sec-fetch-mode': 'navigate', accept: 'text/html' } });
+    expect(out.answer.status).toBe(200);
+    expect(String(out.answer.body)).toContain('action="/auth"');
+    expect(out.answer.extraCookies?.[0]).toMatch(/^mailsift_admin=; .*Max-Age=0/);
+    expect((await call('/api/admin/state')).answer.status).toBe(401);
   });
 
   it('signs in at the ordinary form with the administrator password', async () => {
