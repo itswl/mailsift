@@ -32,7 +32,7 @@ Settings → Mailboxes lists the mailboxes, each marked Ready, Off, Needs sign-i
 
 ## Forwarding between mailboxes
 
-Forwarding meets mailsift in two ways: as a way round OAuth for Gmail, and as the reason one message can arrive twice. A longer version in Chinese, written for 0.1.x but otherwise current, is [Discussion #47](../../../discussions/47).
+Forwarding meets mailsift in two ways: as a way round OAuth for Gmail, and as the reason one message can arrive twice. The same, with room for questions, is the discussion [Mail forwarding](../../../discussions/100).
 
 ### Forwarding Gmail instead of signing in
 

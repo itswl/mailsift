@@ -161,7 +161,7 @@ Gmail and Outlook have switched off plain password sign-in to IMAP for most acco
 
 Enter the app under Settings → Mailboxes → **Gmail and Outlook sign-in**, or in the dialog when you add the first such mailbox; every mailbox of that provider then uses it. Two ways round it without an app at all are a personal Gmail account's app password (the **Gmail (app password)** preset, below) and forwarding Gmail into a mailbox that signs in with a password ([Forwarding between mailboxes](configuration.md#forwarding-between-mailboxes)).
 
-A longer walkthrough in Chinese is [Discussion #46](../../../discussions/46). It was written for 0.1.x: its `.env` lines and `npm run oauth` commands are replaced by Settings and the **Sign in** button, and the provider-side steps still apply.
+The same steps as a walkthrough, with room for questions, are in the discussion [Gmail / Outlook OAuth sign-in](../../../discussions/99).
 
 ### Google
 
