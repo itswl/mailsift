@@ -110,6 +110,11 @@ def convert(rel: Path, text: str, html_set: set[Path]) -> tuple[str, list[Path]]
         attr, target, anchor = m.group(1), m.group(2), m.group(3) or ""
         if target.startswith(("http://", "https://", "#", "mailto:")):
             return m.group(0)
+        # GitHub-relative links out of the tree, such as ../../discussions/46,
+        # resolve on github.com but not on Pages: send them to the repository.
+        outside = re.fullmatch(r"(?:\.\./)+(discussions|issues|pulls|releases)(/.*)?", target)
+        if outside:
+            return f'{attr}="{REPO_URL}/{outside.group(1)}{outside.group(2) or ""}{anchor}"'
         dest = (REPO / rel.parent / target).resolve()
         try:
             t = dest.relative_to(REPO)

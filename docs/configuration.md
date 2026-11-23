@@ -5,6 +5,7 @@ Everything is configured in the web view, under **Settings** (the gear icon in t
 A setting is named here by its section and label. The key the code reads is given in backticks where it helps, because the log and `--check` use it. How a save is applied, and which saves restart the service, is in [Deployment](deployment.md#how-saved-settings-are-applied).
 
 - [Mailboxes and folders](#mailboxes-and-folders)
+- [Forwarding between mailboxes](#forwarding-between-mailboxes)
 - [Sending mail](#sending-mail)
 - [Your sent mail](#your-sent-mail)
 - [Outputs](#outputs)
@@ -29,7 +30,53 @@ Settings → Mailboxes lists the mailboxes, each marked Ready, Off, Needs sign-i
 
 **Test connection** signs in once and lists the mailbox's folders. A saved password is never shown again: leave the field empty to keep it. Turning off **Check this mailbox** stops checking a mailbox without forgetting it. Deleting one stops checking it and forgets its password or OAuth record; mail on the server is not touched. From a terminal, `npm run probe` lists the folders a server offers (see [Commands](deployment.md#commands)).
 
-Settings → Triage rules → More options → **Ignore copies forwarded between your own mailboxes** (`SUPPRESS_SELF_FORWARDS`, on by default) stops one message notifying twice when your mailboxes forward to each other. A forwarded copy is a new message with its own Message-ID, so deduplication cannot recognise it, but its sender is one of your own mailboxes. Such a copy is recorded and stays searchable through `list_mail`, but it is neither pushed nor repeated in the daily digest, since the original was already triaged at its source. It costs no LLM call either. Mail you send to yourself inside a single mailbox is unaffected, and a sender listed under **Always important senders** still wins. For the same reason a message forwarded from the web view or `send_mail` only to your own mailboxes stays in the queue where it is: the copy that arrives is not put before you again.
+## Forwarding between mailboxes
+
+Forwarding meets mailsift in two ways: as a way round OAuth for Gmail, and as the reason one message can arrive twice. A longer version in Chinese, written for 0.1.x but otherwise current, is [Discussion #47](../../../discussions/47).
+
+### Forwarding Gmail instead of signing in
+
+Rather than register a Google OAuth app, you can forward all of a Gmail account into a mailbox that signs in with a password (QQ, 163, iCloud and the like) and add only that one to mailsift. It replaces watching Gmail; it is not added to it:
+
+| | Mailboxes in mailsift | Result |
+|---|---|---|
+| Watch Gmail | Gmail, signed in with OAuth | mailsift reads Gmail directly, spam included |
+| Forward instead | only the mailbox Gmail forwards to | no OAuth, each message once |
+| Both | Gmail and the mailbox it forwards to | every message triaged twice: do not |
+
+Gmail's "Forward a copy of incoming mail" setting forwards only what reaches the inbox, never what it filed as spam, which would lose the bills and codes misjudged as spam that mailsift is there to catch. Forward with a filter instead, in this order:
+
+1. Settings → Forwarding and POP/IMAP → Add a forwarding address, enter the target mailbox, and open the confirmation link sent there. An unconfirmed address is not offered in filters.
+2. Leave "Forward a copy of incoming mail" off; the filter replaces it.
+3. Settings → Filters and Blocked Addresses → Create a new filter, with `*` as the sender, which matches every message.
+4. Tick both **Never send it to Spam** and **Forward it to** the confirmed address.
+
+**Never send it to Spam** is the step that matters: Gmail's filters do not act on mail it has classed as spam, and this keeps such mail in the inbox, where the forward happens. What it costs:
+
+- Gmail's own spam filtering is off for what it forwards, so real spam goes along too. The receiving mailbox judges it again and usually files it in its own spam folder, which mailsift watches, so nothing is lost.
+- The filter applies to new mail only; nothing already received is forwarded.
+- Forwarding a lot of spam can hurt the forwarding's reputation. If the receiving mailbox starts refusing it, go back to OAuth.
+
+Gmail keeps the original sender on what it forwards, so the copy reads as the original, without a "Fwd:" prefix.
+
+Outlook cannot be watched this way. Its forwarding and its inbox rules act only on mail that reaches the inbox, with nothing like "Never send it to Spam", so forwarding would always lose its junk folder. Sign an Outlook mailbox in with OAuth, and mailsift reads its Junk folder over IMAP.
+
+### When two watched mailboxes forward to each other
+
+If mailsift watches both ends of a forward, the copy brings nothing new: the original was triaged at its source. The simplest fix is to turn the forward off.
+
+Outlook has two forwarding mechanisms that know nothing of each other, which makes this easy to get wrong:
+
+| | Where | What arrives |
+|---|---|---|
+| Account forwarding | Settings → Mail → **Forwarding** | the original sender, Message-ID and subject |
+| Inbox rule | Settings → Mail → **Rules** | a new message: new Message-ID, "Fwd:" before the subject, and you as the sender |
+
+Turning off the first does not turn off the second. If copies keep coming after Forwarding is off, look under Rules for one whose action is "Forward to". A copy made by a rule carries headers such as `x-ms-exchange-generated-message-source: Mailbox Rules Agent`, `X-MS-Exchange-Inbox-Rules-Loop` and `auto-submitted: auto-generated`. Gmail's forwarding keeps the original sender, like Outlook's account forwarding.
+
+Settings → Triage rules → More options → **Ignore copies forwarded between your own mailboxes** (`SUPPRESS_SELF_FORWARDS`, on by default) recognises a copy whose sender is one of your other watched mailboxes, as an inbox rule produces, and files it as `Forwarded copy`: not pushed, not in the digest, no model call. The record stays, and `list_mail` with the category `Forwarded copy` finds it. Mail you send to yourself inside a single mailbox is unaffected, and a sender listed under **Always important senders** still wins. For the same reason a message forwarded from the web view or `send_mail` only to your own mailboxes stays in the queue where it is: the copy that arrives is not put before you again.
+
+The check is on the sender, so it catches forwards that rewrite the sender and not those that keep it (Outlook's account forwarding, Gmail's forwarding). Those keep the original Message-ID, and recognising them would take deduplication across mailboxes, which mailsift does not do; turn such a forward off.
 
 ## Sending mail
 

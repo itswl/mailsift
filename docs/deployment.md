@@ -157,35 +157,60 @@ This clears the password and every browser session, and prints a new one-time se
 
 ## Gmail and Outlook sign-in
 
-Gmail and Outlook usually refuse app passwords, so their mailboxes sign in with OAuth, through an OAuth app you register once with Google or Microsoft. Enter it under Settings → Mailboxes → **Gmail and Outlook sign-in**, or in the dialog when you add the first such mailbox; every mailbox of that provider then uses it. A personal Gmail account can instead use the **Gmail (app password)** preset with an app password; Google Workspace accounts cannot.
+Gmail and Outlook have switched off plain password sign-in to IMAP for most accounts, so their mailboxes sign in with OAuth, through an OAuth app you register once with Google or Microsoft. The other providers (QQ, 163, iCloud, Fastmail and the rest) keep using an app password or authorization code and need none of this.
 
-**Google**
+Enter the app under Settings → Mailboxes → **Gmail and Outlook sign-in**, or in the dialog when you add the first such mailbox; every mailbox of that provider then uses it. Two ways round it without an app at all are a personal Gmail account's app password (the **Gmail (app password)** preset, below) and forwarding Gmail into a mailbox that signs in with a password ([Forwarding between mailboxes](configuration.md#forwarding-between-mailboxes)).
 
-1. In Google Cloud Console, go to APIs & Services → Credentials and create an OAuth client ID of type **Desktop app**.
-2. Enter its client ID and client secret as **Google client ID** and **Google client secret**.
-3. While the OAuth consent screen is in Testing, add your address as a test user. Publish the consent screen when it works: in Testing, the sign-in expires every 7 days.
+A longer walkthrough in Chinese is [Discussion #46](../../../discussions/46). It was written for 0.1.x: its `.env` lines and `npm run oauth` commands are replaced by Settings and the **Sign in** button, and the provider-side steps still apply.
 
-**Microsoft**
+### Google
 
-1. In Microsoft Entra, go to App registrations and register an application. Under Authentication, add the platform **Mobile and desktop applications** with the redirect URI `http://localhost`, and allow public client flows.
-2. Under API permissions, add the delegated permissions `IMAP.AccessAsUser.All`, `SMTP.Send` and `offline_access`.
-3. Enter the **Microsoft application (client) ID**. Leave the client secret empty for a public client. **Microsoft tenant** is `common` for personal accounts, or your organisation's tenant ID.
-4. Outlook.com may also need IMAP turned on in the mailbox's own settings, where it is off by default.
+1. In Google Cloud Console, create a project.
+2. Configure the OAuth consent screen with user type **External**, and add your own Gmail address as a test user.
+3. Add the scope `https://mail.google.com/`, which IMAP needs. It is one of Google's restricted scopes; for an app only you use, the "unverified app" warning on the consent screen is expected, and you continue past it.
+4. Under APIs & Services → Credentials, create an OAuth client ID of type **Desktop app**. A desktop client accepts `http://localhost` on any port without registering it.
+5. Enter its client ID and client secret as **Google client ID** and **Google client secret**.
+6. **Publish the consent screen** (In production) once it works. While it is in Testing, Google expires the sign-in every 7 days, which shows up as a "mailbox cannot be read" alert every week; the alert says so too.
 
-**Signing in a mailbox**
+A personal Gmail account with 2-step verification can skip all of this: create an app password in the Google account and use the **Gmail (app password)** preset. Google Workspace administrators usually switch app passwords off, which leaves OAuth.
+
+### Microsoft
+
+1. In the Microsoft Entra admin center, go to App registrations → New registration. Under supported account types, choose personal Microsoft accounts only, or any organisational directory plus personal accounts if work mailboxes should sign in too.
+2. Under Authentication, add the platform **Mobile and desktop applications** with the redirect URI `http://localhost`, and turn on **Allow public client flows**. mailsift uses no client secret here, and without public client flows the token exchange is refused.
+3. Under API permissions, add the delegated permissions `IMAP.AccessAsUser.All`, `SMTP.Send` (for sending from the web view and MCP) and `offline_access`.
+4. Enter the **Microsoft application (client) ID**. Leave the client secret empty. **Microsoft tenant** is `common` (personal and work accounts), `consumers` (personal accounts only), or your organisation's tenant ID.
+5. Outlook.com keeps IMAP off by default, which is the usual reason a correct sign-in still fails: in Outlook on the web, Settings → Mail → Forwarding and IMAP → allow devices and apps to use IMAP.
+
+Right after signing in, Outlook's IMAP sometimes answers `User is authenticated but not connected` before the first command. mailsift treats that as a passing failure and tries again; a line of it in the log at each connection is normal.
+
+### Signing a mailbox in
 
 Add the mailbox and press **Save and sign in**, or **Sign in** on one already saved. The provider's page opens in a new tab. After you allow access:
 
 - If the page is open at a loopback address (on the server, or through the SSH tunnel), the provider sends the browser straight back to `http://localhost:<port>/`, and the page finishes by itself and tests the mailbox.
 - If the page is reached over HTTPS through a proxy, the provider sends the browser to `http://localhost:8765/`, which does not load. Copy that full address from the address bar and paste it into the **Finish signing in** dialog.
 
-The code in that address is exchanged by the server and works once; a sign-in left unfinished expires after 15 minutes. A Google Desktop app client accepts both addresses without registering them, and Microsoft's `http://localhost` redirect covers them because Microsoft ignores the port of a localhost redirect.
+The code in that address is exchanged by the server and works once; a sign-in left unfinished expires after 15 minutes. A Google desktop client accepts both addresses without registering them, and Microsoft's registered `http://localhost` covers them because Microsoft ignores the port of a localhost redirect.
 
 Gmail's one scope covers reading and sending. Outlook asks for permission to send only while sending is on (Settings → Web mail → **Allow sending from the web view and MCP**); a mailbox signed in before that shows "Signed in for reading only — sign in again to send", and **Sign in again** asks for it.
 
 The sign-in records are encrypted in the database and refreshed automatically. Deleting a mailbox forgets its record. If the provider revokes access, the web view's status line names the mailbox (see [Web view](web-view.md#mailboxes-that-cannot-be-read)); sign in again from its entry under Settings → Mailboxes.
 
-A terminal fallback exists for a browser that cannot reach the page at all. It uses the mailboxes and the OAuth app saved in Settings, prints the provider's address to open on any computer, and asks for the address the browser ends on:
+### Borrowing a public client ID
+
+Desktop and mobile mail apps cannot keep a secret, so their OAuth client IDs are public and ship with the app. Any of them that asks for the scopes above could, technically, be entered here and used to sign in your own mailbox: you approve the access yourself and the tokens are yours alone. For Microsoft, the borrowed app must have `http://localhost` registered as a redirect; a Google desktop client always works. The consent screen then shows the other app's name and may list more than mailsift needs, so read it before you allow.
+
+Registering your own takes about ten minutes, and is still the recommendation, because the cost of borrowing falls on the project you borrow from:
+
+1. Your calls count against their app. Unusual volume, repeated sign-in failures or a provider's risk checks get **their** app throttled or suspended, for all of their real users, who never agreed to vouch for your server.
+2. It usually breaks the provider's terms, and the intent with which the ID was published.
+3. When they rotate or revoke the ID, your mailbox stops without warning, and there is no one to appeal to.
+4. The consent records show their app's name, which makes it hard, months later, to audit what you granted to whom.
+
+### From a terminal
+
+A fallback exists for a browser that cannot reach the page at all. It uses the mailboxes and the OAuth app saved in Settings, prints the provider's address to open on any computer, and asks for the address the browser ends on:
 
 ```bash
 docker compose exec -it mailsift node dist/scripts/oauth-setup.js --account you@gmail.com --manual

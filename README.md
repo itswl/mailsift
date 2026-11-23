@@ -39,7 +39,7 @@ ssh -N -L 8410:127.0.0.1:8410 you@your-server
 
 The port is published on the server's loopback address only, and mailsift accepts passwords and tokens only from a local address or over HTTPS. For everyday use from a phone or another computer, put an HTTPS reverse proxy in front; see [Deployment](docs/deployment.md#reaching-it-from-another-computer).
 
-Gmail and Outlook sign in with OAuth, through an OAuth app you register once with Google or Microsoft; see [Gmail and Outlook sign-in](docs/deployment.md#gmail-and-outlook-sign-in).
+Gmail and Outlook sign in with OAuth, through an OAuth app you register once with Google or Microsoft; see [Gmail and Outlook sign-in](docs/deployment.md#gmail-and-outlook-sign-in). A personal Gmail account can use an app password instead, or be forwarded into a mailbox that signs in with a password ([Forwarding between mailboxes](docs/configuration.md#forwarding-between-mailboxes)). Both are walked through in Chinese in the discussions [#46](../../discussions/46) (OAuth) and [#47](../../discussions/47) (forwarding).
 
 ## Settings
 
