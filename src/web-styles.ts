@@ -698,6 +698,13 @@ a.primary-action{display:inline-flex;align-items:center;justify-content:center;t
 @media(pointer:coarse){
   input:not([readonly]):not([type=checkbox]):not([type=radio]):not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]),textarea,select{font-size:16px}
 }
+/* With every action in the header (the settings link included) a phone is short of room: the buttons give
+   up some of their width, down to a still comfortable 36px, before anything spills past the edge. */
+@media(max-width:480px){
+  .header-inner .brand{flex:none}
+  .header-actions{min-width:0;flex:1 1 auto;justify-content:flex-end}
+  .header-actions .icon-btn,.header-actions .word-btn{flex:0 1 44px;min-width:36px;padding:0 4px}
+}
 @media(max-width:370px){
   .brand strong{display:none}
   .seg{padding-left:6px;padding-right:6px}
