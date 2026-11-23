@@ -36,7 +36,7 @@ import {
 } from './services/settings-runtime.js';
 import {
   ADMIN_PASSWORD_MIN, adminPasswordSet, adminSessionValid, changeAdminPassword, claimAdmin, endOtherAdminSessions,
-  newAccessToken, newMailboxId, passwordProblem, readSettings, savePendingOAuth, takePendingOAuth, updateSettings,
+  newAccessToken, newMailboxId, passwordProblem, readSettings, savePendingOAuth, startAdminSession, takePendingOAuth, updateSettings,
   type MailboxSettings, type PendingOAuth, type SettingsDocument,
 } from './services/settings-store.js';
 import { hostPort, requestChannel } from './web-access.js';
@@ -486,7 +486,7 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
     const password = typeof body?.['password'] === 'string' ? body['password'] as string : '';
     const problem = passwordProblem(password);
     if (problem) {
-      return fail(400, 'weak_password', zh ? `密码至少 ${ADMIN_PASSWORD_MIN} 个字符。` : `Use at least ${ADMIN_PASSWORD_MIN} characters.`);
+      return fail(400, 'too_short', zh ? `密码至少 ${ADMIN_PASSWORD_MIN} 个字符。` : `Use at least ${ADMIN_PASSWORD_MIN} characters.`);
     }
     const session = claimAdmin(code, password);
     if (!session) return fail(401, 'invalid_code', zh ? '设置码不正确或已失效。请查看服务日志中最新的设置码。' : 'That setup code is wrong or no longer valid. Use the latest one in the service log.');
@@ -575,7 +575,7 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
       const problem = mailboxProblem(mailbox, { ...current, mailboxes: current.mailboxes.filter((m) => m.id !== mailbox.id) }, lang);
       if (problem) return fail(400, 'invalid_mailbox', problem);
       if (isOAuthProvider(mailbox.provider) && !authorizedUsernames().has(mailbox.username.toLowerCase())) {
-        return fail(400, 'needs_authorization', zh ? '请先登录授权这个邮箱，再测试连接。' : 'Sign in to this mailbox before testing it.');
+        return fail(400, 'sign_in_first', zh ? '请先登录授权这个邮箱，再测试连接。' : 'Sign in to this mailbox before testing it.');
       }
       try {
         const account = mailboxAccount(mailbox);
@@ -593,12 +593,12 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
       const doc = readSettings();
       const mailbox = doc.mailboxes.find((m) => m.id === text(body['id'], 40));
       const auth = mailbox ? oauthKind(mailbox.provider) : undefined;
-      if (!mailbox || !auth) return fail(400, 'not_oauth', zh ? '这个邮箱不使用 OAuth 登录。' : 'This mailbox does not sign in with OAuth.');
+      if (!mailbox || !auth) return fail(400, 'no_sign_in', zh ? '这个邮箱不使用 OAuth 登录。' : 'This mailbox does not sign in with OAuth.');
       let provider;
       try {
         provider = getOAuthProvider(auth, { send: sendingAsked(doc), source: oauthSource(doc) });
       } catch (error) {
-        return fail(400, 'oauth_not_configured', error instanceof Error ? error.message : String(error));
+        return fail(400, 'app_missing', error instanceof Error ? error.message : String(error));
       }
       // At a loopback address the provider can send the browser straight back
       // here; anywhere else it lands on a page that does not load, whose
@@ -680,12 +680,12 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
     case '/api/admin/password': {
       const current = typeof body['current'] === 'string' ? body['current'] as string : '';
       const next = typeof body['next'] === 'string' ? body['next'] as string : '';
-      if (passwordProblem(next)) return fail(400, 'weak_password', zh ? `新密码至少 ${ADMIN_PASSWORD_MIN} 个字符。` : `Use at least ${ADMIN_PASSWORD_MIN} characters.`);
+      if (passwordProblem(next)) return fail(400, 'too_short', zh ? `新密码至少 ${ADMIN_PASSWORD_MIN} 个字符。` : `Use at least ${ADMIN_PASSWORD_MIN} characters.`);
       if (!allowClaimPerClient(ctx.client)) return fail(429, 'rate_limited', zh ? '尝试次数过多，请一分钟后再试。' : 'Too many attempts. Wait a minute.');
-      const session = changeAdminPassword(current, next);
-      if (!session) return fail(401, 'wrong_password', zh ? '当前密码不正确。' : 'The current password is not right.');
+      if (!changeAdminPassword(current, next)) return fail(401, 'not_accepted', zh ? '当前密码不正确。' : 'The current password is not right.');
       log.info('The administrator password was changed; other sessions were signed out.');
-      return { ...ok({ changed: true }), cookie: adminCookie(req, session) };
+      // Every session ended with the change, this one included; it gets a fresh one.
+      return { ...ok({ changed: true }), cookie: adminCookie(req, startAdminSession()) };
     }
 
     case '/api/admin/sessions/end-others': {

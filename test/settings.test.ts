@@ -8,7 +8,7 @@ import { createRequire } from 'node:module';
 import {
   adminPasswordSet, adminSessionValid, changeAdminPassword, claimAdmin, closeSettingsStore, endOtherAdminSessions,
   ensureAccessTokens, issueSetupCode, normalizeSetupCode, readSettings, resetAdmin, savePendingOAuth, settingsKeyPath,
-  signInAdmin, SettingsKeyError, takePendingOAuth, updateSettings,
+  signInAdmin, SettingsKeyError, startAdminSession, takePendingOAuth, updateSettings,
 } from '../src/services/settings-store.js';
 import { applySettings, differsFromBoot, mailboxReadiness, rememberBootState } from '../src/services/settings-runtime.js';
 import { checkField, crossFieldProblems, FIELD_BY_KEY, SECRET_KEYS } from '../src/settings-catalog.js';
@@ -123,10 +123,12 @@ describe('administrator access', { timeout: 30_000 }, () => {
     expect(signInAdmin('wrong password')).toBeUndefined();
     const two = signInAdmin('a long password')!;
     expect(adminSessionValid(two)).toBe(true);
-    expect(changeAdminPassword('wrong password', 'a new long password')).toBeUndefined();
-    const three = changeAdminPassword('a long password', 'a new long password')!;
+    expect(changeAdminPassword('wrong password', 'a new long password')).toBe(false);
+    expect(adminSessionValid(two)).toBe(true);
+    expect(changeAdminPassword('a long password', 'a new long password')).toBe(true);
     expect(adminSessionValid(one)).toBe(false);
     expect(adminSessionValid(two)).toBe(false);
+    const three = startAdminSession();
     expect(adminSessionValid(three)).toBe(true);
     const four = signInAdmin('a new long password')!;
     expect(endOtherAdminSessions(four)).toBe(1);
