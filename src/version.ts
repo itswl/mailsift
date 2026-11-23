@@ -1,3 +1,6 @@
-/** Application and MCP protocol version for the v0.2.0 server redesign. */
-export const APP_VERSION = '0.2.0';
-export const APP_VERSION_TAG = `v${APP_VERSION}`;
+/**
+ * The running release, as the image was built with it (MAILSIFT_VERSION, the
+ * release tag), so /healthz and the MCP server name the release actually
+ * running; "dev" for a build from a checkout.
+ */
+export const APP_VERSION = process.env.MAILSIFT_VERSION?.trim().replace(/^v/, '') || 'dev';
