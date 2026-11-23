@@ -29,7 +29,7 @@ import { sendTestNotification } from './services/sink.js';
 import { resolveLlmBaseUrl } from './services/triage.js';
 import { aiGatewayHeaders } from './services/decider.js';
 import {
-  restartState, requestRestart, serverMode, supervised, type RestartOutcome,
+  bootId, restartState, requestRestart, serverMode, supervised, type RestartOutcome,
 } from './services/runtime-control.js';
 import {
   applySettings, differsFromBoot, isOAuthProvider, mailboxReadiness,
@@ -472,7 +472,9 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
     const doc = readSettings();
     if (path === '/settings' && !doc.setupCompletedAt) return redirect('/setup');
     if (path === '/setup' && doc.setupCompletedAt) return redirect('/settings');
-    return htmlPage(renderSettingsPage(lang, ctx.nonce, ctx.version, doc.setupCompletedAt ? 'settings' : 'setup'), ctx.nonce);
+    return htmlPage(renderSettingsPage(
+      lang, ctx.nonce, ctx.version, doc.setupCompletedAt ? 'settings' : 'setup', statePayload(req, doc), bootId(),
+    ), ctx.nonce);
   }
 
   // Claiming the server: the only API call without a session.
