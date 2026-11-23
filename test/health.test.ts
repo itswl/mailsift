@@ -5,7 +5,7 @@ import { StateStore } from '../src/services/state.js';
 import { AuthError } from '../src/imap/auth.js';
 import type { Account } from '../src/config.js';
 import {
-  mailboxStatuses, oauthCommand, recordAccountFailure, recordAccountSuccess, recordDeciderFailure, recordDeciderSuccess,
+  mailboxStatuses, recordAccountFailure, recordAccountSuccess, recordDeciderFailure, recordDeciderSuccess,
   recordLlmFailure, recordLlmSuccess, recordStartupFailure, ALERTED_AT_KEY, LLM_ALERTED_AT_KEY,
 } from '../src/services/health.js';
 
@@ -174,13 +174,13 @@ describe('LLM outages', () => {
 });
 
 describe('startup failures', () => {
-  it('explains that nothing is being monitored and gives a check command', async () => {
+  it('explains that nothing is being monitored and where to look', async () => {
     process.env.STATE_DB_PATH = ':memory:';
     const sink = new RecordingSink();
     expect(await recordStartupFailure(new Error('MAIL_ACCOUNT_1 格式不对'), sink)).toBe(true);
     const body = sink.pushed[0]![0].body;
     expect(body).toContain('will be checked');
-    expect(body).toContain('--check');
+    expect(body).toContain('Settings');
   });
 
   it('logs without masking the original error when no sink is configured', async () => {
@@ -204,8 +204,6 @@ describe('mailbox status for the page', () => {
     await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     [gmail] = mailboxStatuses(s, [GMAIL]);
     expect(gmail).toMatchObject({ failing: true, fix: 'google' });
-    // The command re-authorizes this account alone, not every OAuth mailbox.
-    expect(gmail!.command).toContain('--account=me@gmail.com');
 
     await recordAccountSuccess(s, sink, GMAIL);
     [gmail] = mailboxStatuses(s, [GMAIL]);
@@ -222,22 +220,19 @@ describe('mailbox status for the page', () => {
     }
     const [qq, outlook] = mailboxStatuses(s, [QQ, OUTLOOK]);
     expect(qq).toMatchObject({ fix: 'password' });
-    expect(qq!.command).toBeUndefined();
     expect(outlook).toMatchObject({ fix: 'connection' });
   });
 
-  it('offers the authorization command when the token was never stored here', async () => {
-    // A host-side "npm run oauth" writes ./data/tokens.json, not the container's volume.
+  it('sends a mailbox with no authorization stored to sign in from Settings', async () => {
     const s = store();
     const sink = new RecordingSink();
-    const missing = new AuthError('me@gmail.com has no authorization record. Run: npm run oauth -- --account me@gmail.com');
+    const missing = new AuthError('me@gmail.com has no authorization record. Open Settings and sign in to this mailbox.');
     for (let n = 0; n < 2; n += 1) await recordAccountFailure(s, sink, GMAIL, missing);
     const [gmail] = mailboxStatuses(s, [GMAIL]);
     expect(gmail).toMatchObject({ failing: true, fix: 'authorize' });
-    expect(gmail!.command).toContain('--account=me@gmail.com');
-    // The remedy, not the error text (which names the host-side command itself).
     expect(sink.pushed[0]![0].body).toContain('**Failure type**: authentication');
-    expect(sink.pushed[0]![0].body).toContain('--manual --force --account=me@gmail.com');
+    expect(sink.pushed[0]![0].body).toContain('Settings');
+    expect(sink.pushed[0]![0].body).not.toContain('npm run');
   });
 
   it('does not send anyone to re-authorize during a provider outage or for a broken token file', async () => {
@@ -246,17 +241,14 @@ describe('mailbox status for the page', () => {
     const outage = new AuthError('gmail token request failed: HTTP 503 Service Unavailable');
     for (let n = 0; n < 2; n += 1) await recordAccountFailure(s, sink, GMAIL, outage);
     expect(mailboxStatuses(s, [GMAIL])[0]).toMatchObject({ fix: 'connection' });
-    expect(mailboxStatuses(s, [GMAIL])[0]!.command).toBeUndefined();
     expect(sink.pushed.at(-1)![0].body).toContain('**Failure type**: connection');
     const corrupt = new AuthError('Token store is not valid JSON; refusing to replace it');
     for (let n = 0; n < 2; n += 1) await recordAccountFailure(s, sink, OUTLOOK, corrupt);
     expect(mailboxStatuses(s, [OUTLOOK])[0]).toMatchObject({ fix: 'setup' });
-    expect(mailboxStatuses(s, [OUTLOOK])[0]!.command).toBeUndefined();
-    // The alert points at the token store, not at a command that would fail on the same file.
+    // The alert points at the token store and the OAuth app, not at signing in again.
     const alert = sink.pushed.at(-1)![0].body;
     expect(alert).toContain('**Failure type**: OAuth setup');
-    expect(alert).toContain('TOKEN_STORE_PATH');
-    expect(alert).not.toContain('--account=');
+    expect(alert).toContain('token store');
     const refused = new AuthError('outlook token request failed: HTTP 400 {"error":"invalid_client"}');
     const t = store();
     for (let n = 0; n < 2; n += 1) await recordAccountFailure(t, sink, OUTLOOK, refused);
@@ -272,21 +264,12 @@ describe('mailbox status for the page', () => {
     expect(mailboxStatuses(s, [QQ])[0]).toMatchObject({ fix: 'folders' });
   });
 
-  it('quotes an address the shell would otherwise break on', () => {
-    expect(oauthCommand({ username: "o'brien@contoso.com" })).toContain(`--account='o'\\''brien@contoso.com'`);
-    expect(oauthCommand({ username: 'a!b@contoso.com' })).toContain("--account='a!b@contoso.com'");
-    expect(oauthCommand({ username: 'me+tag@gmail.com' })).toContain('--account=me+tag@gmail.com');
-    // A leading dash would read as another option without the '='.
-    expect(oauthCommand({ username: '-ops@contoso.com' })).toContain('--account=-ops@contoso.com');
-  });
-
-  it('puts the account in the re-authorization command on the alert card', async () => {
-    expect(oauthCommand(GMAIL)).toContain('--manual --force --account=me@gmail.com');
+  it('says on the alert card where to sign in again', async () => {
     const s = store();
     const sink = new RecordingSink();
     await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
     await recordAccountFailure(s, sink, GMAIL, new Error('invalid_grant'));
-    expect(sink.pushed[0]![0].body).toContain('--account=me@gmail.com');
+    expect(sink.pushed[0]![0].body).toContain('Settings → Mailboxes');
   });
 });
 

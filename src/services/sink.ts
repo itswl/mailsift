@@ -7,9 +7,10 @@
 import {
   snippet, type MailMessage,
 } from '../imap/message.js';
-import { FeishuSink, type PushOutcome, type Sink } from './feishu.js';
+import { buildCard, FeishuSink, sign, type PushOutcome, type Sink } from './feishu.js';
 import { hidesContent, sensitiveWords, type TriageResult } from './triage.js';
 import { buildMailSignalEvent } from './signal.js';
+import { redactSecrets } from '../logger.js';
 import { deliverWithRetry, isRetryableStatus, type RetryState } from './delivery.js';
 import { getLogger } from '../logger.js';
 
@@ -157,9 +158,9 @@ export class CompositeSink implements Sink {
 
   async push(message: MailMessage, result: TriageResult): Promise<PushOutcome> {
     if (this.sinks.length === 0) {
-      // Not a decline: nothing refused the message, the service is misconfigured.
-      log.error(`No configured output; message dropped | ${message.subject}`);
-      return 'failed';
+      // No external destination is a supported choice. Keep the mail in the
+      // local digest/view; browser push is dispatched independently.
+      return 'declined';
     }
     // Do not short-circuit: try every output even when one fails.
     const outcomes = await Promise.all(this.sinks.map((sink) => sink.push(message, result)));
@@ -175,6 +176,97 @@ export function buildSink(): Sink {
   if (process.env.FEISHU_WEBHOOK_URL?.trim()) sinks.push(new FeishuSink());
   if (webhookEndpoint()) sinks.push(new WebhookSink());
   return sinks.length === 1 ? sinks[0]! : new CompositeSink(sinks);
+}
+
+/**
+ * Send one made-up notification to the destinations in `values`, for the
+ * settings page's test button. Nothing from a mailbox is in it, it does not
+ * go through the outbox, and every destination is tried even when one fails.
+ */
+export async function sendTestNotification(
+  values: Record<string, string | undefined>, lang: 'en' | 'zh-CN' = 'en',
+): Promise<string> {
+  const zh = lang === 'zh-CN';
+  const feishuUrl = values['FEISHU_WEBHOOK_URL']?.trim() ?? '';
+  const webhookUrl = values['WEBHOOK_URL']?.trim() ?? '';
+  const webhookToken = values['WEBHOOK_TOKEN']?.trim() ?? '';
+  if (!feishuUrl && !webhookUrl) {
+    throw new Error(zh ? '还没有配置飞书或 Webhook。' : 'Add a Feishu bot or a webhook first.');
+  }
+
+  const message: MailMessage = {
+    account: 'test@mailsift.invalid',
+    accountLabel: 'mailsift',
+    provider: 'imap',
+    folder: 'INBOX',
+    inSpam: false,
+    uid: 1,
+    messageId: `<test-${Date.now()}@mailsift.invalid>`,
+    subject: zh ? 'mailsift 测试通知' : 'mailsift test notification',
+    fromAddr: 'mailsift@mailsift.invalid',
+    fromName: 'mailsift',
+    toAddrs: [],
+    date: new Date().toISOString(),
+    body: zh ? '这是从设置页面发出的测试通知，不含任何邮件内容。' : 'A test sent from the settings page. It carries no mail.',
+    hasAttachments: false,
+    listUnsubscribe: false,
+  };
+  const triage: TriageResult = {
+    importance: 'warning',
+    score: 2,
+    summary: zh ? '通知渠道工作正常。' : 'This notification channel works.',
+    reason: zh ? '管理员在设置页面请求了测试。' : 'Sent because the administrator asked for a test.',
+    deadline: '',
+    category: 'System',
+    actionRequired: false,
+    decidedBy: 'rule',
+  };
+
+  const deliveries: Array<{ name: string; work: () => Promise<void> }> = [];
+  if (feishuUrl) deliveries.push({
+    name: zh ? '飞书' : 'Feishu',
+    work: async () => {
+      const payload = buildCard(message, triage);
+      const secret = values['FEISHU_WEBHOOK_SECRET']?.trim();
+      if (secret) {
+        const timestamp = Math.floor(Date.now() / 1000);
+        payload['timestamp'] = String(timestamp);
+        payload['sign'] = sign(secret, timestamp);
+      }
+      const response = await fetch(feishuUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json().catch(() => ({})) as { code?: number; StatusCode?: number; msg?: string };
+      const code = data.code ?? data.StatusCode ?? 0;
+      if (code !== 0) throw new Error(`${data.msg ?? 'rejected'} (${code})`);
+    },
+  });
+  if (webhookUrl) deliveries.push({
+    name: 'Webhook',
+    work: async () => {
+      const response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(webhookToken ? { token: webhookToken } : {}) },
+        body: JSON.stringify(buildWebhookPayload(message, triage)),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    },
+  });
+
+  const results = await Promise.allSettled(deliveries.map((delivery) => delivery.work()));
+  const failures = results.flatMap((result, index) => result.status === 'rejected'
+    ? [`${deliveries[index]!.name}: ${redactSecrets(result.reason instanceof Error ? result.reason.message : String(result.reason))}`]
+    : []);
+  const sent = deliveries.filter((_, index) => results[index]!.status === 'fulfilled').map((delivery) => delivery.name);
+  if (failures.length) {
+    throw new Error((sent.length ? (zh ? `已送达 ${sent.join('、')}；` : `Delivered to ${sent.join(' and ')}; `) : '') + failures.join('; '));
+  }
+  return zh ? `已送达 ${sent.join('、')}。` : `Delivered to ${sent.join(' and ')}.`;
 }
 
 export type { PushOutcome, Sink };

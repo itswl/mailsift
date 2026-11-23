@@ -407,7 +407,7 @@ const ATTENTION_WINDOW_DAYS = 30;
  * short list; nothing older than STATE_RETENTION_DAYS is kept to list.
  */
 export function doneListDays(): number {
-  // An empty line in .env is "not set".
+  // An empty setting is "not set".
   const raw = process.env.DONE_LIST_DAYS?.trim();
   const value = raw ? Number(raw) : NaN;
   return Number.isFinite(value) && value >= 1 ? Math.min(365, Math.floor(value)) : 7;

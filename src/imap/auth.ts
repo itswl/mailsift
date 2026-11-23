@@ -5,7 +5,7 @@
  * accounts have disabled basic auth, so they require XOAUTH2.
  *
  * access_token values are short-lived; refresh_token values are persisted.
- * Initial authorization is handled by scripts/oauth-setup.ts.
+ * Initial authorization is handled by the server settings page.
  */
 import { readFileSync, statSync } from 'node:fs';
 import { chmod, mkdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
@@ -13,6 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { dirname } from 'node:path';
 import { getLogger } from '../logger.js';
+import { readOAuthTokens, updateOAuthTokens } from '../services/settings-store.js';
 import type { AuthKind } from '../config.js';
 
 const log = getLogger('auth');
@@ -47,8 +48,8 @@ export interface TokenRecord {
 }
 
 /**
- * Microsoft consents to sending separately from reading. Asked for only when
- * the owner authorizes a mailbox with `npm run oauth -- --send`.
+ * Microsoft consents to sending separately from reading. Asked for when
+ * sending is on (SMTP_ENABLED), so the consent screen offers it.
  */
 export const OUTLOOK_SEND_SCOPE = 'https://outlook.office.com/SMTP.Send';
 
@@ -75,19 +76,47 @@ function parseTokenStore(value: unknown): Record<string, TokenRecord> {
   return records;
 }
 
-export function tokenStorePath(): string {
-  return process.env.TOKEN_STORE_PATH ?? 'data/tokens.json';
+/**
+ * Where token records live: encrypted in the settings database, unless
+ * TOKEN_STORE_PATH names a JSON file (tests and one-off tools use that).
+ */
+export function tokenStorePath(): string | undefined {
+  return process.env.TOKEN_STORE_PATH?.trim() || undefined;
+}
+
+/** The records in the settings database, read synchronously; an unreadable store holds none. */
+function storedRecords(): Record<string, TokenRecord> {
+  try {
+    const raw = readOAuthTokens();
+    return raw ? parseTokenStore(JSON.parse(raw) as unknown) : {};
+  } catch (error) {
+    log.warn(`OAuth token records cannot be read: ${error instanceof Error ? error.message : error}`);
+    return {};
+  }
+}
+
+/** Which addresses have an authorization stored, lowercased; synchronous for startup. */
+export function authorizedUsernames(path = tokenStorePath()): Set<string> {
+  if (path) {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      return new Set(isRecord(parsed) ? Object.keys(parsed).map((name) => name.toLowerCase()) : []);
+    } catch {
+      return new Set();
+    }
+  }
+  return new Set(Object.keys(storedRecords()).map((name) => name.toLowerCase()));
 }
 
 /**
- * The scopes a mailbox was authorized with, read from the token file.
+ * The scopes a mailbox was authorized with, read from its protected token store.
  *
- * Synchronous and cached by the file's modification time, because whether a
- * mailbox can send is asked on every page load and must not wait on a lock.
+ * Synchronous because whether a mailbox can send is asked during page loads.
  * Undefined when there is no record or it predates stored scopes.
  */
 let scopeCache: { path: string; mtimeMs: number; scopes: Map<string, string> } | undefined;
 export function authorizedScope(username: string, path = tokenStorePath()): string | undefined {
+  if (!path) return storedRecords()[username]?.scope;
   try {
     const mtimeMs = statSync(path).mtimeMs;
     if (!scopeCache || scopeCache.path !== path || scopeCache.mtimeMs !== mtimeMs) {
@@ -107,14 +136,17 @@ export function authorizedScope(username: string, path = tokenStorePath()): stri
   }
 }
 
-export function getOAuthProvider(auth: AuthKind, options: { send?: boolean } = {}): OAuthProvider {
+export function getOAuthProvider(
+  auth: AuthKind,
+  options: { send?: boolean; source?: Record<string, string | undefined> } = {},
+): OAuthProvider {
+  const source = options.source ?? process.env;
   if (auth === 'gmail_oauth') {
-    const clientId = process.env.GMAIL_CLIENT_ID?.trim();
+    const clientId = source.GMAIL_CLIENT_ID?.trim();
     if (!clientId) {
       throw new AuthError(
-        'Gmail accounts require GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET. ' +
-          'Create a desktop OAuth client in Google Cloud Console and add it to .env.\n' +
-          'Personal Gmail can use gmail_pw plus an app password instead.',
+        'Signing in to Gmail needs a Google OAuth client. Enter its client ID and secret under ' +
+          'Settings → Mailboxes → Gmail and Outlook sign-in. Personal Gmail can use an app password instead.',
       );
     }
     return {
@@ -123,21 +155,21 @@ export function getOAuthProvider(auth: AuthKind, options: { send?: boolean } = {
       tokenUrl: 'https://oauth2.googleapis.com/token',
       scope: 'https://mail.google.com/',
       clientId,
-      ...(process.env.GMAIL_CLIENT_SECRET?.trim()
-        ? { clientSecret: process.env.GMAIL_CLIENT_SECRET.trim() }
+      ...(source.GMAIL_CLIENT_SECRET?.trim()
+        ? { clientSecret: source.GMAIL_CLIENT_SECRET.trim() }
         : {}),
     };
   }
 
   if (auth === 'outlook_oauth') {
-    const clientId = process.env.OUTLOOK_CLIENT_ID?.trim();
+    const clientId = source.OUTLOOK_CLIENT_ID?.trim();
     if (!clientId) {
       throw new AuthError(
-        'Outlook accounts require OUTLOOK_CLIENT_ID. Register a public client in Entra, ' +
-          'set its redirect URI to http://localhost:8765/, and add it to .env.',
+        'Signing in to Outlook needs a Microsoft application (client) ID. Register one in Microsoft Entra ' +
+          'with the redirect URI http://localhost, and enter it under Settings → Mailboxes → Gmail and Outlook sign-in.',
       );
     }
-    const tenant = process.env.OUTLOOK_TENANT?.trim() || 'common';
+    const tenant = source.OUTLOOK_TENANT?.trim() || 'common';
     return {
       name: 'outlook',
       authorizeUrl: `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize`,
@@ -150,8 +182,8 @@ export function getOAuthProvider(auth: AuthKind, options: { send?: boolean } = {
         'offline_access',
       ].join(' '),
       clientId,
-      ...(process.env.OUTLOOK_CLIENT_SECRET?.trim()
-        ? { clientSecret: process.env.OUTLOOK_CLIENT_SECRET.trim() }
+      ...(source.OUTLOOK_CLIENT_SECRET?.trim()
+        ? { clientSecret: source.OUTLOOK_CLIENT_SECRET.trim() }
         : {}),
     };
   }
@@ -160,24 +192,27 @@ export function getOAuthProvider(auth: AuthKind, options: { send?: boolean } = {
 }
 
 /**
- * Persistent refresh_token storage.
- *
- * File mode is 0600: these are long-lived mailbox credentials.
+ * Persistent refresh_token storage. By default the records are encrypted in
+ * the settings database. Explicit paths remain available to local tooling.
  */
 export class TokenStore {
   private static readonly saveQueues = new Map<string, Promise<void>>();
 
-  constructor(private readonly path: string = tokenStorePath()) {}
+  constructor(private readonly path: string | undefined = tokenStorePath()) {}
 
   private async readAll(): Promise<Record<string, TokenRecord>> {
     let raw: string;
-    try {
-      raw = await readFile(this.path, 'utf8');
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT') return {};
-      log.error(`Cannot read token file safely: ${this.path} -> ${error}`);
-      throw new AuthError('Token store cannot be read; refusing to replace it');
+    if (!this.path) {
+      raw = readOAuthTokens() ?? '{}';
+    } else {
+      try {
+        raw = await readFile(this.path, 'utf8');
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') return {};
+        log.error(`Cannot read token file safely: ${this.path} -> ${error}`);
+        throw new AuthError('Token store cannot be read; refusing to replace it');
+      }
     }
     try {
       return parseTokenStore(JSON.parse(raw) as unknown);
@@ -193,30 +228,40 @@ export class TokenStore {
   }
 
   async save(username: string, record: TokenRecord): Promise<void> {
-    const previous = TokenStore.saveQueues.get(this.path) ?? Promise.resolve();
+    const queueKey = this.path ?? `sqlite:${process.env.STATE_DB_PATH?.trim() || 'data/mailsift.db'}`;
+    const previous = TokenStore.saveQueues.get(queueKey) ?? Promise.resolve();
     let current: Promise<void>;
     current = previous.catch(() => undefined).then(async () => {
+      if (!this.path) {
+        updateOAuthTokens((raw) => {
+          const all = parseTokenStore(raw ? JSON.parse(raw) as unknown : {});
+          all[username] = record;
+          return JSON.stringify(all);
+        });
+        return;
+      }
       // The lock directory lives beside the token file, so create its parent
       // before attempting to acquire it on first use.
-      await mkdir(dirname(this.path), { recursive: true });
+      const targetPath = this.path;
+      await mkdir(dirname(targetPath), { recursive: true });
       await this.withFileLock(async () => {
         const all = await this.readAll();
         all[username] = record;
-        const tmp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
+        const tmp = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
         try {
           await writeFile(tmp, JSON.stringify(all, null, 2), 'utf8');
           await chmod(tmp, 0o600);
-          await rename(tmp, this.path);
+          await rename(tmp, targetPath);
         } finally {
           await unlink(tmp).catch(() => undefined);
         }
       });
     });
-    TokenStore.saveQueues.set(this.path, current);
+    TokenStore.saveQueues.set(queueKey, current);
     try {
       await current;
     } finally {
-      if (TokenStore.saveQueues.get(this.path) === current) TokenStore.saveQueues.delete(this.path);
+      if (TokenStore.saveQueues.get(queueKey) === current) TokenStore.saveQueues.delete(queueKey);
     }
   }
 
@@ -253,6 +298,16 @@ export class TokenStore {
 
   async usernames(): Promise<string[]> {
     return Object.keys(await this.readAll()).sort();
+  }
+
+  /** Forget one mailbox's authorization (the mailbox was removed). Only the settings database is supported. */
+  async remove(username: string): Promise<void> {
+    if (this.path) throw new AuthError('Removing records from a token file is not supported');
+    updateOAuthTokens((raw) => {
+      const all = parseTokenStore(raw ? JSON.parse(raw) as unknown : {});
+      delete all[username];
+      return JSON.stringify(all);
+    });
   }
 }
 
@@ -325,7 +380,7 @@ export async function getAccessToken(
 ): Promise<string> {
   const record = await store.get(username);
   if (!record) {
-    throw new AuthError(`${username} has no authorization record. Run: npm run oauth -- --account ${username}`);
+    throw new AuthError(`${username} has no authorization record. Sign in to it under Settings → Mailboxes.`);
   }
   if (record.accessToken && record.expiresAt - EXPIRY_SKEW_SECONDS > Date.now() / 1000) {
     return record.accessToken;

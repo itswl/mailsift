@@ -8,13 +8,13 @@
  *
  * It shares the MCP server's port and its two tokens, because it shares that
  * trust boundary: whoever can read triage results over JSON-RPC can read them
- * here, and only the write credential can act. Disabled unless
- * WEB_UI_ENABLED=true, since a page a browser can reach is a wider surface
- * than a JSON-RPC endpoint and should be opted into.
+ * here, and only the write credential can act. The server starts this UI with
+ * a local setup page because a browser can reach a wider surface than JSON-RPC.
  */
 import { randomBytes } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { loadConfig, type Account } from './config.js';
+import { ADMIN_COOKIE as ADMIN_COOKIE_NAME, adminCookie, adminSessionOf, routeAdmin, routeOAuthCallback } from './admin-api.js';
 import { escapeHtml } from './html.js';
 import {
   AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
@@ -44,6 +44,7 @@ import { LIGHT_BAR, styles } from './web-styles.js';
 import { isLanguage, LANGUAGES, t, type Language, type StringKey } from './web-strings.js';
 import { appPolicy, framePolicy, MAIL_FRAME, SERVICE_WORKER, SHELL_HEADER } from './web-worker.js';
 import { doneListDays, MAX_CONTACTS, type MailRow, type SentRow, type StateStore } from './services/state.js';
+import { adminPasswordSet, endAdminSession, signInAdmin } from './services/settings-store.js';
 
 export { LANGUAGE_COOKIE, readCookie, SESSION_COOKIE, tokenMatches };
 export type { Session, WebBackend, WebResponse };
@@ -98,6 +99,14 @@ export function webVersion(): string {
 export interface WebOptions {
   onRefresh?: (() => Promise<PollStats>) | undefined;
   writeToken?: string | undefined;
+  /** First-run setup is not finished: only the settings pages are served. */
+  setupMode?: boolean | undefined;
+  /**
+   * Sign-in with the administrator password and the settings pages, both
+   * kept in the settings store. On in the server; off where routeWeb is
+   * called without one (tests, tools), which then never opens it.
+   */
+  adminAuth?: boolean | undefined;
   backend?: Partial<WebBackend> | undefined;
   /**
    * Have a mailbox connection ready for the reader. Called when the page
@@ -780,6 +789,7 @@ const ICONS: Record<string, string> = {
   sparkle: '<path d="M11 4l1.7 4.3L17 10l-4.3 1.7L11 16l-1.7-4.3L5 10l4.3-1.7z"/><path d="M18 14.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/>',
   send: '<path d="M20 4L4 11l6 2.5L12.5 20z"/><path d="M10 13.5L20 4"/>',
   bell: '<path d="M6 17v-6a6 6 0 1 1 12 0v6l1.5 1.5h-15z"/><path d="M10 21a2 2 0 0 0 4 0"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.8 3.1-.2-.1a1.8 1.8 0 0 0-1.9.1 1.8 1.8 0 0 0-.9 1.6v.2h-3.6v-.2a1.8 1.8 0 0 0-1-1.6 1.8 1.8 0 0 0-1.9-.1l-.2.1-1.8-3.1.1-.1a1.7 1.7 0 0 0 .3-1.9 1.8 1.8 0 0 0-1.6-1H5v-3.6h.3a1.8 1.8 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 1.8-3.1.2.1a1.8 1.8 0 0 0 1.9-.1 1.8 1.8 0 0 0 .9-1.6V2.5h3.6v.2a1.8 1.8 0 0 0 1 1.6 1.8 1.8 0 0 0 1.9.1l.2-.1 1.8 3.1-.1.1a1.7 1.7 0 0 0-.3 1.9 1.8 1.8 0 0 0 1.6 1h.3V14h-.3a1.8 1.8 0 0 0-1.6 1z" transform="translate(0 1) scale(.94)"/>',
   clip: '<path d="M15.5 7.5l-7 7a2 2 0 0 0 2.8 2.8l7.4-7.4a4 4 0 0 0-5.6-5.6L5.6 11.8a6 6 0 0 0 8.5 8.5l6-6"/>',
   shield: '<path d="M12 3.5l7 2.5v5.5c0 4.2-2.9 7.6-7 9-4.1-1.4-7-4.8-7-9V6z"/><path d="M9 12l2.2 2.2 4-4.2"/>',
   alert: '<path d="M12 4l9 15.5H3z"/><path d="M12 10v4"/><path d="M12 17h.01"/>',
@@ -810,7 +820,7 @@ function icon(id: string, cls = 'icon'): string {
  * their key, so the switch can reword them in place instead of reloading and
  * losing the filters.
  */
-export function renderApp(lang: Language, canRefresh = false, nonce = ''): string {
+export function renderApp(lang: Language, canRefresh = false, nonce = '', canWrite = false): string {
   const s = (key: StringKey): string => escapeHtml(t(lang, key));
   const worded = (tag: string, key: StringKey, attrs = ''): string =>
     `<${tag}${attrs ? ' ' + attrs : ''} data-i18n="${key}">${s(key)}</${tag}>`;
@@ -840,6 +850,7 @@ export function renderApp(lang: Language, canRefresh = false, nonce = ''): strin
         <div class="brand"><img class="brand-mark" src="/icon-192.png?v=3" alt="" aria-hidden="true"><strong>mailsift</strong></div>
         <div class="header-actions">
           ${refresh}
+          ${canWrite ? `<a href="/settings" class="icon-btn" aria-label="${s('settings.title')}" title="${s('settings.title')}" data-i18n-label="settings.title" data-i18n-title="settings.title">${icon('settings')}</a>` : ''}
           ${iconButton('compose-open', 'compose', 'compose.new', 'aria-haspopup="dialog" aria-controls="compose"')}
           ${iconButton('bell', 'bell', 'notify.title', 'aria-haspopup="dialog" aria-controls="notify-sheet" aria-expanded="false"')}
           <button id="lang" type="button" class="word-btn" aria-label="${s('lang.label')}">${s('lang.face')}</button>
@@ -1223,6 +1234,13 @@ async function route(
 
   const lang = pickLanguage(req);
 
+  // The OAuth provider sending the browser back after a sign-in started on
+  // the settings page; it carries its own single-use state, not a session.
+  if (options.adminAuth && url.pathname === '/' && req.method === 'GET' && url.searchParams.has('state')) {
+    const back = await routeOAuthCallback(url, lang);
+    if (back) return back;
+  }
+
   // With no token there is no credential to check, so the request has to have
   // come under one of this machine's own names (see localHost).
   if (!token && !localHost(req.headers.host)) {
@@ -1251,9 +1269,19 @@ async function route(
     } catch {
       return html(413, renderLogin(lang, 'login.tooLarge', nonce));
     }
-    const presented = form.get('token')?.trim() ?? '';
+    const presented = (form.get('password') ?? form.get('token') ?? '').trim();
     const next = signInTarget(form.get('next'));
-    // Either credential signs in; which one it was decides what the session may do.
+    // The administrator password signs in to everything, the settings included.
+    if (options.adminAuth && presented) {
+      const admin = signInAdmin(presented);
+      if (admin) {
+        return {
+          status: 303, body: '', contentType: 'text/html; charset=utf-8', cookie: adminCookie(req, admin),
+          headers: { location: next },
+        };
+      }
+    }
+    // An MCP token also opens the mail view, the write token with the right to act.
     const writes = writeToken !== '' && presented !== '' && tokenMatches(writeToken, presented);
     // With no read token the page reads without one, so a token typed here was meant for writing, and
     // is wrong: signing in read-only on it would leave the owner wondering why nothing can be done.
@@ -1268,21 +1296,34 @@ async function route(
   // is cleared here, and the page then forgets what it kept. Still only from this site.
   if (url.pathname === '/auth/signout' && req.method === 'POST') {
     if (crossSite(req)) return json(403, { error: 'cross-site request refused', code: 'crossSite' });
-    return { ...json(200, { signedOut: true }), cookie: sessionCookie(req, '', 0), cacheControl: 'no-store' };
+    const admin = options.adminAuth ? readCookie(req.headers.cookie, ADMIN_COOKIE_NAME) : '';
+    if (admin) endAdminSession(admin);
+    return {
+      ...json(200, { signedOut: true }), cookie: sessionCookie(req, '', 0), cacheControl: 'no-store',
+      ...(options.adminAuth ? { extraCookies: [adminCookie(req, '', 0)] } : {}),
+    };
   }
 
-  const session = sessionOf(req, token, writeToken);
+  // A browser signed in with the administrator password may do everything a
+  // write token may. Only the server consults the settings store; the
+  // tests and tools that call this without one never open it.
+  const admin = options.adminAuth ? adminSessionOf(req) : '';
+  const session: Session = admin ? 'write' : sessionOf(req, token, writeToken);
+
+  // A server nobody has claimed yet: everything leads to the claim page.
+  if (options.adminAuth && !adminPasswordSet() && req.method === 'GET' && !url.pathname.startsWith('/api/')
+    && url.pathname !== '/setup') {
+    return { status: 303, body: '', contentType: 'text/html; charset=utf-8', cacheControl: 'no-store', headers: { location: '/setup' } };
+  }
 
   // The form on its own address, so a read-only session can sign in again
   // with the credential that may act on mail.
   if (url.pathname === '/signin' && req.method === 'GET') {
-    return html(200, renderLogin(lang, undefined, nonce, session !== 'none'));
-  }
-
-  if (session === 'none') {
-    return url.pathname.startsWith('/api/')
-      ? json(401, { error: 'unauthorized' })
-      : html(401, renderLogin(lang, undefined, nonce));
+    const asked = url.searchParams.get('next');
+    const next = asked ? signInTarget(asked) : '';
+    // Already signed in with the password: nothing more to sign in to.
+    if (admin) return { status: 303, body: '', contentType: 'text/html; charset=utf-8', headers: { location: next || '/' } };
+    return html(200, renderLogin(lang, undefined, nonce, session !== 'none', next === '/' ? '' : next));
   }
 
   // Every POST here changes something. One that another site started is
@@ -1291,9 +1332,25 @@ async function route(
     return json(403, { error: 'cross-site request refused', code: 'crossSite' });
   }
 
+  if (options.adminAuth) {
+    const settings = await routeAdmin(req, url, { lang, nonce, client, version: webVersion(), admin });
+    if (settings) return settings;
+    // Until setup is finished there is no mail to show: the page is the setup.
+    if (options.setupMode) {
+      if (url.pathname.startsWith('/api/')) return json(503, { error: 'setup is not finished', code: 'setup' });
+      return { status: 303, body: '', contentType: 'text/html; charset=utf-8', cacheControl: 'no-store', headers: { location: '/setup' } };
+    }
+  }
+
+  if (session === 'none') {
+    return url.pathname.startsWith('/api/')
+      ? json(401, { error: 'unauthorized' })
+      : html(401, renderLogin(lang, undefined, nonce));
+  }
+
   // HEAD as GET: an uptime check asks for the page without its body, which the server leaves out.
   if (url.pathname === '/' && (req.method === 'GET' || req.method === 'HEAD')) {
-    const answer = html(200, renderApp(lang, Boolean(options.onRefresh), nonce), true);
+    const answer = html(200, renderApp(lang, Boolean(options.onRefresh), nonce, Boolean(admin)), true);
     // Roll the session forward on each visit, so regular use never expires.
     // Only on the page: doing it on the polling calls would rewrite the cookie
     // every minute for nothing.

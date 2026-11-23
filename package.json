@@ -1,6 +1,6 @@
 {
   "name": "mailsift",
-  "version": "1.0.0",
+  "version": "0.2.0",
   "description": "Multi-mailbox AI mail triage with its own web mail: watch inboxes and spam, judge what actually matters with an LLM, push only that, and read, file and answer it in the browser. MCP server included.",
   "type": "module",
   "engines": {
@@ -8,8 +8,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "start": "node --disable-warning=ExperimentalWarning dist/src/main.js",
-    "dev": "tsx src/main.ts",
+    "start": "node --disable-warning=ExperimentalWarning dist/src/server.js",
+    "dev": "tsx src/server.ts",
     "check": "tsx src/main.ts --check",
     "probe": "tsx scripts/probe.ts",
     "oauth": "tsx scripts/oauth-setup.ts",

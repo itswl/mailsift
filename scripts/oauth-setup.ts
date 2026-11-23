@@ -16,14 +16,21 @@
  *
  * On a server, --manual prints the authorization URL. Open it on your computer,
  * approve access, then paste the complete redirected URL back into the terminal.
+ *
+ * The settings page does the same in the browser (Settings → Mailboxes → Sign
+ * in) and is the usual way; this is the fallback for a terminal only. It reads
+ * the mailboxes and OAuth apps saved there and stores the result in the same
+ * encrypted store, so restart the service afterwards for it to be used.
  */
-import '../src/env.js'; // Must run first so .env is loaded.
+import '../src/env.js'; // Must run first for DNS defaults.
+import { bootstrapError } from '../src/bootstrap.js'; // The saved mailboxes and OAuth apps.
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
-import { loadConfig, needsOAuth, type Account } from '../src/config.js';
+import { loadConfig, mailboxAccount, needsOAuth, setSettingsAccounts, type Account } from '../src/config.js';
+import { readSettings } from '../src/services/settings-store.js';
 import { escapeHtml } from '../src/html.js';
 import {
   AuthError, buildTokenRecord, exchangeCode, getOAuthProvider, TokenStore, type OAuthProvider,
@@ -180,13 +187,20 @@ async function main(): Promise<number> {
     allowPositionals: false,
   });
 
+  if (bootstrapError) {
+    console.log(`❌ The saved settings cannot be read: ${bootstrapError.message}`);
+    return 1;
+  }
+  // Every enabled mailbox, the ones still waiting for this sign-in included.
+  const saved = readSettings().mailboxes.filter((mailbox) => mailbox.enabled);
+  if (saved.length) setSettingsAccounts(saved.map((mailbox) => mailboxAccount(mailbox, { requirePassword: false })));
   const config = loadConfig();
   const store = new TokenStore();
   const existing = new Set(await store.usernames());
 
   let targets = config.accounts.filter(needsOAuth);
   if (values.account) {
-    targets = targets.filter((a) => a.username === values.account);
+    targets = targets.filter((a) => a.username === values.account?.toLowerCase());
     if (targets.length === 0) {
       console.log(`❌ No OAuth account configured for ${values.account}.`);
       return 1;

@@ -551,10 +551,11 @@ function skipSensitiveContent(): boolean {
   return (process.env.LLM_SKIP_SENSITIVE ?? 'true').toLowerCase() !== 'false';
 }
 
-export function resolveLlmBaseUrl(): string {
-  const explicit = process.env.LLM_BASE_URL?.trim();
-  const provider = process.env.LLM_PROVIDER?.trim().toLowerCase();
-  if (!provider) return explicit || 'https://api.deepseek.com';
+export function resolveLlmBaseUrl(source: Record<string, string | undefined> = process.env): string {
+  const explicit = source['LLM_BASE_URL']?.trim();
+  const provider = source['LLM_PROVIDER']?.trim().toLowerCase();
+  // "custom" is what the settings page stores for an endpoint of one's own.
+  if (!provider || provider === 'custom') return explicit || 'https://api.deepseek.com';
 
   const presets: Record<string, string> = {
     deepseek: 'https://api.deepseek.com',

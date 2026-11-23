@@ -134,11 +134,11 @@ describe('bearer credentials decide the tool set', () => {
 
 describe('a server with no token answers only to this machine’s names', () => {
   /** A request under a chosen Host, which fetch does not let a caller set. */
-  function under(port: number, host: string, path = '/mcp'): Promise<{ status: number; body: string }> {
+  function under(port: number, host: string, path = '/mcp', extra: Record<string, string> = {}): Promise<{ status: number; body: string }> {
     return new Promise((resolve, reject) => {
       const req = httpRequest({
         host: '127.0.0.1', port, path, method: 'POST',
-        headers: { host, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+        headers: { host, 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...extra },
       }, (res) => {
         let body = '';
         res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
@@ -157,23 +157,27 @@ describe('a server with no token answers only to this machine’s names', () => 
     delete process.env.MCP_ALLOWED_HOSTS;
     await start();
     const { port } = server!.address() as AddressInfo;
+    // Refused before anything else: a name that is not this machine's, over plain HTTP.
     const rebound = await under(port, `evil.example:${port}`);
-    expect(rebound.status).toBe(421);
+    expect(rebound.status).toBe(403);
+    expect(rebound.body).toContain('https_required');
     expect(rebound.body).not.toContain('list_mail');
-    expect((await under(port, 'evil.example', '/api/summary')).status).toBe(421);
+    expect((await under(port, 'evil.example', '/api/summary')).status).toBe(403);
     const local = await under(port, `127.0.0.1:${port}`);
     expect(local.status).toBe(200);
     expect(local.body).toContain('list_mail');
     expect((await under(port, `localhost:${port}`)).status).toBe(200);
   });
 
-  it('does not ask about the name once a token is what is checked', async () => {
+  it('takes a public name only over HTTPS, and then asks for the token', async () => {
     process.env.MCP_TOKEN = READ;
     delete process.env.MCP_WRITE_TOKEN;
     await start();
     const { port } = server!.address() as AddressInfo;
-    // Refused for the missing token, not for the name.
-    expect((await under(port, 'mail.example.org')).status).toBe(401);
+    // Plain HTTP under a public name would carry the token in the clear.
+    expect((await under(port, 'mail.example.org')).status).toBe(403);
+    // Behind a TLS proxy it is refused for the missing token, not for the name.
+    expect((await under(port, 'mail.example.org', '/mcp', { 'x-forwarded-proto': 'https' })).status).toBe(401);
   });
 });
 

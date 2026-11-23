@@ -18,7 +18,7 @@ describe('the size of a letter', () => {
   it('says what providers take in a way the default limit is within', () => {
     // The default limit's files in base64, as the message travels.
     const travelling = Math.ceil(attachmentLimitBytes() / 3) * 4;
-    for (const path of ['.env.example', 'docs/configuration.md', 'src/smtp.ts']) {
+    for (const path of ['docs/configuration.md', 'src/smtp.ts']) {
       const text = prose(read(path));
       expect(text, path).not.toMatch(/refuse a message (?:over a size of their own, commonly )?(?:of )?about 25 MB as it travels/);
       const said = /25 MB of files on a message[^.]*?about (\d+) MB as (?:it|the message) travels/.exec(text);
@@ -87,9 +87,9 @@ describe('putting off until later', () => {
 
 describe('the owner\'s sent mail', () => {
   it('is documented where it is set, said to be local, for the conversation only, and never sent to the model', () => {
-    const env = prose(read('.env.example'));
-    expect(env).toContain('SENT_MAIL_ENABLED=true');
-    expect(env).toContain('SENT_LOOKBACK_DAYS=30');
+    const settings = prose(read('src/settings-catalog.ts'));
+    expect(settings).toContain("key: 'SENT_MAIL_ENABLED'");
+    expect(settings).toContain("key: 'SENT_LOOKBACK_DAYS'");
     const config = prose(read('docs/configuration.md'));
     expect(config).toContain('It is used for the conversation only. It is never judged, never sent to the model');
     expect(config).toContain('What was stored before stays, and still shows in its conversations, until retention removes it');
