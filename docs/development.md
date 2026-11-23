@@ -4,12 +4,18 @@ mailsift needs Node 22.5 or newer.
 
 ```bash
 npm install
-npm run check      # validate .env
-npm run dev        # run from source
+npm run dev        # run from source: the supervisor (src/server.ts) and the service, restarting on saved settings
+npm run check      # report on the settings stored in the local database
 npm test
 npm run typecheck
 npm run build
 ```
+
+`npm run dev` keeps its database and key in `data/` (`STATE_DB_PATH` and `MAILSIFT_KEY_FILE` move them) and prints the first-run setup block in the terminal; open `http://127.0.0.1:8410/` and set it up as on a server. It does not reload on code changes; stop and start it.
+
+## Settings
+
+Every setting the page offers is listed once, in `src/settings-catalog.ts`: its key (the environment name the code has always read), section, type, limits, default and words in both languages. The settings store (`src/services/settings-store.ts`) keeps them encrypted in the database, and `src/bootstrap.ts` hands them to the rest of the code as `process.env` values and to `config.ts` as the mailboxes, before any other module loads. So a module reads its setting the way it always has; a new setting needs only its catalog entry. The settings pages are `src/settings-page.ts` (whose script, like the page's, is a `String.raw` template) and the API behind them `src/admin-api.ts`. Tests and one-off tools that never load `bootstrap.ts` can still set `MAIL_ACCOUNT_N` and the other names in the environment.
 
 ## Working on the web view
 

@@ -89,7 +89,7 @@ Verification codes and sign-in links are judged locally and are not sent to the 
 
 - `pass`: the provider says the message really comes from the From domain (`signedBy` names the domain).
 - `fail`: the provider says DMARC failed. Treat the From address as unproven and say so.
-- `none`: the provider said nothing, or it is a provider whose header mailsift cannot recognise (Gmail, Outlook, Yahoo, iCloud, Fastmail and QQ are recognised; others need `MAIL_ACCOUNT_N_AUTHSERV_ID`). This is absence of evidence, not a bad sign.
+- `none`: the provider said nothing, or it is a provider whose header mailsift cannot recognise (Gmail, Outlook, Yahoo, iCloud, Fastmail and QQ are recognised; others need the mailbox's Authentication-Results server ID in Settings). This is absence of evidence, not a bad sign.
 
 A `pass` proves the domain, not the intent: a real domain can still send a scam. None of these clues is a spam or malware verdict.
 
@@ -164,7 +164,7 @@ After you call it:
 - A `PROVIDER_ERROR` whose message starts with `send_timeout` means the mail server did not confirm the message. **It may have left.** Do not try again: tell the user to look in Sent. Repeating the request is answered the same way and sends nothing, until what became of it is known: then a repeat is answered with that (it left, or it failed and may be sent). Only when the user has looked and wants it sent after all, call again with a different `id`.
 - `MAILBOX_UNAVAILABLE` with `send_auth` or `send_connection` means the mail server could not be reached. Nothing was sent; trying again later is safe.
 - `ACTION_REFUSED` with `send_rate` means more than ten messages in a minute. Wait; do not work around it.
-- `ACTION_REFUSED` with `send_not_configured` means this mailbox cannot send, and the reason in brackets says why: `disabled` (sending is switched off on the server with `SMTP_ENABLED=false` or `DRY_RUN=true`), `no_smtp` (a mailbox on a custom host with no `MAIL_ACCOUNT_N_SMTP_HOST`), or `oauth_scope` (an Outlook mailbox authorized for reading only). It needs the owner, not another call.
+- `ACTION_REFUSED` with `send_not_configured` means this mailbox cannot send, and the reason in brackets says why: `disabled` (sending is switched off in the server's Settings, or it is in dry-run mode), `no_smtp` (a mailbox on a custom host with no SMTP server entered for it), or `oauth_scope` (an Outlook mailbox signed in for reading only). It needs the owner, not another call.
 
 mailsift sends plain text, here and in the web view: there is no way to send markup. Through MCP a file can only go along as a stored message's own attachment, in a forward; the web view's composer can attach files from the owner's device. If the user needs either, say so.
 
