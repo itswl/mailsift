@@ -11,7 +11,7 @@ This page explains how mailsift decides what a message is worth, and what it sen
 
 ## How a message is judged
 
-1. A forwarded copy of mail that another of your mailboxes already received is recorded but not judged again (`SUPPRESS_SELF_FORWARDS`; see [Configuration](configuration.md#mailboxes-and-folders)).
+1. A forwarded copy of mail that another of your mailboxes already received is recorded but not judged again (`SUPPRESS_SELF_FORWARDS`; see [Configuration](configuration.md#forwarding-between-mailboxes)).
 2. Sender rules decide without the LLM: `MAIL_ALWAYS_IMPORTANT`, `MAIL_NEVER_IMPORTANT`, and the rules inferred from feedback (see [Configuration](configuration.md#your-own-rules)).
 3. The content of verification codes, one-time passwords and sign-in links never reaches the LLM (see [below](#verification-codes-and-sign-in-links)).
 4. Everything else goes to the LLM in batches of `LLM_BATCH_SIZE` (default `10`), or through the two-stage pipeline when that is configured.

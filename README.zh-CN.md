@@ -39,7 +39,7 @@ ssh -N -L 8410:127.0.0.1:8410 you@your-server
 
 端口只发布在服务器的回环地址上，mailsift 也只在本机地址或 HTTPS 下接受密码和令牌。要在手机或其他电脑上日常使用，请在前面配置 HTTPS 反向代理，见 [Deployment](docs/deployment.md#reaching-it-from-another-computer)。
 
-Gmail 和 Outlook 通过 OAuth 登录，需要你在 Google 或 Microsoft 注册一次自己的 OAuth 应用，见 [Gmail and Outlook sign-in](docs/deployment.md#gmail-and-outlook-sign-in)。
+Gmail 和 Outlook 通过 OAuth 登录，需要你在 Google 或 Microsoft 注册一次自己的 OAuth 应用，见 [Gmail and Outlook sign-in](docs/deployment.md#gmail-and-outlook-sign-in)。个人 Gmail 也可以改用应用专用密码，或者把 Gmail 整箱转发到一个用密码登录的邮箱（见 [Forwarding between mailboxes](docs/configuration.md#forwarding-between-mailboxes)）。这两件事的中文详解在讨论区：[#46 Gmail / Outlook 的 OAuth 授权](../../discussions/46) 和 [#47 邮箱转发](../../discussions/47)。它们写于 0.1.x，其中的 `.env` 和命令行步骤现在都在“设置”里完成，Google 和 Microsoft 一侧的步骤仍然适用。
 
 ## 设置
 
