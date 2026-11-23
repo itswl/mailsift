@@ -293,15 +293,19 @@ function setupAddress(): string {
   return `http://127.0.0.1:${process.env.MCP_PORT ?? '8410'}`;
 }
 
-function announceSetup(code: string | undefined): void {
+function announceSetup(code: string | undefined, setupFinished: boolean): void {
+  const port = process.env.MCP_PORT ?? '8410';
+  const headline = !code ? ' mailsift is waiting for setup to be finished.'
+    : setupFinished ? ' mailsift is running, but no administrator password is set yet.'
+    : ' mailsift is waiting to be set up.';
   const lines = [
     '',
     '──────────────────────────────────────────────────────────────',
-    code ? ' mailsift is waiting to be set up.' : ' mailsift is waiting for setup to be finished.',
+    headline,
     '',
-    ` Open ${setupAddress()}/ on this machine.`,
+    ` Open ${setupAddress()}/ on this machine${setupFinished ? ', or the address of your HTTPS proxy' : ''}.`,
     ' On a remote server, tunnel the port first from your computer:',
-    `   ssh -N -L ${process.env.MCP_PORT ?? '8410'}:127.0.0.1:${process.env.MCP_PORT ?? '8410'} you@your-server`,
+    `   ssh -N -L ${port}:127.0.0.1:${port} you@your-server`,
     ...(code ? ['', ` One-time setup code: ${code}`, ' (a new code is printed each time mailsift starts until it is used)'] : []),
     '──────────────────────────────────────────────────────────────',
     '',
@@ -324,7 +328,7 @@ async function serve(): Promise<number> {
   setServerMode(mode);
 
   const code = adminPasswordSet() ? undefined : issueSetupCode();
-  if (code || mode === 'setup') announceSetup(code);
+  if (code || mode === 'setup') announceSetup(code, Boolean(doc.setupCompletedAt));
   if (!supervised()) {
     log.warn('Started without the supervisor (dist/src/server.js): saved settings will need a manual restart.');
   }

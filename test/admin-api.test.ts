@@ -115,6 +115,17 @@ describe('the settings API', { timeout: 30_000 }, () => {
     expect(tokenCookie.answer.status).toBe(401);
   });
 
+  it('links Settings from the mail view of a token session too, where the password is asked for', async () => {
+    await claim();
+    cookie = '';
+    const page = await call('/', { headers: { cookie: 'mailsift_session=write-token' } });
+    expect(page.answer.status).toBe(200);
+    expect(String(page.answer.body)).toContain('href="/settings"');
+    const settings = await call('/settings', { headers: { cookie: 'mailsift_session=write-token' } });
+    expect(settings.answer.status).toBe(303);
+    expect(settings.answer.headers?.['location']).toBe('/signin?next=%2Fsettings');
+  });
+
   it('signs in at the ordinary form with the administrator password', async () => {
     await claim();
     cookie = '';
@@ -178,6 +189,10 @@ describe('the settings API', { timeout: 30_000 }, () => {
     expect(readSettings().mailboxes[0]).toMatchObject({ name: 'Personal', password: 'p|w' });
     const duplicate = await call('/api/admin/mailboxes/save', { body: { mailbox: { provider: 'qq', username: 'ME@qq.com', password: 'x' } } });
     expect(duplicate.answer.status).toBe(400);
+    // A test of a mailbox that is gone says so, instead of judging an empty form.
+    const gone = await call('/api/admin/mailboxes/test', { body: { id: 'not-a-mailbox' } });
+    expect(gone.answer.status).toBe(404);
+    expect(gone.json['code']).toBe('no_mailbox');
     const removed = await call('/api/admin/mailboxes/delete', { body: { id: mailbox['id'] } });
     expect(removed.answer.status).toBe(200);
     expect(readSettings().mailboxes).toEqual([]);

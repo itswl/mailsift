@@ -571,6 +571,7 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
       const current = readSettings();
       const id = text(body['id'], 40);
       const existing = id ? current.mailboxes.find((m) => m.id === id) : undefined;
+      if (id && !existing) return fail(404, 'no_mailbox', zh ? '找不到这个邮箱。' : 'That mailbox no longer exists.');
       const mailbox = mailboxFrom(body['mailbox'] ?? existing, existing);
       const problem = mailboxProblem(mailbox, { ...current, mailboxes: current.mailboxes.filter((m) => m.id !== mailbox.id) }, lang);
       if (problem) return fail(400, 'invalid_mailbox', problem);
