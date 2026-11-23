@@ -320,7 +320,7 @@ export function updateOAuthTokens(change: (current: string | undefined) => strin
  * database rather than in memory, because saving the mailbox it belongs to
  * may restart the service in between.
  */
-export interface PendingOAuth {
+export interface PendingSignIn {
   mailboxId: string;
   username: string;
   verifier: string;
@@ -331,20 +331,20 @@ export interface PendingOAuth {
   expiresAt: number;
 }
 
-function readPending(): Record<string, PendingOAuth> {
+function readPending(): Record<string, PendingSignIn> {
   const raw = readSealed(PENDING_ROW);
   if (!raw) return {};
   const parsed: unknown = JSON.parse(raw);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
   const now = Date.now();
-  const out: Record<string, PendingOAuth> = {};
-  for (const [state, value] of Object.entries(parsed as Record<string, PendingOAuth>)) {
+  const out: Record<string, PendingSignIn> = {};
+  for (const [state, value] of Object.entries(parsed as Record<string, PendingSignIn>)) {
     if (value && typeof value === 'object' && typeof value.expiresAt === 'number' && value.expiresAt > now) out[state] = value;
   }
   return out;
 }
 
-export function savePendingOAuth(state: string, pending: PendingOAuth): void {
+export function savePendingSignIn(state: string, pending: PendingSignIn): void {
   const db = database();
   transaction(db, () => {
     const all = readPending();
@@ -356,7 +356,7 @@ export function savePendingOAuth(state: string, pending: PendingOAuth): void {
 }
 
 /** The pending sign-in for this state, removed so it is used once. */
-export function takePendingOAuth(state: string): PendingOAuth | undefined {
+export function takePendingSignIn(state: string): PendingSignIn | undefined {
   if (!state || state.length > 200) return undefined;
   const db = database();
   return transaction(db, () => {
@@ -367,11 +367,6 @@ export function takePendingOAuth(state: string): PendingOAuth | undefined {
     writeSealed(PENDING_ROW, JSON.stringify(all));
     return found;
   });
-}
-
-/** Whether a state belongs to a pending sign-in, without using it. */
-export function hasPendingOAuth(state: string): boolean {
-  return Boolean(state && state.length <= 200 && readPending()[state]);
 }
 
 // ---------------------------------------------------------------------------
