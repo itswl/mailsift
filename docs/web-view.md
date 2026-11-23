@@ -1,10 +1,10 @@
 # Web view
 
-`WEB_UI_ENABLED=true` serves mailsift's own mail client at `http://<host>:<MCP_PORT>/`, on the same port and behind the same tokens as MCP, because it is the same trust boundary.
+The web view is served with the server at `http://127.0.0.1:8410/`, on the same port as MCP. It also holds the first-run setup and Settings; see [Deployment](deployment.md#first-start) and [Configuration](configuration.md).
 
 It is a mail client built around the triage rather than around a folder list. It opens on what needs you, shows each message as it was sent, and lets you deal with it there: mark it done, file it, answer it, or ask a question across everything that was judged.
 
-It is off by default. A page a browser can reach is a wider surface than a JSON-RPC endpoint, so enable it deliberately, keep the port on loopback (`MCP_PUBLIC_HOST` in Docker, `MCP_BIND` otherwise), and put TLS in front of it if you reach it from a phone. Notifications, the installed app and offline opening all need HTTPS.
+Compose publishes the port on the server's loopback address only, and mailsift takes a password or a token only from a localhost address or over HTTPS: on the server itself, through an SSH tunnel, or behind an HTTPS reverse proxy (see [Reaching it from another computer](deployment.md#reaching-it-from-another-computer)). Notifications, the installed app and offline opening need HTTPS or a localhost address.
 
 - [Signing in, and what a session may do](#signing-in-and-what-a-session-may-do)
 - [What needs you](#what-needs-you)
@@ -30,24 +30,23 @@ It is off by default. A page a browser can reach is a wider surface than a JSON-
 
 ## Signing in, and what a session may do
 
-Signing in posts a token and exchanges it for an `HttpOnly` cookie that lasts six months and is renewed on each visit, so a browser in regular use is never asked again. The cookie holds the token itself, the same value MCP takes as its bearer token: whoever reads it holds that credential, so keep the page on HTTPS (see [How the page is protected](#how-the-page-is-protected)). The form carries an account field so a password manager will offer to save the token. An installed app keeps its own cookies on iOS, so expect to sign in once inside it even if the browser is already signed in. Signing in goes on to the address that asked for it: a shared link, a folder, a message named after `#m=`, or the Latest code shortcut opens on what it names rather than on the start of the page.
+Sign in with the administrator password, the one chosen with the setup code. The browser then holds an `HttpOnly` session cookie for 30 days. The cookie is a random session key, stored on the server only as a hash, never the password; changing the password, **Sign out other browsers** (Settings → Access) and `--reset-admin` end sessions. The form carries an account field so a password manager will offer to save the password. An installed app keeps its own cookies on iOS, so expect to sign in once inside it even if the browser is already signed in. Signing in goes on to the address that asked for it: a shared link, a folder, a message named after `#m=`, Settings, or the Latest code shortcut opens on what it names rather than on the start of the page.
 
-Which token you sign in with decides what the page may do, the same split MCP makes between its two credentials:
+The password session may do everything below, and it is the only one that opens Settings. The same form also takes an MCP token (Settings → Access → MCP), which opens the mail view with that token's rights and never Settings: the split MCP makes between its two credentials.
 
-| | `MCP_TOKEN` (read) | `MCP_WRITE_TOKEN` (write) |
-|---|---|---|
-| Read the list, a message, attachments | yes | yes |
-| Open any folder, search the mailbox | yes | yes |
-| Search, ask a question, get notifications | yes | yes |
-| Mark done, put off until later | only when no write token is configured | yes |
-| Archive, bin, star, mark read, move to any folder, spam and not spam | no | yes |
-| The same to many messages at once | no (done and later: as above) | yes |
-| Reply, forward and send; change a signature | no | yes |
-| Correct a judgement, draft with the model | no | yes |
+| | Administrator password | Write token | Read token |
+|---|---|---|---|
+| Read the list, a message, attachments | yes | yes | yes |
+| Open any folder, search the mailbox | yes | yes | yes |
+| Search, ask a question, get notifications | yes | yes | yes |
+| Mark done, put off until later | yes | yes | no |
+| Archive, bin, star, mark read, move to any folder, spam and not spam | yes | yes | no |
+| The same to many messages at once | yes | yes | no |
+| Reply, forward and send; change a signature | yes | yes | no |
+| Correct a judgement, draft with the model | yes | yes | no |
+| Settings | yes | no | no |
 
-With `MCP_WRITE_TOKEN` unset the page reads and never touches a mailbox; the one credential may still tick things off, because that is the page's own bookkeeping and the credential is the owner's. Once a write token exists, the read token is strictly read-only, so it can be given to something that should only look. With `MCP_WRITE_TOKEN` set and `MCP_TOKEN` unset (allowed on loopback only), the page reads without signing in, and a token typed at `/signin` that is not the write token is refused as wrong rather than signing in read-only. The footer says which kind of session this is, and `/signin` signs in again with the other token without signing out first.
-
-Pressing an action a session may not take explains this instead of failing.
+A token session's cookie holds the token itself and lasts six months, renewed on each visit, so give a browser a token only where you would leave the token. `/signin` signs a read-only session in again with more rights without signing out first. Pressing an action a session may not take explains this instead of failing.
 
 ## What needs you
 
@@ -112,7 +111,7 @@ That third layer is where the reader's judgement comes in:
 - **Remote images are held** until you ask, per message. Each one leaves a box of its own size with its description. A sender can be remembered so their images always load, but only when the mailbox's own server vouched for that sender (see below): anyone can write a From line.
 - **Tracking pixels are dropped**, never loaded even with images on, and counted.
 - **A link whose text names one site and whose address is another** is marked beside the link and listed above the message as `shown → real`. Hovering any link shows where it really goes.
-- **The sender's authentication** is shown under the sender's name when the mailbox's provider reported one: "Verified sender · example.com" when the provider says DMARC passed, a warning when it says DMARC failed. Where the provider reports no DMARC result, a DKIM signature counts only if it was made by the From domain itself or a domain above it. mailsift verifies nothing itself. It reads the first `Authentication-Results` header, and believes it only when it names the server your mailbox is actually on, since a sender can write that header too. Gmail, Outlook, Yahoo, iCloud, Fastmail and QQ (`imap.qq.com`) are recognised; for any other provider set `MAIL_ACCOUNT_N_AUTHSERV_ID` to what its receiving server calls itself (the first word after `Authentication-Results:` in a message you received), and until then no verdict is shown rather than a forgeable one.
+- **The sender's authentication** is shown under the sender's name when the mailbox's provider reported one: "Verified sender · example.com" when the provider says DMARC passed, a warning when it says DMARC failed. Where the provider reports no DMARC result, a DKIM signature counts only if it was made by the From domain itself or a domain above it. mailsift verifies nothing itself. It reads the first `Authentication-Results` header, and believes it only when it names the server your mailbox is actually on, since a sender can write that header too. Gmail, Outlook, Yahoo, iCloud, Fastmail and QQ (`imap.qq.com`) are recognised; for any other provider enter the mailbox's **Authentication-Results server ID** (Settings → Mailboxes → Edit → Server and sending): what its receiving server calls itself (the first word after `Authentication-Results:` in a message you received), and until then no verdict is shown rather than a forgeable one.
 
 A message designed for a light page keeps its paper in the dark theme; one that sets no colours takes the page's own. A layout wider than the screen is scaled to fit, with a switch to its actual size. "Plain text" shows the words alone, quoted history is folded under the reply it belongs to, and a `List-Unsubscribe` address is offered as a link, which nothing requests until you press it.
 
@@ -187,12 +186,12 @@ Reply, Reply all, Forward and a new message (the pencil in the header, or `n`) o
 - **A send is never silently repeated.** If the mail server takes longer than a minute (plus the time a letter's files take to travel, about a second for every 256 KB: there, as long again for the server to read them before it answers, and once more to Sent), or the connection drops after the message was handed over, the page says the message was not confirmed and to look in Sent first. So does a proxy in front of mailsift that stops waiting first. An upload to mailsift is given as long as the largest letter takes at about half a megabit a second; one cut off before it arrives whole sent nothing. A send that finishes late is still recorded and filed, and pressing send again on the same unchanged letter reports that it went instead of sending a second copy.
 - Once sent, an answered original is marked answered in the mailbox, and an answered or forwarded one is done in the queue, unless it was forwarded only to your own mailboxes; the page follows what the server says about that. Where the provider does not file a copy in Sent by itself, mailsift appends one, with its Bcc line and its attachments.
 
-Mail is sent over the provider's own SMTP submission server, always encrypted, signed in with the same credential that reads the mailbox. The presets cover every listed provider; a mailbox on a custom host needs `MAIL_ACCOUNT_N_SMTP_HOST`. The audit records of a sent message that one left, from which mailbox and when; never the recipients, the text or the names of its files. The message itself is kept for its conversation (see [The conversation, and your own mail](#the-conversation-and-your-own-mail)) unless `SENT_MAIL_ENABLED=false`. Changing a signature is recorded as that, for which mailbox, never what it says.
+Mail is sent over the provider's own SMTP submission server, always encrypted, signed in with the same credential that reads the mailbox. The presets cover every listed provider; a mailbox on a custom host needs its **SMTP server** entered under the mailbox's Server and sending. The audit records of a sent message that one left, from which mailbox and when; never the recipients, the text or the names of its files. The message itself is kept for its conversation (see [The conversation, and your own mail](#the-conversation-and-your-own-mail)) unless `SENT_MAIL_ENABLED=false`. Changing a signature is recorded as that, for which mailbox, never what it says.
 
 Two cases need a step first:
 
-- **Outlook with OAuth.** Microsoft grants sending separately from reading, and mailsift asks only for reading by default. To answer from such a mailbox, authorize it again with `npm run oauth -- --account you@outlook.com --send --force` (see [Deployment](deployment.md#gmail-and-outlook-oauth)). Gmail's authorization already covers sending.
-- **`SMTP_ENABLED=false`** switches sending off for every mailbox, and `DRY_RUN=true` does the same.
+- **Outlook with OAuth.** Microsoft grants sending separately from reading. mailsift asks for both while sending is on; a mailbox signed in for reading only says so under Settings → Mailboxes, and **Sign in again** asks for sending too (see [Deployment](deployment.md#gmail-and-outlook-sign-in)). Gmail's sign-in already covers sending.
+- Settings → Web mail → **Allow sending from the web view and MCP**, turned off, switches sending off for every mailbox, and so does Settings → Notifications → More options → **Dry run**.
 
 ## Asking
 
@@ -222,8 +221,8 @@ The bell turns on Web Push for the device you are holding: a verification code o
 - A reminder you asked for ([Later](#later)) is sent to every device with notifications on, whatever level it chose and whether or not it wants codes: "Reminder: Vendor", with the summary or the subject under it. Nothing is sent for one marked done before its time, for one brought back with "Back now", or for one that came more than a day before the service was running to send it; it is back in the queue all the same. A message put off is not notified as mail before its time, here or on Feishu or the webhook, even when it is judged again meanwhile: a notification it was owed waits for that time (and moves with it, or is dropped by Back now), and one for a message marked done meanwhile is dropped. Reminders that come together, as every "Tomorrow morning" does at 09:00, go after a fresh code, never instead of it. The time reminders were last looked for is kept in the database, so a restart neither skips a reminder nor sends one twice.
 - Tapping one opens that message, or the code.
 - On iPhone and iPad, notifications work only from the app installed to the Home Screen.
-- The panel under the bell lists the other devices that have notifications on, and the owner can remove one, which is how a lost phone is cut off. A subscription is also tied to the token it was made under: replace `MCP_TOKEN` or `MCP_WRITE_TOKEN` and restart, and every device that subscribed under the old one stops being told.
-- Subscriptions are accepted only for the push services browsers actually use (Google, Mozilla, Apple, Microsoft), because the endpoint is an address this server will post to. `WEB_PUSH_ALLOWED_HOSTS` adds others. `WEB_PUSH_ENABLED=false` removes the feature.
+- The panel under the bell lists the other devices that have notifications on, and the owner can remove one, which is how a lost phone is cut off. A subscription is also tied to the credential it was made under (a password session counts as the write token): generate a new read or write token under Settings → Access, and every device that subscribed under the old one stops being told.
+- Subscriptions are accepted only for the push services browsers actually use (Google, Mozilla, Apple, Microsoft), because the endpoint is an address this server will post to. Settings → Notifications → More options → **Additional push service hosts** adds others; turning off **Browser notifications** removes the feature.
 
 ## Keyboard and the command palette
 
@@ -282,20 +281,21 @@ Message bodies, attachments and API answers are never cached, by the worker or b
 
 ## How the page is protected
 
-- **Tokens** are compared in constant time, and the cookie is `HttpOnly` and `SameSite=Lax`. It is marked `Secure` when the request came over HTTPS, which behind a proxy means the proxy sends `X-Forwarded-Proto: https` (see [Behind a reverse proxy](#behind-a-reverse-proxy)); `WEB_COOKIE_SECURE=true` marks it always, for a page that is only ever reached over HTTPS (a browser then keeps no cookie from a plain-HTTP address, loopback included). The cookie is the token itself, so a plain-HTTP request to the same host would carry the credential in clear. Sign-in has a small rate budget of its own.
+- **Credentials only over a safe channel.** A password, a setup code, an OAuth code or a token is accepted only when the browser's address is `localhost`, `127.0.0.1` or `[::1]` (the server itself, or an SSH tunnel), or over HTTPS (TLS, or a proxy that says `X-Forwarded-Proto: https`). Anything else gets a page that explains the tunnel and the proxy. The decision is made on the address the browser was pointed at, not on the connection's peer, which behind Docker is always the bridge gateway. See [Reaching it from another computer](deployment.md#reaching-it-from-another-computer).
+- **Sessions.** The administrator password is checked against an scrypt hash, and sign-in, claiming with the setup code and changing the password have rate budgets of their own. Tokens are compared in constant time. Cookies are `HttpOnly` and `SameSite=Lax`, and marked `Secure` when the request came over HTTPS; Settings → Access → More options → **Secure cookies** can make that Always (a browser then keeps no cookie from a plain-HTTP address, localhost included) or Never.
 - **Every client has a budget**, per minute: the page ten times `MCP_RATE_LIMIT_PER_MINUTE` (1,200 by default), apart from MCP's own, so an MCP client on the same machine does not use up the page's. Over it, the page says so in its own words.
 - **Every request that changes something is a POST, and a POST another site started is refused** (`Sec-Fetch-Site`, then `Origin`), whatever cookie came with it. That includes signing in.
 - **The page runs only its own script.** Each response carries a content policy with a fresh nonce; nothing is loaded from another origin, the page cannot be framed, and a message's markup is never inserted into it (see [Reading a message](#reading-a-message)).
 - **Nothing under `/api` can be loaded as an image, stylesheet or frame**, so a message shown with its images cannot use your session by naming this server as one.
-- **With no token set, the server answers only to this machine's own names** (`localhost`, `127.0.0.1`, `[::1]`). An unauthenticated server is only allowed on loopback, and this is what keeps a web page elsewhere from reaching it through a host name of its own (DNS rebinding). If a proxy on the same machine forwards a public name without a token in front, list that name in `MCP_ALLOWED_HOSTS`; setting `MCP_TOKEN` is the better answer.
+- **Settings need the password.** No token, not even the write token, can change a setting, generate a token or read whether a secret is set. Secrets are never sent back to the page.
 - **Sending is narrow.** The sender is always the mailbox's own address, every recipient is checked as one bare address before a connection is opened, nothing a request carries can add a header, and sends are rate-limited.
 - **Everything that acts is on record**: mailbox actions and sent messages in the mail-action audit, the rest in the MCP audit log, keyed to a fingerprint of the caller.
 
 ## Behind a reverse proxy
 
-Set `TRUSTED_PROXY=true`. Otherwise every request arrives from the proxy's address, the per-client limits collapse into one shared budget, and a single noisy caller can lock out your own browser and any MCP client. With it set, the limits and the audit log key on `CF-Connecting-IP`, `X-Real-IP` or the first `X-Forwarded-For` entry. Leave it off when the port is reached directly, since anyone can send those headers.
+Turn on Settings → Access → More options → **Trust the proxy's client address** (`TRUSTED_PROXY`) only when the port can be reached through the proxy alone, as with the compose file's loopback-only port. Otherwise every request arrives from the proxy's address, the per-client limits collapse into one shared budget, and a single noisy caller can lock out your own browser and any MCP client. With it on, the server uses `CF-Connecting-IP`, `X-Real-IP` or the first `X-Forwarded-For` entry for rate limits and audit records. Leave it off when the port is reached directly, since anyone can send those headers.
 
-The proxy has to say two more things. `X-Forwarded-Proto` tells mailsift the page was reached over HTTPS, which is what marks the session cookie `Secure` (or set `WEB_COOKIE_SECURE=true`); nginx does not send it unless told. And the `Host` the browser asked for: a POST whose `Origin` names another host than the one mailsift is told is refused as coming from another site, sign-in included, by a browser that sends no `Sec-Fetch-Site`. For nginx, in the `server` block:
+The proxy has to say two more things. `X-Forwarded-Proto` tells mailsift the page was reached over HTTPS: without it every sign-in is refused as plain HTTP, and the session cookie is not marked `Secure`. nginx does not send it unless told; Caddy does. And the `Host` the browser asked for: a POST whose `Origin` names another host than the one mailsift is told is refused as coming from another site, sign-in included, by a browser that sends no `Sec-Fetch-Site`. For nginx, in the `server` block:
 
 ```nginx
 proxy_set_header Host $host;
@@ -316,12 +316,12 @@ location /api/events {
 
 The page works without it, a minute behind.
 
-A letter with files is one large request: up to about 28 MB with the default `SMTP_ATTACHMENT_MAX_BYTES` of 20 MiB (the files in base64, which is a third larger, and the letter), and up to about 48 MB with the 35 MiB ceiling. nginx refuses anything over 1 MB unless told otherwise, and on a slow link to the mail server the answer can take a few minutes, so give `/api/send` room for both:
+A letter with files is one large request: up to about 28 MB with the default attachment limit of 20 MiB (Settings → Web mail → More options) (the files in base64, which is a third larger, and the letter), and up to about 48 MB with the 35 MiB ceiling. nginx refuses anything over 1 MB unless told otherwise, and on a slow link to the mail server the answer can take a few minutes, so give `/api/send` room for both:
 
 ```nginx
 location /api/send {
     proxy_pass http://127.0.0.1:8410;
-    client_max_body_size 30m;   # 48m if SMTP_ATTACHMENT_MAX_BYTES is raised to its ceiling
+    client_max_body_size 30m;   # 48m if the attachment limit is raised to its ceiling
     proxy_read_timeout 10m;
 }
 ```
