@@ -7,8 +7,8 @@ import type { IncomingMessage } from 'node:http';
 import { createRequire } from 'node:module';
 import {
   adminPasswordSet, adminSessionValid, changeAdminPassword, claimAdmin, closeSettingsStore, endOtherAdminSessions,
-  ensureAccessTokens, issueSetupCode, normalizeSetupCode, readSettings, resetAdmin, savePendingOAuth, settingsKeyPath,
-  signInAdmin, SettingsKeyError, startAdminSession, takePendingOAuth, updateSettings,
+  ensureAccessTokens, issueSetupCode, normalizeSetupCode, readSettings, resetAdmin, savePendingSignIn, settingsKeyPath,
+  signInAdmin, SettingsKeyError, startAdminSession, takePendingSignIn, updateSettings,
 } from '../src/services/settings-store.js';
 import { applySettings, differsFromBoot, mailboxReadiness, rememberBootState } from '../src/services/settings-runtime.js';
 import { checkField, crossFieldProblems, FIELD_BY_KEY, SECRET_KEYS } from '../src/settings-catalog.js';
@@ -78,17 +78,17 @@ describe('the settings document', () => {
   });
 
   it('keeps a pending OAuth sign-in across a restart, for one use only', () => {
-    savePendingOAuth('state-1', {
+    savePendingSignIn('state-1', {
       mailboxId: 'm', username: 'a@gmail.com', verifier: 'v', redirectUri: 'http://localhost:8410/', scope: 's',
       returnTo: 'http://127.0.0.1:8410', expiresAt: Date.now() + 60_000,
     });
     closeSettingsStore();
-    expect(takePendingOAuth('state-1')?.mailboxId).toBe('m');
-    expect(takePendingOAuth('state-1')).toBeUndefined();
-    savePendingOAuth('old', {
+    expect(takePendingSignIn('state-1')?.mailboxId).toBe('m');
+    expect(takePendingSignIn('state-1')).toBeUndefined();
+    savePendingSignIn('old', {
       mailboxId: 'm', username: 'a@gmail.com', verifier: 'v', redirectUri: 'r', scope: 's', returnTo: '', expiresAt: Date.now() - 1,
     });
-    expect(takePendingOAuth('old')).toBeUndefined();
+    expect(takePendingSignIn('old')).toBeUndefined();
   });
 });
 

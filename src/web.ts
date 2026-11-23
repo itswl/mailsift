@@ -14,7 +14,7 @@
 import { randomBytes } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { loadConfig, type Account } from './config.js';
-import { ADMIN_COOKIE as ADMIN_COOKIE_NAME, adminCookie, adminSessionOf, routeAdmin, routeOAuthCallback } from './admin-api.js';
+import { ADMIN_COOKIE as ADMIN_COOKIE_NAME, adminCookie, adminSessionOf, routeAdmin, routeProviderRedirect } from './admin-api.js';
 import { escapeHtml } from './html.js';
 import {
   AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId,
@@ -1237,7 +1237,7 @@ async function route(
   // The OAuth provider sending the browser back after a sign-in started on
   // the settings page; it carries its own single-use state, not a session.
   if (options.adminAuth && url.pathname === '/' && req.method === 'GET' && url.searchParams.has('state')) {
-    const back = await routeOAuthCallback(url, lang);
+    const back = await routeProviderRedirect(url, lang);
     if (back) return back;
   }
 

@@ -36,8 +36,8 @@ import {
 } from './services/settings-runtime.js';
 import {
   ADMIN_PASSWORD_MIN, adminPasswordSet, adminSessionValid, changeAdminPassword, claimAdmin, endOtherAdminSessions,
-  newAccessToken, newMailboxId, passwordProblem, readSettings, savePendingOAuth, startAdminSession, takePendingOAuth, updateSettings,
-  type MailboxSettings, type PendingOAuth, type SettingsDocument,
+  newAccessToken, newMailboxId, passwordProblem, readSettings, savePendingSignIn, startAdminSession, takePendingSignIn, updateSettings,
+  type MailboxSettings, type PendingSignIn, type SettingsDocument,
 } from './services/settings-store.js';
 import { hostPort, requestChannel } from './web-access.js';
 import { json, rateWindow, readCookie, readJson, type WebResponse } from './web-http.js';
@@ -349,7 +349,7 @@ function returnOrigin(req: IncomingMessage): string {
   return `${requestChannel(req) === 'https' ? 'https' : 'http'}://${host}`;
 }
 
-async function finishOAuth(pending: PendingOAuth, code: string, lang: Language): Promise<{ ok: true; applied: Applied } | { ok: false; message: string }> {
+async function finishSignIn(pending: PendingSignIn, code: string, lang: Language): Promise<{ ok: true; applied: Applied } | { ok: false; message: string }> {
   const zh = lang === 'zh-CN';
   const doc = readSettings();
   const mailbox = doc.mailboxes.find((m) => m.id === pending.mailboxId);
@@ -389,17 +389,17 @@ function callbackParams(raw: string): URLSearchParams | undefined {
  * is used once; the browser may land here without the session cookie, because
  * localhost and 127.0.0.1 are different sites to it.
  */
-export async function routeOAuthCallback(url: URL, lang: Language): Promise<WebResponse | undefined> {
+export async function routeProviderRedirect(url: URL, lang: Language): Promise<WebResponse | undefined> {
   const state = url.searchParams.get('state') ?? '';
   if (!state || (!url.searchParams.has('code') && !url.searchParams.has('error'))) return undefined;
-  const pending = takePendingOAuth(state);
+  const pending = takePendingSignIn(state);
   if (!pending) {
     return redirect('/settings?oauth=expired#mailboxes');
   }
   const back = `${pending.returnTo}/settings`;
   const error = url.searchParams.get('error');
   if (error) return redirect(`${back}?oauth=denied&mailbox=${pending.mailboxId}#mailboxes`);
-  const result = await finishOAuth(pending, url.searchParams.get('code') ?? '', lang);
+  const result = await finishSignIn(pending, url.searchParams.get('code') ?? '', lang);
   if (!result.ok) return redirect(`${back}?oauth=failed&mailbox=${pending.mailboxId}#mailboxes`);
   return redirect(`${back}?oauth=ok&mailbox=${pending.mailboxId}#mailboxes`);
 }
@@ -607,7 +607,7 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
       const redirectUri = direct ? `http://localhost:${hostPort(req.headers.host)}/` : PASTE_REDIRECT;
       const verifier = randomBytes(48).toString('base64url');
       const state = randomBytes(24).toString('base64url');
-      savePendingOAuth(state, {
+      savePendingSignIn(state, {
         mailboxId: mailbox.id, username: mailbox.username, verifier, redirectUri, scope: provider.scope,
         returnTo: returnOrigin(req), expiresAt: Date.now() + OAUTH_TTL_MS,
       });
@@ -634,14 +634,14 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
       const state = params?.get('state') ?? text(body['state'], 200);
       if (!params) return fail(400, 'bad_url', zh ? '请粘贴浏览器地址栏里的完整地址。' : 'Paste the complete address from the browser\'s address bar.');
       if (params.get('error')) {
-        takePendingOAuth(state);
+        takePendingSignIn(state);
         return fail(400, 'denied', zh ? '授权被拒绝或已取消。' : 'The sign-in was declined or cancelled.');
       }
-      const pending = takePendingOAuth(state);
+      const pending = takePendingSignIn(state);
       if (!pending) return fail(400, 'expired', zh ? '这次登录已过期，请重新点“登录”。' : 'This sign-in has expired. Start it again.');
       const code = params.get('code');
       if (!code) return fail(400, 'no_code', zh ? '地址里没有授权码。' : 'That address carries no authorization code.');
-      const result = await finishOAuth(pending, code, lang);
+      const result = await finishSignIn(pending, code, lang);
       if (!result.ok) return fail(400, 'exchange_failed', result.message);
       return ok({ authorized: true, applied: result.applied, mailbox: pending.mailboxId, state: statePayload(req, readSettings()) });
     }
