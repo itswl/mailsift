@@ -820,7 +820,7 @@ function icon(id: string, cls = 'icon'): string {
  * their key, so the switch can reword them in place instead of reloading and
  * losing the filters.
  */
-export function renderApp(lang: Language, canRefresh = false, nonce = '', canWrite = false): string {
+export function renderApp(lang: Language, canRefresh = false, nonce = '', settingsLink = false): string {
   const s = (key: StringKey): string => escapeHtml(t(lang, key));
   const worded = (tag: string, key: StringKey, attrs = ''): string =>
     `<${tag}${attrs ? ' ' + attrs : ''} data-i18n="${key}">${s(key)}</${tag}>`;
@@ -850,7 +850,7 @@ export function renderApp(lang: Language, canRefresh = false, nonce = '', canWri
         <div class="brand"><img class="brand-mark" src="/icon-192.png?v=3" alt="" aria-hidden="true"><strong>mailsift</strong></div>
         <div class="header-actions">
           ${refresh}
-          ${canWrite ? `<a href="/settings" class="icon-btn" aria-label="${s('settings.title')}" title="${s('settings.title')}" data-i18n-label="settings.title" data-i18n-title="settings.title">${icon('settings')}</a>` : ''}
+          ${settingsLink ? `<a href="/settings" class="icon-btn" aria-label="${s('settings.title')}" title="${s('settings.title')}" data-i18n-label="settings.title" data-i18n-title="settings.title">${icon('settings')}</a>` : ''}
           ${iconButton('compose-open', 'compose', 'compose.new', 'aria-haspopup="dialog" aria-controls="compose"')}
           ${iconButton('bell', 'bell', 'notify.title', 'aria-haspopup="dialog" aria-controls="notify-sheet" aria-expanded="false"')}
           <button id="lang" type="button" class="word-btn" aria-label="${s('lang.label')}">${s('lang.face')}</button>
@@ -1351,7 +1351,8 @@ async function route(
 
   // HEAD as GET: an uptime check asks for the page without its body, which the server leaves out.
   if (url.pathname === '/' && (req.method === 'GET' || req.method === 'HEAD')) {
-    const answer = html(200, renderApp(lang, Boolean(options.onRefresh), nonce, Boolean(admin)), true);
+    // Settings are reached from every signed-in page of the server; a token session is asked for the password there.
+    const answer = html(200, renderApp(lang, Boolean(options.onRefresh), nonce, Boolean(options.adminAuth)), true);
     // Roll the session forward on each visit, so regular use never expires.
     // Only on the page: doing it on the polling calls would rewrite the cookie
     // every minute for nothing.
