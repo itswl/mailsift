@@ -551,7 +551,7 @@ const allowAssistantMinute = rateWindow(20);
 const assistantDay = { day: '', used: 0 };
 
 function assistantDailyLimit(): number {
-  // An empty line in .env is "not set", not zero.
+  // An empty setting is "not set", not zero.
   const raw = process.env.WEB_ASSISTANT_DAILY_LIMIT?.trim();
   const value = raw ? Number(raw) : 300;
   return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 300;

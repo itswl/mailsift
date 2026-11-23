@@ -7,7 +7,7 @@
  *
  * Disabled by default; see README for activation.
  */
-import './env.js'; // Must run first so .env is loaded.
+import './env.js'; // Must run first for DNS defaults.
 import { createHash } from 'node:crypto';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -38,6 +38,9 @@ import { retryAttempts } from './services/delivery.js';
 import { HEARTBEAT_KEY, IDLE_WAKE_KEY, type PollStats } from './services/watcher.js';
 import { PushDispatcher } from './services/push-dispatcher.js';
 import { publicAsset, routeWeb, webRateLimited, webUiEnabled } from './web.js';
+import { APP_VERSION } from './version.js';
+import { insecureChannelResponse, requestChannel } from './web-access.js';
+import { bootId, serverMode, startedAt } from './services/runtime-control.js';
 import {
   actOnMail, asWriteSession, awaitEarlierSend, configuredAccounts, defaultBackend, earlierSend, forwardDraft, letterText,
   liveRead, markHandled, rememberWhereabouts, replyDraft, requestTimeoutMs, resolveTarget, saveSignature, sendMessage,
@@ -706,7 +709,7 @@ export function createServer(
     }
   };
   const server = new McpServer(
-    { name: 'mailsift', version: '1.0.0' },
+    { name: 'mailsift', version: APP_VERSION },
     { instructions: INSTRUCTIONS },
   );
   const json = (value: unknown) => ({
@@ -2195,6 +2198,33 @@ export function createServer(
 }
 
 /**
+ * What /healthz answers: the container's health check and the settings page,
+ * which watches the boot id to see a restart through. Unhealthy only when
+ * mailboxes are being checked and no check has finished for three intervals;
+ * waiting for setup is a healthy state.
+ */
+export function healthReport(): { status: 'ok' | 'stale'; mode: string; version: string; boot: string; lastPollAt?: string } {
+  const base = { mode: serverMode(), version: APP_VERSION, boot: bootId() };
+  if (serverMode() !== 'running') return { status: 'ok', ...base };
+  let last = '';
+  const db = new StateStore();
+  try {
+    last = db.getMeta(HEARTBEAT_KEY) ?? '';
+  } catch {
+    return { status: 'stale', ...base };
+  } finally {
+    db.close();
+  }
+  const interval = Number(process.env.POLL_INTERVAL_SECONDS ?? 300);
+  const deadline = ((Number.isFinite(interval) && interval > 0 ? interval : 300) * 3 + 120) * 1000;
+  const age = last ? Date.now() - Date.parse(last) : Number.POSITIVE_INFINITY;
+  // Before the first check of this boot has finished (a large backfill can take a while), still fine.
+  const lastOfThisBoot = last && Date.parse(last) >= startedAt();
+  const warmingUp = !lastOfThisBoot && Date.now() - startedAt() < 15 * 60_000;
+  return { status: warmingUp || age <= deadline ? 'ok' : 'stale', ...base, ...(last ? { lastPollAt: last } : {}) };
+}
+
+/**
  * Streamable HTTP mode for remote MCP clients.
  *
  * Stateless implementation (sessionIdGenerator is undefined): each request gets
@@ -2205,7 +2235,13 @@ export function createServer(
  * who can reach the port can read triage results.
  */
 export async function startMcpHttp(
-  options: { onRefresh?: () => Promise<PollStats> } = {},
+  options: {
+    onRefresh?: () => Promise<PollStats>;
+    /** First-run setup: MCP answers 503 and the page serves only the setup. */
+    setupMode?: boolean;
+    /** The administrator password and the settings pages (the server; not a bare test instance). */
+    adminAuth?: boolean;
+  } = {},
 ): Promise<import('node:http').Server> {
   const port = Number(process.env.MCP_PORT ?? 8410);
   const host = process.env.MCP_BIND ?? '127.0.0.1';
@@ -2227,6 +2263,18 @@ export async function startMcpHttp(
       const client = clientFingerprint(clientAddress(req));
       const path = (req.url ?? '/').split('?')[0] ?? '/';
       const forMcp = path === '/mcp';
+      if (path === '/healthz' && (req.method === 'GET' || req.method === 'HEAD')) {
+        const report = healthReport();
+        res.writeHead(report.status === 'ok' ? 200 : 503, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+          .end(req.method === 'HEAD' ? undefined : JSON.stringify(report));
+        return;
+      }
+      // Credentials cross only HTTPS or a loopback address (an SSH tunnel counts); see web-access.ts.
+      if (requestChannel(req) === 'insecure') {
+        const refused = insecureChannelResponse(req);
+        res.writeHead(refused.status, { 'content-type': refused.contentType, 'cache-control': 'no-store' }).end(refused.body);
+        return;
+      }
       // The icons, the worker and the manifest come from memory and cost nothing: outside the page's budget,
       // so the page that says the budget is spent still shows its mark.
       if (!(forMcp ? allowMcpRequest(client) : publicAsset(path) || allowWebRequest(client))) {
@@ -2248,6 +2296,11 @@ export async function startMcpHttp(
       }
       try {
         const url = new URL(req.url ?? '/', `http://${host}:${port}`);
+        if (options.setupMode && forMcp) {
+          res.writeHead(503, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+            .end('{"error":"setup_required","message":"Complete web setup before using MCP."}');
+          return;
+        }
         if (url.pathname !== '/mcp') {
           // The web view shares this port and both tokens, because it shares
           // the trust boundary. Off unless explicitly enabled.
@@ -2259,13 +2312,16 @@ export async function startMcpHttp(
           try {
             const answer = await routeWeb(req, url, token, webStore, client, {
               onRefresh: options.onRefresh,
+              setupMode: options.setupMode,
+              adminAuth: options.adminAuth,
               // Signing in to the page with this credential is what lets a
               // browser act on mail, the same split the MCP tools make.
               writeToken,
               warm: warmSession,
             });
-            const headers: Record<string, string> = { 'content-type': answer.contentType };
-            if (answer.cookie) headers['set-cookie'] = answer.cookie;
+            const headers: Record<string, string | string[]> = { 'content-type': answer.contentType };
+            const cookies = [...(answer.cookie ? [answer.cookie] : []), ...(answer.extraCookies ?? [])];
+            if (cookies.length) headers['set-cookie'] = cookies.length === 1 ? cookies[0]! : cookies;
             if (answer.cacheControl) headers['cache-control'] = answer.cacheControl;
             Object.assign(headers, answer.headers);
             // A sign-in goes back where it was asked for; anything else that moves on goes to the page.
@@ -2414,6 +2470,16 @@ async function main(): Promise<void> {
   await server.connect(new StdioServerTransport());
 }
 
+// Run as its own process (a local stdio client starts dist/src/mcp.js), it
+// reads the server's stored settings first. Imported, as by main and the
+// tests, it leaves the environment alone.
 const entry = process.argv[1];
-if (entry && entry.endsWith('mcp.ts')) void main();
-else if (entry && entry.endsWith('mcp.js')) void main();
+if (entry && (entry.endsWith('mcp.ts') || entry.endsWith('mcp.js'))) {
+  void import('./bootstrap.js').then(({ bootstrapError }) => {
+    if (bootstrapError) {
+      console.error(`mailsift: the stored settings cannot be read: ${bootstrapError.message}`);
+      process.exit(1);
+    }
+    return main();
+  });
+}

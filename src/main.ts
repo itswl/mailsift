@@ -1,17 +1,20 @@
 #!/usr/bin/env node
 /**
- * mailsift entry point.
+ * mailsift service.
  *
- * Runs continuously by default; --once runs one poll for cron, and --check validates configuration.
+ * Started by src/server.ts, which restarts it when settings change. Runs
+ * continuously by default; --once runs one poll, --check reports on the stored
+ * configuration, and --reset-admin prints a new one-time setup code.
  */
-import './env.js'; // Must run first so .env is loaded into process.env.
+import './env.js'; // Must run first for DNS defaults.
+import { bootstrapError } from './bootstrap.js'; // Load stored settings before other modules read them.
 import { realpathSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
-import { ConfigError, loadConfig, needsOAuth } from './config.js';
-import { TokenStore } from './imap/auth.js';
+import { ConfigError, loadConfig } from './config.js';
+import { authorizedUsernames } from './imap/auth.js';
 import { StateStore } from './services/state.js';
 import { buildSink, usesLegacyWebhookNames, webhookEndpoint, webhookToken, WebhookSink } from './services/sink.js';
 import { deciderConfigured } from './services/decider.js';
@@ -20,16 +23,20 @@ import {
 } from './services/triage.js';
 import { digestHour, sendDigest } from './services/digest.js';
 import { recordStartupFailure } from './services/health.js';
-import { HEARTBEAT_KEY, Watcher } from './services/watcher.js';
+import { Watcher } from './services/watcher.js';
 import { PollCoordinator } from './services/poll-scheduler.js';
 import { IdleSupervisor, idleEnabled, idleFolderTokens } from './imap/idle.js';
 import { stopConnecting } from './imap/connection.js';
 import { sentLookbackDays, sentMailEnabled } from './imap/sent.js';
-import { webUiEnabled } from './web.js';
 import { flushHeartbeats, heartbeatProblem, heartbeatUrl } from './services/heartbeat.js';
 import { getLogger } from './logger.js';
 import { metrics } from './metrics.js';
 import { startMcpHttp } from './mcp.js';
+import { adminPasswordSet, issueSetupCode, readSettings, resetAdmin } from './services/settings-store.js';
+import { mailboxReadiness } from './services/settings-runtime.js';
+import {
+  onRestartRequested, RESTART_EXIT_CODE, restartRequested, setServerMode, supervised, type ServerMode,
+} from './services/runtime-control.js';
 
 const log = getLogger('main');
 
@@ -39,28 +46,35 @@ const STARTUP_FAILURE_BACKOFF_MS = 30_000;
 let stopping = false;
 
 async function checkConfig(): Promise<number> {
+  // Every stored mailbox, the ones not being checked included, with what stands in its way.
+  const doc = readSettings();
+  const authorized = authorizedUsernames();
+  let problems = 0;
+  console.log('✅ Configuration source: the settings stored in the database (Settings in the web view)');
+  console.log(`   Setup: ${doc.setupCompletedAt ? `finished ${doc.setupCompletedAt}` : 'not finished; no mailbox is checked until it is'}`);
+  console.log(`   Mailboxes (${doc.mailboxes.length}):`);
+  const why: Record<string, string> = {
+    'disabled': 'switched off',
+    'needs-authorization': 'not signed in yet: Settings → Mailboxes → Sign in',
+    'needs-password': 'no password: Settings → Mailboxes → Edit',
+    'invalid': 'settings incomplete: Settings → Mailboxes → Edit',
+  };
+  for (const mailbox of doc.mailboxes) {
+    const state = mailboxReadiness(mailbox, authorized);
+    if (state !== 'ready' && state !== 'disabled') problems += 1;
+    console.log(
+      `   ${state === 'ready' ? '✅' : state === 'disabled' ? '⏸️ ' : '❌'} ${mailbox.name || mailbox.username} (${mailbox.username}) ` +
+        `[${mailbox.provider}] folders: ${(mailbox.folders?.length ? mailbox.folders : ['INBOX', 'spam']).join(', ')}` +
+        (why[state] ? `  <- ${why[state]}` : ''),
+    );
+  }
+
   let config;
   try {
     config = loadConfig();
   } catch (error) {
-    console.log(`❌ Configuration error: ${error instanceof Error ? error.message : error}`);
+    console.log(`❌ ${error instanceof Error ? error.message : error}`);
     return 1;
-  }
-
-  console.log('✅ Configuration source: environment (.env)');
-  console.log(`   Accounts (${config.accounts.length}):`);
-
-  const authorized = new Set(await new TokenStore().usernames());
-  let problems = 0;
-
-  for (const account of config.accounts) {
-    const pending = needsOAuth(account) && !authorized.has(account.username);
-    if (pending) problems += 1;
-    console.log(
-      `   ${pending ? '❌' : '✅'} ${account.name} (${account.username}) ` +
-        `[${account.provider}/${account.auth}] folders: ${account.folders.join(', ')}` +
-        (pending ? '  <- unauthorized; run npm run oauth' : ''),
-    );
   }
 
   const { rules } = config;
@@ -75,10 +89,10 @@ async function checkConfig(): Promise<number> {
   console.log(
     config.accounts.length > 1 && suppressSelfForwards()
       ? '   Self-forwards: a copy arriving from another monitored mailbox is filed to the digest, not pushed'
-      : `   Self-forwards: not suppressed${config.accounts.length > 1 ? ' (SUPPRESS_SELF_FORWARDS=false)' : ''}`,
+      : `   Self-forwards: not suppressed${config.accounts.length > 1 ? ' (turned off in Settings → Triage rules)' : ''}`,
   );
   if (!rules.context) {
-    console.log('   ⚠️  MAIL_CONTEXT is empty; the LLM will lack your personal context.');
+    console.log('   ⚠️  Settings → Triage rules → About you is empty; the LLM will lack your personal context.');
   }
 
   let outlets = 0;
@@ -102,8 +116,7 @@ async function checkConfig(): Promise<number> {
     }
   }
   if (outlets === 0) {
-    console.log('❌ No output configured: set FEISHU_WEBHOOK_URL or WEBHOOK_URL.');
-    problems += 1;
+    console.log('ℹ️  No external output configured; mailsift will keep triaged mail in the web view. Browser notifications are optional.');
   }
 
   if (process.env.LLM_API_KEY?.trim()) {
@@ -150,31 +163,25 @@ async function checkConfig(): Promise<number> {
       console.log('   ℹ️  With IDLE on, POLL_INTERVAL_SECONDS can usually be raised to 900-1800.');
     }
   } else {
-    console.log('   IMAP IDLE: disabled (set IMAP_IDLE_ENABLED=true for real-time wake-ups)');
+    console.log('   IMAP IDLE: disabled (Settings → Checking and digest → Real-time wake-ups)');
   }
   console.log(
     sentMailEnabled()
-      ? `   Sent folders: read for the conversation, first looking back ${sentLookbackDays()} days (SENT_MAIL_ENABLED=false turns this off)`
-      : '   Sent folders: not read (SENT_MAIL_ENABLED=false)',
+      ? `   Sent folders: read for the conversation, first looking back ${sentLookbackDays()} days (Settings → Privacy and retention)`
+      : '   Sent folders: not read (turned off in Settings → Privacy and retention)',
   );
-  if ((process.env.MCP_ENABLED ?? 'true').toLowerCase() === 'true') {
-    const where = `${process.env.MCP_PUBLIC_HOST ?? '127.0.0.1'}:${process.env.MCP_PORT ?? 8410}`;
-    console.log(
-      webUiEnabled()
-        ? `   Web view: on http://${where}/ · ${process.env.MCP_WRITE_TOKEN?.trim()
-          ? 'reads with MCP_TOKEN, acts on mail with MCP_WRITE_TOKEN'
-          : 'read-only (set MCP_WRITE_TOKEN to archive, reply and send from it)'}`
-        : '   Web view: disabled (set WEB_UI_ENABLED=true for the browser mail view)',
-    );
-  }
+  console.log(
+    `   Web view and MCP: http://127.0.0.1:${process.env.MCP_PORT ?? 8410}/ · sign in with the administrator password; ` +
+      'MCP clients use the read or write token (Settings → Access)',
+  );
   const monitor = heartbeatUrl();
   const monitorProblem = heartbeatProblem();
   console.log(
     monitor
       ? `   External heartbeat: pinging ${monitor.host} after each poll`
       : monitorProblem
-        ? `   ⚠️  HEARTBEAT_PING_URL ${monitorProblem}; no heartbeat will be sent.`
-        : '   External heartbeat: off (set HEARTBEAT_PING_URL so a monitor notices when mailsift stops)',
+        ? `   ⚠️  The heartbeat URL ${monitorProblem}; no heartbeat will be sent.`
+        : '   External heartbeat: off (Settings → Notifications → Heartbeat URL lets a monitor notice when mailsift stops)',
   );
   console.log(`   Total per-poll backfill limit: ${process.env.MAX_MESSAGES_PER_POLL_TOTAL ?? 500}`);
   console.log(`   Fresh lookbacks are backfilled in chunks of ${process.env.MAX_MESSAGES_PER_LOOKBACK ?? 500}`);
@@ -183,37 +190,33 @@ async function checkConfig(): Promise<number> {
 }
 
 /**
- * Health probe: whether the last poll completed within a reasonable interval.
+ * Health probe for the container: asks the running service's /healthz.
  *
- * Configuration is intentionally not checked: it does not change at runtime and
- * would make a stuck process appear healthy.
+ * The service knows whether it is waiting for setup (healthy) or checking
+ * mailboxes, and then whether its last check is recent enough. A service
+ * that does not answer at all is unhealthy, which a heartbeat in the
+ * database alone could not tell.
  */
-function healthcheck(): number {
-  const interval = Number(process.env.POLL_INTERVAL_SECONDS ?? 300);
-  const deadline = interval * 3 + 120;
-
-  let last: string | undefined;
+async function healthcheck(): Promise<number> {
+  const port = Number(process.env.MCP_PORT ?? 8410);
+  const bind = process.env.MCP_BIND?.trim() || '127.0.0.1';
+  const host = ['0.0.0.0', '::', '127.0.0.1', 'localhost', ''].includes(bind) ? '127.0.0.1' : bind;
   try {
-    last = new StateStore().getMeta(HEARTBEAT_KEY);
+    const response = await fetch(`http://${host.includes(':') ? `[${host}]` : host}:${port}/healthz`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    const body = await response.json().catch(() => ({})) as { status?: string; mode?: string; lastPollAt?: string };
+    if (!response.ok) {
+      console.log(`unhealthy: ${body.mode ?? 'service'} reports ${body.status ?? response.status}` +
+        (body.lastPollAt ? `; last check finished at ${body.lastPollAt}` : '; no check has finished'));
+      return 1;
+    }
+    console.log(`ok: ${body.mode ?? 'running'}${body.lastPollAt ? `, last check ${body.lastPollAt}` : ''}`);
+    return 0;
   } catch (error) {
-    console.log(`unhealthy: failed to read state database: ${error}`);
+    console.log(`unhealthy: the service does not answer on port ${port}: ${error instanceof Error ? error.message : error}`);
     return 1;
   }
-  if (!last) {
-    console.log('unhealthy: no poll has completed yet');
-    return 1;
-  }
-  const age = (Date.now() - new Date(last).valueOf()) / 1000;
-  if (!Number.isFinite(age)) {
-    console.log(`unhealthy: cannot parse heartbeat timestamp ${last}`);
-    return 1;
-  }
-  if (age > deadline) {
-    console.log(`unhealthy: last poll was ${age.toFixed(0)}s ago, exceeding ${deadline}s`);
-    return 1;
-  }
-  console.log(`ok: last poll was ${age.toFixed(0)}s ago`);
-  return 0;
 }
 
 /** Put messages marked without a triage result back into the pending queue. */
@@ -258,18 +261,106 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       'dry-run': { type: 'boolean', default: false },
       healthcheck: { type: 'boolean', default: false },
       recover: { type: 'boolean', default: false },
+      'reset-admin': { type: 'boolean', default: false },
     },
     allowPositionals: false,
   });
+
+  if (bootstrapError) {
+    console.error(`mailsift: the stored settings cannot be read: ${bootstrapError.message}`);
+    return 1;
+  }
 
   if (values['dry-run']) process.env.DRY_RUN = 'true';
   if (values.healthcheck) return healthcheck();
   if (values.recover) return recover();
   if (values.check) return checkConfig();
 
-  let watcher: Watcher;
+  if (values['reset-admin']) {
+    const code = resetAdmin();
+    console.error('The administrator password and all browser sessions have been cleared.');
+    console.error(`One-time setup code: ${code}`);
+    console.error(`Open ${setupAddress()}/ and use the code to choose a new password.`);
+    return 0;
+  }
+
+  if (!values.once && !values['digest-now']) return serve();
+  return runOnce(values.once, values['digest-now']);
+}
+
+/** Where the page is reached on this machine, for the messages in the log. */
+function setupAddress(): string {
+  return `http://127.0.0.1:${process.env.MCP_PORT ?? '8410'}`;
+}
+
+function announceSetup(code: string | undefined): void {
+  const lines = [
+    '',
+    '──────────────────────────────────────────────────────────────',
+    code ? ' mailsift is waiting to be set up.' : ' mailsift is waiting for setup to be finished.',
+    '',
+    ` Open ${setupAddress()}/ on this machine.`,
+    ' On a remote server, tunnel the port first from your computer:',
+    `   ssh -N -L ${process.env.MCP_PORT ?? '8410'}:127.0.0.1:${process.env.MCP_PORT ?? '8410'} you@your-server`,
+    ...(code ? ['', ` One-time setup code: ${code}`, ' (a new code is printed each time mailsift starts until it is used)'] : []),
+    '──────────────────────────────────────────────────────────────',
+    '',
+  ];
+  console.error(lines.join('\n'));
+}
+
+/**
+ * The long-running service. Starts in one of three modes (see ServerMode) and
+ * serves the page in all of them; mailboxes are checked only once setup is
+ * finished. A settings change ends this function with RESTART_EXIT_CODE.
+ */
+async function serve(): Promise<number> {
+  const doc = readSettings();
+  const authorized = authorizedUsernames();
+  const readiness = doc.mailboxes.map((mailbox) => mailboxReadiness(mailbox, authorized));
+  const ready = readiness.filter((state) => state === 'ready').length;
+  const waiting = readiness.filter((state) => state === 'needs-authorization').length;
+  const mode: ServerMode = !doc.setupCompletedAt ? 'setup' : ready > 0 ? 'running' : 'idle';
+  setServerMode(mode);
+
+  const code = adminPasswordSet() ? undefined : issueSetupCode();
+  if (code || mode === 'setup') announceSetup(code);
+  if (!supervised()) {
+    log.warn('Started without the supervisor (dist/src/server.js): saved settings will need a manual restart.');
+  }
+  if (mode !== 'running') return serveWithoutMonitoring(mode, waiting);
+  if (waiting) log.warn(`${waiting} mailbox(es) wait for authorization in Settings and are not checked yet.`);
+  return monitor();
+}
+
+/** Setup, or nothing to check: the page and the API only. */
+async function serveWithoutMonitoring(mode: ServerMode, waiting: number): Promise<number> {
+  log.info(mode === 'setup'
+    ? 'Waiting for setup to be finished; no mailbox is checked until then.'
+    : `No mailbox can be checked${waiting ? ` (${waiting} wait for authorization)` : ''}; serving the web view only.`);
+  let server: Server;
   try {
-    watcher = new Watcher(loadConfig(), new StateStore(), buildSink());
+    server = await startMcpHttp({ setupMode: mode === 'setup', adminAuth: true });
+  } catch (error) {
+    log.error(`Web server failed to start: ${error}`);
+    return 1;
+  }
+  const stop = (): void => {
+    stopping = true;
+    server.close();
+    server.closeAllConnections();
+  };
+  onRestartRequested(stop);
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+  await new Promise<void>((resolve) => server.once('close', resolve));
+  return restartRequested() ? RESTART_EXIT_CODE : 0;
+}
+
+/** A watcher over the mailboxes that can be checked, or a startup failure already reported. */
+async function buildWatcher(): Promise<Watcher | undefined> {
+  try {
+    return new Watcher(loadConfig(), new StateStore(), buildSink());
   } catch (error) {
     log.error(`Configuration error: ${error instanceof Error ? error.message : error}`);
     if (error instanceof ConfigError) {
@@ -277,36 +368,38 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       log.error(`Exiting in ${STARTUP_FAILURE_BACKOFF_MS / 1000}s to avoid a tight restart loop.`);
       await sleep(STARTUP_FAILURE_BACKOFF_MS);
     }
-    return 1;
+    return undefined;
   }
+}
 
-  const spamWarning = spamBonusWarning();
-  if (spamWarning) log.warn(spamWarning);
-
-  if (values['digest-now']) {
+/** --once and --digest-now, for cron and for trying things by hand. */
+async function runOnce(once: boolean | undefined, digestNow: boolean | undefined): Promise<number> {
+  const watcher = await buildWatcher();
+  if (!watcher) return 1;
+  if (digestNow) {
     await sendDigest(watcher.state, watcher.sink);
     return 0;
   }
-  if (values.once) {
+  if (once) {
     const stats = await watcher.pollOnce();
     // The ping is not awaited inside the poll; a cron run must not exit before it is sent.
     await flushHeartbeats();
     return stats.failures.length ? 2 : 0;
   }
+  return 0;
+}
+
+/** Check the ready mailboxes until stopped, or until saved settings ask for a restart. */
+async function monitor(): Promise<number> {
+  const watcher = await buildWatcher();
+  if (!watcher) return 1;
+
+  const spamWarning = spamBonusWarning();
+  if (spamWarning) log.warn(spamWarning);
 
   // The refresh button and the scheduled loop share this, so a click during a
   // poll joins it rather than opening a second set of IMAP connections.
   const coordinator = new PollCoordinator(() => watcher.pollOnce());
-
-  let mcpServer: Server | undefined;
-  if ((process.env.MCP_ENABLED ?? 'true').toLowerCase() === 'true') {
-    try {
-      mcpServer = await startMcpHttp({ onRefresh: () => coordinator.now() });
-    } catch (error) {
-      log.error(`MCP startup failed: ${error}`);
-      return 1;
-    }
-  }
 
   let idle: IdleSupervisor | undefined;
   if (idleEnabled()) {
@@ -316,24 +409,39 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     idle.start();
   }
 
-  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-    process.on(signal, () => {
-      log.info(`Received ${signal}; exiting after the current poll.`);
-      stopping = true;
-      coordinator.wake();
-      if (mcpServer) mcpServer.close();
-      // Hang up on connections still being made and make no more: a poll
-      // stuck on a provider that is not answering would otherwise outlast
-      // the time a stop is given, and be killed.
-      stopConnecting();
-      // Log the IDLE sessions out now so the server keeps no zombie connections.
-      void idle?.stop().catch((error) => log.warn(`Failed to stop IDLE listeners: ${error}`));
-      void metrics.shutdown().catch((error) => log.warn(`Failed to flush OTel metrics: ${error}`));
-    });
+  let server: Server;
+  try {
+    server = await startMcpHttp({ onRefresh: () => coordinator.now(), adminAuth: true });
+  } catch (error) {
+    log.error(`Web server failed to start: ${error}`);
+    await idle?.stop().catch(() => undefined);
+    return 1;
   }
+
+  let stopped = false;
+  const stop = (why: string): void => {
+    if (stopped) return;
+    stopped = true;
+    log.info(`${why}; exiting after the current poll.`);
+    stopping = true;
+    coordinator.wake();
+    // Hang up on connections still being made and make no more: a poll
+    // stuck on a provider that is not answering would otherwise outlast
+    // the time a stop is given, and be killed.
+    stopConnecting();
+    // Log the IDLE sessions out now so the server keeps no zombie connections.
+    void idle?.stop().catch((error) => log.warn(`Failed to stop IDLE listeners: ${error}`));
+    void metrics.shutdown().catch((error) => log.warn(`Failed to flush OTel metrics: ${error}`));
+  };
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, () => stop(`Received ${signal}`));
+  onRestartRequested(() => stop('Restarting to apply settings'));
+
   await runForever(coordinator);
+  // The page stays up while the last poll finishes, so it can see the restart through.
+  server.close();
+  server.closeAllConnections();
   await idle?.stop().catch((error) => log.warn(`Failed to stop IDLE listeners: ${error}`));
-  return 0;
+  return restartRequested() ? RESTART_EXIT_CODE : 0;
 }
 
 // Detect direct execution under ESM by comparing real paths across tsx and dist.

@@ -202,7 +202,7 @@ export function isSendableAddress(value: unknown): value is string {
  * number is taken as not set.
  */
 export function attachmentLimitBytes(): number {
-  // An empty line in .env is "not set", not zero.
+  // An empty setting is "not set", not zero.
   const raw = process.env.SMTP_ATTACHMENT_MAX_BYTES?.trim();
   const value = raw ? Number(raw) : DEFAULT_ATTACHMENT_BYTES;
   return Number.isFinite(value) && value >= 1 ? Math.min(Math.floor(value), CEILING_ATTACHMENT_BYTES) : DEFAULT_ATTACHMENT_BYTES;

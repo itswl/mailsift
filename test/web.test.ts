@@ -736,7 +736,7 @@ describe('language', () => {
       request({ method: 'POST', url: '/auth', body: 'token=wrong', headers }), url('/auth'), 'secret', store,
     );
     expect(refused.status).toBe(401);
-    expect(String(refused.body)).toContain('令牌不正确');
+    expect(String(refused.body)).toContain('密码不正确');
   });
 
   it('carries every language so the switch rewords the page in place, and tells the server', async () => {

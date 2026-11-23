@@ -1,5 +1,11 @@
 /**
- * Load and validate configuration. Environment variables are the sole source.
+ * Load and validate configuration.
+ *
+ * The server keeps its settings in its own database and hands them to this
+ * module before anything else runs: the mailboxes through setSettingsAccounts,
+ * everything else as the environment names below have always been read
+ * (see services/settings-store.ts and bootstrap.ts). Without a settings store
+ * (tests, one-off tools) the numbered MAIL_ACCOUNT_N variables are read instead.
  *
  * Zod provides runtime validation, TypeScript types, and readable startup errors.
  */
@@ -124,8 +130,8 @@ function splitList(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
-function env(key: string): string | undefined {
-  const value = process.env[key];
+function env(key: string, source: NodeJS.ProcessEnv = process.env): string | undefined {
+  const value = source[key];
   return value?.trim() ? value.trim() : undefined;
 }
 
@@ -138,7 +144,7 @@ interface ParsedAccountLine {
   host: string | undefined;
 }
 
-function normalizeAccount(parsed: ParsedAccountLine, index: number, varName: string): Account {
+function normalizeAccount(parsed: ParsedAccountLine, index: number, varName: string, source: NodeJS.ProcessEnv): Account {
   const preset = (PROVIDER_PRESETS as Record<string, { host?: string; port: number; auth: AuthKind }>)[
     parsed.provider
   ];
@@ -154,7 +160,7 @@ function normalizeAccount(parsed: ParsedAccountLine, index: number, varName: str
     throw new ConfigError(`${varName}: provider "${parsed.provider}" requires an explicit host`);
   }
 
-  const auth = (env(prefix + 'AUTH') ?? preset.auth) as AuthKind;
+  const auth = (env(prefix + 'AUTH', source) ?? preset.auth) as AuthKind;
   if (!['password', 'gmail_oauth', 'outlook_oauth'].includes(auth)) {
     throw new ConfigError(`${prefix}AUTH: unknown authentication method "${auth}"`);
   }
@@ -165,43 +171,133 @@ function normalizeAccount(parsed: ParsedAccountLine, index: number, varName: str
     );
   }
 
-  const portRaw = env(prefix + 'PORT');
+  const portRaw = env(prefix + 'PORT', source);
   if (portRaw && !/^\d+$/.test(portRaw)) {
     throw new ConfigError(`${prefix}PORT must be numeric; got ${JSON.stringify(portRaw)}`);
   }
+  const port = portRaw ? Number(portRaw) : preset.port;
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new ConfigError(`${prefix}PORT must be between 1 and 65535; got ${JSON.stringify(portRaw)}`);
+  }
 
-  const folders = splitList(env(prefix + 'FOLDERS'));
+  const folders = splitList(env(prefix + 'FOLDERS', source));
 
   // Sending is optional, but a port that is not a number would only surface
   // as a refused connection on the first reply; say so at startup instead.
-  const smtpHost = env(prefix + 'SMTP_HOST');
-  const smtpPortRaw = env(prefix + 'SMTP_PORT');
+  const smtpHost = env(prefix + 'SMTP_HOST', source);
+  const smtpPortRaw = env(prefix + 'SMTP_PORT', source);
   if (smtpPortRaw && !/^\d+$/.test(smtpPortRaw)) {
     throw new ConfigError(`${prefix}SMTP_PORT must be numeric; got ${JSON.stringify(smtpPortRaw)}`);
   }
-  const fromName = env(prefix + 'FROM_NAME');
-  const authservId = env(prefix + 'AUTHSERV_ID');
+  const smtpPort = smtpPortRaw ? Number(smtpPortRaw) : undefined;
+  if (smtpPort !== undefined && (!Number.isSafeInteger(smtpPort) || smtpPort < 1 || smtpPort > 65_535)) {
+    throw new ConfigError(`${prefix}SMTP_PORT must be between 1 and 65535; got ${JSON.stringify(smtpPortRaw)}`);
+  }
+  const fromName = env(prefix + 'FROM_NAME', source);
+  const authservId = env(prefix + 'AUTHSERV_ID', source);
 
   return {
-    name: env(prefix + 'NAME') ?? `${parsed.provider}-${parsed.username.split('@')[0]}`,
+    name: env(prefix + 'NAME', source) ?? `${parsed.provider}-${parsed.username.split('@')[0]}`,
     provider: parsed.provider,
     username: parsed.username,
     host,
-    port: portRaw ? Number(portRaw) : preset.port,
+    port,
     auth,
     ...(parsed.password ? { password: parsed.password } : {}),
     folders: folders.length ? folders : [...DEFAULT_FOLDERS],
-    useSsl: !['false', '0', 'no', 'off'].includes((env(prefix + 'SSL') ?? '').toLowerCase()),
+    useSsl: !['false', '0', 'no', 'off'].includes((env(prefix + 'SSL', source) ?? '').toLowerCase()),
     ...(smtpHost ? { smtpHost } : {}),
-    ...(smtpPortRaw ? { smtpPort: Number(smtpPortRaw) } : {}),
+    ...(smtpPort !== undefined ? { smtpPort } : {}),
     ...(fromName ? { fromName } : {}),
     ...(authservId ? { authservId } : {}),
   };
 }
 
-export function loadConfig(): WatchConfig {
+/**
+ * The mailboxes the settings page configured, once the server has loaded them.
+ * Undefined until then, which is what tests and one-off tools see.
+ */
+let settingsAccounts: Account[] | undefined;
+
+export function setSettingsAccounts(accounts: Account[] | undefined): void {
+  settingsAccounts = accounts;
+}
+
+export function usingSettingsAccounts(): boolean {
+  return settingsAccounts !== undefined;
+}
+
+/** The fields of a stored mailbox that matter for building an Account. */
+export interface MailboxFields {
+  provider: string;
+  username: string;
+  password?: string | undefined;
+  name?: string | undefined;
+  host?: string | undefined;
+  port?: number | undefined;
+  ssl?: boolean | undefined;
+  folders?: readonly string[] | undefined;
+  smtpHost?: string | undefined;
+  smtpPort?: number | undefined;
+  fromName?: string | undefined;
+  authservId?: string | undefined;
+}
+
+function validPort(value: number | undefined, what: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || value < 1 || value > 65_535) {
+    throw new ConfigError(`${what} must be between 1 and 65535`);
+  }
+  return value;
+}
+
+/**
+ * A stored mailbox as an Account, checked the way the numbered variables are.
+ * `requirePassword` is off while a mailbox is being edited and its password
+ * is kept from before.
+ */
+export function mailboxAccount(m: MailboxFields, options: { requirePassword?: boolean } = {}): Account {
+  const preset = (PROVIDER_PRESETS as Record<string, { host?: string; port: number; auth: AuthKind }>)[m.provider];
+  if (!preset) throw new ConfigError(`Unknown provider "${m.provider}"`);
+  const username = m.username.trim();
+  if (!/^[^\s@]+@[^\s@]+$/.test(username)) throw new ConfigError(`"${username}" is not an email address`);
+  const host = m.host?.trim() || preset.host;
+  if (!host) throw new ConfigError(`${username}: this provider needs the IMAP server address`);
+  if (!/^[a-z0-9.-]+$/i.test(host) && !/^\[[0-9a-f:.]+\]$/i.test(host)) throw new ConfigError(`${username}: "${host}" is not a server address`);
+  if (preset.auth === 'password' && (options.requirePassword ?? true) && !m.password) {
+    throw new ConfigError(`${username}: enter the app password (or IMAP password) for this mailbox`);
+  }
+  const port = validPort(m.port, `${username}: IMAP port`) ?? preset.port;
+  const smtpPort = validPort(m.smtpPort, `${username}: SMTP port`);
+  const smtpHost = m.smtpHost?.trim();
+  if (smtpHost && !/^[a-z0-9.-]+$/i.test(smtpHost)) throw new ConfigError(`${username}: "${smtpHost}" is not a server address`);
+  const folders = (m.folders ?? []).map((folder) => folder.trim()).filter(Boolean);
+  return {
+    name: m.name?.trim() || `${m.provider}-${username.split('@')[0]}`,
+    provider: m.provider,
+    username,
+    host,
+    port,
+    auth: preset.auth,
+    ...(m.password ? { password: m.password } : {}),
+    folders: folders.length ? folders : [...DEFAULT_FOLDERS],
+    useSsl: m.ssl ?? true,
+    ...(smtpHost ? { smtpHost } : {}),
+    ...(smtpPort !== undefined ? { smtpPort } : {}),
+    ...(m.fromName?.trim() ? { fromName: m.fromName.trim() } : {}),
+    ...(m.authservId?.trim() ? { authservId: m.authservId.trim() } : {}),
+  };
+}
+
+export function loadConfig(source: NodeJS.ProcessEnv = process.env): WatchConfig {
   const numbered: Array<{ index: number; varName: string; raw: string }> = [];
-  for (const [key, value] of Object.entries(process.env)) {
+  if (settingsAccounts) {
+    if (settingsAccounts.length === 0) {
+      throw new ConfigError('No mailbox is configured yet. Add one under Settings → Mailboxes.');
+    }
+    return { accounts: settingsAccounts.map((account) => ({ ...account, folders: [...account.folders] })), rules: rulesFrom(source) };
+  }
+  for (const [key, value] of Object.entries(source)) {
     const match = /^MAIL_ACCOUNT_(\d+)$/.exec(key);
     if (match && value?.trim()) {
       numbered.push({ index: Number(match[1]), varName: key, raw: value.trim() });
@@ -210,11 +306,13 @@ export function loadConfig(): WatchConfig {
   numbered.sort((a, b) => a.index - b.index);
 
   if (numbered.length === 0) {
+    if (settingsAccounts) {
+      throw new ConfigError('No mailbox is configured yet. Add one under Settings → Mailboxes.');
+    }
     throw new ConfigError(
-      'No mail accounts configured. Add a line to .env, for example:\n' +
+      'No mail accounts configured. Add one under Settings → Mailboxes, or for a one-off tool set\n' +
         '  MAIL_ACCOUNT_1=qq|me@qq.com|app-password\n' +
-        'Format: provider|email|app-password[|custom-host]; increment the account number.\n' +
-        'See .env.example for the complete guide.',
+        'Format: provider|email|app-password[|custom-host]; increment the account number.',
     );
   }
 
@@ -223,18 +321,19 @@ export function loadConfig(): WatchConfig {
     if (!parsed.success) {
       throw new ConfigError(`${varName} ${parsed.error.issues[0]?.message ?? 'parse failed'}`);
     }
-    return normalizeAccount(parsed.data, index, varName);
+    return normalizeAccount(parsed.data, index, varName, source);
   });
 
+  return { accounts, rules: rulesFrom(source) };
+}
+
+function rulesFrom(source: NodeJS.ProcessEnv): Rules {
   return {
-    accounts,
-    rules: {
-      // Normalize to lowercase so matching is case-insensitive.
-      alwaysImportant: splitList(env('MAIL_ALWAYS_IMPORTANT')).map((s) => s.toLowerCase()),
-      neverImportant: splitList(env('MAIL_NEVER_IMPORTANT')).map((s) => s.toLowerCase()),
-      keywords: splitList(env('MAIL_KEYWORDS')).map((s) => s.toLowerCase()),
-      context: env('MAIL_CONTEXT') ?? '',
-    },
+    // Normalize to lowercase so matching is case-insensitive.
+    alwaysImportant: splitList(env('MAIL_ALWAYS_IMPORTANT', source)).map((s) => s.toLowerCase()),
+    neverImportant: splitList(env('MAIL_NEVER_IMPORTANT', source)).map((s) => s.toLowerCase()),
+    keywords: splitList(env('MAIL_KEYWORDS', source)).map((s) => s.toLowerCase()),
+    context: env('MAIL_CONTEXT', source) ?? '',
   };
 }
 

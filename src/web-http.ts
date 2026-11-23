@@ -16,6 +16,8 @@ export interface WebResponse {
   contentType: string;
   /** Set-Cookie value, when a request establishes or ends a session. */
   cookie?: string;
+  /** Further Set-Cookie values, for an answer that ends more than one session. */
+  extraCookies?: string[];
   cacheControl?: string;
   headers?: Record<string, string>;
   /**

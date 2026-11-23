@@ -793,7 +793,9 @@ export class Watcher {
     return this.exclusive(async () => {
       await this.commit(collected, stats);
 
-      if (digest.shouldSend(this.state)) await digest.sendDigest(this.state, this.sink);
+      // Without an external sink the digest remains available from the local
+      // triaged mail and can be delivered if an output is added later.
+      if (this.sink.configured && digest.shouldSend(this.state)) await digest.sendDigest(this.state, this.sink);
 
       this.maybePrune();
 

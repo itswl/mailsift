@@ -5,7 +5,6 @@
  * failures send critical alerts and a recovery notice, while one-poll blips
  * stay quiet.
  */
-import { existsSync } from 'node:fs';
 import type { Account } from '../config.js';
 import type { MailMessage } from '../imap/message.js';
 import type { TriageResult } from './triage.js';
@@ -111,37 +110,19 @@ function info(reason: string): TriageResult {
   };
 }
 
-/**
- * The command that re-authorizes one OAuth account, worded for how this
- * process runs. Inside the image the host's npm script would write the token
- * beside the checkout instead of into the container's volume, and without
- * --account, --force walks through every OAuth account again.
- */
-export function oauthCommand(account: Pick<Account, 'username'>): string {
-  const user = shellWord(account.username);
-  return existsSync('/.dockerenv')
-    ? `docker compose run --rm mailsift node dist/scripts/oauth-setup.js --manual --force --account=${user}`
-    : `npm run oauth -- --manual --force --account=${user}`;
-}
-
-/** An address as one POSIX shell word: "o'brien@x" or "a!b@x" must survive a paste. */
-function shellWord(value: string): string {
-  return /^[A-Za-z0-9@._+-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
-}
-
 function remedy(account: Account, kind: FailureKind): string {
   if (kind === 'folders') {
     return 'The sign-in worked, but none of the configured folders could be opened. ' +
-      'Compare MAIL_ACCOUNT_N_FOLDERS with the folders `npm run probe` lists for this account.';
+      'Test the mailbox under Settings → Mailboxes and choose its folders again.';
   }
   if (kind === 'setup') {
-    return 'mailsift could not use its own OAuth setup on this server. Check the token store ' +
-      '(TOKEN_STORE_PATH, data/tokens.json in the data volume) and the OAuth client settings in .env, then restart.';
+    return 'mailsift could not use its own OAuth setup on this server. Check the OAuth app under ' +
+      'Settings → Mailboxes → Gmail and Outlook sign-in, and the service log for the token store error.';
   }
   if (kind === 'connection') return 'If the failure continues, check network connectivity to the mail provider.';
   if (account.auth === 'gmail_oauth') {
     return (
-      `Re-authorize: \`${oauthCommand(account)}\`.\n` +
+      'Sign in again under Settings → Mailboxes.\n' +
       'If this recurs every 7 days, the Google OAuth app is probably still in Testing. ' +
       'Publish the consent screen in Google Cloud Console.\n' +
       'Personal Gmail can use gmail_pw plus an app password instead.'
@@ -152,13 +133,13 @@ function remedy(account: Account, kind: FailureKind): string {
       'Check these likely causes:\n' +
       '1) Outlook.com IMAP is disabled. Open Settings -> Mail -> Forwarding and IMAP -> ' +
       'Allow devices and apps to use IMAP (disabled by default).\n' +
-      `2) OAuth expired: \`${oauthCommand(account)}\`.`
+      '2) The sign-in expired: sign in again under Settings → Mailboxes.'
     );
   }
   return (
     'The error is not provider-specific. Check these likely causes:\n' +
     '1) IMAP is disabled in the provider web settings.\n' +
-    '2) The app password expired; generate a new one, update .env, and restart.\n' +
+    '2) The app password expired; create a new one and enter it under Settings → Mailboxes.\n' +
     '3) Login rate limiting; increase POLL_INTERVAL_SECONDS and observe recovery.'
   );
 }
@@ -183,8 +164,6 @@ export interface MailboxStatus {
   lastFailureAt: string | null;
   /** Which fix to suggest, only while failing. */
   fix?: 'google' | 'outlook' | 'authorize' | 'password' | 'folders' | 'setup' | 'connection';
-  /** The re-authorization command, for OAuth accounts that are failing to sign in. */
-  command?: string;
 }
 
 /**
@@ -217,7 +196,6 @@ export function mailboxStatuses(state: StateStore, accounts: Account[]): Mailbox
       lastSuccessAt: state.getMeta(ACCOUNT_LAST_SUCCESS_KEY + account.username) || null,
       lastFailureAt: state.getMeta(ACCOUNT_LAST_FAILURE_KEY + account.username) || null,
       ...(fix ? { fix } : {}),
-      ...(fix === 'google' || fix === 'outlook' || fix === 'authorize' ? { command: oauthCommand(account) } : {}),
     };
   });
 }
@@ -454,10 +432,7 @@ export async function recordStartupFailure(error: unknown, sink: Sink): Promise<
     `**Error**: ${String(error).slice(0, 400)}`,
     '',
     '---',
-    'The .env file is likely invalid. Run this on the server:',
-    '```',
-    'docker compose run --rm mailsift node dist/src/main.js --check',
-    '```',
+    'Open Settings in the web view to correct it; the service log has the details.',
     '',
     '⚠️ No mailbox, including spam, will be checked until this is fixed.',
   ].join('\n');

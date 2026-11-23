@@ -5,7 +5,8 @@
  * Run this after adding a mailbox. It lists real folders and message counts,
  * identifies spam, and reports folders with mail that are not monitored.
  */
-import '../src/env.js'; // Must run first so .env is loaded.
+import '../src/env.js'; // Must run first for DNS defaults.
+import '../src/bootstrap.js'; // The mailboxes saved in Settings.
 import { parseArgs } from 'node:util';
 import { loadConfig, type Account } from '../src/config.js';
 import { connect, listFolders, targetFolders } from '../src/imap/client.js';
@@ -91,7 +92,7 @@ async function probeAccount(account: Account, withCounts: boolean): Promise<bool
     if (missed) {
       console.log(`\n⚠️  ${missed} messages from the last ${RECENT_DAYS} days are in unmonitored folders.`);
       console.log('   Server-side rules may move messages before they reach INBOX.');
-      console.log('   To scan everything, set MAIL_ACCOUNT_N_FOLDERS=all in .env.');
+      console.log('   To scan everything, choose "All folders" for this mailbox in Settings.');
       console.log('   (all excludes sent, drafts, trash, and Gmail All Mail.)');
     }
     return true;

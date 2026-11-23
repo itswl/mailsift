@@ -12,10 +12,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# WorkingDirectory determines the .env and data/ locations; change it to your path.
+# WorkingDirectory determines the application and local data/ locations; change it to your path.
 WorkingDirectory=/opt/mailsift
 # Confirm the absolute node path with which node; nvm installs under ~/.nvm/versions/.
-ExecStart=/usr/bin/node dist/src/main.js
+ExecStart=/usr/bin/node dist/src/server.js
 
 # After SIGTERM the app finishes the current poll before exiting.
 TimeoutStopSec=90

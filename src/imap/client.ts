@@ -9,7 +9,7 @@
  */
 import { createHash } from 'node:crypto';
 import type { FetchMessageObject, ImapFlow, ListResponse } from 'imapflow';
-import { connect, imapErrorText, withSession } from './connection.js';
+import { connect, connectInteractive, imapErrorText, withSession } from './connection.js';
 import { resolveFolders, toFolder, type Folder } from './folders.js';
 import {
   extractAttachmentManifest, extractBody, fallbackMessageId, findBodyParts, findTextBodyPart, htmlToText, normalizeDate,
@@ -103,8 +103,13 @@ export interface MailboxFolderInfo {
  * Discover folder metadata through IMAP LIST. This does not open a folder or
  * change message flags or contents.
  */
-export async function discoverMailboxFolders(account: Account): Promise<MailboxFolderInfo[]> {
-  const client = await connect(account);
+export async function discoverMailboxFolders(
+  account: Account, options: { interactive?: boolean } = {},
+): Promise<MailboxFolderInfo[]> {
+  // Someone waiting on the settings page gets one quick attempt, not a poll's patient retries.
+  const client = options.interactive
+    ? await connectInteractive(account, { attempts: 1, attemptMs: 20_000 })
+    : await connect(account);
   try {
     const entries = await listFolders(client);
     return entries

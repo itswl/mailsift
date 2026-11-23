@@ -81,7 +81,7 @@ function isMcpToolError(error: unknown): error is McpToolError {
  */
 function bodyFor(error: unknown): McpErrorBody {
   if (isMcpToolError(error)) return error.toBody();
-  // A broken .env is the server's fault, not the caller's, and retrying cannot fix it.
+  // A broken saved configuration is the server's fault, not the caller's, and retrying cannot fix it.
   if (error instanceof ConfigError) return new McpToolError('SERVER_MISCONFIGURED', error.message).toBody();
   if (error instanceof McpError && typeof (error.data as McpErrorBody | undefined)?.code === 'string') {
     return error.data as McpErrorBody;

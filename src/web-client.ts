@@ -1018,27 +1018,11 @@ function renderHealth() {
     else state = m.lastSuccessAt ? fill('mailboxes.ok', { ago: ago(Math.max(0, now - new Date(m.lastSuccessAt))) }) : t('mailboxes.never');
     row.appendChild(el('p', 'mailbox-state', state));
     if (m.fix && STRINGS[lang]['mailboxes.fix.' + m.fix]) row.appendChild(el('p', 'mailbox-fix', t('mailboxes.fix.' + m.fix)));
-    if (m.command) {
-      const box = el('div', 'mailbox-command');
-      const code = el('code', null, m.command);
-      const copy = el('button', 'text-btn', t('detail.copyCode'));
-      copy.type = 'button';
-      copy.dataset.focus = 'copy-' + m.address;
-      copy.onclick = async () => {
-        try { await navigator.clipboard.writeText(m.command); copy.textContent = t('detail.copied'); }
-        catch (e) {
-          const range = document.createRange();
-          range.selectNodeContents(code);
-          const selection = window.getSelection();
-          selection.removeAllRanges();
-          selection.addRange(range);
-          copy.textContent = t('detail.selected');
-        }
-        setTimeout(() => { copy.textContent = t('detail.copyCode'); }, 1600);
-      };
-      box.appendChild(code);
-      box.appendChild(copy);
-      row.appendChild(box);
+    // Everything a person can fix about a mailbox is fixed in Settings now.
+    if (m.fix && m.fix !== 'connection') {
+      const link = el('a', 'text-btn', t('mailboxes.openSettings'));
+      link.href = '/settings#mailboxes';
+      row.appendChild(link);
     }
     body.appendChild(row);
   }
