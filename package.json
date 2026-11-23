@@ -1,6 +1,6 @@
 {
   "name": "mailsift",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Multi-mailbox AI mail triage with its own web mail: watch inboxes and spam, judge what actually matters with an LLM, push only that, and read, file and answer it in the browser. MCP server included.",
   "type": "module",
   "engines": {
