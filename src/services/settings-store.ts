@@ -502,18 +502,23 @@ export function signInAdmin(password: string): string | undefined {
   return newSession(database());
 }
 
-/** Change the password; every other session ends, the one returned replaces the caller's. */
-export function changeAdminPassword(current: string, next: string): string | undefined {
-  if (passwordProblem(next)) return undefined;
+/** Change the password; every session ends with it (see startAdminSession for the caller's next one). */
+export function changeAdminPassword(current: string, next: string): boolean {
+  if (passwordProblem(next)) return false;
   const row = adminRow();
-  if (!row?.password_hash || !passwordMatches(row.password_hash, current)) return undefined;
+  if (!row?.password_hash || !passwordMatches(row.password_hash, current)) return false;
   const hashed = hashPassword(next);
   const db = database();
-  return transaction(db, () => {
+  transaction(db, () => {
     db.prepare('UPDATE settings_admin SET password_hash = ?, changed_at = ? WHERE id = 1').run(hashed, new Date().toISOString());
     db.exec('DELETE FROM settings_admin_sessions');
-    return newSession(db);
   });
+  return true;
+}
+
+/** A new signed-in browser session, for a caller whose identity was just established. */
+export function startAdminSession(): string {
+  return newSession(database());
 }
 
 export function adminSessionValid(token: string): boolean {

@@ -1269,7 +1269,8 @@ async function route(
     } catch {
       return html(413, renderLogin(lang, 'login.tooLarge', nonce));
     }
-    const presented = (form.get('password') ?? form.get('token') ?? '').trim();
+    // One field, named as it always was, takes the administrator password or an MCP token.
+    const presented = (form.get('token') ?? '').trim();
     const next = signInTarget(form.get('next'));
     // The administrator password signs in to everything, the settings included.
     if (options.adminAuth && presented) {
