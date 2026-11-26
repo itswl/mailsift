@@ -125,7 +125,7 @@ Security alerts:
 - secret scanning: stop immediately (see the start of this step).
 
 Issues:
-- Act only when the label is explicit (bug / dependencies / documentation), the reproduction is complete, the fix touches at most 2 files, and no product decision is involved.
+- Act only when the label is explicit (bug / dependencies / documentation), the reproduction is complete, and no product decision is involved.
 - Stop when a product decision is needed, the reproduction is unclear, a database migration is involved, or deployment configuration / retention semantics would change.
 - Never copy mail contents, addresses or credentials from an issue into a commit, a PR or the report.
 
