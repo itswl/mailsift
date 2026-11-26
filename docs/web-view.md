@@ -32,21 +32,21 @@ Compose publishes the port on the server's loopback address only, and mailsift t
 
 Sign in with the administrator password, the one chosen with the setup code. The browser then holds an `HttpOnly` session cookie for 30 days. The cookie is a random session key, stored on the server only as a hash, never the password; changing the password, **Sign out other browsers** (Settings → Access) and `--reset-admin` end sessions. The form carries an account field so a password manager will offer to save the password. An installed app keeps its own cookies on iOS, so expect to sign in once inside it even if the browser is already signed in. Signing in goes on to the address that asked for it: a shared link, a folder, a message named after `#m=`, Settings, or the Latest code shortcut opens on what it names rather than on the start of the page.
 
-The password session may do everything below, and it is the only one that opens Settings. The same form also takes an MCP token (Settings → Access → MCP), which opens the mail view with that token's rights and never Settings: the split MCP makes between its two credentials.
+The password session may do everything below, Settings included. The same form also takes an MCP token (Settings → Access → MCP): the write token and the read token open the mail view with that token's rights and never Settings, the split MCP makes between its credentials. The admin token, where one has been generated (see [MCP](mcp.md#settings-and-the-admin-token)), is the administrator's own credential: it signs the browser in as the administrator, with the session cookie the password gives, which holds a session key and not the token.
 
-| | Administrator password | Write token | Read token |
-|---|---|---|---|
-| Read the list, a message, attachments | yes | yes | yes |
-| Open any folder, search the mailbox | yes | yes | yes |
-| Search, ask a question, get notifications | yes | yes | yes |
-| Mark done, put off until later | yes | yes | no |
-| Archive, bin, star, mark read, move to any folder, spam and not spam | yes | yes | no |
-| The same to many messages at once | yes | yes | no |
-| Reply, forward and send; change a signature | yes | yes | no |
-| Correct a judgement, draft with the model | yes | yes | no |
-| Settings | yes | no | no |
+| | Administrator password | Admin token | Write token | Read token |
+|---|---|---|---|---|
+| Read the list, a message, attachments | yes | yes | yes | yes |
+| Open any folder, search the mailbox | yes | yes | yes | yes |
+| Search, ask a question, get notifications | yes | yes | yes | yes |
+| Mark done, put off until later | yes | yes | yes | no |
+| Archive, bin, star, mark read, move to any folder, spam and not spam | yes | yes | yes | no |
+| The same to many messages at once | yes | yes | yes | no |
+| Reply, forward and send; change a signature | yes | yes | yes | no |
+| Correct a judgement, draft with the model | yes | yes | yes | no |
+| Settings | yes | yes | no | no |
 
-A token session's cookie holds the token itself and lasts six months, renewed on each visit, so give a browser a token only where you would leave the token. `/signin` signs a read-only session in again with more rights without signing out first. Pressing an action a session may not take explains this instead of failing.
+A read or write token session's cookie holds the token itself and lasts six months, renewed on each visit, so give a browser a token only where you would leave the token. The session the admin token opens is the password's own, so it ends with a password change and with **Sign out other browsers** as well. `/signin` signs a read-only session in again with more rights without signing out first. Pressing an action a session may not take explains this instead of failing.
 
 ## What needs you
 
@@ -221,7 +221,7 @@ The bell turns on Web Push for the device you are holding: a verification code o
 - A reminder you asked for ([Later](#later)) is sent to every device with notifications on, whatever level it chose and whether or not it wants codes: "Reminder: Vendor", with the summary or the subject under it. Nothing is sent for one marked done before its time, for one brought back with "Back now", or for one that came more than a day before the service was running to send it; it is back in the queue all the same. A message put off is not notified as mail before its time, here or on Feishu or the webhook, even when it is judged again meanwhile: a notification it was owed waits for that time (and moves with it, or is dropped by Back now), and one for a message marked done meanwhile is dropped. Reminders that come together, as every "Tomorrow morning" does at 09:00, go after a fresh code, never instead of it. The time reminders were last looked for is kept in the database, so a restart neither skips a reminder nor sends one twice.
 - Tapping one opens that message, or the code.
 - On iPhone and iPad, notifications work only from the app installed to the Home Screen.
-- The panel under the bell lists the other devices that have notifications on, and the owner can remove one, which is how a lost phone is cut off. A subscription is also tied to the credential it was made under (a password session counts as the write token): generate a new read or write token under Settings → Access, and every device that subscribed under the old one stops being told.
+- The panel under the bell lists the other devices that have notifications on, and the owner can remove one, which is how a lost phone is cut off. A subscription is also tied to the credential it was made under (a password session counts as the write token): generate a new read or write token under Settings → Access, and every device that subscribed under the old one stops being told. An MCP client holding the write token or the admin token can list these devices and end one (`list_push_devices`, `remove_push_device`).
 - Subscriptions are accepted only for the push services browsers actually use (Google, Mozilla, Apple, Microsoft), because the endpoint is an address this server will post to. Settings → Notifications → More options → **Additional push service hosts** adds others; turning off **Browser notifications** removes the feature.
 
 ## Keyboard and the command palette
@@ -287,7 +287,7 @@ Message bodies, attachments and API answers are never cached, by the worker or b
 - **Every request that changes something is a POST, and a POST another site started is refused** (`Sec-Fetch-Site`, then `Origin`), whatever cookie came with it. That includes signing in.
 - **The page runs only its own script.** Each response carries a content policy with a fresh nonce; nothing is loaded from another origin, the page cannot be framed, and a message's markup is never inserted into it (see [Reading a message](#reading-a-message)).
 - **Nothing under `/api` can be loaded as an image, stylesheet or frame**, so a message shown with its images cannot use your session by naming this server as one.
-- **Settings need the password.** No token, not even the write token, can change a setting, generate a token or read whether a secret is set. Secrets are never sent back to the page.
+- **Settings need the administrator**: the password session, or the admin token, the administrator's own credential, which exists only once you generate it (see [MCP](mcp.md#settings-and-the-admin-token)). The read and write tokens never reach Settings: over MCP the write token may change the four triage rules and nothing else of the settings, and no token but the admin token can generate a token or read whether a secret is set. Secrets are never sent back to the page.
 - **Sending is narrow.** The sender is always the mailbox's own address, every recipient is checked as one bare address before a connection is opened, nothing a request carries can add a header, and sends are rate-limited.
 - **Everything that acts is on record**: mailbox actions and sent messages in the mail-action audit, the rest in the MCP audit log, keyed to a fingerprint of the caller.
 

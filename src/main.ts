@@ -172,7 +172,7 @@ async function checkConfig(): Promise<number> {
   );
   console.log(
     `   Web view and MCP: http://127.0.0.1:${process.env.MCP_PORT ?? 8410}/ · sign in with the administrator password; ` +
-      'MCP clients use the read or write token (Settings → Access)',
+      'MCP clients use a token from Settings → Access (read, write, or admin)',
   );
   const monitor = heartbeatUrl();
   const monitorProblem = heartbeatProblem();

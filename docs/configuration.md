@@ -1,6 +1,6 @@
 # Configuration
 
-Everything is configured in the web view, under **Settings** (the gear icon in the mail view, or `/settings`), signed in with the administrator password. The sections are Mailboxes, AI model, Notifications, Triage rules, Checking and digest, Privacy and retention, Web mail, Access and Advanced; the less common settings of a section are under its **More options**. Each field has its default as a placeholder and a line of help. This page explains what needs more than that.
+Everything is configured in the web view, under **Settings** (the gear icon in the mail view, or `/settings`), signed in with the administrator password. The sections are Mailboxes, AI model, Notifications, Triage rules, Checking and digest, Privacy and retention, Web mail, Access and Advanced; the less common settings of a section are under its **More options**. Each field has its default as a placeholder and a line of help. This page explains what needs more than that. An MCP client holding the admin token reaches the same settings, each with its help and limits, through `get_settings` and `update_settings`; see [MCP](mcp.md#settings-and-the-admin-token).
 
 A setting is named here by its section and label. The key the code reads is given in backticks where it helps, because the log and `--check` use it. How a save is applied, and which saves restart the service, is in [Deployment](deployment.md#how-saved-settings-are-applied).
 
@@ -80,7 +80,7 @@ The check is on the sender, so it catches forwards that rewrite the sender and n
 
 ## Sending mail
 
-Sending is available to the owner in the [web view](web-view.md#writing), and to an MCP client only when it presents the write token. A reply, forward, or new message leaves through the provider's own encrypted SMTP submission server, signed in with the mailbox's credential.
+Sending is available to the owner in the [web view](web-view.md#writing), and to an MCP client only when it presents the write token or the admin token, which carries it. A reply, forward, or new message leaves through the provider's own encrypted SMTP submission server, signed in with the mailbox's credential.
 
 Every provider preset knows its server, so most mailboxes need nothing here. The exceptions:
 
@@ -147,6 +147,8 @@ Settings → Triage rules → **About you** (`MAIL_CONTEXT`) is a few sentences 
 More options → **Fallback keywords** (`MAIL_KEYWORDS`) are the keywords the local fallback looks for, on top of its built-in list, when no LLM is configured or it fails; see [Triage](triage.md#when-the-llm-fails).
 
 Feedback becomes rules too. After two feedback records for the same sender, recorded through MCP `record_feedback` or by correcting a judgement in the web view, `missed` feedback infers an always-important rule and `false_positive` feedback infers a never-important rule. Putting a message in spam (Spam in the web view, `manage_mail` with `spam`) records `spam` feedback, which counts towards a never-important rule as `false_positive` does; taking one of that sender's messages out of spam again (`not_spam`) stops their earlier spam records counting. Rules entered in Settings take precedence; inspect inferred rules with MCP `feedback_rules`.
+
+The four rules above are the only settings an MCP client can change with the write token, because they are what the owner often asks for while talking about a message: `get_triage_rules` shows them and `set_triage_rules` changes them. Every other setting needs the administrator password, or the admin token (see [MCP](mcp.md#settings-and-the-admin-token)).
 
 ## Daily digest
 

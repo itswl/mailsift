@@ -64,7 +64,7 @@ Gmail 和 Outlook 通过 OAuth 登录，需要你在 Google 或 Microsoft 注册
 
 ## MCP
 
-MCP 服务器运行在 mailsift 进程内，地址是同一地址下的 `/mcp`（Streamable HTTP，`Authorization: Bearer <令牌>`）。把它加到 MCP 客户端里，AI 助手就能看到哪些邮件等你处理，列出、搜索和阅读分诊过的邮件、预览日报、查看邮箱健康状况。它还以 prompt 的形式提供这些工具的典型用法：快速了解邮箱现状，或者查清某封邮件为什么没有送到。“设置 → 访问与凭证”可以生成两个令牌，各只显示一次：只读令牌只能查看；写令牌还能做网页里管理员能做的事：标记完成、稍后提醒、归档和删除、发信和转发，全部有审计。只把写令牌交给你愿意托付整个邮箱的客户端。支持 skill 的智能体可以加载 [.agents/skills/mailsift/SKILL.md](.agents/skills/mailsift/SKILL.md)。详见 [docs/mcp.md](docs/mcp.md)。
+MCP 服务器运行在 mailsift 进程内，地址是同一地址下的 `/mcp`（Streamable HTTP，`Authorization: Bearer <令牌>`）。把它加到 MCP 客户端里，AI 助手就能看到哪些邮件等你处理，列出、搜索和阅读分诊过的邮件、预览日报、查看邮箱健康状况。它还以 prompt 的形式提供这些工具的典型用法：快速了解邮箱现状，或者查清某封邮件为什么没有送到。“设置 → 访问与凭证”可以生成令牌，各只显示一次：只读令牌只能查看；写令牌还能做网页里管理员能做的事：标记完成、稍后提醒、归档和删除、发信和转发，全部有审计。只把写令牌交给你愿意托付整个邮箱的客户端。第三枚是管理令牌，只在你主动生成时才有，它让助手拥有你在“设置”里的一切权限，包括更换其他令牌：只把它交给你愿意托付整个设置页的客户端。支持 skill 的智能体可以加载 [.agents/skills/mailsift/SKILL.md](.agents/skills/mailsift/SKILL.md)。详见 [docs/mcp.md](docs/mcp.md)。
 
 ## 常用命令
 
@@ -82,7 +82,7 @@ docker compose exec mailsift node dist/src/main.js --reset-admin    # 忘记管�
 - [Configuration](docs/configuration.md)：邮箱和文件夹、推送出口、推送阈值、自定义规则、日报、轮询限制、IMAP IDLE、告警。
 - [Triage](docs/triage.md)：邮件怎么判定、大模型能看到什么、两段式分诊、降级兜底、验证码和登录链接。
 - [Web view](docs/web-view.md)：待处理队列、阅读及其安全措施、处理、写信、提问、通知、快捷键，以及页面如何受到保护。
-- [MCP](docs/mcp.md)：工具、资源、写凭证、附件、安全线索、审计。
+- [MCP](docs/mcp.md)：工具、资源、写凭证、管理令牌、附件、安全线索、审计。
 - [Deployment and operations](docs/deployment.md)：Docker、首次启动、远程访问与 HTTPS、登录、Gmail 和 Outlook 的 OAuth、备份、升级、systemd、命令、监控、恢复。
 - [Troubleshooting](docs/troubleshooting.md)：常见问题排查。
 - [Signal event v1](docs/signal-event-v1.md)：Webhook 载荷里的 `signal` 对象。

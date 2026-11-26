@@ -224,7 +224,7 @@ describe('maintenance', () => {
   });
 
   it('waits for a concurrent writer instead of failing immediately', () => {
-    // Other processes (healthcheck, stdio MCP) share the file; without a busy
+    // Another process (the healthcheck) shares the file; without a busy
     // timeout a write that collides with the poller throws SQLITE_BUSY at once.
     const s = store();
     const row = (s as unknown as { db: { prepare(sql: string): { get(): Record<string, unknown> } } }).db

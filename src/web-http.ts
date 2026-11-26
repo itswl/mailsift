@@ -120,12 +120,15 @@ export function readCookie(header: string | undefined, name: string): string {
   return '';
 }
 
+/** The credential a request carries in its Authorization header, if any. */
+export function bearerToken(req: IncomingMessage): string {
+  const header = req.headers.authorization;
+  return header?.startsWith('Bearer ') ? header.slice('Bearer '.length) : '';
+}
+
 /** The credential a request carries: a bearer token, else the session cookie. */
 export function presentedToken(req: IncomingMessage): string {
-  const bearer = req.headers.authorization?.startsWith('Bearer ')
-    ? req.headers.authorization.slice('Bearer '.length)
-    : '';
-  return bearer || readCookie(req.headers.cookie, SESSION_COOKIE);
+  return bearerToken(req) || readCookie(req.headers.cookie, SESSION_COOKIE);
 }
 
 export function sessionOf(req: IncomingMessage, token: string, writeToken = ''): Session {

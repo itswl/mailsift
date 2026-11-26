@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
+import type { IncomingHttpHeaders } from 'node:http';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { allowMcpRequest, createServer, forgetUnconfirmedSends, type InFlight } from '../src/mcp.js';
+import type { PollStats } from '../src/services/watcher.js';
 import { AttachmentTooLargeError, LiveMailError, MailActionError, type LiveMessage, type WebMailActionResult } from '../src/imap/client.js';
 import { liveHandle, type LiveItem } from '../src/imap/mailbox.js';
 import { StateStore } from '../src/services/state.js';
@@ -108,9 +110,14 @@ beforeEach(() => {
   forgetUnconfirmedSends();
 });
 
-async function connect(state: StateStore, writable = false, backend?: Partial<WebBackend>, inFlight?: InFlight): Promise<Client> {
+async function connect(
+  state: StateStore, writable = false, backend?: Partial<WebBackend>, inFlight?: InFlight,
+  extra: { admin?: boolean; headers?: IncomingHttpHeaders; onRefresh?: () => Promise<PollStats> } = {},
+): Promise<Client> {
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  const server = createServer({ state, client: 'test', writable, ...(backend ? { backend } : {}), ...(inFlight ? { inFlight } : {}) });
+  const server = createServer({
+    state, client: 'test', writable, ...(backend ? { backend } : {}), ...(inFlight ? { inFlight } : {}), ...extra,
+  });
   const client = new Client({ name: 'mcp-test', version: '0.0.0' });
   await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
   open.push(async () => {
@@ -119,6 +126,17 @@ async function connect(state: StateStore, writable = false, backend?: Partial<We
   });
   return client;
 }
+
+/** What the write credential adds to the read one: everything that changes something. */
+const WRITE_TOOLS = [
+  'get_triage_rules', 'manage_mail', 'mark_handled', 'record_feedback', 'remove_push_device', 'retry_dead_letter',
+  'send_mail', 'set_signature', 'set_triage_rules', 'snooze',
+];
+/** What the admin token adds on top: the settings API of the page, one tool to a route. */
+const ADMIN_TOOLS = [
+  'change_admin_password', 'end_other_sessions', 'get_settings', 'manage_mailbox', 'rotate_token', 'test_model',
+  'test_notifications', 'update_settings',
+];
 
 async function call(client: Client, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   const result = await client.callTool({ name, arguments: args });
@@ -152,9 +170,9 @@ describe('tool surface', () => {
     const client = await connect(new StateStore(':memory:'));
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
-      'browse_folder', 'feedback_rules', 'find_contacts', 'get_mail', 'health', 'inspect_mail_safety', 'list_accounts', 'list_attachments', 'list_audit', 'list_dead_letters',
-      'list_digest', 'list_folders', 'list_mail', 'list_threads', 'mail_summary', 'needs_you', 'observability',
-      'prepare_forward', 'prepare_reply', 'read_message', 'recovery_status', 'scan_attachment', 'search_mail', 'search_mailbox',
+      'browse_folder', 'feedback_rules', 'find_contacts', 'get_conversation', 'get_mail', 'health', 'inspect_mail_safety', 'list_accounts', 'list_attachments',
+      'list_audit', 'list_dead_letters', 'list_digest', 'list_folders', 'list_mail', 'list_push_devices', 'list_threads', 'mail_summary', 'needs_you',
+      'observability', 'prepare_forward', 'prepare_reply', 'read_message', 'recovery_status', 'scan_attachment', 'search_mail', 'search_mailbox',
     ]);
     for (const tool of tools) expect(tool.description ?? '').not.toBe('');
   });
@@ -165,23 +183,28 @@ describe('tool surface', () => {
     // silences that sender's future alerts.
     const client = await connect(seeded());
     const names = (await client.listTools()).tools.map((t) => t.name);
-    expect(names).not.toContain('record_feedback');
-    expect(names).not.toContain('retry_dead_letter');
-    expect(names).not.toContain('manage_mail');
-    expect(names).not.toContain('mark_handled');
-    expect(names).not.toContain('send_mail');
-    expect(names).not.toContain('set_signature');
+    for (const name of WRITE_TOOLS) expect(names, name).not.toContain(name);
+    for (const name of ADMIN_TOOLS) expect(names, name).not.toContain(name);
 
     // Absent from the listing and also unreachable by name.
     expect(await client.callTool({ name: 'record_feedback', arguments: { messageId: '<one@x>', label: 'false_positive' } }))
+      .toMatchObject({ isError: true });
+    expect(await client.callTool({ name: 'update_settings', arguments: { values: { DIGEST_HOUR: '9' } } }))
       .toMatchObject({ isError: true });
   });
 
   it('adds exactly the tools that change something for a caller holding the write credential', async () => {
     const reader = new Set((await (await connect(new StateStore(':memory:'))).listTools()).tools.map((t) => t.name));
     const writer = (await (await connect(new StateStore(':memory:'), true)).listTools()).tools.map((t) => t.name);
-    expect(writer.filter((name) => !reader.has(name)).sort())
-      .toEqual(['manage_mail', 'mark_handled', 'record_feedback', 'retry_dead_letter', 'send_mail', 'set_signature', 'snooze']);
+    expect(writer.filter((name) => !reader.has(name)).sort()).toEqual([...WRITE_TOOLS].sort());
+  });
+
+  it('adds the administrator\'s tools, and nothing more, for a caller holding the admin token', async () => {
+    const writer = (await (await connect(new StateStore(':memory:'), true)).listTools()).tools.map((t) => t.name).sort();
+    const holder = (await (await connect(new StateStore(':memory:'), true, undefined, undefined, { admin: true })).listTools()).tools.map((t) => t.name).sort();
+    // The admin token carries the write credential's tools with it, and adds the administrator's to them.
+    expect(holder).toEqual([...writer, ...ADMIN_TOOLS].sort());
+    for (const name of ADMIN_TOOLS) expect(holder).toContain(name);
   });
 
   it('gives the write credential what the page has, the bin and sending included, and a reader none of it', async () => {
@@ -230,8 +253,15 @@ describe('tool surface', () => {
     const { tools } = await client.listTools();
     const listMail = tools.find((t) => t.name === 'list_mail')!;
     expect(Object.keys(listMail.inputSchema.properties ?? {}).sort()).toEqual([
-      'account', 'category', 'cursor', 'hours', 'importance', 'limit', 'pushedOnly', 'spamOnly',
+      'account', 'category', 'codesOnly', 'cursor', 'hours', 'importance', 'limit', 'pushedOnly', 'spamOnly',
     ]);
+    const listThreads = tools.find((t) => t.name === 'list_threads')!;
+    expect(Object.keys(listThreads.inputSchema.properties ?? {}).sort())
+      .toEqual(['account', 'category', 'codesOnly', 'hours', 'importance', 'limit', 'pushedOnly', 'query', 'spamOnly']);
+    // A file of the caller's own goes in base64, and the schema says how much of it.
+    const sendMail = (await (await connect(new StateStore(':memory:'), true)).listTools()).tools.find((t) => t.name === 'send_mail')!;
+    const sendSchema = sendMail.inputSchema.properties as Record<string, { items?: { required?: string[] } }>;
+    expect(sendSchema['attachments']?.items?.required).toEqual(['name', 'data']);
     const getMail = tools.find((t) => t.name === 'get_mail')!;
     expect(getMail.inputSchema.required).toEqual(['messageId']);
   });
@@ -322,17 +352,80 @@ describe('queries', () => {
     expect(await call(client, 'search_mail', { query: 'Finance' })).toMatchObject({ count: 4 });
   });
 
-  it('previews what is waiting for the daily digest', async () => {
+  it('previews what is waiting for the daily digest, and says when it goes out', async () => {
     const state = seeded();
-    state.queueDigest('k3', { subject: 'queued one', importance: 'info', category: 'Social' });
-    state.queueDigest('k2', { subject: 'queued two', importance: 'info', category: 'Marketing' });
+    // What the poller queues for the digest, in full: the page's preview is rendered from them.
+    const queued = (subject: string, summary: string, category: string): Record<string, unknown> => ({
+      subject, summary, importance: 'info', category, threadCount: 1, date: '', accountLabel: 'me@qq.com', folder: 'INBOX',
+      inSpam: false, from: 'billing@vendor.com', fromName: 'Vendor', deadline: '', actionRequired: false,
+    });
+    state.queueDigest('k3', queued('queued one', 'first summary', 'Social'));
+    state.queueDigest('k2', queued('queued two', 'second summary', 'Marketing'));
     const client = await connect(state);
 
     const digest = await call(client, 'list_digest');
-    expect(digest).toMatchObject({ count: 2, pending: 2 });
+    expect(digest).toMatchObject({ count: 2, pending: 2, enabled: true });
     expect((digest['items'] as Array<{ subject: string }>).map((i) => i.subject).sort())
       .toEqual(['queued one', 'queued two']);
+    // When the next one goes out, as the page is told, by the clock that sends it.
+    expect(typeof digest['nextAt']).toBe('string');
+    expect(digest).not.toHaveProperty('preview');
     expect(await call(client, 'list_digest', { limit: 1 })).toMatchObject({ count: 1, pending: 2 });
+    // The text as the channel that sends it will show it, asked for.
+    const preview = await call(client, 'list_digest', { preview: true });
+    expect(String(preview['preview'])).toContain('first summary');
+    expect(String(preview['preview'])).toContain('second summary');
+  });
+
+  it('keeps only the verification codes when asked, as the page\'s switch does', async () => {
+    const state = seeded();
+    state.markSeen('k4', 'me@qq.com', '验证码邮件');
+    state.recordOutcome('k4', 'warning', true, {
+      messageId: '<code@x>', category: 'Security', summary: '收到验证码邮件。', verificationCode: '227857', folder: 'INBOX',
+    });
+    const client = await connect(state);
+
+    expect(await call(client, 'list_mail', { codesOnly: true })).toMatchObject({ count: 1 });
+    expect((await call(client, 'list_mail', { codesOnly: true }))['mail']).toMatchObject([{ messageId: '<code@x>' }]);
+    expect(await call(client, 'list_threads', { codesOnly: true })).toMatchObject({ count: 1 });
+    // Without the switch everything is there, as before.
+    expect(await call(client, 'list_mail')).toMatchObject({ count: 4 });
+  });
+
+  it('gives the conversation around a stored message, the owner\'s own messages in it included', async () => {
+    const state = new StateStore(':memory:');
+    const thread = 'me@qq.com|<root@x>';
+    const minute = 60_000;
+    const received = (key: string, messageId: string, at: string) => {
+      state.markSeen(key, 'me@qq.com', `subject ${key}`);
+      state.recordOutcome(key, 'info', false, {
+        messageId, threadKey: thread, mailDate: at, folder: 'INBOX', sender: 'ann@example.org', category: 'Personal', summary: `summary ${key}`,
+      });
+    };
+    received('first', '<root@x>', new Date(Date.now() - 30 * minute).toISOString());
+    received('second', '<two@x>', new Date(Date.now() - 5 * minute).toISOString());
+    state.recordSent({
+      account: 'me@qq.com', accountLabel: 'personal', messageId: '<out@qq.com>', threadKey: thread, inReplyTo: '<root@x>', answers: '<root@x>',
+      subject: 'Re: lunch', fromAddr: 'me@qq.com', to: [{ name: 'Ann', address: 'ann@example.org' }], cc: [], bcc: [],
+      date: new Date(Date.now() - 20 * minute).toISOString(), text: 'Thursday works.', attachmentCount: 1, attachmentNames: ['plan.pdf'],
+      folder: 'Sent', uid: 5, uidValidity: '1', source: 'poll',
+    });
+    const client = await connect(state);
+
+    const conversation = await call(client, 'get_conversation', { messageId: '<root@x>' });
+    expect(conversation).toMatchObject({ threadKey: thread, count: 3, omitted: 0, between: 0 });
+    const messages = conversation['messages'] as Array<Record<string, unknown>>;
+    expect(messages.map((m) => m['direction'])).toEqual(['in', 'out', 'in']);
+    expect(messages[0]).toMatchObject({ messageId: '<root@x>', current: true, summary: 'summary first' });
+    expect(messages[1]).toMatchObject({
+      direction: 'out', from: { address: 'me@qq.com' }, to: [{ name: 'Ann', address: 'ann@example.org' }],
+      text: 'Thursday works.', attachments: { count: 1, names: ['plan.pdf'] },
+    });
+    expect(messages[2]).toMatchObject({ messageId: '<two@x>', current: false });
+    // A message nothing is stored about: said as not found, and under the code the other lookups use.
+    const missing = await client.callTool({ name: 'get_conversation', arguments: { messageId: '<absent@x>' } });
+    expect(missing).toMatchObject({ isError: true });
+    expect(String((missing.content as Array<{ text: string }>)[0]!.text)).toContain('NOT_FOUND');
   });
 
   it('searches the stored fields', async () => {
@@ -1433,6 +1526,107 @@ describe('forwarding and signatures', () => {
   });
 });
 
+describe('what the page can do, a client can ask for', () => {
+  beforeEach(() => { process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw'; });
+  const failure = async (client: Client, name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const answer = await client.callTool({ name, arguments: args });
+    expect(answer, name).toMatchObject({ isError: true });
+    return JSON.parse((answer.content as Array<{ text: string }>)[0]!.text) as Record<string, unknown>;
+  };
+
+  it('sends files of the caller\'s own, given in base64, and refuses what is wrong with them before anything leaves', async () => {
+    const state = seeded();
+    const box = mailbox(state);
+    const client = await connect(state, true, box.backend);
+    const letter = { account: 'me@qq.com', to: ['a@example.org'], subject: 'with files', text: 'See attached.' };
+
+    const answer = await call(client, 'send_mail', {
+      ...letter,
+      attachments: [
+        { name: 'notes.txt', type: 'text/plain', data: Buffer.from('hello there').toString('base64') },
+        // A name with a path in it goes under its last part, as the page's own upload does.
+        { name: '..\\..\\etc\\plan.pdf', type: 'application/pdf', data: Buffer.from('%PDF-1.4').toString('base64') },
+      ],
+    });
+    expect(answer).toMatchObject({ sent: true, attachments: ['notes.txt', 'plan.pdf'] });
+    expect(box.sent[0]!.attachments!.map((file) => [file.filename, file.contentType, file.content.toString()]))
+      .toEqual([['notes.txt', 'text/plain', 'hello there'], ['plan.pdf', 'application/pdf', '%PDF-1.4']]);
+
+    // What is not cleanly encoded refuses the whole letter: a file that would arrive with bytes missing is not sent at all.
+    const broken = await failure(client, 'send_mail', {
+      ...letter, attachments: [{ name: 'broken.bin', data: `${Buffer.from('ok').toString('base64')}ab=d` }],
+    });
+    expect(broken).toMatchObject({ code: 'INVALID_ARGUMENT' });
+    // More than one call may carry is said from the length of the encoding alone, before a byte is decoded or sent.
+    const large = (megabytes: number): string => Buffer.alloc(Math.floor(megabytes * 1024 * 1024), 1).toString('base64');
+    expect(await failure(client, 'send_mail', {
+      ...letter, attachments: [{ name: 'one.bin', data: large(5) }, { name: 'two.bin', data: large(4) }],
+    })).toMatchObject({ code: 'ATTACHMENT_UNSUPPORTED' });
+    expect(box.sent).toHaveLength(1);
+  });
+
+  it('checks every mailbox now when the server has a poller to run, and offers nothing to check when it has none', async () => {
+    const state = seeded();
+    expect((await (await connect(state)).listTools()).tools.map((t) => t.name)).not.toContain('refresh');
+    const polls: number[] = [];
+    const stats: PollStats = { accountsOk: 1, accountsFailed: 0, fetched: 12, fresh: 2, pushed: 1, queued: 1, spamRescued: 0, failures: [] };
+    const client = await connect(state, false, undefined, undefined, { onRefresh: async () => { polls.push(1); return stats; } });
+
+    // As the refresh button, and for anyone who may read: it reads mail and changes nothing in a mailbox.
+    expect(await call(client, 'refresh')).toEqual(stats);
+    expect(polls).toEqual([1]);
+  });
+
+  it('says a check that did not finish as the mailbox\'s doing', async () => {
+    const client = await connect(seeded(), false, undefined, undefined, { onRefresh: async () => { throw new Error('imap is down'); } });
+    expect(await failure(client, 'refresh', {})).toMatchObject({ code: 'MAILBOX_UNAVAILABLE' });
+  });
+
+  it('lists the devices told about mail by their labels alone, and lets a writer end one', async () => {
+    const state = seeded();
+    const device = (n: number, label: string): void => {
+      state.savePushSubscription({
+        endpoint: `https://fcm.googleapis.com/fcm/send/device-${n}`, p256dh: 'B'.repeat(87), auth: 'A'.repeat(22),
+        level: 'critical', codes: true, lang: 'en', label,
+      });
+    };
+    device(1, 'iPhone');
+    device(2, 'Mac');
+    const reader = await connect(state);
+    const listed = await call(reader, 'list_push_devices');
+    expect(listed['canRemove']).toBe(false);
+    const devices = listed['devices'] as Array<Record<string, unknown>>;
+    expect(devices.map((d) => [d['label'], d['level'], d['codes']])).toEqual([['iPhone', 'critical', true], ['Mac', 'critical', true]]);
+    // Where pushes go, what encrypts them, and which device is asking never leave the server.
+    expect(JSON.stringify(listed)).not.toContain('fcm.googleapis.com');
+    expect(JSON.stringify(listed)).not.toContain('current');
+    const id = String(devices[0]!['id']);
+    expect(await failure(reader, 'remove_push_device', { id })).toMatchObject({ code: 'INVALID_ARGUMENT' });
+
+    const writer = await connect(state, true);
+    expect(await call(writer, 'list_push_devices')).toMatchObject({ canRemove: true });
+    expect(await call(writer, 'remove_push_device', { id })).toEqual({ removed: true, id });
+    expect((await call(writer, 'list_push_devices'))['devices']).toMatchObject([{ label: 'Mac' }]);
+    expect(await failure(writer, 'remove_push_device', { id })).toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('says of each mailbox whether mail may be sent from it, and whether the poller can still read it', async () => {
+    process.env.SMTP_ENABLED = 'false';
+    const state = seeded();
+    state.setMeta('account_fail_count:me@qq.com', '3');
+    const accounts = await call(await connect(state), 'list_accounts');
+    expect(accounts).toMatchObject({
+      count: 1,
+      accounts: [{ address: 'me@qq.com', provider: 'qq', canSend: false, sendReason: 'disabled' }],
+      mailboxes: [{ address: 'me@qq.com', consecutiveFailures: 3, failing: true }],
+    });
+    delete process.env.SMTP_ENABLED;
+    const sending = await call(await connect(seeded()), 'list_accounts');
+    expect(sending['accounts']).toMatchObject([{ canSend: true }]);
+    expect((sending['accounts'] as Array<Record<string, unknown>>)[0]).not.toHaveProperty('sendReason');
+  });
+});
+
 describe('a call that outlasts its caller', () => {
   beforeEach(() => { process.env.MAIL_ACCOUNT_1 = 'qq|me@qq.com|pw'; });
 
@@ -1527,6 +1721,29 @@ describe('resources', () => {
     const uris = resourceTemplates.map((t) => t.uriTemplate);
     expect(uris).toContain('mailsift://mail/{messageId}');
     expect(uris).toContain('mailsift://thread/{threadKey}');
+  });
+
+  it('lists the newest records and threads as resources, each of which reads back', async () => {
+    // A client that only lists, and fills no template in for itself, still has mail to open.
+    const state = seeded();
+    state.markSeen('k4', 'me@qq.com', 'a thread');
+    state.recordOutcome('k4', 'info', false, {
+      messageId: '<four@x>', threadKey: 'me@qq.com|<root@x>', category: 'Work', summary: 'summary k4',
+    });
+    const client = await connect(state);
+
+    const { resources } = await client.listResources();
+    const uris = resources.map((r) => r.uri);
+    // Each record once, by the key that names it alone; a thread only by a key that is really one.
+    expect(uris.filter((uri) => uri.startsWith('mailsift://mail/'))).toHaveLength(4);
+    expect(uris).toContain('mailsift://mail/k1');
+    expect(uris).toContain(`mailsift://thread/${encodeURIComponent('me@qq.com|<root@x>')}`);
+    expect(resources.find((r) => r.uri === 'mailsift://mail/k1')?.name).toContain('subject k1');
+
+    const record = await client.readResource({ uri: 'mailsift://mail/k1' });
+    expect(String((record.contents as Array<{ text: string }>)[0]!.text)).toContain('<one@x>');
+    const thread = await client.readResource({ uri: `mailsift://thread/${encodeURIComponent('me@qq.com|<root@x>')}` });
+    expect(String((thread.contents as Array<{ text: string }>)[0]!.text)).toContain('<four@x>');
   });
 });
 

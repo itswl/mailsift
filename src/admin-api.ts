@@ -4,15 +4,19 @@
  * Everything here needs an administrator session (a browser signed in with the
  * administrator password), except claiming the server with the one-time setup
  * code and the OAuth provider's redirect, which carries its own single-use
- * state. The MCP tokens never reach these routes: an agent holding the write
- * token may act on mail, not reconfigure the server.
+ * state. Two more callers reach the API, never the pages, and only through
+ * callAdmin: a caller holding the admin token, who may do everything an
+ * administrator may except claim the server, and a caller holding the write
+ * token, who may save the triage rules (TRIAGE_RULE_KEYS) and nothing else.
+ * The read token reaches nothing here.
  *
  * Secrets go one way. The page can set or clear one, and is told whether one
  * is set, never what it is. The single exception is a newly generated MCP
  * token, shown once in the answer that created it.
  */
 import { createHash, randomBytes } from 'node:crypto';
-import type { IncomingMessage } from 'node:http';
+import type { IncomingHttpHeaders, IncomingMessage } from 'node:http';
+import { Readable } from 'node:stream';
 import { ConfigError, mailboxAccount, PROVIDER_PRESETS, type AuthKind } from './config.js';
 import {
   authorizedScope, authorizedUsernames, buildTokenRecord, exchangeCode, getOAuthProvider, TokenStore,
@@ -22,7 +26,8 @@ import { imapErrorText } from './imap/connection.js';
 import { getLogger } from './logger.js';
 import { scopeAllowsSending } from './smtp.js';
 import {
-  ACCESS_TOKEN_KEYS, checkField, crossFieldProblems, FIELD_BY_KEY, SECRET_KEYS, words, type FieldProblem,
+  checkField, crossFieldProblems, FIELD_BY_KEY, SECRET_KEYS, SETTING_FIELDS, TOKEN_KIND_KEYS, words,
+  type FieldProblem, type TokenKind,
 } from './settings-catalog.js';
 import { renderClaimPage, renderSettingsPage } from './settings-page.js';
 import { sendTestNotification } from './services/sink.js';
@@ -32,7 +37,7 @@ import {
   bootId, restartState, requestRestart, serverMode, supervised, type RestartOutcome,
 } from './services/runtime-control.js';
 import {
-  applySettings, differsFromBoot, isOAuthProvider, mailboxReadiness,
+  applySettings, differsFromBoot, effectiveValue, isOAuthProvider, mailboxReadiness,
 } from './services/settings-runtime.js';
 import {
   ADMIN_PASSWORD_MIN, adminPasswordSet, adminSessionValid, changeAdminPassword, claimAdmin, endOtherAdminSessions,
@@ -62,6 +67,19 @@ export interface AdminContext {
   version: string;
   /** The signed-in administrator's session token, or '' for none. */
   admin: string;
+  /**
+   * The caller presented the admin token (MCP_ADMIN_TOKEN): it may do what a
+   * session may, with two differences that follow from having no session.
+   * It is never handed a session cookie, so changing the password ends every
+   * browser's, and ending other sessions ends all of them.
+   */
+  adminByToken?: boolean;
+  /**
+   * The only settings this caller may save, when it holds the write token
+   * rather than the administrator's: it reaches /api/admin/settings for
+   * those keys alone. Undefined for everyone else.
+   */
+  scope?: readonly string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +177,10 @@ function statePayload(req: IncomingMessage, doc: SettingsDocument): Record<strin
     values,
     secrets,
     mailboxes: doc.mailboxes.map((mailbox) => safeMailbox(mailbox, authorized)),
-    tokens: { read: Boolean(doc.values['MCP_TOKEN']), write: Boolean(doc.values['MCP_WRITE_TOKEN']) },
+    tokens: {
+      read: Boolean(doc.values['MCP_TOKEN']), write: Boolean(doc.values['MCP_WRITE_TOKEN']),
+      admin: Boolean(doc.values['MCP_ADMIN_TOKEN']),
+    },
     oauthApps: {
       gmail: Boolean(doc.values['GMAIL_CLIENT_ID']),
       outlook: Boolean(doc.values['OUTLOOK_CLIENT_ID']),
@@ -197,10 +218,11 @@ function fieldErrors(problems: FieldProblem[], lang: Language): Record<string, s
 /**
  * The values a save or a test would leave, from the page's changes: a string
  * sets a value ('' resets it to the default), null clears it. A secret left
- * out keeps what is stored.
+ * out keeps what is stored. `scope` narrows what may be saved to those keys:
+ * anything else is refused as a key that is no setting is.
  */
 function mergeValues(
-  current: Record<string, string>, changes: unknown, lang: Language,
+  current: Record<string, string>, changes: unknown, lang: Language, scope?: readonly string[],
 ): { values: Record<string, string>; errors: Record<string, string> } {
   const values = { ...current };
   const problems: FieldProblem[] = [];
@@ -209,6 +231,10 @@ function mergeValues(
       const field = FIELD_BY_KEY.get(key);
       if (!field) {
         problems.push({ key, message: { en: 'Not a setting.', zh: '不是可设置的项。' } });
+        continue;
+      }
+      if (scope && !scope.includes(key)) {
+        problems.push({ key, message: { en: 'This credential cannot change this setting.', zh: '这个凭证不能修改这一项。' } });
         continue;
       }
       if (raw === null) {
@@ -349,7 +375,9 @@ function returnOrigin(req: IncomingMessage): string {
   return `${requestChannel(req) === 'https' ? 'https' : 'http'}://${host}`;
 }
 
-async function finishSignIn(pending: PendingSignIn, code: string, lang: Language): Promise<{ ok: true; applied: Applied } | { ok: false; message: string }> {
+async function finishSignIn(
+  pending: PendingSignIn, code: string, lang: Language, via: 'page' | 'token' = 'page',
+): Promise<{ ok: true; applied: Applied } | { ok: false; message: string }> {
   const zh = lang === 'zh-CN';
   const doc = readSettings();
   const mailbox = doc.mailboxes.find((m) => m.id === pending.mailboxId);
@@ -363,7 +391,7 @@ async function finishSignIn(pending: PendingSignIn, code: string, lang: Language
     const previous = await store.get(mailbox.username);
     const record = buildTokenRecord(await exchangeCode(provider, code, pending.redirectUri, pending.verifier), previous, pending.scope);
     await store.save(mailbox.username, record);
-    log.info(`Authorized ${mailbox.provider} mailbox ${mailbox.id} from the settings page.`);
+    log.info(`Authorized ${mailbox.provider} mailbox ${mailbox.id} ${via === 'token' ? 'with the MCP admin token' : 'from the settings page'}.`);
   } catch (error) {
     log.warn(`OAuth token exchange failed for mailbox ${mailbox.id}: ${error instanceof Error ? error.message : error}`);
     const detail = error instanceof Error ? error.message.slice(0, 240) : '';
@@ -496,7 +524,14 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
     return { ...ok({ claimed: true }), cookie: adminCookie(req, session) };
   }
 
-  if (!ctx.admin) return fail(401, 'admin_required', zh ? '请用管理员密码登录。' : 'Sign in with the administrator password.');
+  // Every other call is the administrator's. A caller scoped to the triage
+  // rules (the write token) is let through to the one route that saves them
+  // and to nothing else; each route below still sees the scope.
+  const rulesOnly = ctx.scope !== undefined && !ctx.admin && !ctx.adminByToken
+    && path === '/api/admin/settings' && req.method === 'POST';
+  if (!ctx.admin && !ctx.adminByToken && !rulesOnly) {
+    return fail(401, 'admin_required', zh ? '请用管理员密码登录。' : 'Sign in with the administrator password.');
+  }
 
   if (path === '/api/admin/state' && req.method === 'GET') {
     return ok(statePayload(req, readSettings()));
@@ -513,7 +548,7 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
       let doc: SettingsDocument;
       try {
         doc = updateSettings((d) => {
-          const merged = mergeValues(d.values, body['values'], lang);
+          const merged = mergeValues(d.values, body['values'], lang, rulesOnly ? ctx.scope : undefined);
           errors = merged.errors;
           if (Object.keys(errors).length) throw new NotSaved();
           d.values = merged.values;
@@ -644,7 +679,7 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
       if (!pending) return fail(400, 'expired', zh ? '这次登录已过期，请重新点“登录”。' : 'This sign-in has expired. Start it again.');
       const code = params.get('code');
       if (!code) return fail(400, 'no_code', zh ? '地址里没有授权码。' : 'That address carries no authorization code.');
-      const result = await finishSignIn(pending, code, lang);
+      const result = await finishSignIn(pending, code, lang, ctx.adminByToken ? 'token' : 'page');
       if (!result.ok) return fail(400, 'exchange_failed', result.message);
       return ok({ authorized: true, applied: result.applied, mailbox: pending.mailboxId, state: statePayload(req, readSettings()) });
     }
@@ -671,11 +706,11 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
 
     case '/api/admin/tokens/rotate': {
       const kind = body['kind'];
-      if (kind !== 'read' && kind !== 'write') return fail(400, 'bad_kind', 'kind must be read or write');
-      const key = kind === 'read' ? 'MCP_TOKEN' : 'MCP_WRITE_TOKEN';
+      if (kind !== 'read' && kind !== 'write' && kind !== 'admin') return fail(400, 'bad_kind', 'kind must be read, write or admin');
+      const key = TOKEN_KIND_KEYS[kind as TokenKind];
       const token = newAccessToken();
       const doc = updateSettings((d) => { d.values[key] = token; });
-      log.info(`The MCP ${kind} token was replaced from the settings page.`);
+      log.info(`The MCP ${kind} token was replaced ${ctx.adminByToken ? 'with the admin token' : 'from the settings page'}.`);
       const applied = apply(doc, `the MCP ${kind} token was replaced`);
       return ok({ token, applied, state: statePayload(req, doc) });
     }
@@ -685,10 +720,14 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
       const next = typeof body['next'] === 'string' ? body['next'] as string : '';
       if (passwordProblem(next)) return fail(400, 'too_short', zh ? `新密码至少 ${ADMIN_PASSWORD_MIN} 个字符。` : `Use at least ${ADMIN_PASSWORD_MIN} characters.`);
       if (!allowClaimPerClient(ctx.client)) return fail(429, 'rate_limited', zh ? '尝试次数过多，请一分钟后再试。' : 'Too many attempts. Wait a minute.');
+      // The current password is asked of the admin token too, exactly as of a browser: a token that leaked must not lock its owner out.
       if (!changeAdminPassword(current, next)) return fail(401, 'not_accepted', zh ? '当前密码不正确。' : 'The current password is not right.');
-      log.info('The administrator password was changed; other sessions were signed out.');
-      // Every session ended with the change, this one included; it gets a fresh one.
-      return { ...ok({ changed: true }), cookie: adminCookie(req, startAdminSession()) };
+      log.info(ctx.adminByToken
+        ? 'The administrator password was changed with the admin token; every session was signed out.'
+        : 'The administrator password was changed; other sessions were signed out.');
+      const changed = ok({ changed: true });
+      // Every session ended with the change, this one included; a browser gets a fresh one. A caller holding the admin token keeps none.
+      return ctx.admin ? { ...changed, cookie: adminCookie(req, startAdminSession()) } : changed;
     }
 
     case '/api/admin/sessions/end-others': {
@@ -710,4 +749,104 @@ export async function routeAdmin(req: IncomingMessage, url: URL, ctx: AdminConte
     default:
       return fail(404, 'not_found', 'not found');
   }
+}
+
+// ---------------------------------------------------------------------------
+// Calls from the MCP server
+// ---------------------------------------------------------------------------
+
+/** A caller of the settings API that is not a browser request. */
+export interface AdminCaller {
+  /** Rate limits are kept per client, as they are for the page. */
+  client: string;
+  lang?: Language;
+  /**
+   * The headers of the MCP request being answered, when there is one. They say
+   * by which name and over which channel the server was reached, which is
+   * what the OAuth sign-in works its redirect out of.
+   */
+  headers?: IncomingHttpHeaders;
+  /** Holding the admin token: everything an administrator at the page may do, except claiming the server. */
+  adminByToken?: boolean;
+  /** Holding only the write token: may save these settings, and nothing else. */
+  scope?: readonly string[];
+}
+
+/**
+ * Of the request being answered, what the routes read from a browser's: the
+ * name the server was reached under, and what a proxy said of the channel.
+ */
+function channelHeaders(headers: IncomingHttpHeaders | undefined): IncomingHttpHeaders {
+  const out: IncomingHttpHeaders = {};
+  for (const name of ['host', 'x-forwarded-proto', 'forwarded', 'origin']) {
+    const value = headers?.[name];
+    if (value !== undefined) out[name] = value;
+  }
+  return out;
+}
+
+/**
+ * One call of the settings API from the MCP server's admin tools, answered
+ * by the route that answers a browser.
+ *
+ * The request is made here in the shape the routes read, so each check and
+ * each save has one implementation, the page's. It carries the least they
+ * need: the method, the path, a JSON body and the four headers above, and
+ * never a session: a caller is admitted only by `adminByToken` or `scope`,
+ * whichever its credential earned. The pages and /claim are refused: the
+ * first need a browser, and the second the one-time setup code, which no
+ * token stands in for.
+ */
+export async function callAdmin(path: string, body: unknown, caller: AdminCaller): Promise<WebResponse> {
+  if (!path.startsWith('/api/admin/') || path === '/api/admin/claim') return fail(404, 'not_found', 'not found');
+  const req = Object.assign(Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]), {
+    method: body === undefined ? 'GET' : 'POST', url: path,
+    headers: { ...channelHeaders(caller.headers), 'content-type': 'application/json' },
+  }) as unknown as IncomingMessage;
+  // The routes answer undefined only for a path that is not theirs, which the line above has ruled out.
+  return (await routeAdmin(req, new URL(path, 'http://mailsift.invalid'), {
+    lang: caller.lang ?? 'en', nonce: '', client: caller.client, version: '', admin: '',
+    ...(caller.adminByToken ? { adminByToken: true } : {}),
+    ...(caller.scope ? { scope: caller.scope } : {}),
+  })) ?? fail(404, 'not_found', 'not found');
+}
+
+/**
+ * The settings the page offers, each with what may be saved for it (its
+ * type, its words, its limits and its choices) and the value the service runs
+ * on: the stored value, else what the environment gave, else nothing, which
+ * is the field's default. A secret is never given back, only whether one is
+ * stored. For a caller that configures the server without the page.
+ */
+export function settingsCatalog(lang: Language): Array<Record<string, unknown>> {
+  const doc = readSettings();
+  return SETTING_FIELDS.map((field) => ({
+    key: field.key, section: field.section, type: field.type, label: words(field.label, lang),
+    ...(field.help ? { help: words(field.help, lang) } : {}),
+    ...(field.advanced ? { advanced: true } : {}),
+    ...(SECRET_KEYS.has(field.key) ? { set: Boolean(effectiveValue(doc, field.key)) } : { value: effectiveValue(doc, field.key) }),
+    ...(field.defaultValue !== undefined ? { default: field.defaultValue } : {}),
+    ...(field.placeholder ? { example: field.placeholder } : {}),
+    ...(field.min !== undefined ? { min: field.min } : {}),
+    ...(field.max !== undefined ? { max: field.max } : {}),
+    ...(field.maxLength !== undefined ? { maxLength: field.maxLength } : {}),
+    ...(field.options ? { options: field.options.map((option) => option.value) } : {}),
+  }));
+}
+
+/**
+ * The rules that decide mail without a model, as they will be once the
+ * service runs on the stored settings: the stored value, or else what the
+ * environment gives. Lists are stored as the page saves them, separated by
+ * commas; they are given back as lists.
+ */
+export function triageRules(): { alwaysImportant: string[]; neverImportant: string[]; keywords: string[]; context: string } {
+  const doc = readSettings();
+  const list = (key: string): string[] => effectiveValue(doc, key).split(',').map((item) => item.trim()).filter(Boolean);
+  return {
+    alwaysImportant: list('MAIL_ALWAYS_IMPORTANT'),
+    neverImportant: list('MAIL_NEVER_IMPORTANT'),
+    keywords: list('MAIL_KEYWORDS'),
+    context: effectiveValue(doc, 'MAIL_CONTEXT'),
+  };
 }
