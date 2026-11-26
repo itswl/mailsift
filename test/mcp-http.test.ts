@@ -1,16 +1,31 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
+import { connect } from 'node:net';
 import type { AddressInfo, Server } from 'node:net';
-import { startMcpHttp } from '../src/mcp.js';
+import { Client, StreamableHTTPClientTransport, type VersionNegotiationOptions } from '@modelcontextprotocol/client';
+import { SkillsClient } from '@modelcontextprotocol/client/ext/skills';
+import { CLIENT_CAPABILITIES_META_KEY, PROTOCOL_VERSION_META_KEY } from '@modelcontextprotocol/server';
+import { MCP_MAX_REQUEST_BODY_BYTES, startMcpHttp } from '../src/mcp.js';
+import { SKILL_URI, skillCatalogOrNone } from '../src/mcp-skills.js';
 import { StateStore } from '../src/services/state.js';
 import { closeSettingsStore } from '../src/services/settings-store.js';
 import { setSettingsAccounts } from '../src/config.js';
 import { resetRuntimeControl } from '../src/services/runtime-control.js';
 import { sendBodyLimit } from '../src/web-actions.js';
+
+/**
+ * The skill is read as the endpoint starts. It reads the same here as there;
+ * through this it can be made to come to nothing, to see what the endpoint
+ * does without it.
+ */
+vi.mock('../src/mcp-skills.js', async (original) => {
+  const real = await original<typeof import('../src/mcp-skills.js')>();
+  return { ...real, skillCatalogOrNone: vi.fn(real.skillCatalogOrNone) };
+});
 
 /**
  * The credential split lives in the HTTP layer, not in createServer.
@@ -23,6 +38,9 @@ import { sendBodyLimit } from '../src/web-actions.js';
 const READ = 'r'.repeat(64);
 const WRITE = 'w'.repeat(64);
 const ADMIN = 'a'.repeat(64);
+
+/** The skill as the repository has it, which is what the endpoint serves. */
+const skillFile = (): string => readFileSync(new URL('../.agents/skills/mailsift/SKILL.md', import.meta.url), 'utf8');
 
 let server: Server | undefined;
 let dir: string;
@@ -299,6 +317,250 @@ describe('a letter from the page is one large request', () => {
     await start();
     expect((server as unknown as { requestTimeout: number }).requestTimeout).toBeGreaterThanOrEqual(Math.ceil(sendBodyLimit() / (64 * 1024)) * 1000);
     expect(sendBodyLimit()).toBeGreaterThan(40 * 1024 * 1024);
+  });
+});
+
+describe('one request to /mcp has a size of its own', () => {
+  it('is refused by its size alone before anything in it is parsed, says the limit, and is read whole just inside it', async () => {
+    process.env.MCP_TOKEN = READ;
+    const url = await start();
+    const limit = MCP_MAX_REQUEST_BODY_BYTES;
+    // The same call, padded past what a whole request may carry, and again just inside it.
+    const call = (padding: number) => JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_mail', arguments: { note: 'x'.repeat(padding) } },
+    });
+    const send = (body: string) => fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${READ}` },
+      body,
+    });
+    const over = await send(call(limit));
+    expect(over.status).toBe(413);
+    const refused = JSON.parse(await over.text()) as { error: { code: number; message: string } };
+    // The transport's own answer, in the protocol's reserved range for it.
+    expect(refused.error.code).toBe(-32000);
+    expect(refused.error.message).toContain(String(limit));
+    // Just inside the limit the call is read to its end and answered like any other.
+    const { status, body } = await rpc(url, READ, 'tools/call', { name: 'list_mail', arguments: { note: 'x'.repeat(limit - 4096) } });
+    expect(status).toBe(200);
+    expect(body['result']).toBeDefined();
+    expect(body['error']).toBeUndefined();
+  });
+
+  it('has its refusal reach a caller that is still sending, every time it asks', async () => {
+    process.env.MCP_TOKEN = READ;
+    const url = await start();
+    // A caller learns the limit from the answer, so the answer has to get past what it is still sending.
+    const body = JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_mail', arguments: { note: 'x'.repeat(MCP_MAX_REQUEST_BODY_BYTES) } },
+    });
+    for (let ask = 1; ask <= 8; ask += 1) {
+      const refused = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${READ}` },
+        body,
+      }).catch((error: Error) => {
+        throw new Error(`ask ${ask} was cut off: ${error.message}, ${(error.cause as Error | undefined)?.message ?? ''}`);
+      });
+      expect(refused.status, `ask ${ask}`).toBe(413);
+      expect(((await refused.json()) as { error: { message: string } }).error.message).toContain(String(MCP_MAX_REQUEST_BODY_BYTES));
+    }
+  });
+
+  it('waits for a caller that is still sending before it refuses it, so that the caller reads the refusal', async () => {
+    process.env.MCP_TOKEN = READ;
+    await start();
+    const { port } = server!.address() as AddressInfo;
+    // Declared one byte over the limit and sent in two pieces with a pause between: the server has
+    // its reason to answer after the first. A caller that uploads for minutes is this, for longer.
+    const declared = MCP_MAX_REQUEST_BODY_BYTES + 1;
+    const first = 'x'.repeat(1024);
+    const answer = await new Promise<string>((resolve, reject) => {
+      const socket = connect(port, '127.0.0.1');
+      let heard = Buffer.alloc(0);
+      let finished = false;
+      socket.setTimeout(10_000, () => socket.destroy(new Error('no answer')));
+      socket.on('error', reject);
+      socket.on('data', (chunk: Buffer) => { heard = Buffer.concat([heard, chunk]); });
+      socket.on('close', () => {
+        // Closed before the caller was done: that is an answer sent while the rest was still coming.
+        if (finished) resolve(heard.toString('utf8'));
+        else reject(new Error(`the line was closed while the caller was still sending; it had heard: ${heard.toString('utf8').slice(0, 60)}`));
+      });
+      socket.on('connect', () => {
+        socket.write(
+          `POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\ncontent-type: application/json\r\naccept: application/json, text/event-stream\r\n` +
+            `authorization: Bearer ${READ}\r\ncontent-length: ${declared}\r\n\r\n${first}`,
+        );
+        setTimeout(() => {
+          // Answered now, the answer would be followed by a close with the rest still coming, and
+          // what the caller reads of that is a reset.
+          if (heard.length > 0) {
+            socket.destroy();
+            reject(new Error(`answered while the caller was still sending: ${heard.toString('utf8').slice(0, 60)}`));
+            return;
+          }
+          finished = true;
+          socket.end('x'.repeat(declared - first.length));
+        }, 700);
+      });
+    });
+    expect(answer.split('\r\n')[0]).toBe('HTTP/1.1 413 Payload Too Large');
+    // The answer comes in chunks: its JSON is from the first brace to the last.
+    const body = JSON.parse(answer.slice(answer.indexOf('{'), answer.lastIndexOf('}') + 1)) as { error: { code: number; message: string } };
+    expect(body.error.code).toBe(-32000);
+    expect(body.error.message).toContain(String(MCP_MAX_REQUEST_BODY_BYTES));
+  });
+});
+
+describe('the revision a client is served on', () => {
+  /** The SDK's own client at the endpoint with the read credential, asked for a revision the way a client asks. */
+  async function connected(url: string, negotiation?: VersionNegotiationOptions): Promise<Client> {
+    const client = new Client(
+      { name: 'mcp-test', version: '0.0.0' },
+      negotiation ? { versionNegotiation: negotiation } : {},
+    );
+    await client.connect(new StreamableHTTPClientTransport(new URL(url), {
+      requestInit: { headers: { authorization: `Bearer ${READ}` } },
+    }));
+    return client;
+  }
+
+  it('is 2026-07-28 for a client that asks for it, and the skill is on it', async () => {
+    process.env.MCP_TOKEN = READ;
+    const url = await start();
+    // The second is a client that asks what is on offer and takes the newest; the first takes nothing else.
+    for (const negotiation of [{ mode: { pin: '2026-07-28' } }, { mode: 'auto' }] as const) {
+      const client = await connected(url, negotiation);
+      try {
+        expect(client.getNegotiatedProtocolVersion()).toBe('2026-07-28');
+        const skills = new SkillsClient(client);
+        expect(skills.supported).toBe(true);
+        expect((await skills.list()).skills.map((one) => one.uri)).toEqual([SKILL_URI]);
+        const { skill } = await skills.get(SKILL_URI);
+        expect((await skills.read(skill)).text).toBe(skillFile());
+        // What a client has always come for answers on the same revision.
+        expect((await client.listTools()).tools.map((one) => one.name)).toContain('list_mail');
+      } finally {
+        await client.close();
+      }
+    }
+    // Each read of it is written down, once; the listing and the asking are not.
+    const store = new StateStore();
+    try {
+      expect(store.mcpAuditByAction().find((row) => row.action === 'resource:skill')).toMatchObject({ calls: 2, failures: 0 });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('is 2025-11-25 for a client that asks for nothing, as before, and the skill is on it all the same', async () => {
+    process.env.MCP_TOKEN = READ;
+    const url = await start();
+    const client = await connected(url);
+    try {
+      expect(client.getNegotiatedProtocolVersion()).toBe('2025-11-25');
+      const skills = new SkillsClient(client);
+      expect((await skills.list()).skills.map((one) => one.uri)).toEqual([SKILL_URI]);
+      const { skill } = await skills.get(SKILL_URI);
+      expect((await skills.read(skill)).text).toBe(skillFile());
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('answers a client listening for changes with what it would be told of, on a line the client holds', async () => {
+    process.env.MCP_TOKEN = READ;
+    const url = await start();
+    const revision = '2026-07-28';
+    const listening = new AbortController();
+    const answer = await fetch(url, {
+      method: 'POST', signal: listening.signal,
+      headers: {
+        'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${READ}`,
+        'mcp-protocol-version': revision, 'mcp-method': 'subscriptions/listen',
+      },
+      // A client on this revision says which changes it wants told of, in the envelope it says its revision in.
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'subscriptions/listen',
+        params: {
+          notifications: { toolsListChanged: true, resourcesListChanged: true, resourceSubscriptions: ['mailsift://search-syntax'] },
+          _meta: { [PROTOCOL_VERSION_META_KEY]: revision, [CLIENT_CAPABILITIES_META_KEY]: {} },
+        },
+      }),
+    });
+    expect(answer.status).toBe(200);
+    expect(answer.headers.get('content-type')).toContain('text/event-stream');
+    const reader = answer.body!.getReader();
+    const decoder = new TextDecoder();
+    let heard = '';
+    // The first event says which of those this server undertakes to tell of.
+    while (!heard.includes('\n\n')) heard += decoder.decode((await reader.read()).value, { stream: true });
+    listening.abort();
+    const acknowledged = JSON.parse(heard.split('\n').find((line) => line.startsWith('data:'))!.slice('data:'.length)) as {
+      method: string; params: { notifications: Record<string, unknown> };
+    };
+    expect(acknowledged.method).toBe('notifications/subscriptions/acknowledged');
+    // It takes no subscription for one resource: it has no way to say that a letter arrived.
+    expect(acknowledged.params.notifications).toEqual({ toolsListChanged: true, resourcesListChanged: true });
+    // Nothing waits on the line once the client has let go of it: the server closes without being asked twice.
+    await new Promise<void>((resolve) => server!.close(() => resolve()));
+    server = undefined;
+  });
+
+  it('has nothing to say to a GET, and says so with the one method it takes', async () => {
+    process.env.MCP_TOKEN = READ;
+    const url = await start();
+    // Each call is a server of its own: there is no session whose changes a standing line could carry.
+    const asked = await fetch(url, { headers: { authorization: `Bearer ${READ}` } });
+    expect(asked.status).toBe(405);
+    expect(asked.headers.get('allow')).toBe('POST');
+    // The credential is asked for first, whatever the method.
+    expect((await fetch(url)).status).toBe(401);
+  });
+});
+
+describe('the skill over the endpoint', () => {
+  it('is served to each credential alike, as the file itself, and to no one without one', async () => {
+    process.env.MCP_TOKEN = READ;
+    process.env.MCP_WRITE_TOKEN = WRITE;
+    process.env.MCP_ADMIN_TOKEN = ADMIN;
+    const url = await start({ adminAuth: true });
+    for (const token of [READ, WRITE, ADMIN]) {
+      const read = await rpc(url, token, 'resources/read', { uri: SKILL_URI });
+      expect(read.status, 'read').toBe(200);
+      expect(read.body['error']).toBeUndefined();
+      expect((read.body['result'] as { contents: unknown }).contents).toMatchObject([{ uri: SKILL_URI, mimeType: 'text/markdown', text: skillFile() }]);
+      const listed = await rpc(url, token, 'skills/list');
+      expect((listed.body['result'] as { skills: Array<{ uri: string }> }).skills.map((one) => one.uri)).toEqual([SKILL_URI]);
+    }
+    for (const token of ['', 'x'.repeat(64)]) {
+      expect((await rpc(url, token, 'resources/read', { uri: SKILL_URI })).status).toBe(401);
+      expect((await rpc(url, token, 'skills/list')).status).toBe(401);
+    }
+  });
+
+  it('is said at every start: served, or not there', async () => {
+    process.env.MCP_TOKEN = READ;
+    const said = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await start();
+      expect(said.mock.calls.flat().some((line) => String(line).endsWith(` · skill: served at ${SKILL_URI}`))).toBe(true);
+    } finally {
+      said.mockRestore();
+    }
+  });
+
+  it('does not keep the endpoint from starting, or from answering mail, when it could not be read', async () => {
+    process.env.MCP_TOKEN = READ;
+    vi.mocked(skillCatalogOrNone).mockResolvedValueOnce(undefined);
+    const url = await start();
+    const { body } = await rpc(url, READ, 'initialize', {
+      protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'mcp-test', version: '0.0.0' },
+    });
+    expect((body['result'] as { capabilities: Record<string, unknown> }).capabilities['extensions']).toBeUndefined();
+    expect((await listTools(url, READ)).names).toContain('list_mail');
+    expect((await rpc(url, READ, 'resources/read', { uri: SKILL_URI })).body['error']).toMatchObject({ code: -32602 });
   });
 });
 

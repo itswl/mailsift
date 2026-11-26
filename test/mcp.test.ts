@@ -2,8 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
 import type { IncomingHttpHeaders } from 'node:http';
 
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 import { allowMcpRequest, createServer, forgetUnconfirmedSends, type InFlight } from '../src/mcp.js';
 import type { PollStats } from '../src/services/watcher.js';
 import { AttachmentTooLargeError, LiveMailError, MailActionError, type LiveMessage, type WebMailActionResult } from '../src/imap/client.js';
@@ -234,7 +233,9 @@ describe('tool surface', () => {
 
   it('warns a client that message fields are untrusted data', async () => {
     // Subjects and summaries reach the model verbatim, so the server has to
-    // say so itself; a client without the skill file sees nothing else.
+    // say so itself, in the one place every client reads. The skill it serves
+    // (test/mcp-skills.test.ts) says it again, in its description, for a host
+    // that shows that and drops the instructions.
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     const server = createServer({ state: new StateStore(':memory:') });
     const client = new Client({ name: 'mcp-test', version: '0.0.0' });
@@ -817,7 +818,7 @@ describe('reading a message and answering it', () => {
       const client = await connect(state, true, box.backend);
       const letter = { account: 'me@qq.com', to: ['friend@example.org'], subject: 'Slow', text: 'Takes its time.' };
       // A client that is patient enough to hear the server's own answer; most give up at a minute themselves.
-      const first = client.callTool({ name: 'send_mail', arguments: letter }, undefined, { timeout: 120_000 });
+      const first = client.callTool({ name: 'send_mail', arguments: letter }, { timeout: 120_000 });
       // The mail server takes longer than a caller is made to wait.
       await vi.advanceTimersByTimeAsync(61_000);
       expect(JSON.parse(((await first).content as Array<{ text: string }>)[0]!.text)).toMatchObject({ code: 'PROVIDER_ERROR' });
@@ -1018,7 +1019,7 @@ describe('the review of what goes out', () => {
       };
       const client = await connect(state, true, box.backend);
       const letter = { account: 'me@qq.com', to: ['friend@example.org'], subject: 'Hanging', text: 'Will it?' };
-      const first = client.callTool({ name: 'send_mail', arguments: letter }, undefined, { timeout: 300_000 });
+      const first = client.callTool({ name: 'send_mail', arguments: letter }, { timeout: 300_000 });
       await vi.advanceTimersByTimeAsync(61_000);
       expect(JSON.parse(((await first).content as Array<{ text: string }>)[0]!.text)).toMatchObject({ code: 'PROVIDER_ERROR' });
       // The attempt then fails before the message was handed over, with nobody waiting.
@@ -1163,7 +1164,7 @@ describe('the review of what goes out', () => {
       box.backend.savesSentCopy = () => { throw new Error('savesSentCopy threw'); };
       const client = await connect(state, true, box.backend);
       const letter = { account: 'me@qq.com', to: ['friend@example.org'], subject: 'Odd', text: 'Ends oddly.' };
-      const first = client.callTool({ name: 'send_mail', arguments: letter }, undefined, { timeout: 300_000 });
+      const first = client.callTool({ name: 'send_mail', arguments: letter }, { timeout: 300_000 });
       await vi.advanceTimersByTimeAsync(61_000);
       expect(JSON.parse(((await first).content as Array<{ text: string }>)[0]!.text)).toMatchObject({ code: 'PROVIDER_ERROR' });
       release();
@@ -1418,11 +1419,11 @@ describe('forwarding and signatures', () => {
       const client = await connect(state, true, box.backend);
       const letter = { forward: '<one@x>', to: ['colleague@example.org'], text: 'FYI' };
       const patient = { timeout: 300_000 };
-      const first = client.callTool({ name: 'send_mail', arguments: letter }, undefined, patient);
+      const first = client.callTool({ name: 'send_mail', arguments: letter }, patient);
       await vi.advanceTimersByTimeAsync(2_000);
       // The caller lost the first answer and asks again, as it is told to.
       let second: Record<string, unknown> | undefined;
-      void client.callTool({ name: 'send_mail', arguments: letter }, undefined, patient)
+      void client.callTool({ name: 'send_mail', arguments: letter }, patient)
         .then((answer) => { second = JSON.parse((answer.content as Array<{ text: string }>)[0]!.text) as Record<string, unknown>; });
       // Past the minute and five seconds a repeat used to wait, nothing has been handed over, and nothing is said.
       await vi.advanceTimersByTimeAsync(66_000);

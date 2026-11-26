@@ -7,7 +7,7 @@
     "node": ">=22.5"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-skills.mjs",
     "start": "node --disable-warning=ExperimentalWarning dist/src/server.js",
     "dev": "tsx src/server.ts",
     "check": "tsx src/main.ts --check",
@@ -17,7 +17,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@modelcontextprotocol/core": "^2.4.0",
+    "@modelcontextprotocol/node": "^2.1.2",
+    "@modelcontextprotocol/server": "^2.4.0",
     "@opentelemetry/api": "^1.10.0",
     "@opentelemetry/exporter-metrics-otlp-proto": "^0.301.2",
     "@opentelemetry/sdk-metrics": "^3.0.0",
@@ -27,6 +29,7 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "^2.4.0",
     "@types/mailparser": "^3.9.0",
     "@types/node": "^26.6.6",
     "tsx": "^4.23.15",

@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import './setup.js';
+import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/server';
 import { attachmentLimitBytes } from '../src/smtp.js';
 import { STRINGS } from '../src/web-strings.js';
 
@@ -71,6 +72,24 @@ describe('docs/web-view.md', () => {
     expect(STRINGS.en['reader.imagesAuto']).toContain('{sender}');
     expect(STRINGS.en['reader.stopImages']).toBe('Not always');
     expect(STRINGS['zh-CN']['reader.stopImages']).toBe('不再总是显示');
+  });
+});
+
+describe('the endpoint on both protocol revisions', () => {
+  it('docs/mcp.md names the revision a client is served on without asking, and says a GET is answered, not held open', () => {
+    const text = prose(read('docs/mcp.md'));
+    // The older one is the revision the SDK serves a client that does not ask what the server has.
+    expect(text).toContain(`\`${LATEST_PROTOCOL_VERSION}\` and \`2026-07-28\``);
+    expect(text).toMatch(/so a `GET` or a `DELETE` is answered `405`/);
+  });
+
+  it('says a line a client keeps open is cut when mailsift stops, and needs no block of its own in nginx', () => {
+    const mcp = prose(read('docs/mcp.md'));
+    expect(mcp).toContain('a keep-alive every fifteen seconds and nothing else');
+    expect(mcp).toContain('it is cut when mailsift stops, as every connection is');
+    const web = prose(read('docs/web-view.md'));
+    expect(web).toContain('The MCP endpoint keeps a line open the same way');
+    expect(web).toContain('`/mcp` needs no block of its own');
   });
 });
 
