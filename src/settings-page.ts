@@ -125,7 +125,7 @@ const EN: Dict = {
   'triage.lede': 'What counts as important to you.',
   'schedule.lede': 'How often mailboxes are checked, and the daily digest of what was not pushed.',
   'privacy.lede': 'What reaches the model, and how long mailsift keeps its own records.',
-  'sending.lede': 'Replying and sending from the web view (and MCP clients holding the write token).',
+  'sending.lede': 'Replying and sending from the web view (and MCP clients holding the write token or the admin token).',
   'oauth.lede': 'Gmail and Outlook usually refuse app passwords. Register an OAuth app once and every such mailbox signs in through it.',
   'advanced.lede': 'Limits and diagnostics. The defaults suit almost everyone.',
   'access.lede': 'How you, and the AI clients you connect, reach this server.',
@@ -145,8 +145,13 @@ const EN: Dict = {
   'access.readBody': 'Reads triage results and mail.',
   'access.write': 'Write token',
   'access.writeBody': 'Everything the read token does, plus acting on mail and sending it.',
+  'access.admin': 'Admin token',
+  'access.adminBody': 'Everything the write token does, plus the settings: mailboxes, notifications, the model, the other tokens and the administrator password (with the current one). It is not made until you ask for it here.',
   'access.generate': 'Generate new',
+  'access.generateFirst': 'Generate',
   'access.generateConfirm': 'Generate a new {k}? The current one stops working.',
+  'access.adminFirst': 'Generate an admin token? Whoever holds it can change every setting and every mailbox, replace the other tokens, and change the administrator password (the current one is still asked for). Give it only to a client you would trust with this settings page.',
+  'access.adminConfirm': 'Generate a new admin token? The current one stops working.',
   'access.tokenTitle': 'Your new {k}',
   'access.tokenBody': 'Copy it now: it is not shown again. Clients using the old one need this one.',
   'access.tokenRestart': 'mailsift restarts to start using it.',
@@ -285,7 +290,7 @@ const ZH: Dict = {
   'triage.lede': '对你来说什么算重要。',
   'schedule.lede': '多久检查一次邮箱，以及未实时推送邮件的每日摘要。',
   'privacy.lede': '哪些内容会发给模型，以及 mailsift 自己的记录保留多久。',
-  'sending.lede': '从网页（以及持有写令牌的 MCP 客户端）回复和发信。',
+  'sending.lede': '从网页（以及持有写令牌或管理令牌的 MCP 客户端）回复和发信。',
   'oauth.lede': 'Gmail 和 Outlook 通常不接受应用专用密码。注册一次 OAuth 应用，所有这类邮箱都通过它登录。',
   'advanced.lede': '各类上限与诊断选项。默认值适合绝大多数情况。',
   'access.lede': '你和你连接的 AI 客户端如何访问这台服务器。',
@@ -305,8 +310,13 @@ const ZH: Dict = {
   'access.readBody': '读取分诊结果和邮件。',
   'access.write': '写令牌',
   'access.writeBody': '包含只读令牌的全部权限，并且可以处理邮件和发信。',
+  'access.admin': '管理令牌',
+  'access.adminBody': '包含写令牌的全部权限，并且可以修改设置：邮箱、通知、模型、其他令牌和管理员密码（仍需当前密码）。只有你在这里生成它才会存在。',
   'access.generate': '生成新令牌',
+  'access.generateFirst': '生成',
   'access.generateConfirm': '生成新的{k}？当前的令牌将失效。',
+  'access.adminFirst': '生成管理令牌？持有者可以修改所有设置和邮箱、更换其他令牌，以及修改管理员密码（仍需当前密码）。只交给你放心把设置页交给它的客户端。',
+  'access.adminConfirm': '生成新的管理令牌？当前的管理令牌将失效。',
   'access.tokenTitle': '新的{k}',
   'access.tokenBody': '请立即复制，之后不会再显示。使用旧令牌的客户端需要换成这个。',
   'access.tokenRestart': 'mailsift 会重启以启用它。',
@@ -1374,11 +1384,13 @@ function renderAccess(section) {
   var mcp = el('div', { class: 'st-block' }, el('h3', { text: t('access.mcp') }), el('p', { class: 'st-help', text: t('access.mcpBody') }),
     el('div', { class: 'st-field' }, el('span', { class: 'st-label', text: t('access.endpoint') }),
       el('div', { class: 'st-inline' }, el('code', { class: 'st-code', text: endpoint }), copyButton(endpoint))));
-  [['read', t('access.read'), t('access.readBody')], ['write', t('access.write'), t('access.writeBody')]].forEach(function (row) {
+  // The admin token is the one token never made by itself: it exists only once the administrator asks for it here.
+  [['read', t('access.read'), t('access.readBody')], ['write', t('access.write'), t('access.writeBody')], ['admin', t('access.admin'), t('access.adminBody')]].forEach(function (row) {
+    var set = Boolean(state.tokens && state.tokens[row[0]]);
     mcp.appendChild(el('div', { class: 'st-token' },
       el('div', null, el('div', { class: 'st-label', text: row[1] }), el('p', { class: 'st-help', text: row[2] })),
-      el('div', { class: 'st-inline' }, el('span', { class: 'st-pill' + (state.tokens[row[0]] ? ' set' : ''), text: state.tokens[row[0]] ? t('common.set') : t('common.notSet') }),
-        el('button', { type: 'button', class: 'st-btn', text: t('access.generate'), onclick: function () { rotate(row[0], row[1]); } }))));
+      el('div', { class: 'st-inline' }, el('span', { class: 'st-pill' + (set ? ' set' : ''), text: set ? t('common.set') : t('common.notSet') }),
+        el('button', { type: 'button', class: 'st-btn', text: set ? t('access.generate') : t('access.generateFirst'), onclick: function () { rotate(row[0], row[1]); } }))));
   });
   mcp.appendChild(el('p', { class: 'st-help', text: state.channel === 'https' ? t('access.https') : t('access.loopback') }));
   section.appendChild(mcp);
@@ -1394,7 +1406,9 @@ function copyButton(value) {
 }
 
 async function rotate(kind, label) {
-  if (!confirm(t('access.generateConfirm', { k: label }))) return;
+  // An admin token is asked for in words that say what it is: nothing makes it until this does.
+  var asked = kind !== 'admin' ? 'access.generateConfirm' : state.tokens && state.tokens.admin ? 'access.adminConfirm' : 'access.adminFirst';
+  if (!confirm(t(asked, { k: label }))) return;
   try {
     var data = await api('/api/admin/tokens/rotate', { kind: kind });
     state = data.state;

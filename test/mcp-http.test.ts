@@ -7,18 +7,22 @@ import { request as httpRequest } from 'node:http';
 import type { AddressInfo, Server } from 'node:net';
 import { startMcpHttp } from '../src/mcp.js';
 import { StateStore } from '../src/services/state.js';
+import { closeSettingsStore } from '../src/services/settings-store.js';
+import { setSettingsAccounts } from '../src/config.js';
+import { resetRuntimeControl } from '../src/services/runtime-control.js';
 import { sendBodyLimit } from '../src/web-actions.js';
 
 /**
  * The credential split lives in the HTTP layer, not in createServer.
  *
- * createServer takes `writable` as an argument, so a unit test of it proves
- * only that the flag is honoured. Whether a presented bearer token turns into
- * that flag, and whether the read token is kept away from it, is decided here
- * and is the part a leak would exploit.
+ * createServer takes `writable` and `admin` as arguments, so a unit test of it
+ * proves only that the flags are honoured. Whether a presented bearer token
+ * turns into those flags, and whether the read token is kept away from them,
+ * is decided here and is the part a leak would exploit.
  */
 const READ = 'r'.repeat(64);
 const WRITE = 'w'.repeat(64);
+const ADMIN = 'a'.repeat(64);
 
 let server: Server | undefined;
 let dir: string;
@@ -26,6 +30,7 @@ let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'mailsift-mcp-http-'));
   process.env.STATE_DB_PATH = join(dir, 'state.db');
+  process.env.MAILSIFT_KEY_FILE = join(dir, 'mailsift.key');
   process.env.MCP_BIND = '127.0.0.1';
   process.env.MCP_PORT = '0';
 });
@@ -33,16 +38,20 @@ beforeEach(() => {
 afterEach(async () => {
   if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
   server = undefined;
+  closeSettingsStore();
+  setSettingsAccounts(undefined);
+  resetRuntimeControl();
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function start(): Promise<string> {
-  server = await startMcpHttp();
+async function start(options: Parameters<typeof startMcpHttp>[0] = {}): Promise<string> {
+  server = await startMcpHttp(options);
   const { port } = server.address() as AddressInfo;
   return `http://127.0.0.1:${port}/mcp`;
 }
 
-async function listTools(url: string, token: string): Promise<{ status: number; names: string[] }> {
+/** One call, as a client makes it. Stateless Streamable HTTP answers a single call as one SSE event. */
+async function rpc(url: string, token: string, method: string, params: Record<string, unknown> = {}): Promise<{ status: number; body: Record<string, unknown> }> {
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -50,19 +59,48 @@ async function listTools(url: string, token: string): Promise<{ status: number; 
       accept: 'application/json, text/event-stream',
       ...(token ? { authorization: `Bearer ${token}` } : {}),
     },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
   });
-  if (!res.ok) return { status: res.status, names: [] };
-  // Stateless Streamable HTTP answers a single call as one SSE event.
+  if (!res.ok) return { status: res.status, body: {} };
   const text = await res.text();
   const payload = text.startsWith('event:') || text.startsWith('data:')
     ? text.split('\n').find((line) => line.startsWith('data:'))!.slice('data:'.length)
     : text;
-  const body = JSON.parse(payload) as { result?: { tools?: Array<{ name: string }> } };
-  return { status: res.status, names: (body.result?.tools ?? []).map((t) => t.name) };
+  return { status: res.status, body: JSON.parse(payload) as Record<string, unknown> };
 }
 
-const WRITE_TOOLS = ['record_feedback', 'retry_dead_letter', 'manage_mail', 'mark_handled', 'send_mail'];
+async function listTools(url: string, token: string): Promise<{ status: number; names: string[] }> {
+  const { status, body } = await rpc(url, token, 'tools/list');
+  const result = body['result'] as { tools?: Array<{ name: string }> } | undefined;
+  return { status, names: (result?.tools ?? []).map((t) => t.name) };
+}
+
+/** A tool's answer over the endpoint: its first block, as the JSON the tools answer with. */
+async function tool(url: string, token: string, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  const { body } = await rpc(url, token, 'tools/call', { name, arguments: args });
+  const result = body['result'] as { isError?: boolean; content?: Array<{ type: string; text: string }> } | undefined;
+  expect(result?.isError ?? false, JSON.stringify(body)).toBe(false);
+  return JSON.parse(result!.content![0]!.text) as Record<string, unknown>;
+}
+
+/** A tool's refusal over the endpoint. */
+async function refusal(url: string, token: string, name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  const { body } = await rpc(url, token, 'tools/call', { name, arguments: args });
+  const result = body['result'] as { isError?: boolean; content?: Array<{ type: string; text: string }> } | undefined;
+  expect(result?.isError, JSON.stringify(body)).toBe(true);
+  return JSON.parse(result!.content![0]!.text) as Record<string, unknown>;
+}
+
+/** What the write credential adds to the read one: everything that changes something. */
+const WRITE_TOOLS = [
+  'get_triage_rules', 'manage_mail', 'mark_handled', 'record_feedback', 'remove_push_device', 'retry_dead_letter', 'send_mail',
+  'set_signature', 'set_triage_rules', 'snooze',
+];
+/** What the admin token adds on top of those: the settings API of the page, one tool to a route. */
+const ADMIN_TOOLS = [
+  'change_admin_password', 'end_other_sessions', 'get_settings', 'manage_mailbox', 'rotate_token', 'test_model', 'test_notifications',
+  'update_settings',
+];
 
 describe('bearer credentials decide the tool set', () => {
   it('gives a read token everything except the tools that change something', async () => {
@@ -74,21 +112,49 @@ describe('bearer credentials decide the tool set', () => {
     expect(status).toBe(200);
     expect(names).toContain('list_mail');
     expect(names).toContain('read_message');
+    // What the page only shows, the page has here too.
+    expect(names).toEqual(expect.arrayContaining(['get_conversation', 'list_push_devices']));
+    // A check of the mailboxes needs the server's poller: a bare endpoint does not offer it.
+    expect(names).not.toContain('refresh');
     // Nothing that changes a mailbox, sends mail, or changes how mail is judged.
     for (const name of WRITE_TOOLS) expect(names, name).not.toContain(name);
+    for (const name of ADMIN_TOOLS) expect(names, name).not.toContain(name);
   });
 
-  it('gives the write token the full surface, sending included', async () => {
+  it('gives the write token the full surface, sending included, and none of the administrator’s', async () => {
     process.env.MCP_TOKEN = READ;
     process.env.MCP_WRITE_TOKEN = WRITE;
-    const url = await start();
+    process.env.MCP_ADMIN_TOKEN = ADMIN;
+    const url = await start({ adminAuth: true });
 
     const { names } = await listTools(url, WRITE);
     for (const name of WRITE_TOOLS) expect(names, name).toContain(name);
-    expect(names).toContain('list_mail');
+    for (const name of ADMIN_TOOLS) expect(names, name).not.toContain(name);
+    // Not listed, and not reachable by name either.
+    expect(await refusal(url, WRITE, 'get_settings')).toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(await refusal(url, WRITE, 'rotate_token', { kind: 'admin' })).toMatchObject({ code: 'INVALID_ARGUMENT' });
   });
 
-  it('registers neither write tool when no write token is configured', async () => {
+  it('gives the admin token everything, the administrator’s tools included, and only over the server’s endpoint', async () => {
+    process.env.MCP_TOKEN = READ;
+    process.env.MCP_WRITE_TOKEN = WRITE;
+    process.env.MCP_ADMIN_TOKEN = ADMIN;
+    const url = await start({ adminAuth: true });
+
+    const { names } = await listTools(url, ADMIN);
+    for (const name of [...WRITE_TOOLS, ...ADMIN_TOOLS]) expect(names, name).toContain(name);
+    expect(names).toContain('list_mail');
+    // The settings answer it with the token it is called with: here the one the environment gave, which is not one
+    // generated in Settings, so of the three it says none is stored, as it does of the other two.
+    expect(await tool(url, ADMIN, 'get_settings', { keys: ['DIGEST_HOUR'] })).toMatchObject({ mode: 'setup', tokens: { admin: false } });
+    expect(await refusal(url, ADMIN, 'update_settings', { values: {} })).toMatchObject({ code: 'INVALID_ARGUMENT' });
+    // The other two tokens get nothing of the administrator's, with one issued beside them.
+    for (const token of [READ, WRITE]) {
+      for (const name of ADMIN_TOOLS) expect((await listTools(url, token)).names, name).not.toContain(name);
+    }
+  });
+
+  it('registers no write tool when no write token is configured', async () => {
     // The default deployment: one token, strictly read-only.
     process.env.MCP_TOKEN = READ;
     delete process.env.MCP_WRITE_TOKEN;
@@ -96,6 +162,25 @@ describe('bearer credentials decide the tool set', () => {
 
     const { names } = await listTools(url, READ);
     for (const name of WRITE_TOOLS) expect(names, name).not.toContain(name);
+  });
+
+  it('has no administrator’s tool without one issued, whoever presents a value, and offers it from the server’s endpoint alone', async () => {
+    process.env.MCP_TOKEN = READ;
+    process.env.MCP_WRITE_TOKEN = WRITE;
+    delete process.env.MCP_ADMIN_TOKEN;
+    // The server's endpoint with no admin token issued: the value in the header is anybody's.
+    const issued = await start({ adminAuth: true });
+    expect((await listTools(issued, ADMIN)).status).toBe(401);
+    for (const name of ADMIN_TOOLS) expect((await listTools(issued, WRITE)).names, name).not.toContain(name);
+    await new Promise<void>((resolve) => server!.close(() => resolve()));
+    server = undefined;
+    // The same value in the environment is read by the server's endpoint alone: an instance without the settings
+    // store, as a tool run by hand is, offers the administrator's tools to nobody, whoever presents it.
+    process.env.MCP_ADMIN_TOKEN = ADMIN;
+    const bare = await start();
+    expect((await listTools(bare, ADMIN)).status).toBe(401);
+    const { names } = await listTools(bare, WRITE);
+    for (const name of ADMIN_TOOLS) expect(names, name).not.toContain(name);
   });
 
   it('rejects a token that is neither', async () => {
@@ -107,12 +192,29 @@ describe('bearer credentials decide the tool set', () => {
     expect((await listTools(url, '')).status).toBe(401);
   });
 
-  it('refuses to start when one value is used for both', async () => {
-    // Sharing the value would hand every reader the write tools, which is the
-    // whole thing the split exists to prevent, so it fails loudly.
+  it('refuses to start when one value is used for two of them', async () => {
+    // Sharing the value would hand every reader the write tools, or either of
+    // them the administrator's, which is the whole thing the split exists to
+    // prevent, so it fails loudly.
     process.env.MCP_TOKEN = READ;
     process.env.MCP_WRITE_TOKEN = READ;
     await expect(start()).rejects.toThrow(/must differ/i);
+    process.env.MCP_WRITE_TOKEN = WRITE;
+    process.env.MCP_ADMIN_TOKEN = WRITE;
+    await expect(start({ adminAuth: true })).rejects.toThrow(/must differ/i);
+    process.env.MCP_ADMIN_TOKEN = READ;
+    await expect(start({ adminAuth: true })).rejects.toThrow(/must differ/i);
+  });
+
+  it('offers a check of the mailboxes when the server has a poller to run, to a reader too', async () => {
+    process.env.MCP_TOKEN = READ;
+    let polls = 0;
+    const url = await start({
+      onRefresh: async () => { polls += 1; return { accountsOk: 1, accountsFailed: 0, fetched: 3, fresh: 1, pushed: 0, queued: 1, spamRescued: 0, failures: [] }; },
+    });
+    expect((await listTools(url, READ)).names).toContain('refresh');
+    expect(await tool(url, READ, 'refresh')).toMatchObject({ accountsOk: 1, fetched: 3 });
+    expect(polls).toBe(1);
   });
 
   it('records a rejected attempt without storing what was presented', async () => {
@@ -154,6 +256,7 @@ describe('a server with no token answers only to this machine’s names', () => 
     // name of its own at 127.0.0.1, and the browser sends that name in Host.
     delete process.env.MCP_TOKEN;
     delete process.env.MCP_WRITE_TOKEN;
+    delete process.env.MCP_ADMIN_TOKEN;
     delete process.env.MCP_ALLOWED_HOSTS;
     await start();
     const { port } = server!.address() as AddressInfo;
@@ -172,6 +275,7 @@ describe('a server with no token answers only to this machine’s names', () => 
   it('takes a public name only over HTTPS, and then asks for the token', async () => {
     process.env.MCP_TOKEN = READ;
     delete process.env.MCP_WRITE_TOKEN;
+    delete process.env.MCP_ADMIN_TOKEN;
     await start();
     const { port } = server!.address() as AddressInfo;
     // Plain HTTP under a public name would carry the token in the clear.

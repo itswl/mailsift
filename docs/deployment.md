@@ -139,13 +139,13 @@ The MCP endpoint is then `https://mail.example.com/mcp`; see [MCP](mcp.md#connec
 
 ## Signing in
 
-The web view and Settings are opened with the administrator password, on the sign-in form at `/signin`. A browser stays signed in for 30 days. Settings need that password: an MCP token, even the write token, can open the mail view (see [Web view](web-view.md#signing-in-and-what-a-session-may-do)) but never Settings, so a client holding a token can act on mail and cannot reconfigure the server.
+The web view and Settings are opened with the administrator password, on the sign-in form at `/signin`. A browser stays signed in for 30 days. Settings need that password: the read and write MCP tokens can open the mail view (see [Web view](web-view.md#signing-in-and-what-a-session-may-do)) but never Settings, so a client holding one can act on mail and cannot reconfigure the server. The exception is the admin token (below): the administrator's own credential, which opens Settings too. Give it only to a client you would hand the settings page to.
 
 Settings → Access:
 
 - **Change password** asks for the current one and signs out every other browser.
 - **Sign out other browsers** ends every session but your own.
-- **MCP** shows the endpoint and generates new read and write tokens; see [MCP](mcp.md#connecting).
+- **MCP** shows the endpoint and generates tokens: a new read or write token to replace the current one, and the admin token, which does not exist until you generate it; see [MCP](mcp.md#connecting).
 
 If the password is forgotten:
 
@@ -153,7 +153,7 @@ If the password is forgotten:
 docker compose exec mailsift node dist/src/main.js --reset-admin
 ```
 
-This clears the password and every browser session, and prints a new one-time setup code. Open the page, which shows **Set up mailsift** again, enter the code and choose a new password. Mailboxes, settings and tokens are not touched.
+This clears the password and every browser session, and prints a new one-time setup code. Open the page, which shows **Set up mailsift** again, enter the code and choose a new password. Mailboxes, settings and tokens are not touched, the admin token included: it does nothing while no password is set, and a client holding it has the administrator's rights again once a new one has been chosen. If the password was reset because a credential may have leaked, sign in and generate a new admin token as well.
 
 ## Gmail and Outlook sign-in
 
@@ -224,6 +224,8 @@ Add `--send` for an Outlook mailbox that should send, and `--force` to sign in a
 Each section of Settings has its own **Save**. Values are checked on the server, and one it refuses is marked at its field with the reason. Secrets (API keys, webhook addresses, passwords) are never sent back to the page: a secret field shows only **Set** or **Not set**, a value typed into it replaces what is stored, and **Remove** clears it. The AI model and Notifications sections have test buttons, which use the values as typed, before they are saved.
 
 Most settings are read when the service starts, so a save that changes what the running service uses restarts it. The poll in progress finishes, the service exits, and the supervisor (`node dist/src/server.js`, the image's command) starts it again at once; saves in quick succession restart once. The page shows "Applying changes — mailsift is restarting…" and then "Changes applied." A save that changes nothing the service runs on, such as adding a Gmail mailbox that still waits for sign-in, does not restart it. Generating a new MCP token restarts it too, which is when the old token stops working.
+
+An MCP client holding the write token or the admin token saves through the same routes, and its answer says the same in `applied`: `scheduled` (the restart is coming), `manual` (it has to be done by hand) or `none` (the change is in effect now).
 
 Started without the supervisor (`node dist/src/main.js` directly), mailsift cannot start itself again: the page says the change is saved and that mailsift has to be restarted by hand. Any exit other than a restart for settings, a crash included, is passed on to Docker's or systemd's restart policy.
 
@@ -321,7 +323,7 @@ A healthy container does not prove that every mailbox, LLM call or notification 
 
 To notice when the host or the process stops, enter a monitor's address under Settings → Notifications → **Heartbeat URL** (`HEARTBEAT_PING_URL`). mailsift sends it a plain GET after each completed poll; the request carries no mail data, does not hold up a poll, and only the monitor's host is logged.
 
-Logs are plain lines on stderr, because stdout is the MCP protocol channel in stdio mode. Settings → Advanced → **Log level** sets the level. Credentials are redacted from lines mailsift writes, including OAuth tokens and client secrets, JWTs, authorization headers, and secrets in URLs and form bodies.
+Logs are plain lines on stderr. Settings → Advanced → **Log level** sets the level. Credentials are redacted from lines mailsift writes, including OAuth tokens and client secrets, JWTs, authorization headers, and secrets in URLs and form bodies.
 
 Metrics use OpenTelemetry and stay off until Settings → Advanced → **OpenTelemetry collector** is set. Metric attributes use low-cardinality values such as provider, outcome, channel, importance and decision source; they never include mailbox addresses, Message-IDs or subjects.
 

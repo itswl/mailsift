@@ -6,10 +6,12 @@
  * persisted nowhere. The part that changes things (marking done, mailbox
  * actions, sending, asking the model, notifications) is in web-actions.ts.
  *
- * It shares the MCP server's port and its two tokens, because it shares that
+ * It shares the MCP server's port and its tokens, because it shares that
  * trust boundary: whoever can read triage results over JSON-RPC can read them
- * here, and only the write credential can act. The server starts this UI with
- * a local setup page because a browser can reach a wider surface than JSON-RPC.
+ * here, only the write credential can act, and the admin credential is the
+ * administrator's own for a client that is not a browser. The server starts
+ * this UI with a local setup page because a browser can reach a wider
+ * surface than JSON-RPC.
  */
 import { randomBytes } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
@@ -35,8 +37,8 @@ import { handleShaped } from './imap/mailbox.js';
 import { routeMailbox } from './web-mailbox.js';
 import { clientScript, LANGUAGE_COOKIE, storeLanguageScript } from './web-client.js';
 import {
-  credentialMark, crossSite, embedded, json, localHost, presentedToken, rateWindow, readBody, readCookie,
-  SESSION_COOKIE, sessionOf, timedOut, tokenMatches, within, type Session, type WebResponse,
+  bearerToken, credentialMark, crossSite, embedded, json, localHost, presentedToken, rateWindow, readBody, readCookie,
+  secretEquals, SESSION_COOKIE, sessionOf, timedOut, tokenMatches, within, type Session, type WebResponse,
 } from './web-http.js';
 import { appleTouch180, favicon64, icon192, icon512, maskable512 } from './web-icons.js';
 import { liveHub } from './web-live.js';
@@ -44,7 +46,7 @@ import { LIGHT_BAR, styles } from './web-styles.js';
 import { isLanguage, LANGUAGES, t, type Language, type StringKey } from './web-strings.js';
 import { appPolicy, framePolicy, MAIL_FRAME, SERVICE_WORKER, SHELL_HEADER } from './web-worker.js';
 import { doneListDays, MAX_CONTACTS, type MailRow, type SentRow, type StateStore } from './services/state.js';
-import { adminPasswordSet, endAdminSession, signInAdmin } from './services/settings-store.js';
+import { adminPasswordSet, endAdminSession, signInAdmin, startAdminSession } from './services/settings-store.js';
 
 export { LANGUAGE_COOKIE, readCookie, SESSION_COOKIE, tokenMatches };
 export type { Session, WebBackend, WebResponse };
@@ -93,12 +95,17 @@ export function webVersion(): string {
  * poll with; the button and the endpoint then stay out of the page entirely
  * rather than offering a control that can only fail. `writeToken` is the
  * credential that turns a session into one that may act on mail; without it
- * the view is read-only for everyone. `backend` stands in for the mailbox,
+ * the view is read-only for everyone. `adminToken` goes further: it is the
+ * administrator's own credential, which acts on mail as the write token does
+ * and also opens the settings API, and which signs a browser in to the
+ * settings pages at the ordinary form. `backend` stands in for the mailbox,
  * the mail server and the model in the preview and in tests.
  */
 export interface WebOptions {
   onRefresh?: (() => Promise<PollStats>) | undefined;
   writeToken?: string | undefined;
+  /** The admin token (MCP_ADMIN_TOKEN); absent when none is issued, or where routeWeb is called without the server. */
+  adminToken?: string | undefined;
   /** First-run setup is not finished: only the settings pages are served. */
   setupMode?: boolean | undefined;
   /**
@@ -1129,7 +1136,7 @@ function sessionCookie(req: IncomingMessage, token: string, maxAge = SESSION_MAX
  * The response carries the poller's own stats so the page can say how many new
  * messages it found. A poll reads mail and changes nothing in a mailbox.
  */
-async function handleRefresh(
+export async function handleRefresh(
   store: StateStore, client: string, options: WebOptions,
 ): Promise<WebResponse> {
   const onRefresh = options.onRefresh;
@@ -1273,9 +1280,14 @@ async function route(
     // One field, named as it always was, takes the administrator password or an MCP token.
     const presented = (form.get('token') ?? '').trim();
     const next = signInTarget(form.get('next'));
-    // The administrator password signs in to everything, the settings included.
+    const adminToken = options.adminToken ?? '';
+    // The administrator password signs in to everything, the settings included. So does the admin
+    // token, which is that administrator's own credential: it is given a session of the same kind.
+    // Where nobody has set a password there is no administrator for it to stand for, and it does
+    // nothing: the one-time setup code is then the only way in.
     if (options.adminAuth && presented) {
-      const admin = signInAdmin(presented);
+      const admin = signInAdmin(presented)
+        || (adminToken !== '' && adminPasswordSet() && secretEquals(adminToken, presented) ? startAdminSession() : '');
       if (admin) {
         return {
           status: 303, body: '', contentType: 'text/html; charset=utf-8', cookie: adminCookie(req, admin),
@@ -1313,9 +1325,18 @@ async function route(
 
   // A browser signed in with the administrator password may do everything a
   // write token may. Only the server consults the settings store; the
-  // tests and tools that call this without one never open it.
+  // tests and tools that call this without one never open it. The admin
+  // token is that administrator without a browser: carried as a bearer
+  // credential it may do what the write token may here, and the settings
+  // API answers it below. It is never a session: nothing is set aside for
+  // it, so it is asked for on every request, as a token is. Until a password
+  // has been set there is no administrator for it to stand for, and it does
+  // nothing here, as at the sign-in form.
   const admin = options.adminAuth ? adminSessionOf(req) : '';
-  const session: Session = admin ? 'write' : sessionOf(req, token, writeToken);
+  const adminToken = options.adminAuth ? options.adminToken ?? '' : '';
+  const adminByToken = adminToken !== '' && admin === '' && adminPasswordSet()
+    && secretEquals(adminToken, bearerToken(req));
+  const session: Session = admin || adminByToken ? 'write' : sessionOf(req, token, writeToken);
 
   // A server nobody has claimed yet: everything leads to the claim page.
   if (options.adminAuth && !adminPasswordSet() && req.method === 'GET' && !url.pathname.startsWith('/api/')
@@ -1340,7 +1361,9 @@ async function route(
   }
 
   if (options.adminAuth) {
-    const settings = await routeAdmin(req, url, { lang, nonce, client, version: webVersion(), admin });
+    const settings = await routeAdmin(req, url, {
+      lang, nonce, client, version: webVersion(), admin, ...(adminByToken ? { adminByToken: true } : {}),
+    });
     if (settings) return settings;
     // Until setup is finished there is no mail to show: the page is the setup.
     if (options.setupMode) {
@@ -1407,7 +1430,8 @@ async function route(
   const context: ActionContext = {
     session, backend: backendOf(options), lang, client, decorate,
     mayMark: session === 'write' || writeToken === '',
-    credential: credentialMark(session === 'write' ? writeToken : token),
+    // What a notification subscription is tied to, so that rotating that credential ends it too.
+    credential: credentialMark(adminByToken ? adminToken : session === 'write' ? writeToken : token),
   };
   const acted = await routeActions(req, url, store, context);
   if (acted) return acted;

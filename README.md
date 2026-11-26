@@ -64,7 +64,7 @@ Notifications and installing to a home screen need HTTPS (or the page opened at 
 
 ## MCP
 
-The MCP server runs inside mailsift at `/mcp` on the same address (Streamable HTTP, `Authorization: Bearer <token>`). Add it to an MCP client and an assistant can see what needs you, list, search and read your triaged mail, preview the digest, or check mailbox health. It also ships the workflows those tools are meant to be used in, as prompts: catch up on the mailbox, or work out why something never reached you. Settings → Access generates two tokens, each shown once: the read token only looks; the write token also gives an assistant what the web view's owner has: marking mail done, putting it off until later, filing and binning it, and sending and forwarding mail, all audited. Give that token only to a client you would hand your mailbox to. An agent that supports skills can load [.agents/skills/mailsift/SKILL.md](.agents/skills/mailsift/SKILL.md). See [docs/mcp.md](docs/mcp.md).
+The MCP server runs inside mailsift at `/mcp` on the same address (Streamable HTTP, `Authorization: Bearer <token>`). Add it to an MCP client and an assistant can see what needs you, list, search and read your triaged mail, preview the digest, or check mailbox health. It also ships the workflows those tools are meant to be used in, as prompts: catch up on the mailbox, or work out why something never reached you. Settings → Access generates the tokens, each shown once: the read token only looks; the write token also gives an assistant what the web view's owner has: marking mail done, putting it off until later, filing and binning it, and sending and forwarding mail, all audited. Give that token only to a client you would hand your mailbox to. A third, the admin token, is made only when you ask for it and gives an assistant what you have in Settings, down to the other tokens: give it only to a client you would hand the settings page to. An agent that supports skills can load [.agents/skills/mailsift/SKILL.md](.agents/skills/mailsift/SKILL.md). See [docs/mcp.md](docs/mcp.md).
 
 ## Everyday commands
 
@@ -82,7 +82,7 @@ Every command and flag is in [docs/deployment.md](docs/deployment.md#commands).
 - [Configuration](docs/configuration.md): mailboxes and folders, outputs, push thresholds, your own rules, the digest, polling limits, IMAP IDLE, alerts.
 - [Triage](docs/triage.md): how mail is judged, the LLM and what it sees, two-stage triage, fallback, verification codes and sign-in links.
 - [Web view](docs/web-view.md): the queue, reading and what keeps it safe, acting, writing, asking, notifications, the keyboard, and how the page is protected.
-- [MCP](docs/mcp.md): tools, resources, the write token, attachments, safety clues, audit.
+- [MCP](docs/mcp.md): tools, resources, the write token and the admin token, attachments, safety clues, audit.
 - [Deployment and operations](docs/deployment.md): Docker, first start, remote access and HTTPS, sign-in, Gmail and Outlook OAuth, backups, upgrades, systemd, commands, monitoring, recovery.
 - [Troubleshooting](docs/troubleshooting.md)
 - [Signal event v1](docs/signal-event-v1.md): the `signal` object in webhook payloads.

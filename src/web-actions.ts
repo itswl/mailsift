@@ -1871,7 +1871,13 @@ function requestOrigin(req: IncomingMessage): string | undefined {
 /** A name for a device that is safe to hand to the page: not the endpoint, which is where pushes go. */
 const deviceId = (endpoint: string): string => createHash('sha256').update(endpoint, 'utf8').digest('hex').slice(0, 16);
 
-async function handlePush(path: string, req: IncomingMessage, store: StateStore, ctx: ActionContext): Promise<WebResponse> {
+/**
+ * The page's notification routes: which devices are told about mail by push,
+ * and subscribing one, unsubscribing it and testing it. The MCP server runs
+ * the listing and the removal for a caller that is not a browser, with a
+ * request of its own making.
+ */
+export async function handlePush(path: string, req: IncomingMessage, store: StateStore, ctx: ActionContext): Promise<WebResponse> {
   if (!webPushEnabled()) return json(404, { error: 'notifications are switched off on this server', code: 'pushDisabled' });
   if (path === '/api/push/key' && req.method === 'GET') {
     return json(200, { publicKey: vapidKeys(store).publicKey });

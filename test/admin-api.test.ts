@@ -6,9 +6,11 @@ import { join } from 'node:path';
 import type { IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
 import { routeWeb } from '../src/web.js';
+import { ADMIN_COOKIE, callAdmin } from '../src/admin-api.js';
+import { TRIAGE_RULE_KEYS } from '../src/settings-catalog.js';
 import { StateStore } from '../src/services/state.js';
 import {
-  closeSettingsStore, issueSetupCode, readSettings, updateSettings,
+  adminPasswordSet, adminSessionValid, closeSettingsStore, issueSetupCode, readSettings, signInAdmin, startAdminSession, updateSettings,
 } from '../src/services/settings-store.js';
 import { resetRuntimeControl, setServerMode } from '../src/services/runtime-control.js';
 import { authorizedUsernames } from '../src/imap/auth.js';
@@ -47,7 +49,10 @@ function request(options: { method?: string; url?: string; headers?: Record<stri
 let cookie = '';
 let client = 0;
 
-async function call(path: string, options: { method?: string; body?: unknown; headers?: Record<string, string>; setupMode?: boolean } = {}) {
+async function call(
+  path: string,
+  options: { method?: string; body?: unknown; headers?: Record<string, string>; setupMode?: boolean; adminToken?: string } = {},
+) {
   const method = options.method ?? (options.body !== undefined ? 'POST' : 'GET');
   const headers: Record<string, string> = {
     ...(cookie ? { cookie } : {}),
@@ -57,7 +62,7 @@ async function call(path: string, options: { method?: string; body?: unknown; he
   const answer = await routeWeb(
     request({ method, url: path, headers, ...(options.body !== undefined ? { body: typeof options.body === 'string' ? options.body : JSON.stringify(options.body) } : {}) }),
     new URL(path, 'http://127.0.0.1:8410'), 'read-token', store, `client-${client}`,
-    { adminAuth: true, setupMode: options.setupMode ?? false, writeToken: 'write-token' },
+    { adminAuth: true, setupMode: options.setupMode ?? false, writeToken: 'write-token', adminToken: options.adminToken ?? '' },
   );
   let json: Record<string, unknown> = {};
   try { json = JSON.parse(String(answer.body)) as Record<string, unknown>; } catch { /* a page */ }
@@ -100,6 +105,27 @@ describe('a server nobody has claimed', { timeout: 30_000 }, () => {
     });
     expect(answer.status).toBe(403);
   });
+
+  it('lets the admin token do nothing until a password has been set', async () => {
+    // One the service was started with by its environment, on a server nobody has claimed:
+    // there is no administrator yet for it to stand for.
+    const ADMIN = 'a'.repeat(64);
+    const bearer = { authorization: `Bearer ${ADMIN}` };
+    const refused = await call('/api/admin/state', { headers: bearer, adminToken: ADMIN, setupMode: true });
+    expect(refused.answer.status).toBe(401);
+    expect(refused.json['code']).toBe('admin_required');
+    const form = await routeWeb(
+      request({ method: 'POST', url: '/auth', body: `token=${ADMIN}&next=%2Fsettings`, headers: { 'sec-fetch-site': 'same-origin' } }),
+      new URL('/auth', 'http://127.0.0.1:8410'), 'read-token', store, `client-${client}`,
+      { adminAuth: true, adminToken: ADMIN, setupMode: true },
+    );
+    expect(form.status).toBe(401);
+    expect(form.cookie).toBeUndefined();
+    // Once the password is set it stands for the administrator, as on any other server.
+    await claim();
+    cookie = '';
+    expect((await call('/api/admin/state', { headers: bearer, adminToken: ADMIN })).answer.status).toBe(200);
+  });
 });
 
 describe('the settings API', { timeout: 30_000 }, () => {
@@ -113,6 +139,39 @@ describe('the settings API', { timeout: 30_000 }, () => {
     expect(bearer.answer.status).toBe(401);
     const tokenCookie = await call('/api/admin/settings', { body: { values: { LOG_LEVEL: 'debug' } }, headers: { cookie: 'mailsift_session=write-token' } });
     expect(tokenCookie.answer.status).toBe(401);
+  });
+
+  it('answers the admin token as the administrator, without a session, and signs a browser in with it', async () => {
+    const ADMIN = 'a'.repeat(64);
+    await claim();
+    cookie = '';
+    // No admin token issued: the value in the header is anybody's.
+    expect((await call('/api/admin/state', { headers: { authorization: `Bearer ${ADMIN}` } })).answer.status).toBe(401);
+    const bearer = { authorization: `Bearer ${ADMIN}` };
+    const state = await call('/api/admin/state', { headers: bearer, adminToken: ADMIN });
+    expect(state.answer.status).toBe(200);
+    // It is never a session: nothing is set aside for the caller, and it is not read from a cookie.
+    expect(state.answer.cookie).toBeUndefined();
+    expect(state.json['tokens']).toEqual({ read: false, write: false, admin: false });
+    expect((await call('/api/admin/state', { headers: { cookie: `${ADMIN_COOKIE}=${ADMIN}` }, adminToken: ADMIN })).answer.status).toBe(401);
+    expect((await call('/api/admin/state', { headers: { authorization: 'Bearer not-the-admin-token' }, adminToken: ADMIN })).answer.status).toBe(401);
+    const saved = await call('/api/admin/settings', { body: { values: { DIGEST_HOUR: '8' } }, headers: bearer, adminToken: ADMIN });
+    expect(saved.answer.status).toBe(200);
+    expect(readSettings().values['DIGEST_HOUR']).toBe('8');
+
+    // The ordinary form takes it, and gives that browser a session of the administrator's own.
+    const form = await routeWeb(
+      request({ method: 'POST', url: '/auth', body: `token=${ADMIN}&next=%2Fsettings`, headers: { 'sec-fetch-site': 'same-origin' } }),
+      new URL('/auth', 'http://127.0.0.1:8410'), 'read-token', store, `client-${client}`,
+      { adminAuth: true, adminToken: ADMIN },
+    );
+    expect(form.status).toBe(303);
+    expect(form.headers?.['location']).toBe('/settings');
+    const session = String(form.cookie).split(';')[0]!;
+    expect(session).toMatch(/^mailsift_admin=/);
+    // The session, not the token, is what the browser now holds.
+    expect(session).not.toContain(ADMIN);
+    expect((await call('/api/admin/state', { headers: { cookie: session } })).answer.status).toBe(200);
   });
 
   it('links Settings from the mail view of a token session too, where the password is asked for', async () => {
@@ -182,9 +241,25 @@ describe('the settings API', { timeout: 30_000 }, () => {
   it('cannot overwrite the API tokens through the field list', async () => {
     await claim();
     const before = readSettings().values['MCP_TOKEN'];
-    const attempt = await call('/api/admin/settings', { body: { values: { MCP_TOKEN: 'mine' } } });
+    const attempt = await call('/api/admin/settings', { body: { values: { MCP_TOKEN: 'mine', MCP_ADMIN_TOKEN: 'mine' } } });
     expect(attempt.answer.status).toBe(400);
     expect(readSettings().values['MCP_TOKEN']).toBe(before);
+    expect(readSettings().values['MCP_ADMIN_TOKEN']).toBeUndefined();
+  });
+
+  it('issues the admin token only when an administrator asks for it, and then shows that one exists', async () => {
+    // Nothing made one: an all-powerful credential does not come into being because the server was started.
+    expect(readSettings().values['MCP_ADMIN_TOKEN']).toBeUndefined();
+    await claim();
+    expect((await call('/api/admin/state')).json['tokens']).toMatchObject({ admin: false });
+    const { json } = await call('/api/admin/tokens/rotate', { body: { kind: 'admin' } });
+    expect(json['token']).toMatch(/^ms_/);
+    expect(readSettings().values['MCP_ADMIN_TOKEN']).toBe(json['token']);
+    // Given once: the state that comes back says only that it exists.
+    expect(JSON.stringify(json['state'])).not.toContain(String(json['token']));
+    expect((json['state'] as Record<string, unknown>)['tokens']).toMatchObject({ admin: true });
+    expect((await call('/api/admin/state')).json['tokens']).toMatchObject({ admin: true });
+    expect((await call('/api/admin/tokens/rotate', { body: { kind: 'root' } })).answer.status).toBe(400);
   });
 
   it('keeps a mailbox password when the field is left empty, and checks the mailbox', async () => {
@@ -299,6 +374,93 @@ describe('signing in to Gmail and Outlook', { timeout: 30_000 }, () => {
     const start = await call('/api/admin/oauth/start', { body: { id } });
     expect(start.answer.status).toBe(400);
     expect(String(start.json['error'])).toContain('Microsoft');
+  });
+});
+
+describe('calls from the MCP server', { timeout: 30_000 }, () => {
+  const bodyOf = (answer: { body: string | Buffer }): Record<string, unknown> =>
+    JSON.parse(String(answer.body)) as Record<string, unknown>;
+  const caller = { client: 'mcp-client' };
+
+  it('are refused without a credential, never carry a session, and reach nothing outside the settings API', async () => {
+    await claim();
+    const refused = await callAdmin('/api/admin/settings', { values: { MAIL_KEYWORDS: 'invoice' } }, caller);
+    expect(refused.status).toBe(401);
+    // An administrator's session is a browser's, and is not lent to a caller that names one.
+    const borrowed = await callAdmin('/api/admin/state', undefined, { ...caller, headers: { cookie, host: '127.0.0.1:8410' } });
+    expect(borrowed.status).toBe(401);
+    // The pages need a browser, claiming needs the one-time setup code, and no other route is gone through, whatever
+    // the caller holds.
+    for (const [path, body] of [
+      ['/settings', undefined], ['/setup', undefined], ['/', undefined], ['/api/summary', undefined],
+      ['/api/admin/claim', { code: 'x', password: 'a long password' }], ['/api/admin', undefined],
+    ] as Array<[string, unknown]>) {
+      const answer = await callAdmin(path, body, { ...caller, adminByToken: true });
+      expect(answer.status, path).toBe(404);
+    }
+    expect(adminPasswordSet()).toBe(true);
+  });
+
+  it('let the write credential save the four triage rules, and reach nothing else', async () => {
+    const rules = { MAIL_ALWAYS_IMPORTANT: 'boss@corp.com', MAIL_KEYWORDS: 'invoice,urgent', MAIL_CONTEXT: 'The owner is a designer.' };
+    const saved = await callAdmin('/api/admin/settings', { values: rules }, { ...caller, scope: TRIAGE_RULE_KEYS });
+    expect(saved.status).toBe(200);
+    expect(readSettings().values).toEqual(rules);
+    // Another setting is refused by name, and the rules given with it are not saved either.
+    const beyond = await callAdmin('/api/admin/settings', { values: { MAIL_KEYWORDS: 'receipt', LLM_MODEL: 'some-model' } }, { ...caller, scope: TRIAGE_RULE_KEYS });
+    expect(beyond.status).toBe(400);
+    expect(bodyOf(beyond)['errors']).toEqual({ LLM_MODEL: 'This credential cannot change this setting.' });
+    expect(readSettings().values['MAIL_KEYWORDS']).toBe('invoice,urgent');
+    // The tokens are not rules, and no other route answers this credential.
+    expect((await callAdmin('/api/admin/settings', { values: { MCP_ADMIN_TOKEN: 'ms_mine' } }, { ...caller, scope: TRIAGE_RULE_KEYS })).status).toBe(400);
+    for (const [path, body] of [['/api/admin/state', undefined], ['/api/admin/tokens/rotate', { kind: 'write' }]] as Array<[string, unknown]>) {
+      expect((await callAdmin(path, body, { ...caller, scope: TRIAGE_RULE_KEYS })).status, path).toBe(401);
+    }
+    expect(readSettings().values['MCP_ADMIN_TOKEN']).toBeUndefined();
+  });
+
+  it('give the admin token what an administrator has at the API, with no session to keep', async () => {
+    await claim();
+    const claimSession = cookie.split('=')[1]!;
+    const holder = { ...caller, adminByToken: true };
+    expect((await callAdmin('/api/admin/state', undefined, holder)).status).toBe(200);
+
+    // The current password is asked of it exactly as of a browser: a token that leaked must not lock its owner out.
+    const wrong = await callAdmin('/api/admin/password', { current: 'not the password', next: 'another password' }, holder);
+    expect(wrong.status).toBe(401);
+    expect(bodyOf(wrong)['code']).toBe('not_accepted');
+    const changed = await callAdmin('/api/admin/password', { current: 'a long password', next: 'another password' }, holder);
+    expect(changed.status).toBe(200);
+    // Every session ended with the change, and the caller is handed none, as a browser is.
+    expect(changed.cookie).toBeUndefined();
+    expect(adminSessionValid(claimSession)).toBe(false);
+    expect(signInAdmin('another password')).toBeTruthy();
+
+    // Having no session of its own, ending the others ends all of them: the two here, and the one the sign-in above opened.
+    const one = startAdminSession();
+    const two = startAdminSession();
+    const ended = await callAdmin('/api/admin/sessions/end-others', {}, holder);
+    expect(bodyOf(ended)).toEqual({ ended: 3 });
+    expect(adminSessionValid(one)).toBe(false);
+    expect(adminSessionValid(two)).toBe(false);
+  });
+
+  it('carry only what says where the server was reached, which a mailbox sign-in works its way back from', async () => {
+    setServerMode('setup');
+    await claim();
+    await call('/api/admin/settings', { body: { values: { GMAIL_CLIENT_ID: 'client.apps.googleusercontent.com', GMAIL_CLIENT_SECRET: 'GOCSPX-x' } } });
+    const saved = await call('/api/admin/mailboxes/save', { body: { mailbox: { provider: 'gmail', username: 'me@gmail.com' } } });
+    const id = (saved.json['mailbox'] as Record<string, unknown>)['id'];
+    const start = (headers: Record<string, string> | undefined): Promise<Record<string, unknown>> =>
+      callAdmin('/api/admin/oauth/start', { id }, { ...caller, adminByToken: true, ...(headers ? { headers } : {}) }).then(bodyOf);
+
+    // Of everything a request might carry, the page's address and its channel are the parts the route reads.
+    expect(await start({
+      host: 'mail.example.com', 'x-forwarded-proto': 'https', cookie: 'mailsift_admin=not-a-session', authorization: 'Bearer whatever',
+    })).toMatchObject({ mode: 'paste', redirectUri: 'http://localhost:8765/' });
+    expect(await start({ host: '127.0.0.1:8410' })).toMatchObject({ mode: 'direct', redirectUri: 'http://localhost:8410/' });
+    // With nothing said of where, as from an instance with no request behind it, the provider is not sent back to an address that may not be there.
+    expect(await start(undefined)).toMatchObject({ mode: 'paste' });
   });
 });
 

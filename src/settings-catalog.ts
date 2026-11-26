@@ -268,8 +268,25 @@ export const FIELD_BY_KEY = new Map(SETTING_FIELDS.map((field) => [field.key, fi
 /** Settings whose values are never sent back to the page. */
 export const SECRET_KEYS = new Set(SETTING_FIELDS.filter((field) => field.type === 'secret').map((field) => field.key));
 
-/** The API credentials; managed with their own controls, never through the field list. */
-export const ACCESS_TOKEN_KEYS = ['MCP_TOKEN', 'MCP_WRITE_TOKEN'] as const;
+/**
+ * The API credentials; managed with their own controls, never through the
+ * field list. Each goes further than the one before it: the write token can
+ * do what the read token can, and the admin token what the write token can.
+ * The admin token is never made on its own: it exists only once an
+ * administrator asks for it (see /api/admin/tokens/rotate).
+ */
+export const ACCESS_TOKEN_KEYS = ['MCP_TOKEN', 'MCP_WRITE_TOKEN', 'MCP_ADMIN_TOKEN'] as const;
+
+/** The setting keys of the three tokens, by the name the rotate route takes. */
+export const TOKEN_KIND_KEYS = { read: 'MCP_TOKEN', write: 'MCP_WRITE_TOKEN', admin: 'MCP_ADMIN_TOKEN' } as const;
+export type TokenKind = keyof typeof TOKEN_KIND_KEYS;
+
+/**
+ * The four settings that say what mail is judged by rule, as the only ones
+ * the write credential may change: who the owner is, which senders always or
+ * never matter, and the keywords used when there is no model.
+ */
+export const TRIAGE_RULE_KEYS = ['MAIL_ALWAYS_IMPORTANT', 'MAIL_NEVER_IMPORTANT', 'MAIL_KEYWORDS', 'MAIL_CONTEXT'] as const;
 
 export function words(value: Words | undefined, lang: Language): string {
   if (!value) return '';

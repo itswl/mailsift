@@ -95,6 +95,18 @@ export function rememberBootState(doc: SettingsDocument, authorized: ReadonlySet
   bootFingerprint = runtimeFingerprint(doc, authorized);
 }
 
+/**
+ * What a setting will be once the process runs on this document: the value
+ * stored for it, or else what the environment gives. A key the document once
+ * carried falls back to what the environment held before mailsift touched
+ * it; one it never carried was never touched, so the environment still has it.
+ */
+export function effectiveValue(doc: SettingsDocument, key: string): string {
+  const stored = doc.values[key];
+  if (stored !== undefined) return stored;
+  return (original.has(key) ? original.get(key) : process.env[key]) ?? '';
+}
+
 /** Whether the stored settings now differ from what this process started with. */
 export function differsFromBoot(doc: SettingsDocument, authorized: ReadonlySet<string>): boolean {
   return bootFingerprint === undefined || runtimeFingerprint(doc, authorized) !== bootFingerprint;

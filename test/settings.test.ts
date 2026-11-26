@@ -7,11 +7,11 @@ import type { IncomingMessage } from 'node:http';
 import { createRequire } from 'node:module';
 import {
   adminPasswordSet, adminSessionValid, changeAdminPassword, claimAdmin, closeSettingsStore, endOtherAdminSessions,
-  ensureAccessTokens, issueSetupCode, normalizeSetupCode, readSettings, resetAdmin, savePendingSignIn, settingsKeyPath,
+  ensureAccessTokens, issueSetupCode, newAccessToken, normalizeSetupCode, readSettings, resetAdmin, savePendingSignIn, settingsKeyPath,
   signInAdmin, SettingsKeyError, startAdminSession, takePendingSignIn, updateSettings,
 } from '../src/services/settings-store.js';
 import { applySettings, differsFromBoot, mailboxReadiness, rememberBootState } from '../src/services/settings-runtime.js';
-import { checkField, crossFieldProblems, FIELD_BY_KEY, SECRET_KEYS } from '../src/settings-catalog.js';
+import { checkField, crossFieldProblems, FIELD_BY_KEY, SECRET_KEYS, TRIAGE_RULE_KEYS } from '../src/settings-catalog.js';
 import { loadConfig, setSettingsAccounts } from '../src/config.js';
 import { requestChannel } from '../src/web-access.js';
 import { authorizedUsernames, TokenStore } from '../src/imap/auth.js';
@@ -70,11 +70,19 @@ describe('the settings document', () => {
     expect(() => readSettings()).toThrow(/not the key/);
   });
 
-  it('creates the API tokens once, different from each other', () => {
+  it('creates the API tokens once, different from each other, and never the admin token', () => {
     const first = ensureAccessTokens();
     expect(first.read).not.toBe(first.write);
     expect(first.read).toMatch(/^ms_/);
     expect(ensureAccessTokens()).toEqual(first);
+    // The admin token carries everything: it exists only once an administrator asks for it (see test/admin-api.test.ts).
+    expect(readSettings().values['MCP_ADMIN_TOKEN']).toBeUndefined();
+    expect(ensureAccessTokens()).toEqual(first);
+    expect(readSettings().values['MCP_ADMIN_TOKEN']).toBeUndefined();
+    // Once one is issued it is left alone, like the other two.
+    updateSettings((doc) => { doc.values['MCP_ADMIN_TOKEN'] = newAccessToken(); });
+    expect(ensureAccessTokens()).toEqual(first);
+    expect(readSettings().values['MCP_ADMIN_TOKEN']).toMatch(/^ms_/);
   });
 
   it('keeps a pending OAuth sign-in across a restart, for one use only', () => {
@@ -144,6 +152,14 @@ describe('administrator access', { timeout: 30_000 }, () => {
     expect(claimAdmin(code, 'a fresh long password')).toBeTruthy();
   });
 
+  it('loses no API token to that reset: they are settings, replaced one at a time by their own route', () => {
+    updateSettings((doc) => { doc.values['MCP_ADMIN_TOKEN'] = 'ms_admin'; });
+    resetAdmin();
+    // A reset is for an administrator who forgot the password. A token that may have leaked is replaced after signing
+    // back in, which is what the page's Access section and rotate_token do.
+    expect(readSettings().values['MCP_ADMIN_TOKEN']).toBe('ms_admin');
+  });
+
   it('compares setup codes leniently but exactly', () => {
     expect(normalizeSetupCode('ab1o-il22')).toBe('AB10112' + '2');
   });
@@ -169,12 +185,16 @@ describe('the field catalog', () => {
     expect(crossFieldProblems({ IMAP_IDLE_FOLDERS: 'INBOX,all' }).map((p) => p.key)).toEqual(['IMAP_IDLE_FOLDERS']);
   });
 
-  it('keeps every credential among the secrets', () => {
+  it('keeps every credential among the secrets, and the tokens and the rules out of the field list', () => {
     for (const key of ['LLM_API_KEY', 'DECIDER_API_TOKEN', 'FEISHU_WEBHOOK_URL', 'FEISHU_WEBHOOK_SECRET', 'WEBHOOK_URL',
       'WEBHOOK_TOKEN', 'HEARTBEAT_PING_URL', 'GMAIL_CLIENT_SECRET', 'OUTLOOK_CLIENT_SECRET']) {
       expect(SECRET_KEYS.has(key), key).toBe(true);
     }
-    expect(FIELD_BY_KEY.has('MCP_TOKEN')).toBe(false);
+    // Each token is managed by its own control, never through the field list.
+    for (const key of ['MCP_TOKEN', 'MCP_WRITE_TOKEN', 'MCP_ADMIN_TOKEN']) expect(FIELD_BY_KEY.has(key), key).toBe(false);
+    // The four settings a writer may change without being the administrator, and no more.
+    expect([...TRIAGE_RULE_KEYS].sort()).toEqual(['MAIL_ALWAYS_IMPORTANT', 'MAIL_CONTEXT', 'MAIL_KEYWORDS', 'MAIL_NEVER_IMPORTANT']);
+    for (const key of TRIAGE_RULE_KEYS) expect(FIELD_BY_KEY.has(key), key).toBe(true);
   });
 });
 
@@ -201,6 +221,17 @@ describe('handing the settings to the service', () => {
     const cleared = updateSettings((d) => { delete d.values['LOG_LEVEL']; });
     applySettings(cleared, new Set());
     expect(process.env.LOG_LEVEL).toBe('error');
+  });
+
+  it('gives the service a token issued in Settings in place of the one it was started with', () => {
+    process.env.MCP_ADMIN_TOKEN = 'ms_from-the-environment';
+    const doc = updateSettings((d) => { d.values['MCP_ADMIN_TOKEN'] = 'ms_rotated'; });
+    applySettings(doc, new Set());
+    // What the endpoint reads at its next start is the one generated in Settings.
+    expect(process.env.MCP_ADMIN_TOKEN).toBe('ms_rotated');
+    const cleared = updateSettings((d) => { delete d.values['MCP_ADMIN_TOKEN']; });
+    applySettings(cleared, new Set());
+    expect(process.env.MCP_ADMIN_TOKEN).toBe('ms_from-the-environment');
   });
 
   it('needs a restart only when what the service runs on changed', () => {

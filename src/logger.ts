@@ -52,7 +52,7 @@ function emit(level: Level, scope: string, message: string, ...rest: unknown[]):
   if (LEVELS[level] < currentLevel()) return;
   const line = `${new Date().toISOString()} [${level.toUpperCase()}] ${scope}: ${redactSecrets(message)}`;
   const extra = rest.length ? ` ${redactSecrets(rest.map(String).join(' '))}` : '';
-  // stdout is the MCP protocol channel in stdio mode; logs always use stderr.
+  // Logs go to stderr, where the diagnostics of a service belong.
   process.stderr.write(`${line}${extra}\n`);
 }
 
