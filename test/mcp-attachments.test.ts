@@ -1,9 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
 
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { McpError } from '@modelcontextprotocol/sdk/types.js';
+import { Client, InMemoryTransport, ProtocolError } from '@modelcontextprotocol/client';
 import { createServer } from '../src/mcp.js';
 import { StateStore } from '../src/services/state.js';
 import * as imap from '../src/imap/client.js';
@@ -42,9 +40,9 @@ async function resourceFailure(client: Client, uri: string): Promise<{ rpc: numb
   try {
     await client.readResource({ uri });
   } catch (error) {
-    expect(error).toBeInstanceOf(McpError);
-    const data = (error as McpError).data as { code: string; hint?: string };
-    return { rpc: (error as McpError).code, code: data.code, ...(data.hint ? { hint: data.hint } : {}) };
+    expect(error).toBeInstanceOf(ProtocolError);
+    const data = (error as ProtocolError).data as { code: string; hint?: string };
+    return { rpc: (error as ProtocolError).code, code: data.code, ...(data.hint ? { hint: data.hint } : {}) };
   }
   throw new Error(`${uri} was read`);
 }

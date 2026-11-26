@@ -10,10 +10,9 @@ import './env.js'; // Must run first for DNS defaults.
 import { createHash } from 'node:crypto';
 import { createServer as createHttpServer, type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
 import { Readable } from 'node:stream';
-import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { CallToolRequestSchema, type CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolRequestSchema } from '@modelcontextprotocol/core';
+import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
+import { McpServer, ResourceTemplate, type CallToolResult } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { loadConfig } from './config.js';
 import { McpToolError, toResourceError, toToolError } from './mcp-errors.js';
@@ -2794,7 +2793,7 @@ export function createServer(
 
   registerPrompts(server, { writable });
   // In place of the SDK's own handler for tools/call, now that every tool is registered (see callTool).
-  server.server.setRequestHandler(CallToolRequestSchema, (request, extra) => callTool(request, extra));
+  server.server.setRequestHandler('tools/call', (request, ctx) => callTool(request, ctx));
 
   return server;
 }
@@ -2997,7 +2996,7 @@ export async function startMcpHttp(
         // Omitting sessionIdGenerator selects stateless mode. A call is read
         // whole before its tool sees it, and send_mail takes files: the most
         // it may carry is worked out beside that tool.
-        const transport = new StreamableHTTPServerTransport({ maxRequestBodySize: MCP_MAX_REQUEST_BODY_BYTES });
+        const transport = new NodeStreamableHTTPServerTransport({ maxRequestBodySize: MCP_MAX_REQUEST_BODY_BYTES });
         let cleaned = false;
         const cleanup = (): void => {
           if (cleaned) return;
@@ -3012,9 +3011,7 @@ export async function startMcpHttp(
         };
         res.once('close', cleanup);
         res.once('finish', cleanup);
-        // The SDK declares onclose as nullable here, which conflicts with the
-        // Transport interface under exactOptionalPropertyTypes.
-        await server.connect(transport as unknown as Transport);
+        await server.connect(transport);
         await transport.handleRequest(req, res);
       } catch (error) {
         console.error('MCP request failed:', error);

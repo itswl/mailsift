@@ -11,8 +11,7 @@
  * protocol has for a failure a model is meant to read. Resources have no such
  * shape, so the same body travels in a JSON-RPC error's `data`.
  */
-import { ErrorCode as RpcErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { ProtocolError, ProtocolErrorCode, type CallToolResult } from '@modelcontextprotocol/server';
 import { ConfigError } from './config.js';
 import { redactSecrets } from './logger.js';
 
@@ -83,7 +82,7 @@ function bodyFor(error: unknown): McpErrorBody {
   if (isMcpToolError(error)) return error.toBody();
   // A broken saved configuration is the server's fault, not the caller's, and retrying cannot fix it.
   if (error instanceof ConfigError) return new McpToolError('SERVER_MISCONFIGURED', error.message).toBody();
-  if (error instanceof McpError && typeof (error.data as McpErrorBody | undefined)?.code === 'string') {
+  if (error instanceof ProtocolError && typeof (error.data as McpErrorBody | undefined)?.code === 'string') {
     return error.data as McpErrorBody;
   }
   return { code: 'PROVIDER_ERROR', message: 'The mailbox or a stored record could not be read.' };
@@ -102,14 +101,14 @@ export function toToolError(error: unknown): CallToolResult {
 }
 
 /** The same body for a resource read, where the protocol only has JSON-RPC errors. */
-export function toResourceError(error: unknown): McpError {
-  if (error instanceof McpError) return error;
+export function toResourceError(error: unknown): ProtocolError {
+  if (error instanceof ProtocolError) return error;
   const body = bodyFor(error);
   // What was asked for cannot be had (an unknown id, a file over the limit): the caller's to change, not a fault here.
   const rpcCode =
     body.code === 'NOT_FOUND' || body.code === 'INVALID_ARGUMENT' || body.code === 'ACCOUNT_UNKNOWN'
       || body.code === 'ATTACHMENT_UNSUPPORTED'
-      ? RpcErrorCode.InvalidParams
-      : RpcErrorCode.InternalError;
-  return new McpError(rpcCode, `${body.code}: ${body.message}`, body);
+      ? ProtocolErrorCode.InvalidParams
+      : ProtocolErrorCode.InternalError;
+  return new ProtocolError(rpcCode, `${body.code}: ${body.message}`, body);
 }

@@ -10,7 +10,7 @@
  * The renderers are pure so the tests can read them; the register functions are
  * thin. MCP prompt arguments are always strings.
  */
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { SEARCH_SYNTAX_URI } from './mcp-syntax.js';
 
@@ -100,10 +100,10 @@ export function registerPrompts(server: McpServer, options: { writable: boolean 
       title: 'Catch up on the mailbox',
       description:
         'Report what arrived and what needs action, reading the judgements and the pending digest rather than searching.',
-      argsSchema: {
+      argsSchema: z.object({
         hours,
         focus: z.string().optional().describe('Optional: what matters most this time, in plain language.'),
-      },
+      }),
     },
     (args) => ({
       description: `What arrived in the last ${args.hours} hours`,
@@ -117,12 +117,12 @@ export function registerPrompts(server: McpServer, options: { writable: boolean 
       title: 'Why was I not notified',
       description:
         'Diagnose a missing notification in order: mailbox read, judged above the threshold, delivered.',
-      argsSchema: {
+      argsSchema: z.object({
         about: z
           .string()
           .min(1)
           .describe('The message that should have arrived: a sender, a subject, or what it was about.'),
-      },
+      }),
     },
     (args) => ({
       description: `Why nothing arrived about: ${args.about}`,
@@ -138,7 +138,7 @@ export function registerPrompts(server: McpServer, options: { writable: boolean 
       title: 'Review recent judgements',
       description:
         'Go through how recent mail was judged and record feedback on what was wrong. Asks before recording anything.',
-      argsSchema: { hours },
+      argsSchema: z.object({ hours }),
     },
     (args) => ({
       description: `Review the last ${args.hours} hours of judgements`,

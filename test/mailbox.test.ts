@@ -203,8 +203,7 @@ import { Watcher } from '../src/services/watcher.js';
 import { forgetLive } from '../src/web-actions.js';
 import { routeWeb, SESSION_COOKIE } from '../src/web.js';
 import { makeMessage, RecordingSink } from './helpers.js';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 import { createServer } from '../src/mcp.js';
 
 const ME: Account = {
