@@ -473,11 +473,18 @@ function imagesAllowed(row, data) {
   const sender = vouchedSender(row, data);
   return Boolean(sender) && imageSenders().indexOf(sender) !== -1;
 }
+// Says whether the list holds the sender afterwards: this browser may be unable to keep it.
 function alwaysImages(sender) {
-  if (!sender) return;
+  if (!sender) return false;
   const list = imageSenders().filter((s) => s !== sender);
   list.push(sender);
   writeStorage('imagesFrom', JSON.stringify(list.slice(-200)));
+  return imageSenders().indexOf(sender) !== -1;
+}
+// The way back: the sender comes off the list, the others on it stay.
+function neverImages(sender) {
+  if (!sender) return;
+  writeStorage('imagesFrom', JSON.stringify(imageSenders().filter((s) => s !== sender)));
 }
 
 // ---- The message itself: fetched when a message is opened ----
@@ -568,13 +575,22 @@ function renderMessage(row, data, section, hooks) {
       said.appendChild(el('b', null, clean.misleading.join(lang === 'zh-CN' ? '；' : '; ')));
       warn.appendChild(said);
     }
+    const vouched = vouchedSender(row, data);
+    const remembered = Boolean(vouched) && imageSenders().indexOf(vouched) !== -1;
     if (clean && clean.remote && !state.images) {
       const line = note(clean.remote === 1 ? t('reader.images1') : fill('reader.images', { count: clean.remote }));
       line.appendChild(quiet(t('reader.showImages'), () => { imagesShown.add(key); state.images = true; draw(); }));
-      const vouched = vouchedSender(row, data);
       if (vouched) line.appendChild(quiet(fill('reader.alwaysImages', { sender: vouched }), () => {
-        alwaysImages(vouched); imagesShown.add(key); state.images = true; draw();
+        // Shown for this message as "Show" would have it, where the list could not be written.
+        // Otherwise this message follows the list alone, so "Not always" holds its images again.
+        if (!alwaysImages(vouched)) imagesShown.add(key);
+        state.images = true; draw();
       }));
+    }
+    // A remembered sender's images load on their own: the buttons above are gone now, so the way back is offered here.
+    if (clean && clean.remote && state.images && remembered) {
+      const line = note(fill('reader.imagesAuto', { sender: vouched }));
+      line.appendChild(quiet(t('reader.stopImages'), () => { neverImages(vouched); state.images = imagesShown.has(key); draw(); }));
     }
     if (clean && clean.trackers) note(clean.trackers === 1 ? t('reader.trackers1') : fill('reader.trackers', { count: clean.trackers }));
     if (data.htmlOmitted && state.mode !== 'html') note(t('reader.htmlOmitted'));

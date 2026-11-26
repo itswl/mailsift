@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import './setup.js';
 import { attachmentLimitBytes } from '../src/smtp.js';
+import { STRINGS } from '../src/web-strings.js';
 
 /**
  * What the documents promise about sending, held to what the code does.
@@ -60,6 +61,16 @@ describe('docs/web-view.md', () => {
     const text = prose(read('docs/web-view.md'));
     expect(text).not.toContain('a larger letter, or one with files, goes back to being a draft');
     expect(text).toContain('a larger letter, or one with files added from this device, goes back to being a draft');
+  });
+
+  it('says that a sender whose images always load is said so, with the way back, and where the list lives', () => {
+    const web = prose(read('docs/web-view.md'));
+    expect(web).toContain('the line above the message says so and offers "Not always", which takes the sender off the list again');
+    expect(web).toContain('The list is kept by this browser alone, and signing out clears it');
+    // The page has those words, in both of its languages.
+    expect(STRINGS.en['reader.imagesAuto']).toContain('{sender}');
+    expect(STRINGS.en['reader.stopImages']).toBe('Not always');
+    expect(STRINGS['zh-CN']['reader.stopImages']).toBe('不再总是显示');
   });
 });
 
