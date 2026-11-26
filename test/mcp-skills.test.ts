@@ -150,6 +150,18 @@ describe('the skill, served', () => {
     expect(served.split(SKILL_URI)).toHaveLength(2);
   });
 
+  it('is said where a host that keeps only the start of the instructions reads it', async () => {
+    // Claude Code keeps the first 4096 characters of a server's instructions and
+    // drops the rest (2.1.332: "Server instructions truncated from … to 4096
+    // chars"). What a client must be told comes first, and all of it fits.
+    const LIMIT = 4096;
+    const served = (await connect()).client.getInstructions() ?? '';
+    expect(served.startsWith(SKILL_INSTRUCTIONS)).toBe(true);
+    expect(served.length).toBeLessThanOrEqual(LIMIT);
+    // Without the skill's line, as a host that loads the skill itself has it: whole too.
+    expect(served.length - SKILL_INSTRUCTIONS.length).toBeLessThanOrEqual(LIMIT);
+  });
+
   it('is declared, listed and read by no server that was not given it', async () => {
     const { client } = await connect({}, false);
     expect(client.getServerCapabilities()?.extensions).toBeUndefined();
