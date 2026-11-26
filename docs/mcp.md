@@ -2,7 +2,7 @@
 
 mailsift includes an MCP server, so an AI assistant can see what needs you, list, search and read your triaged mail, reach the rest of the mailbox live, preview the digest, look at attachments and at what your provider said about a sender, and check whether mailsift is healthy. With a second, write token it is given what the web view's owner has: it can mark mail done, file it, bin it, and send mail. With a third, the admin token, it has what the administrator has in Settings: the mailboxes, notifications, the model, the rules and the other tokens (see [Settings and the admin token](#settings-and-the-admin-token)).
 
-An agent that supports skills can load [`.agents/skills/mailsift/SKILL.md`](../.agents/skills/mailsift/SKILL.md), which says how these tools are meant to be used and where the limits are.
+The server serves its own skill, which says how these tools are meant to be used and where the limits are, through the MCP Skills extension (still in beta): `skill://mailsift/SKILL.md`. A client that supports the extension finds it with `skills/list` and loads it from the server. Any token is enough, and all three get the same file. A client that does not support the extension can still read the skill as a resource, or be given [`.agents/skills/mailsift/SKILL.md`](../.agents/skills/mailsift/SKILL.md) by hand: it is the same file, the one the server serves.
 
 - [Connecting](#connecting)
 - [Tools and resources](#tools-and-resources)
@@ -26,6 +26,10 @@ Three tokens reach it, each starting `ms_` and each carrying the one before it: 
 Settings → Access → More options → **MCP requests per client per minute** (`MCP_RATE_LIMIT_PER_MINUTE`, default `120`) applies per client. The web view on the same port has a separate request budget, so a busy MCP client does not lock the owner's browser out.
 
 MCP is served by the process that checks the mail, and only over HTTP, as above. There is no stdio entry point to run beside it (`node dist/src/mcp.js` says so and stops): every call is made with a token, and a setting an agent saves takes effect in the very process that runs on it.
+
+### Loading the skill in a client
+
+Whether a skill is loaded *as a skill* is for the client to decide, and clients ask for it differently. mailsift does its part on both revisions: the skill is listed (`skills/list`, and in `resources/list`) and served whole (`skills/get` and `resources/read`), and the server's instructions, which every client reads along with the tools, begin by saying that the skill tells how the tools are meant to be used together. A client that cannot load it as a skill can be pointed at the resource `skill://mailsift/SKILL.md` instead.
 
 ## Tools and resources
 
@@ -86,8 +90,9 @@ MCP is served by the process that checks the mail, and only over HTTP, as above.
 | `mailsift://thread/{threadKey}` | A conversation as one markdown page, oldest first: its newest 50 messages, your own among them and marked as yours, with a line saying how many older ones are left out. Thread keys come from `list_threads`. |
 | `mailsift://imap/{account}/{messageId}` | A bounded normalized body with its headers, as a JSON object, fetched from the mailbox on demand. |
 | `mailsift://imap/{account}/{messageId}/attachment/{partId}` | One attachment, fetched on demand. |
+| `skill://mailsift/SKILL.md` | The skill: how the tools are meant to be used together, and where their limits are. The repository's `.agents/skills/mailsift/SKILL.md`, as the build shipped it. The server's instructions point at it. |
 
-A client that lists resources (`resources/list`) is given the syntax page and the newest 20 records and 20 threads of the last day by their URIs, so one that only lists can read them; the two live templates are not listed, as there is nothing to list.
+A client that lists resources (`resources/list`) is given the skill, the syntax page and the newest 20 records and 20 threads of the last day by their URIs, so one that only lists can read them; the two live templates are not listed, as there is nothing to list.
 
 The first three are markdown because a model reads them: the headings say what each field means, which a JSON object has to be told. The same records are still JSON from `get_mail` and `list_threads`, which is what an application should parse. Nothing fetched live is persisted. The webhook's [signal event](signal-event-v1.md) carries the `mailsift://imap/...` form as its reference.
 
@@ -238,4 +243,4 @@ The MCP recovery tools expose `recovery_status` always, and `retry_dead_letter` 
 
 ## Audit
 
-Every tool and live resource call is audited by name, outcome, caller fingerprint, and (where useful) a bounded account/message/part target; rejected authentication attempts are included. A `mark_handled` row says whether the message was marked done or put back (`handled`), and a `record_feedback` row the label it was given. The administrator's tools are recorded the same way, under their own names: an `update_settings` row names the settings the call would have changed and never their values, a `rotate_token` row which of the three tokens, and a `manage_mailbox` row the action and the mailbox's id. What the web view does is recorded the same way: its mailbox actions and each message it sends (as `send`, without recipients or text) in the mailbox-action audit, and marking done, putting off, feedback, questions, drafts and notification subscriptions as `web:*` rows in the access audit. `list_audit` returns recent rows and mailbox-action audit, and `observability` groups the access audit by tool. Credentials, message bodies, and URL query strings are never stored in the audit.
+Every tool call and every resource read is audited by name, outcome, caller fingerprint, and (where useful) a bounded account/message/part target: the syntax page as `resource:search-syntax`, a skill file as `resource:skill` with its URI, and each mail resource under its own name. Rejected authentication attempts are included. A `mark_handled` row says whether the message was marked done or put back (`handled`), and a `record_feedback` row the label it was given. The administrator's tools are recorded the same way, under their own names: an `update_settings` row names the settings the call would have changed and never their values, a `rotate_token` row which of the three tokens, and a `manage_mailbox` row the action and the mailbox's id. What the web view does is recorded the same way: its mailbox actions and each message it sends (as `send`, without recipients or text) in the mailbox-action audit, and marking done, putting off, feedback, questions, drafts and notification subscriptions as `web:*` rows in the access audit. `list_audit` returns recent rows and mailbox-action audit, and `observability` groups the access audit by tool. Credentials, message bodies, and URL query strings are never stored in the audit.

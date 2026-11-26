@@ -64,7 +64,7 @@ Gmail 和 Outlook 通过 OAuth 登录，需要你在 Google 或 Microsoft 注册
 
 ## MCP
 
-MCP 服务器运行在 mailsift 进程内，地址是同一地址下的 `/mcp`（Streamable HTTP，`Authorization: Bearer <令牌>`）。把它加到 MCP 客户端里，AI 助手就能看到哪些邮件等你处理，列出、搜索和阅读分诊过的邮件、预览日报、查看邮箱健康状况。它还以 prompt 的形式提供这些工具的典型用法：快速了解邮箱现状，或者查清某封邮件为什么没有送到。“设置 → 访问与凭证”可以生成令牌，各只显示一次：只读令牌只能查看；写令牌还能做网页里管理员能做的事：标记完成、稍后提醒、归档和删除、发信和转发，全部有审计。只把写令牌交给你愿意托付整个邮箱的客户端。第三枚是管理令牌，只在你主动生成时才有，它让助手拥有你在“设置”里的一切权限，包括更换其他令牌：只把它交给你愿意托付整个设置页的客户端。支持 skill 的智能体可以加载 [.agents/skills/mailsift/SKILL.md](.agents/skills/mailsift/SKILL.md)。详见 [docs/mcp.md](docs/mcp.md)。
+MCP 服务器运行在 mailsift 进程内，地址是同一地址下的 `/mcp`（Streamable HTTP，`Authorization: Bearer <令牌>`）。把它加到 MCP 客户端里，AI 助手就能看到哪些邮件等你处理，列出、搜索和阅读分诊过的邮件、预览日报、查看邮箱健康状况。它还以 prompt 的形式提供这些工具的典型用法：快速了解邮箱现状，或者查清某封邮件为什么没有送到。“设置 → 访问与凭证”可以生成令牌，各只显示一次：只读令牌只能查看；写令牌还能做网页里管理员能做的事：标记完成、稍后提醒、归档和删除、发信和转发，全部有审计。只把写令牌交给你愿意托付整个邮箱的客户端。第三枚是管理令牌，只在你主动生成时才有，它让助手拥有你在“设置”里的一切权限，包括更换其他令牌：只把它交给你愿意托付整个设置页的客户端。服务器还通过 MCP 提供自带的 skill，说明这些工具该怎么配合使用（`skill://mailsift/SKILL.md`）：支持 skill 的客户端会直接从服务器加载，其他的可以手动加载 [.agents/skills/mailsift/SKILL.md](.agents/skills/mailsift/SKILL.md)，两者是同一个文件。详见 [docs/mcp.md](docs/mcp.md)。
 
 ## 常用命令
 

@@ -10,6 +10,8 @@ RUN npm ci
 
 COPY src/ src/
 COPY scripts/ scripts/
+# The skill the MCP server serves; the build puts it in dist/skills, which is all the image needs of it.
+COPY .agents/skills/ .agents/skills/
 RUN npm run build
 
 # Keep only runtime dependencies in the final image; typescript, vitest, and tsx are omitted.

@@ -1,16 +1,27 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import './setup.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import type { AddressInfo, Server } from 'node:net';
 import { startMcpHttp } from '../src/mcp.js';
+import { SKILL_URI, skillCatalogOrNone } from '../src/mcp-skills.js';
 import { StateStore } from '../src/services/state.js';
 import { closeSettingsStore } from '../src/services/settings-store.js';
 import { setSettingsAccounts } from '../src/config.js';
 import { resetRuntimeControl } from '../src/services/runtime-control.js';
 import { sendBodyLimit } from '../src/web-actions.js';
+
+/**
+ * The skill is read as the endpoint starts. It reads the same here as there;
+ * through this it can be made to come to nothing, to see what the endpoint
+ * does without it.
+ */
+vi.mock('../src/mcp-skills.js', async (original) => {
+  const real = await original<typeof import('../src/mcp-skills.js')>();
+  return { ...real, skillCatalogOrNone: vi.fn(real.skillCatalogOrNone) };
+});
 
 /**
  * The credential split lives in the HTTP layer, not in createServer.
@@ -23,6 +34,9 @@ import { sendBodyLimit } from '../src/web-actions.js';
 const READ = 'r'.repeat(64);
 const WRITE = 'w'.repeat(64);
 const ADMIN = 'a'.repeat(64);
+
+/** The skill as the repository has it, which is what the endpoint serves. */
+const skillFile = (): string => readFileSync(new URL('../.agents/skills/mailsift/SKILL.md', import.meta.url), 'utf8');
 
 let server: Server | undefined;
 let dir: string;
@@ -299,6 +313,50 @@ describe('a letter from the page is one large request', () => {
     await start();
     expect((server as unknown as { requestTimeout: number }).requestTimeout).toBeGreaterThanOrEqual(Math.ceil(sendBodyLimit() / (64 * 1024)) * 1000);
     expect(sendBodyLimit()).toBeGreaterThan(40 * 1024 * 1024);
+  });
+});
+
+describe('the skill over the endpoint', () => {
+  it('is served to each credential alike, as the file itself, and to no one without one', async () => {
+    process.env.MCP_TOKEN = READ;
+    process.env.MCP_WRITE_TOKEN = WRITE;
+    process.env.MCP_ADMIN_TOKEN = ADMIN;
+    const url = await start({ adminAuth: true });
+    for (const token of [READ, WRITE, ADMIN]) {
+      const read = await rpc(url, token, 'resources/read', { uri: SKILL_URI });
+      expect(read.status, 'read').toBe(200);
+      expect(read.body['error']).toBeUndefined();
+      expect((read.body['result'] as { contents: unknown }).contents).toMatchObject([{ uri: SKILL_URI, mimeType: 'text/markdown', text: skillFile() }]);
+      const listed = await rpc(url, token, 'skills/list');
+      expect((listed.body['result'] as { skills: Array<{ uri: string }> }).skills.map((one) => one.uri)).toEqual([SKILL_URI]);
+    }
+    for (const token of ['', 'x'.repeat(64)]) {
+      expect((await rpc(url, token, 'resources/read', { uri: SKILL_URI })).status).toBe(401);
+      expect((await rpc(url, token, 'skills/list')).status).toBe(401);
+    }
+  });
+
+  it('is said at every start: served, or not there', async () => {
+    process.env.MCP_TOKEN = READ;
+    const said = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await start();
+      expect(said.mock.calls.flat().some((line) => String(line).endsWith(` · skill: served at ${SKILL_URI}`))).toBe(true);
+    } finally {
+      said.mockRestore();
+    }
+  });
+
+  it('does not keep the endpoint from starting, or from answering mail, when it could not be read', async () => {
+    process.env.MCP_TOKEN = READ;
+    vi.mocked(skillCatalogOrNone).mockResolvedValueOnce(undefined);
+    const url = await start();
+    const { body } = await rpc(url, READ, 'initialize', {
+      protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'mcp-test', version: '0.0.0' },
+    });
+    expect((body['result'] as { capabilities: Record<string, unknown> }).capabilities['extensions']).toBeUndefined();
+    expect((await listTools(url, READ)).names).toContain('list_mail');
+    expect((await rpc(url, READ, 'resources/read', { uri: SKILL_URI })).body['error']).toMatchObject({ code: -32602 });
   });
 });
 

@@ -233,7 +233,9 @@ describe('tool surface', () => {
 
   it('warns a client that message fields are untrusted data', async () => {
     // Subjects and summaries reach the model verbatim, so the server has to
-    // say so itself; a client without the skill file sees nothing else.
+    // say so itself, in the one place every client reads. The skill it serves
+    // (test/mcp-skills.test.ts) says it again, in its description, for a host
+    // that shows that and drops the instructions.
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     const server = createServer({ state: new StateStore(':memory:') });
     const client = new Client({ name: 'mcp-test', version: '0.0.0' });

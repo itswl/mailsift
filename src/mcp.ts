@@ -13,11 +13,13 @@ import { Readable } from 'node:stream';
 import { CallToolRequestSchema } from '@modelcontextprotocol/core';
 import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import { McpServer, ResourceTemplate, type CallToolResult } from '@modelcontextprotocol/server';
+import type { SkillCatalog } from '@modelcontextprotocol/server/ext/skills';
 import { z } from 'zod';
 import { loadConfig } from './config.js';
 import { McpToolError, toResourceError, toToolError } from './mcp-errors.js';
 import { mailRecordToMarkdown, threadToMarkdown } from './mcp-markdown.js';
 import { registerPrompts } from './mcp-prompts.js';
+import { attachSkills, SKILL_INSTRUCTIONS, SKILL_URI, skillCatalogOrNone } from './mcp-skills.js';
 import { renderSearchSyntax, SEARCH_SYNTAX_URI } from './mcp-syntax.js';
 import {
   AttachmentNotFoundError, AttachmentTooLargeError, fetchAttachmentByMessageId, fetchAttachmentManifestByMessageId,
@@ -538,6 +540,12 @@ export function createServer(
     headers?: IncomingHttpHeaders;
     /** Checks every mailbox now. The server gives one; a bare instance has none, and then refresh is not registered. */
     onRefresh?: () => Promise<PollStats>;
+    /**
+     * The skill, read once by whoever runs this server (mcp-skills.ts). A bare
+     * instance, as in the tests, has none: it declares no extension, lists no
+     * skill, and its instructions do not speak of one.
+     */
+    skills?: SkillCatalog;
   } = {},
 ): McpServer {
   const store = options.state ?? new StateStore();
@@ -851,7 +859,8 @@ export function createServer(
   };
   const server = new McpServer(
     { name: 'mailsift', version: APP_VERSION },
-    { instructions: INSTRUCTIONS },
+    // Only a server that serves the skill points the model at it, and first (see INSTRUCTIONS).
+    { instructions: options.skills ? SKILL_INSTRUCTIONS + INSTRUCTIONS : INSTRUCTIONS },
   );
   const json = (value: unknown) => ({
     content: [{ type: 'text' as const, text: JSON.stringify(value, withoutCodes, 2) }],
@@ -2792,6 +2801,10 @@ export function createServer(
   );
 
   registerPrompts(server, { writable });
+  // Through this server's own registerResource (above), so that a skill file read leaves an audit row as the others do.
+  if (options.skills) {
+    attachSkills(server, options.skills, registerResource, (uri, ok) => audited('resource:skill', ok, uri));
+  }
   // In place of the SDK's own handler for tools/call, now that every tool is registered (see callTool).
   server.server.setRequestHandler('tools/call', (request, ctx) => callTool(request, ctx));
 
@@ -2870,6 +2883,8 @@ export async function startMcpHttp(
   if (adminToken && adminToken === token) {
     throw new Error('MCP_ADMIN_TOKEN must differ from MCP_TOKEN; refusing to start.');
   }
+  // Read once, here: every server made below is given what this read found (mcp-skills.ts).
+  const skills = await skillCatalogOrNone();
 
   const httpServer = createHttpServer((req, res) => {
     void (async () => {
@@ -2992,6 +3007,7 @@ export async function startMcpHttp(
           // The settings API reads from them where the server was reached, for a mailbox's OAuth sign-in.
           headers: req.headers,
           ...(options.onRefresh ? { onRefresh: options.onRefresh } : {}),
+          ...(skills ? { skills } : {}),
         });
         // Omitting sessionIdGenerator selects stateless mode. A call is read
         // whole before its tool sees it, and send_mail takes files: the most
@@ -3039,7 +3055,9 @@ export async function startMcpHttp(
             ? 'read-only, except for callers presenting MCP_WRITE_TOKEN, and the administrator\'s tools for MCP_ADMIN_TOKEN'
             : writeToken
               ? 'read-only, except for callers presenting MCP_WRITE_TOKEN'
-              : 'read-only (write tools such as send_mail and manage_mail not registered)'),
+              : 'read-only (write tools such as send_mail and manage_mail not registered)') +
+        // Said at every start, so that a deploy where the skill went missing can be seen for one in the logs.
+        ' · skill: ' + (skills ? 'served at ' + SKILL_URI : 'none'),
       );
       resolve();
     };
