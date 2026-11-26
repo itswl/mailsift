@@ -8,11 +8,11 @@
  */
 import './env.js'; // Must run first for DNS defaults.
 import { createHash } from 'node:crypto';
-import { createServer as createHttpServer, type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
+import { createServer as createHttpServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http';
 import { Readable } from 'node:stream';
 import { CallToolRequestSchema } from '@modelcontextprotocol/core';
-import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
-import { McpServer, ResourceTemplate, type CallToolResult } from '@modelcontextprotocol/server';
+import { toNodeHandler, type NodeIncomingMessageLike } from '@modelcontextprotocol/node';
+import { createMcpHandler, McpServer, ResourceTemplate, type CallToolResult } from '@modelcontextprotocol/server';
 import type { SkillCatalog } from '@modelcontextprotocol/server/ext/skills';
 import { z } from 'zod';
 import { loadConfig } from './config.js';
@@ -343,6 +343,37 @@ export const MCP_SEND_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024;
  * longest letter once JSON has escaped it, and the envelope around both.
  */
 export const MCP_MAX_REQUEST_BODY_BYTES = 14 * 1024 * 1024;
+
+/**
+ * What a body over that size is told, in the SDK's words: its entry answers
+ * them for a body it finds too long as it reads one, so a caller reads the same
+ * thing whether the size was declared up front or came as it was read.
+ */
+const REQUEST_BODY_TOO_LARGE = `Payload Too Large: Request body must not exceed ${MCP_MAX_REQUEST_BODY_BYTES} bytes`;
+
+/**
+ * Answers a request whose body is declared longer than the endpoint reads,
+ * without reading it into anything. What is still coming is dropped to its
+ * end first, so that the caller then reads the answer: answered at once and
+ * closed, as the SDK's adapter does when it finds this itself, the close comes
+ * while the remainder is still arriving, and what the caller reads is a reset
+ * connection in place of the answer. A caller takes as long to finish as any
+ * other does: a request not all in by the server's own request timeout is
+ * ended there.
+ */
+function refuseOversizedBody(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  return new Promise<void>((resolve) => {
+    req.once('end', resolve);
+    req.once('close', resolve);
+    req.once('error', resolve);
+    req.resume();
+  }).then(() => {
+    // The line may have gone meanwhile: the caller gave up, or the request timeout answered for it.
+    if (res.headersSent || res.destroyed) return;
+    res.writeHead(413, { 'content-type': 'application/json', connection: 'close' })
+      .end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: REQUEST_BODY_TOO_LARGE }, id: null }));
+  });
+}
 
 /**
  * A POST of a JSON body to one of the page's routes, for a tool that runs
@@ -3006,35 +3037,47 @@ export async function startMcpHttp(
           res.writeHead(401, { 'content-type': 'application/json' }).end('{"error":"unauthorized"}');
           return;
         }
+        if (Number(req.headers['content-length']) > MCP_MAX_REQUEST_BODY_BYTES) {
+          await refuseOversizedBody(req, res);
+          return;
+        }
         const state = new StateStore();
         const inFlight: InFlight = { count: 0 };
-        const server = createServer({
-          state, client, writable: writable || admin, admin, inFlight,
-          // The settings API reads from them where the server was reached, for a mailbox's OAuth sign-in.
-          headers: req.headers,
-          ...(options.onRefresh ? { onRefresh: options.onRefresh } : {}),
-          ...(skills ? { skills } : {}),
-        });
-        // Omitting sessionIdGenerator selects stateless mode. A call is read
-        // whole before its tool sees it, and send_mail takes files: the most
-        // it may carry is worked out beside that tool.
-        const transport = new NodeStreamableHTTPServerTransport({ maxRequestBodySize: MCP_MAX_REQUEST_BODY_BYTES });
         let cleaned = false;
         const cleanup = (): void => {
           if (cleaned) return;
           cleaned = true;
-          void transport.close();
-          void server.close();
           // A call the client walked away from runs to its end all the same:
           // a message it is sending still leaves, and that has to be written
-          // down. The handle is closed when the last such call is done.
+          // down. The handle is closed when the last such call is done. The
+          // server itself is closed by the entry that made it, with the exchange.
           if (inFlight.count === 0) state.close();
           else inFlight.idle = () => state.close();
         };
         res.once('close', cleanup);
         res.once('finish', cleanup);
-        await server.connect(transport);
-        await transport.handleRequest(req, res);
+        // The SDK's HTTP entry serves a client on the 2026-07-28 revision when
+        // it claims one, and on the revision a client without that claim
+        // negotiated, as before. Both come from the one server made per request.
+        // A call is read whole before its tool sees it, and send_mail takes
+        // files: the most it may carry is worked out beside that tool. It is
+        // said twice because the adapter stops reading at it and the entry
+        // answers for it.
+        const onError = (error: Error): void => console.error('MCP request failed:', error);
+        const handler = createMcpHandler(
+          () => createServer({
+            state, client, writable: writable || admin, admin, inFlight,
+            // The settings API reads from them where the server was reached, for a mailbox's OAuth sign-in.
+            headers: req.headers,
+            ...(options.onRefresh ? { onRefresh: options.onRefresh } : {}),
+            ...(skills ? { skills } : {}),
+          }),
+          { legacy: 'stateless', maxRequestBodySize: MCP_MAX_REQUEST_BODY_BYTES, onerror: onError },
+        );
+        // The adapter's parameter leaves out the undefined Node's own request type
+        // carries on method and url (it is the response's type too), which
+        // exactOptionalPropertyTypes insists on. A request has both.
+        await toNodeHandler(handler, { maxRequestBodySize: MCP_MAX_REQUEST_BODY_BYTES, onerror: onError })(req as NodeIncomingMessageLike, res);
       } catch (error) {
         console.error('MCP request failed:', error);
         if (!res.headersSent) res.writeHead(500).end();

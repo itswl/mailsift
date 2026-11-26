@@ -314,6 +314,8 @@ location /api/events {
 }
 ```
 
+The MCP endpoint keeps a line open the same way for a client on protocol revision `2026-07-28` (see [MCP](mcp.md#connecting)), with the same `X-Accel-Buffering: no` and a keep-alive every fifteen seconds. That is short enough for nginx's default read timeout, so `/mcp` needs no block of its own: only a proxy that cuts a quiet line in under fifteen seconds has to be set.
+
 The page works without it, a minute behind.
 
 A letter with files is one large request: up to about 28 MB with the default attachment limit of 20 MiB (Settings → Web mail → More options) (the files in base64, which is a third larger, and the letter), and up to about 48 MB with the 35 MiB ceiling. nginx refuses anything over 1 MB unless told otherwise, and on a slow link to the mail server the answer can take a few minutes, so give `/api/send` room for both:
