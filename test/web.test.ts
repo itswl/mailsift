@@ -3039,6 +3039,166 @@ describe('what a QA pass found in the reader and on signing out', () => {
   });
 });
 
+describe('a sender whose images always load', () => {
+  /** The page's words in one language, filled in as the page fills them. */
+  const words = (lang: 'en' | 'zh-CN') => {
+    const t = (key: string): string => STRINGS[lang][key as StringKey] ?? key;
+    const fill = (key: string, vars: Record<string, unknown> = {}): string =>
+      Object.entries(vars).reduce((text, [name, value]) => text.split(`{${name}}`).join(String(value)), t(key));
+    return { t, fill, lang };
+  };
+  type Page = Record<string, unknown>;
+  /** As much of an element as the reader's code touches. */
+  function node(tag = 'div', cls?: string, text?: string): Page {
+    const self: Page = {
+      tag, className: cls ?? '', textContent: text ?? '', children: [] as Page[], attrs: {} as Record<string, string>, isConnected: true,
+      appendChild: (child: Page) => { (self['children'] as Page[]).push(child); return child; },
+      replaceChildren: (...children: Page[]) => { self['children'] = children; },
+      setAttribute: (name: string, value: string) => { (self['attrs'] as Record<string, string>)[name] = value; },
+      // The frame's own document is the browser's to fill; the test says when that is done.
+      addEventListener: (name: string, run: () => void) => { if (name === 'load') self['load'] = run; },
+      classList: { toggle: () => undefined },
+    };
+    return self;
+  }
+  /**
+   * A message from one sender, open in the reader. What the frame's document
+   * holds is three remote pictures and nothing else to say.
+   */
+  function open(options: { kept?: string; keeps?: boolean; vouched?: boolean; lang?: 'en' | 'zh-CN' } = {}): {
+    store: Record<string, string>; frame: () => string; lines: () => string[]; press: (label: string) => void; redraw: () => void;
+  } {
+    const { t, fill, lang } = words(options.lang ?? 'en');
+    const store: Record<string, string> = options.kept ? { imagesFrom: options.kept } : {};
+    const { renderMessage, openMessages } = lifted<{
+      renderMessage: (row: unknown, data: unknown, section: Page, hooks: unknown) => void;
+      openMessages: Set<{ draw: () => void }>;
+    }>(['el', 'rowKey', 'imageSenders', 'vouchedSender', 'imagesShown', 'imagesAllowed', 'alwaysImages', 'neverImages', 'openMessages', 'renderMessage'],
+      '({ renderMessage, openMessages })', {
+        t, fill, lang, readerMode: 'html', document: { createElement: (tag: string) => node(tag) },
+        readStorage: (key: string): string | null => store[key] ?? null,
+        writeStorage: (key: string, value: string): void => { if (options.keeps !== false) store[key] = value; },
+        fillFrame: () => ({ remote: 3, trackers: 0, deceptive: 0, misleading: [] }),
+      });
+    const section = node('section');
+    const notes = (): Page[] => (section['children'] as Page[])[1]!['children'] as Page[];
+    renderMessage({ dedupKey: 'k1' }, { html: '<p>Hello</p>', text: 'Hello', from: { address: 'news@example.com' },
+      auth: { result: options.vouched === false ? 'fail' : 'pass' } }, section, {});
+    /** The frame showing now, once the browser has loaded it and the page has said what it found. */
+    const frame = (): string => {
+      const showing = ((section['children'] as Page[])[2]!['children'] as Page[])[0]!;
+      (showing['load'] as () => void)();
+      return String(showing['src']);
+    };
+    // Opened: its frame has loaded, so its notes are on the page, as they are when a button can be pressed.
+    frame();
+    return {
+      store, frame,
+      /** What is said above the message, a line each, with the buttons each line offers in brackets. */
+      lines: (): string[] => notes().map((line) =>
+        [String(line['textContent'])].concat((line['children'] as Page[]).map((button) => '[' + button['textContent'] + ']')).join(' ')),
+      press: (label: string): void => {
+        const button = notes().flatMap((line) => line['children'] as Page[]).find((child) => child['textContent'] === label);
+        expect(button, label).toBeDefined();
+        (button!['onclick'] as () => void)();
+      },
+      /** The page drawn again, as a theme change draws it. */
+      redraw: (): void => { for (const entry of openMessages) entry.draw(); },
+    };
+  }
+
+  it('keeps each sender once, the last pressed last, two hundred at most, and takes one off alone', () => {
+    const store: Record<string, string> = {};
+    type List = { alwaysImages: (sender: string) => boolean; neverImages: (sender: string) => void; imageSenders: () => string[] };
+    const list = (writable: boolean): List => lifted<List>(['imageSenders', 'alwaysImages', 'neverImages'], '({ alwaysImages, neverImages, imageSenders })', {
+      readStorage: (key: string): string | null => store[key] ?? null,
+      writeStorage: (key: string, value: string): void => { if (writable) store[key] = value; },
+    });
+    const page = list(true);
+    // What is kept is not a list: begun afresh.
+    store['imagesFrom'] = '{not json';
+    expect(page.alwaysImages('news@example.com')).toBe(true);
+    expect(page.alwaysImages('news@example.com')).toBe(true);
+    expect(page.imageSenders()).toEqual(['news@example.com']);
+    page.alwaysImages('shop@example.org');
+    page.alwaysImages('news@example.com');
+    expect(page.imageSenders()).toEqual(['shop@example.org', 'news@example.com']);
+    page.neverImages('shop@example.org');
+    expect(page.imageSenders()).toEqual(['news@example.com']);
+    // One never on the list, or no address at all: the list is left as it is.
+    page.neverImages('nobody@example.net');
+    expect(page.alwaysImages('')).toBe(false);
+    page.neverImages('');
+    expect(page.imageSenders()).toEqual(['news@example.com']);
+    for (let i = 0; i < 250; i += 1) page.alwaysImages('sender' + i + '@example.com');
+    const kept = page.imageSenders();
+    expect(kept).toHaveLength(200);
+    expect(kept[199]).toBe('sender249@example.com');
+    expect(kept).not.toContain('news@example.com');
+    // A browser that keeps nothing says so, rather than letting the page believe the sender was remembered.
+    store['imagesFrom'] = '[]';
+    expect(list(false).alwaysImages('news@example.com')).toBe(false);
+    expect(page.imageSenders()).toEqual([]);
+  });
+
+  it('is said above the message, with the way back: the sender is forgotten and the message holds their images again', () => {
+    const page = open({ kept: '["other@example.org","news@example.com"]' });
+    expect(page.frame()).toBe('/mail-frame?images=1');
+    expect(page.lines()).toEqual(['Images from news@example.com always load [Not always]']);
+    page.press('Not always');
+    // The other sender stays remembered.
+    expect(page.store['imagesFrom']).toBe('["other@example.org"]');
+    expect(page.frame()).toBe('/mail-frame');
+    expect(page.lines()).toEqual(['3 remote images hidden [Show] [Always for news@example.com]']);
+    // Both ways, on the same message, as many times as asked.
+    page.press('Always for news@example.com');
+    expect(page.store['imagesFrom']).toBe('["other@example.org","news@example.com"]');
+    expect(page.frame()).toBe('/mail-frame?images=1');
+    expect(page.lines()).toEqual(['Images from news@example.com always load [Not always]']);
+    page.press('Not always');
+    expect(page.frame()).toBe('/mail-frame');
+    expect(page.lines()).toEqual(['3 remote images hidden [Show] [Always for news@example.com]']);
+  });
+
+  it('is not said where the browser kept nothing, nor for a sender the mailbox did not vouch for', () => {
+    // "Always for" pressed where nothing can be kept: this message is shown, as "Show" would have it, and nothing more is claimed.
+    const blank = open({ keeps: false });
+    blank.press('Always for news@example.com');
+    expect(blank.store).toEqual({});
+    expect(blank.frame()).toBe('/mail-frame?images=1');
+    expect(blank.lines()).toEqual([]);
+    // Anyone can write a From line: without the mailbox's verdict a sender is never remembered, address on the list or not.
+    const forged = open({ kept: '["news@example.com"]', vouched: false });
+    expect(forged.frame()).toBe('/mail-frame');
+    expect(forged.lines()).toEqual(['3 remote images hidden [Show]']);
+  });
+
+  it('leaves a message that was shown with Show showing, once the sender is forgotten', () => {
+    const page = open();
+    page.press('Show');
+    expect(page.frame()).toBe('/mail-frame?images=1');
+    expect(page.lines()).toEqual([]);
+    // The sender comes to be remembered while this message is open, and the page is drawn again.
+    page.store['imagesFrom'] = '["news@example.com"]';
+    page.redraw();
+    expect(page.frame()).toBe('/mail-frame?images=1');
+    expect(page.lines()).toEqual(['Images from news@example.com always load [Not always]']);
+    page.press('Not always');
+    expect(page.store['imagesFrom']).toBe('[]');
+    // Still shown, as was asked for this message; no longer said to be always.
+    expect(page.frame()).toBe('/mail-frame?images=1');
+    expect(page.lines()).toEqual([]);
+  });
+
+  it('says it in Chinese with the words of the button that remembered the sender', () => {
+    const page = open({ kept: '["news@example.com"]', lang: 'zh-CN' });
+    expect(page.lines()).toEqual(['总是显示 news@example.com 的图片 [不再总是显示]']);
+    page.press('不再总是显示');
+    expect(page.frame()).toBe('/mail-frame');
+    expect(page.lines()).toEqual(['已隐藏 3 张远程图片 [显示] [总是显示 news@example.com 的图片]']);
+  });
+});
+
 describe('what a QA pass found in the queue and the mailbox, in the page', () => {
   const en = (key: string): string => STRINGS.en[key as StringKey] ?? key;
   const fillEn = (key: string, vars: Record<string, unknown> = {}): string =>
